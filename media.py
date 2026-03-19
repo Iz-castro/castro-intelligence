@@ -1,27 +1,40 @@
 # -*- coding: utf-8 -*-
 
 """
-Gerencia download de midia recebida via WhatsApp Cloud API
-e conversao de formatos de audio para compatibilidade.
+Gerencia download de midia recebida via WhatsApp Cloud API,
+conversao de audio e persistencia em disco local ou Cloud Storage.
 """
 
-import os
-import logging
 import hashlib
+import logging
+import mimetypes
+import os
 import subprocess
 import tempfile
 from datetime import datetime
 
 import httpx
 
-from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE, MEDIA_DIR, MAX_MEDIA_SIZE_MB
+from config import (
+    WHATSAPP_TOKEN,
+    WHATSAPP_PHONE_NUMBER_ID,
+    GRAPH_API_BASE,
+    MEDIA_DIR,
+    MAX_MEDIA_SIZE_MB,
+    MEDIA_STORAGE_BACKEND,
+    GCS_MEDIA_BUCKET,
+    GCS_MEDIA_PREFIX,
+)
 
 logger = logging.getLogger("castro_crm.media")
+
+_storage_client = None
+_storage_backend_logged = False
 
 
 def _normalize_br(wa_id):
     s = str(wa_id)
-    if len(s) == 12 and s.startswith("55") and s[4] in ("6","7","8","9"):
+    if len(s) == 12 and s.startswith("55") and s[4] in ("6", "7", "8", "9"):
         return f"55{s[2:4]}9{s[4:]}"
     return s
 
@@ -49,7 +62,44 @@ MIME_EXTENSIONS = {
 }
 
 
+def _using_gcs():
+    return MEDIA_STORAGE_BACKEND == "gcs" and bool(GCS_MEDIA_BUCKET)
+
+
+def _get_storage_client():
+    global _storage_client
+    if _storage_client is None:
+        try:
+            from google.cloud import storage
+        except ImportError as exc:
+            raise RuntimeError("google-cloud-storage nao instalado") from exc
+        _storage_client = storage.Client()
+    return _storage_client
+
+
+def _get_bucket():
+    return _get_storage_client().bucket(GCS_MEDIA_BUCKET)
+
+
+def _log_storage_backend_once():
+    global _storage_backend_logged
+    if _storage_backend_logged:
+        return
+    if _using_gcs():
+        logger.info(
+            "Midia configurada para Cloud Storage | bucket=%s prefix=%s",
+            GCS_MEDIA_BUCKET,
+            GCS_MEDIA_PREFIX or "(raiz)",
+        )
+    else:
+        logger.info("Midia configurada para filesystem local | dir=%s", MEDIA_DIR)
+    _storage_backend_logged = True
+
+
 def ensure_media_dir():
+    _log_storage_backend_once()
+    if _using_gcs():
+        return
     os.makedirs(MEDIA_DIR, exist_ok=True)
     for subdir in ("images", "audio", "video", "documents", "stickers", "avatars"):
         os.makedirs(os.path.join(MEDIA_DIR, subdir), exist_ok=True)
@@ -66,34 +116,148 @@ def get_subdir_for_type(msg_type):
     return mapping.get(msg_type, "documents")
 
 
+def _build_media_path(subdir, filename):
+    return f"/media/{subdir}/{filename}"
+
+
+def _split_media_path(media_path):
+    normalized = (media_path or "").strip()
+    if not normalized.startswith("/media/"):
+        return None, None
+    parts = normalized.split("/", 3)
+    if len(parts) != 4:
+        return None, None
+    subdir = os.path.basename(parts[2])
+    filename = os.path.basename(parts[3])
+    if not subdir or not filename:
+        return None, None
+    return subdir, filename
+
+
+def _build_object_name(subdir, filename):
+    parts = []
+    if GCS_MEDIA_PREFIX:
+        parts.append(GCS_MEDIA_PREFIX)
+    parts.extend([subdir, filename])
+    return "/".join(parts)
+
+
+def _build_local_path(subdir, filename):
+    return os.path.join(MEDIA_DIR, subdir, filename)
+
+
+def _default_mime_type(filename):
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def _resolve_extension(mime_type, filename=""):
+    ext = MIME_EXTENSIONS.get(mime_type or "", "")
+    if not ext and filename:
+        _, ext = os.path.splitext(filename)
+    return ext or ".bin"
+
+
+def _write_media_bytes(content, subdir, filename, mime_type):
+    ensure_media_dir()
+    if _using_gcs():
+        blob = _get_bucket().blob(_build_object_name(subdir, filename))
+        blob.upload_from_string(content, content_type=mime_type)
+        return _build_media_path(subdir, filename)
+
+    filepath = _build_local_path(subdir, filename)
+    with open(filepath, "wb") as f:
+        f.write(content)
+    return _build_media_path(subdir, filename)
+
+
+def save_avatar_media(content, prefix, entity_id, mime_type):
+    ext = _resolve_extension(mime_type)
+    file_hash = hashlib.sha256(content).hexdigest()[:16]
+    filename = f"{prefix}_{entity_id}_{file_hash}{ext}"
+    return _write_media_bytes(content, "avatars", filename, mime_type)
+
+
+def delete_media(media_path):
+    if not media_path:
+        return
+
+    subdir, filename = _split_media_path(media_path)
+    if not subdir or not filename:
+        return
+
+    deleted = False
+    if _using_gcs():
+        try:
+            blob = _get_bucket().blob(_build_object_name(subdir, filename))
+            if blob.exists():
+                blob.delete()
+                deleted = True
+        except Exception as exc:
+            logger.warning("Falha ao remover midia no Cloud Storage (%s): %s", media_path, exc)
+
+    filepath = _build_local_path(subdir, filename)
+    if os.path.isfile(filepath):
+        try:
+            os.remove(filepath)
+            deleted = True
+        except OSError:
+            pass
+
+    if deleted:
+        logger.info("Midia removida: %s", media_path)
+
+
+def get_media_asset(media_path):
+    subdir, filename = _split_media_path(media_path)
+    if not subdir or not filename:
+        return None
+
+    if _using_gcs():
+        try:
+            blob = _get_bucket().blob(_build_object_name(subdir, filename))
+            if blob.exists():
+                return {
+                    "content": blob.download_as_bytes(),
+                    "mime_type": blob.content_type or _default_mime_type(filename),
+                    "filename": filename,
+                    "source": "gcs",
+                }
+        except Exception as exc:
+            logger.warning("Falha ao ler midia no Cloud Storage (%s): %s", media_path, exc)
+
+    filepath = _build_local_path(subdir, filename)
+    if os.path.isfile(filepath):
+        return {
+            "file_path": filepath,
+            "mime_type": _default_mime_type(filename),
+            "filename": filename,
+            "source": "local",
+        }
+    return None
+
+
 def convert_audio_to_ogg_opus(input_bytes, input_mime="audio/webm"):
     """
     Converte audio gravado pelo navegador (webm/opus) para OGG/Opus
     que e o formato aceito pelo WhatsApp.
     Retorna os bytes do arquivo OGG ou None em caso de falha.
     """
-    # Determinar extensao de entrada
     ext_in = ".webm"
     if "mp4" in input_mime or "m4a" in input_mime:
         ext_in = ".m4a"
     elif "mpeg" in input_mime or "mp3" in input_mime:
         ext_in = ".mp3"
     elif "ogg" in input_mime:
-        # Ja pode ser ogg valido, verificar se precisa conversao
         ext_in = ".ogg"
 
     tmp_in = None
     tmp_out_path = None
     try:
-        # Criar arquivo temporario de entrada
         tmp_in = tempfile.NamedTemporaryFile(suffix=ext_in, delete=False)
         tmp_in.write(input_bytes)
         tmp_in.close()
 
-        # Criar caminho de saida
         tmp_out_path = tmp_in.name.replace(ext_in, "_converted.ogg")
-
-        # Executar ffmpeg para converter
         cmd = [
             "ffmpeg",
             "-i", tmp_in.name,
@@ -118,7 +282,6 @@ def convert_audio_to_ogg_opus(input_bytes, input_mime="audio/webm"):
             logger.error("FFmpeg falhou (code=%d): %s", result.returncode, stderr_text)
             return None
 
-        # Ler resultado
         with open(tmp_out_path, "rb") as f:
             converted = f.read()
 
@@ -200,26 +363,14 @@ async def download_media(media_id, msg_type, original_filename=""):
 
             content = resp.content
             mime = media_info["mime_type"]
-            ext = MIME_EXTENSIONS.get(mime, "")
-
-            if not ext and original_filename:
-                _, ext = os.path.splitext(original_filename)
-            if not ext:
-                ext = ".bin"
-
+            ext = _resolve_extension(mime, original_filename)
             timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             safe_id = hashlib.sha256(media_id.encode()).hexdigest()[:12]
             filename = f"{timestamp}_{safe_id}{ext}"
-
             subdir = get_subdir_for_type(msg_type)
-            filepath = os.path.join(MEDIA_DIR, subdir, filename)
+            relative_path = _write_media_bytes(content, subdir, filename, mime or _default_mime_type(filename))
 
-            with open(filepath, "wb") as f:
-                f.write(content)
-
-            relative_path = f"/media/{subdir}/{filename}"
             logger.info("Midia salva: %s (%s, %d bytes)", relative_path, mime, len(content))
-
             return {
                 "path": relative_path,
                 "mime_type": mime,
@@ -235,43 +386,35 @@ async def download_media(media_id, msg_type, original_filename=""):
 def detect_media_type(mime_type):
     if mime_type.startswith("image/"):
         return "image"
-    elif mime_type.startswith("audio/"):
+    if mime_type.startswith("audio/"):
         return "audio"
-    elif mime_type.startswith("video/"):
+    if mime_type.startswith("video/"):
         return "video"
-    else:
-        return "document"
+    return "document"
 
 
-async def save_upload_locally(file_content, filename, mime_type):
+async def save_upload_media(file_content, filename, mime_type):
     ensure_media_dir()
 
     msg_type = detect_media_type(mime_type)
     subdir = get_subdir_for_type(msg_type)
-    ext = MIME_EXTENSIONS.get(mime_type, "")
-
-    if not ext and filename:
-        _, ext = os.path.splitext(filename)
-    if not ext:
-        ext = ".bin"
-
+    ext = _resolve_extension(mime_type, filename)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     safe_hash = hashlib.sha256(file_content[:1024]).hexdigest()[:12]
     safe_name = f"{timestamp}_{safe_hash}{ext}"
+    relative_path = _write_media_bytes(file_content, subdir, safe_name, mime_type)
 
-    filepath = os.path.join(MEDIA_DIR, subdir, safe_name)
-    with open(filepath, "wb") as f:
-        f.write(file_content)
-
-    relative_path = f"/media/{subdir}/{safe_name}"
-    logger.info("Upload local salvo: %s (%s, %d bytes)", relative_path, mime_type, len(file_content))
-
+    logger.info("Upload salvo: %s (%s, %d bytes)", relative_path, mime_type, len(file_content))
     return {
         "path": relative_path,
         "mime_type": mime_type,
         "size": len(file_content),
         "msg_type": msg_type,
     }
+
+
+async def save_upload_locally(file_content, filename, mime_type):
+    return await save_upload_media(file_content, filename, mime_type)
 
 
 async def upload_media_to_whatsapp(file_content, mime_type, filename=""):
@@ -297,10 +440,9 @@ async def upload_media_to_whatsapp(file_content, mime_type, filename=""):
                 media_id = result.get("id", "")
                 logger.info("Upload para Meta OK: media_id=%s", media_id)
                 return media_id
-            else:
-                error = result.get("error", {}).get("message", resp.text[:200])
-                logger.error("Upload para Meta falhou: %s", error)
-                return None
+            error = result.get("error", {}).get("message", resp.text[:200])
+            logger.error("Upload para Meta falhou: %s", error)
+            return None
         except Exception as exc:
             logger.error("Erro no upload para Meta: %s", exc)
             return None
@@ -311,7 +453,6 @@ async def send_media_message(wa_id, media_id, msg_type, caption=""):
         return None
 
     wa_id = _normalize_br(wa_id)
-
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -337,10 +478,9 @@ async def send_media_message(wa_id, media_id, msg_type, caption=""):
                 wa_msg_id = result.get("messages", [{}])[0].get("id", "")
                 logger.info("[WA MEDIA OUT] %s -> %s (type=%s)", wa_id, wa_msg_id, msg_type)
                 return {"wa_message_id": wa_msg_id, "status": "sent"}
-            else:
-                error = result.get("error", {}).get("message", "Erro desconhecido")
-                logger.error("[WA MEDIA FAIL] %s: %s", wa_id, error)
-                return {"error": error}
+            error = result.get("error", {}).get("message", "Erro desconhecido")
+            logger.error("[WA MEDIA FAIL] %s: %s", wa_id, error)
+            return {"error": error}
         except Exception as exc:
             logger.error("Erro ao enviar midia para %s: %s", wa_id, exc)
             return {"error": str(exc)}

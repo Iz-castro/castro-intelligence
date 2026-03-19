@@ -1,53 +1,131 @@
 # -*- coding: utf-8 -*-
 
-import sqlite3
 import logging
-from datetime import datetime, timezone
+import re
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
-from config import DATABASE_PATH
+from sqlalchemy import create_engine, event, inspect, text
+
+from config import DATABASE_URL
 
 logger = logging.getLogger("castro_crm.database")
 
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+PRIMARY_KEY_SQL = "INTEGER PRIMARY KEY AUTOINCREMENT" if IS_SQLITE else "BIGSERIAL PRIMARY KEY"
+NOW_SQL = "(datetime('now'))" if IS_SQLITE else "CURRENT_TIMESTAMP"
+
+ENGINE_KWARGS = {
+    "future": True,
+    "pool_pre_ping": True,
+}
+if IS_SQLITE:
+    ENGINE_KWARGS["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **ENGINE_KWARGS)
+
+INSERT_RE = re.compile(r"^\s*INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
+RETURNING_RE = re.compile(r"\bRETURNING\b", re.IGNORECASE)
+
+
+if IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
+def _prepare_sql(query, params=None):
+    if params is None:
+        return query, {}
+
+    if isinstance(params, dict):
+        return query, params
+
+    if not isinstance(params, (tuple, list)):
+        params = (params,)
+
+    pieces = query.split("?")
+    expected = len(pieces) - 1
+    if expected != len(params):
+        raise ValueError(f"Esperados {expected} parametros, recebidos {len(params)}")
+
+    bind_params = {}
+    translated = [pieces[0]]
+    for idx, value in enumerate(params):
+        key = f"p{idx}"
+        translated.append(f":{key}")
+        translated.append(pieces[idx + 1])
+        bind_params[key] = value
+    return "".join(translated), bind_params
+
+
+class CompatResult:
+    def __init__(self, result=None, lastrowid=None, buffered_rows=None):
+        self._result = result
+        self.lastrowid = lastrowid
+        self._buffered_rows = buffered_rows
+
+    def fetchone(self):
+        if self._buffered_rows is not None:
+            if not self._buffered_rows:
+                return None
+            return dict(self._buffered_rows[0])
+        row = self._result.mappings().first()
+        return dict(row) if row else None
+
+    def fetchall(self):
+        if self._buffered_rows is not None:
+            return [dict(row) for row in self._buffered_rows]
+        return [dict(row) for row in self._result.mappings().all()]
+
+
+class CompatConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, query, params=None):
+        translated_query, bind_params = _prepare_sql(query, params)
+        insert_match = INSERT_RE.match(translated_query)
+
+        if not IS_SQLITE and insert_match and not RETURNING_RE.search(translated_query):
+            result = self._connection.execute(text(f"{translated_query} RETURNING id"), bind_params)
+            row = result.fetchone()
+            lastrowid = row[0] if row else None
+            buffered_rows = [row._mapping] if row else []
+            return CompatResult(lastrowid=lastrowid, buffered_rows=buffered_rows)
+
+        result = self._connection.execute(text(translated_query), bind_params)
+        return CompatResult(result=result, lastrowid=getattr(result, "lastrowid", None))
+
 
 def get_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return CompatConnection(engine.connect())
 
 
 @contextmanager
 def db_session():
-    conn = get_connection()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with engine.begin() as connection:
+        yield CompatConnection(connection)
 
 
 def init_database():
     with db_session() as conn:
-        c = conn.cursor()
-
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS departments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 name TEXT NOT NULL UNIQUE,
                 description TEXT DEFAULT '',
                 is_active INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL}
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 username TEXT NOT NULL UNIQUE,
                 display_name TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
@@ -55,7 +133,7 @@ def init_database():
                 role TEXT DEFAULT 'operador',
                 avatar_path TEXT DEFAULT '',
                 is_active INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL},
                 last_login TEXT,
                 failed_attempts INTEGER DEFAULT 0,
                 locked_until TEXT,
@@ -63,23 +141,23 @@ def init_database():
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 sender_id INTEGER NOT NULL,
                 receiver_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 msg_type TEXT NOT NULL DEFAULT 'text',
                 is_read INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL},
                 FOREIGN KEY (sender_id) REFERENCES users(id),
                 FOREIGN KEY (receiver_id) REFERENCES users(id)
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS wa_contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 wa_id TEXT NOT NULL UNIQUE,
                 display_name TEXT DEFAULT '',
                 phone_formatted TEXT DEFAULT '',
@@ -90,16 +168,16 @@ def init_database():
                 assigned_to INTEGER,
                 department_id INTEGER,
                 is_archived INTEGER DEFAULT 0,
-                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                first_seen_at TEXT NOT NULL DEFAULT {NOW_SQL},
                 last_message_at TEXT,
                 FOREIGN KEY (assigned_to) REFERENCES users(id),
                 FOREIGN KEY (department_id) REFERENCES departments(id)
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS wa_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 wa_message_id TEXT UNIQUE,
                 contact_id INTEGER NOT NULL,
                 direction TEXT NOT NULL DEFAULT 'inbound',
@@ -114,25 +192,25 @@ def init_database():
                 status TEXT DEFAULT 'received',
                 operator_id INTEGER,
                 timestamp_wa TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL},
                 FOREIGN KEY (contact_id) REFERENCES wa_contacts(id),
                 FOREIGN KEY (operator_id) REFERENCES users(id)
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS wa_message_status (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 wa_message_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 timestamp_wa TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL}
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS wa_transfer_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 contact_id INTEGER NOT NULL,
                 from_user_id INTEGER,
                 to_user_id INTEGER,
@@ -141,7 +219,7 @@ def init_database():
                 reason TEXT DEFAULT '',
                 summary TEXT DEFAULT '',
                 transferred_by INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL},
                 FOREIGN KEY (contact_id) REFERENCES wa_contacts(id),
                 FOREIGN KEY (from_user_id) REFERENCES users(id),
                 FOREIGN KEY (to_user_id) REFERENCES users(id),
@@ -149,47 +227,46 @@ def init_database():
             )
         """)
 
-        c.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {PRIMARY_KEY_SQL},
                 user_id INTEGER,
                 action TEXT NOT NULL,
                 detail TEXT DEFAULT '',
                 ip_address TEXT DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT {NOW_SQL}
             )
         """)
 
-        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_sender ON messages(sender_id, created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_msg_receiver ON messages(receiver_id, created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wa_contact ON wa_contacts(wa_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wa_contact_assigned ON wa_contacts(assigned_to)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wa_msg_contact ON wa_messages(contact_id, created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wa_msg_wamid ON wa_messages(wa_message_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_wa_transfer ON wa_transfer_log(contact_id, created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_sender ON messages(sender_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_receiver ON messages(receiver_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wa_contact ON wa_contacts(wa_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wa_contact_assigned ON wa_contacts(assigned_to)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wa_msg_contact ON wa_messages(contact_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wa_msg_wamid ON wa_messages(wa_message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wa_transfer ON wa_transfer_log(contact_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id, created_at)")
 
-        # Migracoes para bancos existentes
-        _migrate(c, "wa_contacts", "assigned_to", "INTEGER")
-        _migrate(c, "wa_contacts", "department_id", "INTEGER")
-        _migrate(c, "wa_contacts", "qualification", "TEXT DEFAULT 'novo'")
-        _migrate(c, "wa_contacts", "notes", "TEXT DEFAULT ''")
-        _migrate(c, "wa_contacts", "is_archived", "INTEGER DEFAULT 0")
-        _migrate(c, "wa_contacts", "contact_avatar_path", "TEXT DEFAULT ''")
-        _migrate(c, "users", "department_id", "INTEGER")
-        _migrate(c, "users", "avatar_path", "TEXT DEFAULT ''")
-        _migrate(c, "users", "role", "TEXT DEFAULT 'operador'")
-        _migrate(c, "wa_transfer_log", "summary", "TEXT DEFAULT ''")
+        _migrate(conn, "wa_contacts", "assigned_to", "INTEGER")
+        _migrate(conn, "wa_contacts", "department_id", "INTEGER")
+        _migrate(conn, "wa_contacts", "qualification", "TEXT DEFAULT 'novo'")
+        _migrate(conn, "wa_contacts", "notes", "TEXT DEFAULT ''")
+        _migrate(conn, "wa_contacts", "is_archived", "INTEGER DEFAULT 0")
+        _migrate(conn, "wa_contacts", "contact_avatar_path", "TEXT DEFAULT ''")
+        _migrate(conn, "users", "department_id", "INTEGER")
+        _migrate(conn, "users", "avatar_path", "TEXT DEFAULT ''")
+        _migrate(conn, "users", "role", "TEXT DEFAULT 'operador'")
+        _migrate(conn, "wa_transfer_log", "summary", "TEXT DEFAULT ''")
 
     logger.info("Banco de dados inicializado")
 
 
-def _migrate(cursor, table, column, col_type):
-    try:
-        cursor.execute(f"SELECT {column} FROM {table} LIMIT 1")
-    except sqlite3.OperationalError:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        logger.info("Migrado: %s.%s", table, column)
+def _migrate(conn, table, column, col_type):
+    columns = {col["name"] for col in inspect(engine).get_columns(table)}
+    if column in columns:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    logger.info("Migrado: %s.%s", table, column)
 
 
 # -- Departamentos --
@@ -369,12 +446,11 @@ def upsert_wa_contact(wa_id, display_name=""):
                 (display_name or "", now, wa_id)
             )
             return existing["id"]
-        else:
-            cursor = conn.execute(
-                "INSERT INTO wa_contacts (wa_id, display_name, phone_formatted, last_message_at) VALUES (?, ?, ?, ?)",
-                (wa_id, display_name or "", phone_formatted, now)
-            )
-            return cursor.lastrowid
+        cursor = conn.execute(
+            "INSERT INTO wa_contacts (wa_id, display_name, phone_formatted, last_message_at) VALUES (?, ?, ?, ?)",
+            (wa_id, display_name or "", phone_formatted, now)
+        )
+        return cursor.lastrowid
 
 
 def get_wa_contact(contact_id):
@@ -465,7 +541,6 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
 
 
 def insert_transfer_system_message(contact_id, content, operator_id=None):
-    """Insere mensagem de sistema na conversa para marcar transferencia."""
     now = datetime.now(timezone.utc).isoformat()
     with db_session() as conn:
         cursor = conn.execute(
@@ -575,7 +650,7 @@ def format_phone_br(wa_id):
     s = str(wa_id)
     if len(s) == 13 and s.startswith("55"):
         return f"+55 ({s[2:4]}) {s[4:9]}-{s[9:]}"
-    elif len(s) == 12 and s.startswith("55"):
+    if len(s) == 12 and s.startswith("55"):
         return f"+55 ({s[2:4]}) {s[4:8]}-{s[8:]}"
     return f"+{s}" if not s.startswith("+") else s
 
@@ -585,6 +660,6 @@ def normalize_br_phone(wa_id):
     if len(s) == 12 and s.startswith("55"):
         ddd = s[2:4]
         local = s[4:]
-        if local[0] in ("6", "7", "8", "9"):
+        if local and local[0] in ("6", "7", "8", "9"):
             return f"55{ddd}9{local}"
     return s

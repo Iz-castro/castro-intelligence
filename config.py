@@ -2,11 +2,33 @@
 
 import os
 import secrets
+from pathlib import Path
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = Path(__file__).resolve().parent
+IS_CLOUD_RUN = bool(os.getenv("K_SERVICE"))
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_database_path():
+    raw_path = os.getenv("DATABASE_PATH", str(BASE_DIR / "castro_crm.db"))
+    return Path(raw_path).resolve()
+
+
+def _default_database_url():
+    value = os.getenv("DATABASE_URL", "").strip()
+    if value:
+        return value
+    return f"sqlite:///{DATABASE_PATH.as_posix()}"
+
 
 # -- Banco de dados --
-DATABASE_PATH = os.getenv("DATABASE_PATH", os.path.join(BASE_DIR, "castro_crm.db"))
+DATABASE_PATH = _default_database_path()
+DATABASE_URL = _default_database_url()
 
 # -- Seguranca --
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
@@ -32,7 +54,14 @@ GRAPH_API_VERSION = "v22.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 # -- Media --
-MEDIA_DIR = os.getenv("MEDIA_DIR", os.path.join(BASE_DIR, "media"))
+DEFAULT_MEDIA_DIR = Path("/tmp/castro_crm_media") if IS_CLOUD_RUN else BASE_DIR / "media"
+MEDIA_DIR = os.getenv("MEDIA_DIR", str(DEFAULT_MEDIA_DIR))
+GCS_MEDIA_BUCKET = os.getenv("GCS_MEDIA_BUCKET", "").strip()
+GCS_MEDIA_PREFIX = os.getenv("GCS_MEDIA_PREFIX", "media").strip().strip("/")
+MEDIA_STORAGE_BACKEND = os.getenv(
+    "MEDIA_STORAGE_BACKEND",
+    "gcs" if GCS_MEDIA_BUCKET else "local",
+).strip().lower()
 MAX_MEDIA_SIZE_MB = 16
 
 # -- Avatar / Foto de perfil --
@@ -60,6 +89,14 @@ ROLE_OPTIONS = [
     "operador",
 ]
 
+# -- Bootstrap inicial --
+BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip().lower()
+BOOTSTRAP_ADMIN_PASSWORD = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+BOOTSTRAP_ADMIN_DISPLAY_NAME = os.getenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Administrador")
+BOOTSTRAP_ADMIN_DEPARTMENT = os.getenv("BOOTSTRAP_ADMIN_DEPARTMENT", "Geral")
+
 # -- Logging --
-LOG_FILE = os.path.join(BASE_DIR, "logs", "castro_crm.log")
+DEFAULT_LOG_FILE = Path("/tmp/logs/castro_crm.log") if IS_CLOUD_RUN else BASE_DIR / "logs" / "castro_crm.log"
+LOG_FILE = os.getenv("LOG_FILE", str(DEFAULT_LOG_FILE))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_TO_FILE = _as_bool(os.getenv("LOG_TO_FILE"), default=not IS_CLOUD_RUN)

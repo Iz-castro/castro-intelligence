@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import hashlib
 import html
 import logging
 import os
@@ -11,17 +10,19 @@ from fastapi import (
     FastAPI, WebSocket, WebSocketDisconnect, Request,
     HTTPException, Depends, Query, UploadFile, File, Form,
 )
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 from config import (
-    HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL,
-    MEDIA_DIR, WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
+    HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
+    WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE,
-    AVATAR_DIR, AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
+    AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS,
+    BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_PASSWORD,
+    BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
@@ -33,7 +34,7 @@ from database import (
     get_all_departments, create_department,
     assign_wa_contact, get_transfer_history,
     update_user_avatar, get_user_avatar,
-    create_user, update_user, deactivate_user,
+    create_user, update_user, deactivate_user, get_user_by_username,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message,
 )
@@ -41,20 +42,21 @@ from auth import authenticate, decode_token, hash_password
 from webhook import process_webhook_payload, validate_signature
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
-    save_upload_locally, detect_media_type, convert_audio_to_ogg_opus,
+    save_upload_media, convert_audio_to_ogg_opus,
+    save_avatar_media, delete_media, get_media_asset,
 )
 
 # -- Logging --
 
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+log_handlers = [logging.StreamHandler()]
+if LOG_TO_FILE and LOG_FILE:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    log_handlers.insert(0, logging.FileHandler(LOG_FILE, encoding="utf-8"))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=log_handlers,
 )
 logger = logging.getLogger("castro_crm.main")
 
@@ -158,26 +160,38 @@ def _save_avatar(content, prefix, entity_id):
     real_mime = _validate_image_bytes(content)
     if not real_mime or real_mime not in AVATAR_ALLOWED_MIME:
         return None
-    ext_map = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-    ext = ext_map.get(real_mime, ".jpg")
-    file_hash = hashlib.sha256(content).hexdigest()[:16]
-    filename = f"{prefix}_{entity_id}_{file_hash}{ext}"
-    os.makedirs(AVATAR_DIR, exist_ok=True)
-    filepath = os.path.join(AVATAR_DIR, filename)
-    with open(filepath, "wb") as f:
-        f.write(content)
-    return f"/media/avatars/{filename}"
+    return save_avatar_media(content, prefix, entity_id, real_mime)
 
 
 def _remove_old_avatar(old_path):
-    if not old_path:
+    delete_media(old_path)
+
+
+def bootstrap_admin_user():
+    if not BOOTSTRAP_ADMIN_USERNAME or not BOOTSTRAP_ADMIN_PASSWORD:
+        logger.info("Bootstrap admin nao configurado")
         return
-    old_file = os.path.join(BASE_DIR, old_path.lstrip("/"))
-    if os.path.isfile(old_file):
-        try:
-            os.remove(old_file)
-        except OSError:
-            pass
+
+    existing = get_user_by_username(BOOTSTRAP_ADMIN_USERNAME)
+    if existing:
+        logger.info("Bootstrap admin ja existe | username=%s", BOOTSTRAP_ADMIN_USERNAME)
+        return
+
+    department_id = create_department(
+        BOOTSTRAP_ADMIN_DEPARTMENT,
+        "Setor criado automaticamente no primeiro deploy",
+    )
+    user_id = create_user(
+        BOOTSTRAP_ADMIN_USERNAME,
+        BOOTSTRAP_ADMIN_DISPLAY_NAME,
+        hash_password(BOOTSTRAP_ADMIN_PASSWORD),
+        department_id,
+        "admin",
+    )
+    if user_id:
+        logger.info("Bootstrap admin criado | username=%s", BOOTSTRAP_ADMIN_USERNAME)
+    else:
+        logger.warning("Falha ao criar bootstrap admin | username=%s", BOOTSTRAP_ADMIN_USERNAME)
 
 
 # -- Startup --
@@ -185,6 +199,7 @@ def _remove_old_avatar(old_path):
 @app.on_event("startup")
 async def startup():
     init_database()
+    bootstrap_admin_user()
     ensure_media_dir()
     logger.info("CRM iniciado | host=%s port=%d", HOST, PORT)
     if WHATSAPP_TOKEN:
@@ -213,10 +228,12 @@ async def chat_page():
 async def serve_media(subdir: str, filename: str):
     safe_subdir = os.path.basename(subdir)
     safe_filename = os.path.basename(filename)
-    filepath = os.path.join(MEDIA_DIR, safe_subdir, safe_filename)
-    if not os.path.isfile(filepath):
+    asset = get_media_asset(f"/media/{safe_subdir}/{safe_filename}")
+    if not asset:
         raise HTTPException(status_code=404, detail="Arquivo nao encontrado")
-    return FileResponse(filepath)
+    if asset.get("file_path"):
+        return FileResponse(asset["file_path"], media_type=asset.get("mime_type"))
+    return Response(content=asset["content"], media_type=asset.get("mime_type"))
 
 
 # -- Webhook WABA --
@@ -502,7 +519,7 @@ async def wa_send_media(
 
     mime_type = file.content_type or "application/octet-stream"
     filename = file.filename or "upload"
-    local_result = await save_upload_locally(file_content, filename, mime_type)
+    local_result = await save_upload_media(file_content, filename, mime_type)
     msg_type = local_result["msg_type"]
 
     media_id = await upload_media_to_whatsapp(file_content, mime_type, filename)
@@ -555,7 +572,7 @@ async def wa_send_audio(
         raise HTTPException(status_code=500, detail="Falha na conversao do audio. Verifique se o FFmpeg esta instalado.")
 
     # Salvar versao convertida localmente
-    local_result = await save_upload_locally(converted, "gravacao.ogg", "audio/ogg")
+    local_result = await save_upload_media(converted, "gravacao.ogg", "audio/ogg")
 
     # Upload do OGG convertido para a Meta
     media_id = await upload_media_to_whatsapp(converted, "audio/ogg", "audio.ogg")

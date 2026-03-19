@@ -14,8 +14,6 @@ COPY . .
 RUN mkdir -p /app/media/images /app/media/audio /app/media/video \
     /app/media/documents /app/media/stickers /app/media/avatars /app/logs
 
-RUN python init_db.py
-
 EXPOSE 8080
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
