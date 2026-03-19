@@ -36,6 +36,7 @@ uploads/
 # Test files
 test_debug.py
 start_tunnel.py
+start.ps1
 
 # Build
 build/

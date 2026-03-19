@@ -21,7 +21,7 @@
 +-- main.py
 +-- media.py
 +-- requirements.txt
-+-- start.ps1
++-- start.example.ps1
 +-- start_tunnel.py
 +-- test_debug.py
 +-- webhook.py
@@ -62,9 +62,9 @@ SECRET_KEY=gerar_com_openssl_rand_hex_32
 
 # WhatsApp Business API (Meta Cloud API)
 WHATSAPP_TOKEN=seu_token_temporario_ou_permanente
-WHATSAPP_PHONE_NUMBER_ID=983401388192837
-WHATSAPP_WABA_ID=275244975509458
-WHATSAPP_VERIFY_TOKEN=hubloc2024
+WHATSAPP_PHONE_NUMBER_ID=000000000000000
+WHATSAPP_WABA_ID=000000000000000
+WHATSAPP_VERIFY_TOKEN=seu_token_verificacao_webhook
 WHATSAPP_APP_SECRET=chave_secreta_do_app_meta
 
 # Google Cloud (deploy)
@@ -220,7 +220,7 @@ PORT = int(os.getenv("PORT", "8080"))
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_WABA_ID = os.getenv("WHATSAPP_WABA_ID", "")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "hubloc2024")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 
 GRAPH_API_VERSION = "v22.0"
@@ -884,7 +884,7 @@ SERVICE_NAME="castro-crm"
 WA_TOKEN="${WHATSAPP_TOKEN:-}"
 WA_PHONE_ID="${WHATSAPP_PHONE_NUMBER_ID:-}"
 WA_WABA_ID="${WHATSAPP_WABA_ID:-}"
-WA_VERIFY="${WHATSAPP_VERIFY_TOKEN:-hubloc2024}"
+WA_VERIFY="${WHATSAPP_VERIFY_TOKEN:-}"
 WA_APP_SECRET="${WHATSAPP_APP_SECRET:-}"
 APP_SECRET_KEY="${SECRET_KEY:-$(openssl rand -hex 32)}"
 
@@ -892,6 +892,12 @@ APP_SECRET_KEY="${SECRET_KEY:-$(openssl rand -hex 32)}"
 if [ "$PROJECT_ID" = "seu-projeto-gcp" ]; then
     echo "ERRO: Defina GCP_PROJECT_ID antes de rodar."
     echo "  export GCP_PROJECT_ID=meu-projeto-123"
+    exit 1
+fi
+
+if [ -z "$WA_VERIFY" ]; then
+    echo "ERRO: Defina WHATSAPP_VERIFY_TOKEN antes de rodar."
+    echo "  export WHATSAPP_VERIFY_TOKEN=seu_token_verificacao_webhook"
     exit 1
 fi
 
@@ -947,7 +953,7 @@ echo ""
 echo "  URL do webhook (copiar para o painel da Meta):"
 echo "  ${SERVICE_URL}/webhook"
 echo ""
-echo "  Verify Token: $WA_VERIFY"
+echo "  Verify Token configurado via ambiente."
 echo "=========================================="
 
 ```
@@ -978,7 +984,7 @@ echo "=========================================="
 +-- main.py
 +-- media.py
 +-- requirements.txt
-+-- start.ps1
++-- start.example.ps1
 +-- start_tunnel.py
 +-- test_debug.py
 +-- webhook.py
@@ -1019,9 +1025,9 @@ SECRET_KEY=gerar_com_openssl_rand_hex_32
 
 # WhatsApp Business API (Meta Cloud API)
 WHATSAPP_TOKEN=seu_token_temporario_ou_permanente
-WHATSAPP_PHONE_NUMBER_ID=983401388192837
-WHATSAPP_WABA_ID=275244975509458
-WHATSAPP_VERIFY_TOKEN=hubloc2024
+WHATSAPP_PHONE_NUMBER_ID=000000000000000
+WHATSAPP_WABA_ID=000000000000000
+WHATSAPP_VERIFY_TOKEN=seu_token_verificacao_webhook
 WHATSAPP_APP_SECRET=chave_secreta_do_app_meta
 
 # Google Cloud (deploy)
@@ -1177,7 +1183,7 @@ PORT = int(os.getenv("PORT", "8080"))
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_WABA_ID = os.getenv("WHATSAPP_WABA_ID", "")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "hubloc2024")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 
 GRAPH_API_VERSION = "v22.0"
@@ -3229,14 +3235,14 @@ python-multipart==0.0.9
 
 ```
 
-## start.ps1
+## start.example.ps1
 
 ```powershell
-$env:SECRET_KEY="castro_intel_2026_chave_fixa"
-$env:WHATSAPP_TOKEN="EAALBK2KV99sBQZCwHhZBiiL3BFQoW7FZBeIxZAYWDhZAQIVZCKDhGNZABztEjHH5Due2xZCArZAZBXOj4DjTHZCyy651OLu2RxTlSSDhDnlp3Ho58ipdxnmFIUTetlXVlkzNZAFqZCdxov8j8n0dCZAaskxaCNBkUcjdNIkpFZBZACFRjXCBcVEdy5g9KZBVoCc9tNSloTax3cAZDZD"
-$env:WHATSAPP_PHONE_NUMBER_ID="983401388192837"
-$env:WHATSAPP_VERIFY_TOKEN="hubloc2024"
-$env:WHATSAPP_APP_SECRET=""
+$env:SECRET_KEY="troque_por_uma_chave_hex_aleatoria"
+$env:WHATSAPP_TOKEN="troque_pelo_token_da_meta"
+$env:WHATSAPP_PHONE_NUMBER_ID="000000000000000"
+$env:WHATSAPP_VERIFY_TOKEN="troque_pelo_token_de_verificacao"
+$env:WHATSAPP_APP_SECRET="troque_pelo_app_secret_da_meta"
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
@@ -3247,6 +3253,8 @@ Write-Host "  Abrindo dois terminais:"
 Write-Host "    1. Servidor FastAPI (porta 8080)"
 Write-Host "    2. Tunel ngrok (HTTPS)"
 Write-Host ""
+
+# Copie este arquivo para start.ps1 e preencha os valores reais antes de rodar.
 
 # Terminal 1: Servidor
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$PWD'; .\venv\Scripts\activate; python main.py"
@@ -3313,7 +3321,7 @@ def main():
     print(f"\n  Acesso local:  http://127.0.0.1:8080")
     print(f"  Acesso externo: {url}")
     print(f"\n  Webhook (para Meta): {url}/webhook")
-    print(f"  Verify Token: hubloc2024")
+    print("  Verify Token configurado via ambiente.")
     print(f"\n  Ctrl+C para encerrar")
     print("=" * 56 + "\n")
 
@@ -4255,13 +4263,13 @@ def make_wa_payload(msg_type, msg_data, wa_id="5531982779779", name="Cliente Tes
     return {
         "object": "whatsapp_business_account",
         "entry": [{
-            "id": "275244975509458",
+            "id": "000000000000000",
             "changes": [{
                 "value": {
                     "messaging_product": "whatsapp",
                     "metadata": {
                         "display_phone_number": "15551754802",
-                        "phone_number_id": "983401388192837"
+                        "phone_number_id": "000000000000000"
                     },
                     "contacts": [{
                         "profile": {"name": name},
@@ -4279,13 +4287,13 @@ def make_status_payload(msg_id, status, recipient="5531982779779"):
     return {
         "object": "whatsapp_business_account",
         "entry": [{
-            "id": "275244975509458",
+            "id": "000000000000000",
             "changes": [{
                 "value": {
                     "messaging_product": "whatsapp",
                     "metadata": {
                         "display_phone_number": "15551754802",
-                        "phone_number_id": "983401388192837"
+                        "phone_number_id": "000000000000000"
                     },
                     "statuses": [{
                         "id": msg_id,
@@ -4394,7 +4402,7 @@ def test_webhook_verify():
     # Verificacao correta
     r = requests.get(f"{BASE_URL}/webhook", params={
         "hub.mode": "subscribe",
-        "hub.verify_token": "hubloc2024",
+        "hub.verify_token": "seu_token_verificacao_webhook",
         "hub.challenge": "teste_challenge_123"
     })
     test("Verificacao com token correto", r.status_code == 200)

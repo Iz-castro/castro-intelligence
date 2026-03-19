@@ -22,7 +22,7 @@ SERVICE_NAME="castro-crm"
 WA_TOKEN="${WHATSAPP_TOKEN:-}"
 WA_PHONE_ID="${WHATSAPP_PHONE_NUMBER_ID:-}"
 WA_WABA_ID="${WHATSAPP_WABA_ID:-}"
-WA_VERIFY="${WHATSAPP_VERIFY_TOKEN:-hubloc2024}"
+WA_VERIFY="${WHATSAPP_VERIFY_TOKEN:-}"
 WA_APP_SECRET="${WHATSAPP_APP_SECRET:-}"
 APP_SECRET_KEY="${SECRET_KEY:-$(openssl rand -hex 32)}"
 
@@ -30,6 +30,12 @@ APP_SECRET_KEY="${SECRET_KEY:-$(openssl rand -hex 32)}"
 if [ "$PROJECT_ID" = "seu-projeto-gcp" ]; then
     echo "ERRO: Defina GCP_PROJECT_ID antes de rodar."
     echo "  export GCP_PROJECT_ID=meu-projeto-123"
+    exit 1
+fi
+
+if [ -z "$WA_VERIFY" ]; then
+    echo "ERRO: Defina WHATSAPP_VERIFY_TOKEN antes de rodar."
+    echo "  export WHATSAPP_VERIFY_TOKEN=seu_token_verificacao_webhook"
     exit 1
 fi
 
@@ -85,5 +91,5 @@ echo ""
 echo "  URL do webhook (copiar para o painel da Meta):"
 echo "  ${SERVICE_URL}/webhook"
 echo ""
-echo "  Verify Token: $WA_VERIFY"
+echo "  Verify Token configurado via ambiente."
 echo "=========================================="
