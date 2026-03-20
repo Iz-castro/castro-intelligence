@@ -10,7 +10,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from config import WHATSAPP_APP_SECRET
+from config import REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit,
 )
@@ -22,10 +22,10 @@ logger = logging.getLogger("castro_crm.webhook")
 def validate_signature(payload_bytes, signature_header):
     """
     Valida assinatura HMAC-SHA256 do webhook da Meta.
-    Retorna True se valido ou se APP_SECRET nao esta configurado (modo dev).
+    Em dev pode operar sem APP_SECRET; em runtime endurecido a assinatura e obrigatoria.
     """
     if not WHATSAPP_APP_SECRET:
-        return True  # Pular validacao em dev
+        return not REQUIRE_WEBHOOK_SIGNATURE
 
     if not signature_header:
         logger.warning("Webhook recebido sem assinatura")

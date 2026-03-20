@@ -2,10 +2,12 @@ __pycache__
 *.pyc
 *.pyo
 .env
+service-account*.json
 .git
 .gitignore
 venv
 *.db
+data/
 logs/*.log
 media/*
 *.tar.gz

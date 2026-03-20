@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
+from bootstrap_data import ensure_default_departments
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
@@ -22,7 +23,10 @@ from config import (
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS,
     BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_PASSWORD,
-    BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
+    BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
+    CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN, IS_SQLITE,
+    MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
+    DATA_BACKEND, CHAT_DELIVERY_MODE, POLLING_INTERVAL_MS, AUTH_MODE, USE_FIREBASE_AUTH,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
@@ -35,10 +39,11 @@ from database import (
     assign_wa_contact, get_transfer_history,
     update_user_avatar, get_user_avatar,
     create_user, update_user, deactivate_user, get_user_by_username,
+    upsert_firebase_user, get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message,
 )
-from auth import authenticate, decode_token, hash_password
+from auth import authenticate, authenticate_firebase_token, decode_token, hash_password
 from webhook import process_webhook_payload, validate_signature
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
@@ -71,7 +76,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -131,6 +136,14 @@ def get_current_user(request: Request):
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token ausente")
     token = auth_header.split(" ", 1)[1]
+    ip = request.client.host if request.client else "unknown"
+
+    if USE_FIREBASE_AUTH:
+        result = authenticate_firebase_token(token, ip)
+        if not result["success"]:
+            raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
+        return result["user"]
+
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Token invalido ou expirado")
@@ -168,6 +181,28 @@ def _remove_old_avatar(old_path):
 
 
 def bootstrap_admin_user():
+    if USE_FIREBASE_AUTH:
+        if not BOOTSTRAP_ADMIN_EMAIL:
+            logger.info("Bootstrap admin Firebase nao configurado")
+            return
+
+        department_id = create_department(
+            BOOTSTRAP_ADMIN_DEPARTMENT,
+            "Setor criado automaticamente no primeiro deploy",
+        )
+        user = upsert_firebase_user(
+            firebase_uid="",
+            email=BOOTSTRAP_ADMIN_EMAIL,
+            display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
+            role="admin",
+            department_id=department_id,
+        )
+        if user:
+            logger.info("Bootstrap admin Firebase sincronizado | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        else:
+            logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        return
+
     if not BOOTSTRAP_ADMIN_USERNAME or not BOOTSTRAP_ADMIN_PASSWORD:
         logger.info("Bootstrap admin nao configurado")
         return
@@ -194,11 +229,38 @@ def bootstrap_admin_user():
         logger.warning("Falha ao criar bootstrap admin | username=%s", BOOTSTRAP_ADMIN_USERNAME)
 
 
+def bootstrap_departments():
+    dept_map = ensure_default_departments(create_department)
+    logger.info("Departamentos padrao sincronizados | total=%d", len(dept_map))
+
+
+def validate_runtime_config():
+    if not IS_CLOUD_RUN:
+        return
+
+    if DATA_BACKEND == "sql" and IS_SQLITE:
+        raise RuntimeError("Cloud Run nao deve usar SQLite. Use PostgreSQL/Cloud SQL.")
+
+    if MEDIA_STORAGE_BACKEND == "gcs":
+        if not GCS_MEDIA_BUCKET:
+            raise RuntimeError("Cloud Run com GCS requer GCS_MEDIA_BUCKET configurado")
+    elif MEDIA_STORAGE_BACKEND != "firestore":
+        raise RuntimeError("Cloud Run requer MEDIA_STORAGE_BACKEND=gcs ou firestore")
+
+    if REQUIRE_WEBHOOK_SIGNATURE and not WHATSAPP_APP_SECRET:
+        raise RuntimeError("Cloud Run requer WHATSAPP_APP_SECRET quando REQUIRE_WEBHOOK_SIGNATURE=true")
+
+    if not WHATSAPP_VERIFY_TOKEN:
+        raise RuntimeError("Cloud Run requer WHATSAPP_VERIFY_TOKEN configurado")
+
+
 # -- Startup --
 
 @app.on_event("startup")
 async def startup():
+    validate_runtime_config()
     init_database()
+    bootstrap_departments()
     bootstrap_admin_user()
     ensure_media_dir()
     logger.info("CRM iniciado | host=%s port=%d", HOST, PORT)
@@ -267,6 +329,8 @@ async def webhook_receive(request: Request):
 
 @app.post("/api/login")
 async def login(body: LoginRequest, request: Request):
+    if USE_FIREBASE_AUTH:
+        raise HTTPException(status_code=405, detail="Use Firebase Auth no frontend e envie o ID token nas chamadas da API")
     ip = request.client.host if request.client else "unknown"
     result = authenticate(body.username, body.password, ip)
     if not result["success"]:
@@ -277,6 +341,25 @@ async def login(body: LoginRequest, request: Request):
     full_user = get_user_by_id(result["user"]["id"])
     user_data["role"] = full_user.get("role", "operador") if full_user else "operador"
     return {"token": result["token"], "user": user_data}
+
+
+@app.get("/api/session")
+async def session_info(current_user: dict = Depends(get_current_user)):
+    return {
+        "user": current_user,
+        "auth_mode": AUTH_MODE,
+    }
+
+
+@app.get("/api/client-config")
+async def client_config():
+    return {
+        "auth_mode": AUTH_MODE,
+        "chat_delivery_mode": CHAT_DELIVERY_MODE,
+        "polling_interval_ms": POLLING_INTERVAL_MS,
+        "data_backend": DATA_BACKEND,
+        "media_storage_backend": MEDIA_STORAGE_BACKEND,
+    }
 
 
 # -- API: Avatar do operador --
@@ -519,7 +602,10 @@ async def wa_send_media(
 
     mime_type = file.content_type or "application/octet-stream"
     filename = file.filename or "upload"
-    local_result = await save_upload_media(file_content, filename, mime_type)
+    try:
+        local_result = await save_upload_media(file_content, filename, mime_type)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     msg_type = local_result["msg_type"]
 
     media_id = await upload_media_to_whatsapp(file_content, mime_type, filename)
@@ -572,7 +658,10 @@ async def wa_send_audio(
         raise HTTPException(status_code=500, detail="Falha na conversao do audio. Verifique se o FFmpeg esta instalado.")
 
     # Salvar versao convertida localmente
-    local_result = await save_upload_media(converted, "gravacao.ogg", "audio/ogg")
+    try:
+        local_result = await save_upload_media(converted, "gravacao.ogg", "audio/ogg")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
     # Upload do OGG convertido para a Meta
     media_id = await upload_media_to_whatsapp(converted, "audio/ogg", "audio.ogg")
@@ -750,6 +839,8 @@ async def list_operators(current_user: dict = Depends(get_current_user)):
             "department_id": u.get("department_id"),
             "avatar_path": u.get("avatar_path", ""),
             "role": u.get("role", "operador"),
+            "email": u.get("email", ""),
+            "firebase_uid": u.get("firebase_uid", ""),
         }
         for u in users if u.get("is_active")
     ]

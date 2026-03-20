@@ -2,9 +2,10 @@
 
 """
 Gerencia download de midia recebida via WhatsApp Cloud API,
-conversao de audio e persistencia em disco local ou Cloud Storage.
+conversao de audio e persistencia em disco local, Cloud Storage ou Firestore.
 """
 
+import gzip
 import hashlib
 import logging
 import mimetypes
@@ -24,7 +25,11 @@ from config import (
     MEDIA_STORAGE_BACKEND,
     GCS_MEDIA_BUCKET,
     GCS_MEDIA_PREFIX,
+    FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB,
+    FIRESTORE_MEDIA_MAX_MB,
+    FIRESTORE_MEDIA_CHUNK_KB,
 )
+from firestore_common import collection, document, utcnow
 
 logger = logging.getLogger("castro_crm.media")
 
@@ -66,6 +71,10 @@ def _using_gcs():
     return MEDIA_STORAGE_BACKEND == "gcs" and bool(GCS_MEDIA_BUCKET)
 
 
+def _using_firestore():
+    return MEDIA_STORAGE_BACKEND == "firestore"
+
+
 def _get_storage_client():
     global _storage_client
     if _storage_client is None:
@@ -91,6 +100,13 @@ def _log_storage_backend_once():
             GCS_MEDIA_BUCKET,
             GCS_MEDIA_PREFIX or "(raiz)",
         )
+    elif _using_firestore():
+        logger.info(
+            "Midia configurada para Firestore | compress_threshold_kb=%d max_mb=%d chunk_kb=%d",
+            FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB,
+            FIRESTORE_MEDIA_MAX_MB,
+            FIRESTORE_MEDIA_CHUNK_KB,
+        )
     else:
         logger.info("Midia configurada para filesystem local | dir=%s", MEDIA_DIR)
     _storage_backend_logged = True
@@ -98,7 +114,7 @@ def _log_storage_backend_once():
 
 def ensure_media_dir():
     _log_storage_backend_once()
-    if _using_gcs():
+    if _using_gcs() or _using_firestore():
         return
     os.makedirs(MEDIA_DIR, exist_ok=True)
     for subdir in ("images", "audio", "video", "documents", "stickers", "avatars"):
@@ -146,6 +162,14 @@ def _build_local_path(subdir, filename):
     return os.path.join(MEDIA_DIR, subdir, filename)
 
 
+def _firestore_asset_id(subdir, filename):
+    return f"{subdir}__{filename}"
+
+
+def _firestore_asset_ref(subdir, filename):
+    return document("media_assets", _firestore_asset_id(subdir, filename))
+
+
 def _default_mime_type(filename):
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
@@ -157,8 +181,56 @@ def _resolve_extension(mime_type, filename=""):
     return ext or ".bin"
 
 
+def _maybe_compress_content(content):
+    threshold = max(FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB, 0) * 1024
+    if len(content) < threshold:
+        return content, False
+    compressed = gzip.compress(content, compresslevel=6)
+    if len(compressed) + 64 < len(content):
+        return compressed, True
+    return content, False
+
+
+def _store_media_in_firestore(content, subdir, filename, mime_type):
+    stored_content, compressed = _maybe_compress_content(content)
+    max_bytes = max(FIRESTORE_MEDIA_MAX_MB, 1) * 1024 * 1024
+    if len(stored_content) > max_bytes:
+        raise RuntimeError(
+            f"Arquivo excede limite seguro para Firestore ({FIRESTORE_MEDIA_MAX_MB}MB apos compressao)."
+        )
+
+    chunk_size = min(max(FIRESTORE_MEDIA_CHUNK_KB, 64) * 1024, 900 * 1024)
+    chunks = [
+        stored_content[index:index + chunk_size]
+        for index in range(0, len(stored_content), chunk_size)
+    ] or [b""]
+
+    asset_ref = _firestore_asset_ref(subdir, filename)
+    asset_ref.set({
+        "subdir": subdir,
+        "filename": filename,
+        "mime_type": mime_type,
+        "content_encoding": "gzip" if compressed else "",
+        "original_size": len(content),
+        "stored_size": len(stored_content),
+        "chunk_count": len(chunks),
+        "created_at": utcnow(),
+        "checksum": hashlib.sha256(content).hexdigest(),
+    })
+
+    for idx, chunk in enumerate(chunks):
+        asset_ref.collection("chunks").document(f"{idx:06d}").set({
+            "seq": idx,
+            "data": chunk,
+        })
+
+    return _build_media_path(subdir, filename)
+
+
 def _write_media_bytes(content, subdir, filename, mime_type):
     ensure_media_dir()
+    if _using_firestore():
+        return _store_media_in_firestore(content, subdir, filename, mime_type)
     if _using_gcs():
         blob = _get_bucket().blob(_build_object_name(subdir, filename))
         blob.upload_from_string(content, content_type=mime_type)
@@ -186,6 +258,17 @@ def delete_media(media_path):
         return
 
     deleted = False
+    if _using_firestore():
+        try:
+            asset_ref = _firestore_asset_ref(subdir, filename)
+            chunk_refs = list(asset_ref.collection("chunks").stream())
+            for chunk_snapshot in chunk_refs:
+                chunk_snapshot.reference.delete()
+            asset_ref.delete()
+            deleted = True
+        except Exception as exc:
+            logger.warning("Falha ao remover midia no Firestore (%s): %s", media_path, exc)
+
     if _using_gcs():
         try:
             blob = _get_bucket().blob(_build_object_name(subdir, filename))
@@ -211,6 +294,27 @@ def get_media_asset(media_path):
     subdir, filename = _split_media_path(media_path)
     if not subdir or not filename:
         return None
+
+    if _using_firestore():
+        try:
+            asset = _firestore_asset_ref(subdir, filename).get()
+            if asset.exists:
+                data = asset.to_dict() or {}
+                chunk_docs = sorted(
+                    asset.reference.collection("chunks").stream(),
+                    key=lambda snapshot: int((snapshot.to_dict() or {}).get("seq", 0)),
+                )
+                content = b"".join((snapshot.to_dict() or {}).get("data", b"") for snapshot in chunk_docs)
+                if data.get("content_encoding") == "gzip":
+                    content = gzip.decompress(content)
+                return {
+                    "content": content,
+                    "mime_type": data.get("mime_type") or _default_mime_type(filename),
+                    "filename": filename,
+                    "source": "firestore",
+                }
+        except Exception as exc:
+            logger.warning("Falha ao ler midia no Firestore (%s): %s", media_path, exc)
 
     if _using_gcs():
         try:

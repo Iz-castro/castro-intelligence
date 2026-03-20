@@ -268,16 +268,48 @@
         var mediaRecorder = null;
         var audioChunks = [];
         var recInterval = null;
+        var clientConfig = { chat_delivery_mode: "snapshot", polling_interval_ms: 5000 };
+        var liveRefreshTimer = null;
 
         document.getElementById("currentUserName").textContent = USER.display_name;
         document.getElementById("currentUserRole").textContent = USER.role || "operador";
 
         function hdrs() { return {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"}; }
+        function useSnapshotMode() { return clientConfig.chat_delivery_mode === "snapshot"; }
+        function useWebSocketMode() { return false; }
         function initials(name) { var p = (name || "?").split(" "); return p.length >= 2 ? (p[0][0] + p[p.length-1][0]).toUpperCase() : p[0][0].toUpperCase(); }
         function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
         function fmtTime(iso) { var d = new Date(iso); if (isNaN(d.getTime())) d = new Date(iso.replace(" ", "T") + "Z"); return String(d.getHours()).padStart(2,"0") + ":" + String(d.getMinutes()).padStart(2,"0"); }
         function fmtDate(iso) { var d = new Date(iso); if (isNaN(d.getTime())) d = new Date(iso.replace(" ", "T") + "Z"); var today = new Date(); if (d.toDateString() === today.toDateString()) return "Hoje"; var y = new Date(today); y.setDate(y.getDate()-1); if (d.toDateString() === y.toDateString()) return "Ontem"; return String(d.getDate()).padStart(2,"0") + "/" + String(d.getMonth()+1).padStart(2,"0") + "/" + d.getFullYear(); }
         function scrollBottom(el) { el.scrollTop = el.scrollHeight; }
+
+        function loadClientConfig() {
+            return fetch("/api/client-config", {headers: {"Authorization": "Bearer " + TOKEN}})
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+                clientConfig.chat_delivery_mode = data.chat_delivery_mode || "snapshot";
+                clientConfig.polling_interval_ms = data.polling_interval_ms || 5000;
+            })
+            .catch(function(){
+                clientConfig.chat_delivery_mode = "snapshot";
+                clientConfig.polling_interval_ms = 5000;
+            });
+        }
+
+        function refreshActiveChat() {
+            if (!activeChat) return;
+            if (activeChat.type === "internal") loadInternalMessages(activeChat.id);
+            else if (activeChat.type === "whatsapp") loadWaMessages(activeChat.id);
+        }
+
+        function startLiveRefresh() {
+            if (liveRefreshTimer) clearInterval(liveRefreshTimer);
+            var interval = Math.max(clientConfig.polling_interval_ms || 5000, 2000);
+            liveRefreshTimer = setInterval(function(){
+                loadAll();
+                refreshActiveChat();
+            }, interval);
+        }
 
         function avatarHtml(name, path, cls, sz) {
             var c = "contact-avatar" + (cls ? " " + cls : "");
@@ -399,7 +431,7 @@
                 '<div class="message-input-area"><textarea class="msg-input" id="msgInput" rows="1" placeholder="Digite uma mensagem..."></textarea>' +
                 '<button class="btn-send" id="btnSend">Enviar</button></div>';
             bindInput("internal");
-            if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({event: "mark_read", sender_id: contact.id}));
+            if (useWebSocketMode() && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({event: "mark_read", sender_id: contact.id}));
             loadInternalMessages(contact.id);
         }
 
@@ -569,7 +601,7 @@
             var input = document.getElementById("msgInput");
             var btn = document.getElementById("btnSend");
             input.addEventListener("input", function(){ this.style.height = "auto"; this.style.height = Math.min(this.scrollHeight, 100) + "px";
-                if (chatType === "internal" && ws && ws.readyState === WebSocket.OPEN) { var now = Date.now(); if (now - lastTypingSent > 2000) { ws.send(JSON.stringify({event: "typing", receiver_id: activeChat.id})); lastTypingSent = now; } }
+                if (chatType === "internal" && useWebSocketMode() && ws && ws.readyState === WebSocket.OPEN) { var now = Date.now(); if (now - lastTypingSent > 2000) { ws.send(JSON.stringify({event: "typing", receiver_id: activeChat.id})); lastTypingSent = now; } }
             });
             input.addEventListener("keydown", function(e){ if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSend(chatType); } });
             btn.addEventListener("click", function(){ doSend(chatType); });
@@ -584,7 +616,21 @@
             var input = document.getElementById("msgInput"); var content = input.value.trim();
             if (chatType === "whatsapp" && pendingFile) { sendMedia(content); return; }
             if (!content || !activeChat) return;
-            if (chatType === "internal") { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({event: "send_message", receiver_id: activeChat.id, content: content})); }
+            if (chatType === "internal") {
+                if (useWebSocketMode() && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({event: "send_message", receiver_id: activeChat.id, content: content}));
+                } else {
+                    fetch("/api/messages", {method: "POST", headers: hdrs(), body: JSON.stringify({receiver_id: activeChat.id, content: content, msg_type: "text"})})
+                    .then(function(r){ return r.json(); })
+                    .then(function(data){
+                        if (data.status === "sent") {
+                            var c = document.getElementById("messagesContainer");
+                            if (c) { addInternalMsg(c, {sender_id: USER.id, content: content, created_at: new Date().toISOString()}); scrollBottom(c); }
+                            loadAll();
+                        }
+                    });
+                }
+            }
             else { fetch("/api/wa/send", {method: "POST", headers: hdrs(), body: JSON.stringify({contact_id: activeChat.id, content: content})})
                 .then(function(r){ return r.json(); }).then(function(data){ if (data.status === "sent") { var c = document.getElementById("messagesContainer"); if (c) { addWaMsg(c, {direction:"outbound",msg_type:"text",content:content,status:"sent",created_at:new Date().toISOString(),timestamp_wa:new Date().toISOString()}); scrollBottom(c); } } }); }
             input.value = ""; input.style.height = "auto"; input.focus();
@@ -608,6 +654,7 @@
 
         // -- WebSocket --
         function connectWS() {
+            if (!useWebSocketMode()) return;
             var proto = location.protocol === "https:" ? "wss" : "ws";
             ws = new WebSocket(proto + "://" + location.host + "/ws/" + TOKEN);
             ws.onmessage = function(evt){
@@ -638,7 +685,7 @@
                     case "wa_contact_reassigned": loadAll(); break;
                 }
             };
-            ws.onclose = function(evt){ if (evt.code === 4001) { sessionStorage.removeItem("crm_session"); window.location.href = "/"; } else { setTimeout(connectWS, 3000); } };
+            ws.onclose = function(evt){ if (evt.code === 4001) { sessionStorage.removeItem("crm_session"); window.location.href = "/"; } else if (useWebSocketMode()) { setTimeout(connectWS, 3000); } };
         }
 
         // -- Modal: Transferencia --
@@ -731,12 +778,22 @@
         });
 
         // -- Logout --
-        document.getElementById("btnLogout").addEventListener("click", function(){ if (ws) ws.close(); sessionStorage.removeItem("crm_session"); window.location.href = "/"; });
+        document.getElementById("btnLogout").addEventListener("click", function(){ if (liveRefreshTimer) clearInterval(liveRefreshTimer); if (ws) ws.close(); sessionStorage.removeItem("crm_session"); window.location.href = "/"; });
+
+        function initTransport() {
+            if (useWebSocketMode()) {
+                connectWS();
+            } else {
+                if (ws) { try { ws.close(); } catch(e) {} ws = null; }
+                onlineUsers = {};
+                renderSidebar();
+            }
+            startLiveRefresh();
+        }
 
         // -- Init --
         loadAll();
-        connectWS();
-        setInterval(function(){ fetch("/api/wa/contacts", {headers: hdrs()}).then(function(r){return r.json();}).then(function(data){ waContacts = data.contacts || []; renderSidebar(); }); }, 15000);
+        loadClientConfig().finally(initTransport);
     })();
     </script>
 </body>

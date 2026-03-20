@@ -11,11 +11,13 @@ ENV/
 # Environment
 .env
 .env.local
+service-account*.json
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
+data/
 
 # Logs
 logs/
@@ -37,6 +39,7 @@ uploads/
 test_debug.py
 start_tunnel.py
 start.ps1
+RESUMO_SISTEMA_E_ROTACAO.md
 
 # Build
 build/
