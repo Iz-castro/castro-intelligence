@@ -10,9 +10,10 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from config import REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET
+from config import REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET, FEATURE_AUDIO_TRANSCRIPTION, STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS, STT_FALLBACK_TEXT
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit,
+    update_wa_message_transcription,
 )
 from media import download_media
 
@@ -92,12 +93,21 @@ async def _process_messages(value, ws_notify_callback):
         latitude = None
         longitude = None
         filename = ""
+        effective_msg_type = msg_type
+        _audio_bytes_for_stt = None
+        _audio_mime_for_stt = None
+        image = msg.get("image", {}) if isinstance(msg.get("image"), dict) else {}
+        audio = msg.get("audio", {}) if isinstance(msg.get("audio"), dict) else {}
+        video = msg.get("video", {}) if isinstance(msg.get("video"), dict) else {}
+        sticker = msg.get("sticker", {}) if isinstance(msg.get("sticker"), dict) else {}
+        document_msg = msg.get("document", {}) if isinstance(msg.get("document"), dict) else {}
+        unsupported = msg.get("unsupported", {}) if isinstance(msg.get("unsupported"), dict) else {}
 
         if msg_type == "text":
             content = msg.get("text", {}).get("body", "")
 
-        elif msg_type == "image":
-            image = msg.get("image", {})
+        elif msg_type == "image" or image.get("id"):
+            effective_msg_type = "image"
             media_id_str = image.get("id", "")
             media_mime = image.get("mime_type", "")
             content = image.get("caption", "")
@@ -106,17 +116,19 @@ async def _process_messages(value, ws_notify_callback):
                 media_path = media_result["path"]
                 media_mime = media_result["mime_type"]
 
-        elif msg_type == "audio":
-            audio = msg.get("audio", {})
+        elif msg_type == "audio" or audio.get("id"):
+            effective_msg_type = "audio"
             media_id_str = audio.get("id", "")
             media_mime = audio.get("mime_type", "")
             media_result = await download_media(media_id_str, "audio")
             if media_result:
                 media_path = media_result["path"]
                 media_mime = media_result["mime_type"]
+            _audio_bytes_for_stt = media_result.get("content") if media_result else None
+            _audio_mime_for_stt = media_mime
 
-        elif msg_type == "video":
-            video = msg.get("video", {})
+        elif msg_type == "video" or video.get("id"):
+            effective_msg_type = "gif" if video.get("gif") else "video"
             media_id_str = video.get("id", "")
             media_mime = video.get("mime_type", "")
             content = video.get("caption", "")
@@ -125,8 +137,8 @@ async def _process_messages(value, ws_notify_callback):
                 media_path = media_result["path"]
                 media_mime = media_result["mime_type"]
 
-        elif msg_type == "sticker":
-            sticker = msg.get("sticker", {})
+        elif msg_type == "sticker" or sticker.get("id"):
+            effective_msg_type = "sticker"
             media_id_str = sticker.get("id", "")
             media_mime = sticker.get("mime_type", "image/webp")
             media_result = await download_media(media_id_str, "sticker")
@@ -134,12 +146,12 @@ async def _process_messages(value, ws_notify_callback):
                 media_path = media_result["path"]
                 media_mime = media_result["mime_type"]
 
-        elif msg_type == "document":
-            doc = msg.get("document", {})
-            media_id_str = doc.get("id", "")
-            media_mime = doc.get("mime_type", "")
-            filename = doc.get("filename", "")
-            content = doc.get("caption", "")
+        elif msg_type == "document" or document_msg.get("id"):
+            effective_msg_type = "document"
+            media_id_str = document_msg.get("id", "")
+            media_mime = document_msg.get("mime_type", "")
+            filename = document_msg.get("filename", "")
+            content = document_msg.get("caption", "")
             media_result = await download_media(media_id_str, "document", filename)
             if media_result:
                 media_path = media_result["path"]
@@ -161,6 +173,20 @@ async def _process_messages(value, ws_notify_callback):
             reaction = msg.get("reaction", {})
             content = reaction.get("emoji", "")
 
+        elif msg_type == "unsupported":
+            errors = msg.get("errors", []) if isinstance(msg.get("errors"), list) else []
+            error_code = ""
+            if errors and isinstance(errors[0], dict):
+                error_code = str(errors[0].get("code") or "")
+            detail = unsupported.get("type", "") or error_code or "unsupported"
+            content = f"[{detail}]"
+            logger.info(
+                "Mensagem unsupported sem midia tratavel | keys=%s | wa_id=%s | id=%s",
+                sorted(msg.keys()),
+                wa_id,
+                msg_id[:20],
+            )
+
         else:
             content = f"[{msg_type}]"
             logger.info("Tipo de mensagem nao tratado: %s", msg_type)
@@ -170,7 +196,7 @@ async def _process_messages(value, ws_notify_callback):
             wa_message_id=msg_id,
             contact_id=contact_id,
             direction="inbound",
-            msg_type=msg_type,
+            msg_type=effective_msg_type,
             content=content,
             media_path=media_path,
             media_mime=media_mime,
@@ -184,8 +210,28 @@ async def _process_messages(value, ws_notify_callback):
 
         logger.info(
             "[WA IN] %s (%s) | tipo=%s | id=%s",
-            contact_name, wa_id, msg_type, msg_id[:20]
+            contact_name, wa_id, effective_msg_type, msg_id[:20]
         )
+
+        # Transcricao de audio inbound
+        if FEATURE_AUDIO_TRANSCRIPTION and _audio_bytes_for_stt and db_id:
+            try:
+                from transcription_service import get_speech_client, transcribe_audio_bytes
+                speech_client = get_speech_client()
+                if speech_client:
+                    transcript = transcribe_audio_bytes(
+                        _audio_bytes_for_stt,
+                        media_mime=_audio_mime_for_stt,
+                        language_code=STT_LANGUAGE_CODE,
+                        timeout_s=STT_TIMEOUT_SECONDS,
+                    )
+                    if not transcript and STT_FALLBACK_TEXT:
+                        transcript = STT_FALLBACK_TEXT
+                    if transcript:
+                        update_wa_message_transcription(db_id, transcript)
+                        logger.info("[STT] Transcricao salva | msg_id=%s | len=%d", db_id, len(transcript))
+            except Exception as stt_exc:
+                logger.error("[STT] Falha na transcricao: %s", stt_exc, exc_info=True)
 
         # Notificar operadores conectados via WebSocket
         if ws_notify_callback:
@@ -196,7 +242,7 @@ async def _process_messages(value, ws_notify_callback):
                     "contact_id": contact_id,
                     "contact_name": contact_name,
                     "wa_id": wa_id,
-                    "msg_type": msg_type,
+                    "msg_type": effective_msg_type,
                     "content": content,
                     "media_path": media_path,
                     "media_mime": media_mime,

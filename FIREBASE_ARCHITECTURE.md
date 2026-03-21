@@ -11,8 +11,9 @@ Arquitetura alvo do CRM:
 
 - O backend FastAPI ja foi preparado para `Firestore + Firebase Auth + Cloud Storage`.
 - As `Firestore Rules` e `Storage Rules` base ja existem neste repo.
-- O arquivo [static/chat.html](/c:/Projetos/Hubloc/castro-intelligence/static/chat.html) continua sendo um cliente legado de fallback.
-- Ainda nao existe um projeto React dedicado neste repositorio.
+- Existe um frontend React dedicado em [frontend/](/c:/Projetos/Hubloc/castro-intelligence/frontend).
+- O bundle gerado vai para `frontend_dist/` e eh servido pelo FastAPI quando `AUTH_MODE=firebase`.
+- O arquivo [static/chat.html](/c:/Projetos/Hubloc/castro-intelligence/static/chat.html) continua disponivel como cliente legado de fallback.
 
 ## Collections expostas ao React
 

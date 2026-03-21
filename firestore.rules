@@ -1,26 +1,33 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Ajuste o dominio abaixo para o dominio real do Google Workspace do cliente.
+    // Estas rules precisam usar o mesmo prefixo definido em FIRESTORE_COLLECTION_PREFIX.
+    // No ambiente atual, as collections reais sao "castro_crm_*".
+    // Regra temporaria de teste:
+    // libera somente o email abaixo. Depois troque para o dominio oficial da empresa.
     function signedIn() {
       return request.auth != null && request.auth.token.email != null;
     }
 
-    function emailDomainOk() {
-      return signedIn() && request.auth.token.email.matches('^[^@]+@empresa\\.com\\.br$');
+    function emailAllowed() {
+      return signedIn() && (
+        request.auth.token.email == 'rafaluisc@outlook.com' ||
+        request.auth.token.email == 'izaeldecastro@gmail.com' ||
+        request.auth.token.email.matches('.*@centralloc\\.com\\.br')
+      );
     }
 
     function myProfileExists() {
       return signedIn() &&
-        exists(/databases/$(database)/documents/operator_profiles/$(request.auth.uid));
+        exists(/databases/$(database)/documents/castro_crm_operator_profiles/$(request.auth.uid));
     }
 
     function myProfile() {
-      return get(/databases/$(database)/documents/operator_profiles/$(request.auth.uid));
+      return get(/databases/$(database)/documents/castro_crm_operator_profiles/$(request.auth.uid));
     }
 
     function operatorActive() {
-      return emailDomainOk() &&
+      return emailAllowed() &&
         myProfileExists() &&
         myProfile().data.is_active == 1;
     }
@@ -40,32 +47,35 @@ service cloud.firestore {
       );
     }
 
-    match /operator_profiles/{uid} {
-      allow read: if emailDomainOk() && (uid == request.auth.uid || operatorActive());
+    match /castro_crm_operator_profiles/{uid} {
+      allow read: if emailAllowed() && (uid == request.auth.uid || operatorActive());
       allow write: if false;
     }
 
-    match /departments/{departmentId} {
+    match /castro_crm_departments/{departmentId} {
       allow read: if operatorActive();
       allow write: if false;
     }
 
-    match /wa_contacts/{contactId} {
-      allow read: if canSeeConversation(resource.data.assigned_to_uid, resource.data.department_id);
+    match /castro_crm_wa_contacts/{contactId} {
+      // Regra temporaria de demo: para os emails explicitamente liberados,
+      // permita leitura completa das conversas no snapshot sem depender de
+      // filtros por atribuicao/departamento.
+      allow read: if emailAllowed();
       allow write: if false;
     }
 
-    match /wa_messages/{messageId} {
-      allow read: if canSeeConversation(resource.data.assigned_to_uid, resource.data.department_id);
+    match /castro_crm_wa_messages/{messageId} {
+      allow read: if emailAllowed();
       allow write: if false;
     }
 
-    match /wa_transfer_log/{transferId} {
-      allow read: if canSeeConversation(resource.data.to_user_uid, resource.data.department_id);
+    match /castro_crm_wa_transfer_log/{transferId} {
+      allow read: if emailAllowed();
       allow write: if false;
     }
 
-    match /messages/{messageId} {
+    match /castro_crm_messages/{messageId} {
       allow read: if operatorActive() && (
         resource.data.sender_id == myProfile().data.user_id ||
         resource.data.receiver_id == myProfile().data.user_id
@@ -73,25 +83,25 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    match /internal_unread/{docId} {
+    match /castro_crm_internal_unread/{docId} {
       allow read: if operatorActive() &&
         resource.data.receiver_id == myProfile().data.user_id;
       allow write: if false;
     }
 
-    match /users/{userId} {
+    match /castro_crm_users/{userId} {
       allow read, write: if false;
     }
 
-    match /audit_log/{docId} {
+    match /castro_crm_audit_log/{docId} {
       allow read, write: if false;
     }
 
-    match /wa_message_status/{docId} {
+    match /castro_crm_wa_message_status/{docId} {
       allow read, write: if false;
     }
 
-    match /_meta/{docId} {
+    match /castro_crm__meta/{docId} {
       allow read, write: if false;
     }
   }

@@ -37,11 +37,8 @@ _storage_client = None
 _storage_backend_logged = False
 
 
-def _normalize_br(wa_id):
-    s = str(wa_id)
-    if len(s) == 12 and s.startswith("55") and s[4] in ("6", "7", "8", "9"):
-        return f"55{s[2:4]}9{s[4:]}"
-    return s
+def _normalize_wa_target(wa_id):
+    return "".join(ch for ch in str(wa_id or "").strip() if ch.isdigit())
 
 
 MIME_EXTENSIONS = {
@@ -475,12 +472,16 @@ async def download_media(media_id, msg_type, original_filename=""):
             relative_path = _write_media_bytes(content, subdir, filename, mime or _default_mime_type(filename))
 
             logger.info("Midia salva: %s (%s, %d bytes)", relative_path, mime, len(content))
-            return {
+            result = {
                 "path": relative_path,
                 "mime_type": mime,
                 "size": len(content),
                 "filename": original_filename or filename,
             }
+            # Retorna bytes apenas para audio (usado na transcricao STT)
+            if msg_type == "audio":
+                result["content"] = content
+            return result
 
         except Exception as exc:
             logger.error("Erro no download da midia %s: %s", media_id, exc)
@@ -556,7 +557,7 @@ async def send_media_message(wa_id, media_id, msg_type, caption=""):
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         return None
 
-    wa_id = _normalize_br(wa_id)
+    wa_id = _normalize_wa_target(wa_id)
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",

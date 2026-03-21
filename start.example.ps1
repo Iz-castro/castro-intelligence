@@ -5,6 +5,10 @@ $env:FIRESTORE_PROJECT_ID="seu_project_id"
 $env:FIRESTORE_COLLECTION_PREFIX="castro_crm"
 $env:ALLOWED_FIREBASE_EMAIL_DOMAIN="empresa.com.br"
 $env:AUTO_PROVISION_FIREBASE_USERS="true"
+$env:FIREBASE_WEB_API_KEY="sua_firebase_web_api_key"
+$env:FIREBASE_WEB_AUTH_DOMAIN="seu_project_id.firebaseapp.com"
+$env:FIREBASE_WEB_APP_ID="1:1234567890:web:abcdef123456"
+$env:FIREBASE_WEB_MESSAGING_SENDER_ID="1234567890"
 $env:GOOGLE_APPLICATION_CREDENTIALS="$PWD\service-account.json"
 $env:WHATSAPP_TOKEN="troque_pelo_token_da_meta"
 $env:WHATSAPP_PHONE_NUMBER_ID="000000000000000"
@@ -56,6 +60,7 @@ Write-Host "  Acesso local: http://127.0.0.1:8080" -ForegroundColor Yellow
 Write-Host "  Firestore project: $env:FIRESTORE_PROJECT_ID" -ForegroundColor Yellow
 Write-Host "  Storage bucket: $env:GCS_MEDIA_BUCKET" -ForegroundColor Yellow
 Write-Host "  Entrega do chat: $env:CHAT_DELIVERY_MODE" -ForegroundColor Yellow
+Write-Host "  Firebase Auth domain: $env:FIREBASE_WEB_AUTH_DOMAIN" -ForegroundColor Yellow
 Write-Host "  Copie a URL HTTPS do ngrok e atualize no painel da Meta se necessario."
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan

@@ -64,22 +64,59 @@ def _sort_records(records, field_name, reverse=False):
     )
 
 
+_user_cache = {}
+_department_cache = {}
+
+
 def _user_map(user_ids):
-    result = {}
-    for user_id in {uid for uid in user_ids if uid}:
+    unique_ids = {uid for uid in user_ids if uid}
+    missing = unique_ids - _user_cache.keys()
+    for user_id in missing:
         user = _get_doc("users", user_id)
         if user:
-            result[user_id] = user
-    return result
+            _user_cache[user_id] = user
+    return {uid: _user_cache[uid] for uid in unique_ids if uid in _user_cache}
 
 
 def _department_map(department_ids):
-    result = {}
-    for department_id in {did for did in department_ids if did}:
+    unique_ids = {did for did in department_ids if did}
+    missing = unique_ids - _department_cache.keys()
+    for department_id in missing:
         department = _get_doc("departments", department_id)
         if department:
-            result[department_id] = department
-    return result
+            _department_cache[department_id] = department
+    return {did: _department_cache[did] for did in unique_ids if did in _department_cache}
+
+
+def invalidate_caches():
+    _user_cache.clear()
+    _department_cache.clear()
+
+
+def _prefer_wa_msg_type(existing_type, new_type):
+    existing = (existing_type or "").strip().lower()
+    incoming = (new_type or "").strip().lower()
+    weak = {"", "unknown", "unsupported"}
+    if incoming == "gif" and existing == "video":
+        return incoming
+    if incoming not in weak and existing in weak:
+        return incoming
+    if incoming in weak:
+        return existing or incoming
+    return existing or incoming
+
+
+def _prefer_wa_content(existing_content, new_content):
+    existing = (existing_content or "").strip()
+    incoming = (new_content or "").strip()
+    placeholders = {"[unknown]", "[unsupported]"}
+    if not incoming:
+        return existing
+    if existing.lower() in placeholders and incoming.lower() not in placeholders:
+        return incoming
+    if incoming.lower() in placeholders and existing:
+        return existing
+    return incoming or existing
 
 
 def _operator_profile_ref(firebase_uid):
@@ -470,7 +507,24 @@ def get_all_wa_contacts(include_archived=False):
     if not include_archived:
         rows = [row for row in rows if not row.get("is_archived")]
     rows = _sort_records(rows, "last_message_at", reverse=True)
-    return [_enrich_contact(row) for row in rows]
+
+    # Batch: coletar todos IDs unicos antes de enriquecer (evita N+1)
+    all_user_ids = [row.get("assigned_to") for row in rows]
+    all_dept_ids = [row.get("department_id") for row in rows]
+    users = _user_map(all_user_ids)
+    departments = _department_map(all_dept_ids)
+
+    enriched = []
+    for row in rows:
+        item = dict(row)
+        user = users.get(row.get("assigned_to"))
+        department = departments.get(row.get("department_id"))
+        item["assigned_name"] = user.get("display_name", "") if user else ""
+        item["assigned_role"] = user.get("role", "") if user else ""
+        item["assigned_to_uid"] = row.get("assigned_to_uid", "") or (user.get("firebase_uid", "") if user else "")
+        item["department_name"] = department.get("name", "") if department else ""
+        enriched.append(normalize_record(item))
+    return enriched
 
 
 def update_wa_contact_qualification(contact_id, qualification, notes=""):
@@ -478,6 +532,13 @@ def update_wa_contact_qualification(contact_id, qualification, notes=""):
     if notes is not None:
         fields["notes"] = notes
     document("wa_contacts", contact_id).set(fields, merge=True)
+
+
+def set_attendance_protocol(contact_id, protocol, started_at):
+    document("wa_contacts", contact_id).set({
+        "attendance_protocol": protocol,
+        "attendance_started_at": started_at,
+    }, merge=True)
 
 
 def archive_wa_contact(contact_id):
@@ -571,6 +632,19 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
         if existing:
+            document("wa_messages", existing["id"]).set({
+                "msg_type": _prefer_wa_msg_type(existing.get("msg_type"), msg_type),
+                "content": _prefer_wa_content(existing.get("content"), content),
+                "media_path": media_path or existing.get("media_path", ""),
+                "media_mime": media_mime or existing.get("media_mime", ""),
+                "media_id": media_id or existing.get("media_id", ""),
+                "latitude": latitude if latitude is not None else existing.get("latitude"),
+                "longitude": longitude if longitude is not None else existing.get("longitude"),
+                "filename": filename or existing.get("filename", ""),
+                "status": status or existing.get("status", "received"),
+                "operator_id": operator_id if operator_id is not None else existing.get("operator_id"),
+                "timestamp_wa": _coerce_timestamp(timestamp_wa) or existing.get("timestamp_wa"),
+            }, merge=True)
             return existing["id"]
 
     message_id = next_sequence("wa_messages")
@@ -608,17 +682,25 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     return message_id
 
 
-def get_wa_conversation(contact_id, limit=200, offset=0):
+def get_wa_conversation(contact_id, limit=50, offset=0):
+    q = (
+        collection("wa_messages")
+        .where("contact_id", "==", contact_id)
+        .order_by("created_at", direction="DESCENDING")
+    )
+    if limit:
+        q = q.limit(limit + offset)
+
     rows = []
-    for snapshot in collection("wa_messages").where("contact_id", "==", contact_id).stream():
+    for snapshot in q.stream():
         row = _raw_doc(snapshot)
         if row:
             rows.append(row)
-    rows = _sort_records(rows, "created_at")
+
     if offset:
         rows = rows[offset:]
-    if limit:
-        rows = rows[:limit]
+    # Reverter para ordem cronologica (mais antigo primeiro)
+    rows.reverse()
 
     contact = _get_doc("wa_contacts", contact_id)
     operators = _user_map([row.get("operator_id") for row in rows])
@@ -632,6 +714,16 @@ def get_wa_conversation(contact_id, limit=200, offset=0):
         item["operator_name"] = operators.get(row.get("operator_id"), {}).get("display_name", "")
         enriched.append(item)
     return _normalize_many(enriched)
+
+
+def get_wa_message_by_id(message_id: int):
+    for snap in collection("wa_messages").where("id", "==", message_id).limit(1).stream():
+        return _raw_doc(snap)
+    return None
+
+
+def update_wa_message_transcription(db_id: int, transcription: str):
+    document("wa_messages", db_id).set({"transcription": transcription}, merge=True)
 
 
 def update_wa_message_status(wa_message_id, status, timestamp_wa=""):
@@ -650,19 +742,40 @@ def update_wa_message_status(wa_message_id, status, timestamp_wa=""):
 
 
 def get_wa_unread_count():
-    rows = [row for row in _all_docs("wa_contacts") if row]
-    return {int(row["id"]): int(row.get("unread_count", 0)) for row in rows if int(row.get("unread_count", 0)) > 0}
+    """Retorna mapa {contact_id: unread_count}.
+
+    Nota: get_all_wa_contacts() ja inclui unread_count nos contatos.
+    Esta funcao existe apenas para chamadas avulsas; o endpoint
+    /api/wa/contacts NAO precisa mais chamar esta funcao separadamente.
+    """
+    result = {}
+    for snapshot in collection("wa_contacts").where("unread_count", ">", 0).stream():
+        row = _raw_doc(snapshot)
+        if row:
+            result[int(row["id"])] = int(row.get("unread_count", 0))
+    return result
 
 
 def mark_wa_conversation_read(contact_id):
-    rows = []
-    for snapshot in collection("wa_messages").where("contact_id", "==", contact_id).stream():
-        row = _raw_doc(snapshot)
-        if row:
-            rows.append(row)
-    for row in rows:
-        if row.get("direction") == "inbound" and row.get("status") == "received":
-            document("wa_messages", row["id"]).set({"status": "read"}, merge=True)
+    """Marca mensagens inbound como lidas. Usa query filtrada para ler apenas
+    as mensagens que realmente precisam ser atualizadas (em vez de todas)."""
+    q = (
+        collection("wa_messages")
+        .where("contact_id", "==", contact_id)
+        .where("direction", "==", "inbound")
+        .where("status", "==", "received")
+    )
+    batch = get_firestore_client().batch()
+    count = 0
+    for snapshot in q.stream():
+        batch.set(snapshot.reference, {"status": "read"}, merge=True)
+        count += 1
+        if count >= 400:  # Firestore batch limit = 500
+            batch.commit()
+            batch = get_firestore_client().batch()
+            count = 0
+    if count > 0:
+        batch.commit()
     document("wa_contacts", contact_id).set({"unread_count": 0}, merge=True)
 
 

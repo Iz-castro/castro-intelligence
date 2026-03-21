@@ -1,17 +1,22 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    // Ajuste o dominio abaixo para o dominio real do Google Workspace do cliente.
+    // Regra temporaria de teste:
+    // libera somente o email abaixo. Depois troque para o dominio oficial da empresa.
     function signedIn() {
       return request.auth != null && request.auth.token.email != null;
     }
 
-    function emailDomainOk() {
-      return signedIn() && request.auth.token.email.matches('^[^@]+@empresa\\.com\\.br$');
+    function emailAllowed() {
+      return signedIn() && (
+        request.auth.token.email == 'rafaluisc@outlook.com' ||
+        request.auth.token.email == 'izaeldecastro@gmail.com' ||
+        request.auth.token.email.matches('.*@centralloc\\.com\\.br')
+      );
     }
 
     match /media/{allPaths=**} {
-      allow read: if emailDomainOk();
+      allow read: if emailAllowed();
       allow write: if false;
     }
 

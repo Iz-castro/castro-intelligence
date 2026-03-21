@@ -9,7 +9,7 @@ import jwt
 from config import (
     SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_MINUTES,
     MAX_LOGIN_ATTEMPTS, LOGIN_LOCKOUT_SECONDS,
-    ALLOWED_FIREBASE_EMAIL_DOMAIN, AUTO_PROVISION_FIREBASE_USERS,
+    ALLOWED_FIREBASE_EMAIL_DOMAIN, ALLOWED_FIREBASE_EMAILS, AUTO_PROVISION_FIREBASE_USERS,
 )
 from database import (
     get_user_by_username, get_user_by_id, get_user_by_email, get_user_by_firebase_uid,
@@ -89,11 +89,15 @@ def authenticate(username, password, ip_address=""):
 
 
 def _firebase_email_allowed(email):
-    if not ALLOWED_FIREBASE_EMAIL_DOMAIN:
+    email = (email or "").strip().lower()
+    # Email avulso autorizado → libera independente do dominio
+    if ALLOWED_FIREBASE_EMAILS and email in ALLOWED_FIREBASE_EMAILS:
         return True
-    if not email or "@" not in email:
-        return False
-    return email.split("@", 1)[1].lower() == ALLOWED_FIREBASE_EMAIL_DOMAIN
+    # Dominio autorizado → checa sufixo
+    if ALLOWED_FIREBASE_EMAIL_DOMAIN:
+        return bool(email) and "@" in email and email.split("@", 1)[1].lower() == ALLOWED_FIREBASE_EMAIL_DOMAIN
+    # Nenhuma restricao configurada → libera todos
+    return not ALLOWED_FIREBASE_EMAILS
 
 
 def authenticate_firebase_token(id_token, ip_address=""):
@@ -111,7 +115,7 @@ def authenticate_firebase_token(id_token, ip_address=""):
         return {"success": False, "status_code": 401, "error": "Token Firebase sem uid"}
 
     if not _firebase_email_allowed(email):
-        return {"success": False, "status_code": 403, "error": "Acesso restrito ao dominio autorizado"}
+        return {"success": False, "status_code": 403, "error": "Acesso restrito ao email ou dominio autorizado"}
 
     user = get_user_by_firebase_uid(firebase_uid) or get_user_by_email(email)
     if user:

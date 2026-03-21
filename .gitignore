@@ -44,3 +44,8 @@ RESUMO_SISTEMA_E_ROTACAO.md
 # Build
 build/
 dist/
+frontend/node_modules/
+frontend_dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

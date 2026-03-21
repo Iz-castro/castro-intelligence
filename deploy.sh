@@ -3,6 +3,32 @@
 
 set -euo pipefail
 
+import_dotenv() {
+    local path="$1"
+    [[ -f "$path" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+        [[ "$line" != *=* ]] && continue
+
+        local name="${line%%=*}"
+        local value="${line#*=}"
+        name="${name%"${name##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]] || [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+
+        if [[ -n "$name" && -z "${!name+x}" ]]; then
+            export "$name=$value"
+        fi
+    done < "$path"
+}
+
 require_value() {
     local name="$1"
     local value="${2:-}"
@@ -24,11 +50,17 @@ set_gcp_secret() {
     printf "%s" "$value" > "$tmp_file"
 
     if ! gcloud secrets describe "$name" --project "$project_id" >/dev/null 2>&1; then
-        gcloud secrets create "$name" \
+        if gcloud secrets create "$name" \
             --project "$project_id" \
             --data-file="$tmp_file" \
-            --replication-policy="automatic" >/dev/null
-        echo "Secret criado: $name"
+            --replication-policy="automatic" >/dev/null; then
+            echo "Secret criado: $name"
+        else
+            gcloud secrets versions add "$name" \
+                --project "$project_id" \
+                --data-file="$tmp_file" >/dev/null
+            echo "Nova versao adicionada ao secret: $name"
+        fi
     else
         gcloud secrets versions add "$name" \
             --project "$project_id" \
@@ -40,9 +72,28 @@ set_gcp_secret() {
     trap - RETURN
 }
 
+new_cloud_run_env_file() {
+    local tmp_file
+    tmp_file="$(mktemp)"
+    trap 'rm -f "$tmp_file"' RETURN
+
+    for entry in "$@"; do
+        local name="${entry%%=*}"
+        local value="${entry#*=}"
+        value="${value//\'/\'\'}"
+        printf "%s: '%s'\n" "$name" "$value" >> "$tmp_file"
+    done
+
+    echo "$tmp_file"
+    trap - RETURN
+}
+
 urlencode() {
     python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+import_dotenv "${SCRIPT_DIR}/.env"
 
 PROJECT_ID="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
 REGION="${GCP_REGION:-southamerica-east1}"
@@ -57,7 +108,17 @@ MEDIA_BUCKET="${FIREBASE_STORAGE_BUCKET:-${GCS_MEDIA_BUCKET:-${PROJECT_ID}-castr
 GCS_MEDIA_PREFIX="${GCS_MEDIA_PREFIX:-media}"
 FIRESTORE_COLLECTION_PREFIX="${FIRESTORE_COLLECTION_PREFIX:-castro_crm}"
 ALLOWED_FIREBASE_EMAIL_DOMAIN="${ALLOWED_FIREBASE_EMAIL_DOMAIN:-}"
+ALLOWED_FIREBASE_EMAILS="${ALLOWED_FIREBASE_EMAILS:-}"
 AUTO_PROVISION_FIREBASE_USERS="${AUTO_PROVISION_FIREBASE_USERS:-true}"
+FIREBASE_WEB_API_KEY="${FIREBASE_WEB_API_KEY:-}"
+FIREBASE_WEB_AUTH_DOMAIN="${FIREBASE_WEB_AUTH_DOMAIN:-${PROJECT_ID}.firebaseapp.com}"
+FIREBASE_WEB_APP_ID="${FIREBASE_WEB_APP_ID:-}"
+FIREBASE_WEB_MESSAGING_SENDER_ID="${FIREBASE_WEB_MESSAGING_SENDER_ID:-}"
+FIREBASE_WEB_MEASUREMENT_ID="${FIREBASE_WEB_MEASUREMENT_ID:-}"
+FEATURE_AUDIO_TRANSCRIPTION="${FEATURE_AUDIO_TRANSCRIPTION:-false}"
+STT_LANGUAGE_CODE="${STT_LANGUAGE_CODE:-pt-BR}"
+STT_TIMEOUT_SECONDS="${STT_TIMEOUT_SECONDS:-30.0}"
+STT_FALLBACK_TEXT="${STT_FALLBACK_TEXT:-}"
 SECRET_KEY="${SECRET_KEY:-$(openssl rand -hex 32)}"
 WHATSAPP_TOKEN="${WHATSAPP_TOKEN:-}"
 WHATSAPP_VERIFY_TOKEN="${WHATSAPP_VERIFY_TOKEN:-}"
@@ -75,6 +136,10 @@ CORS_ORIGINS="${CORS_ORIGINS:-}"
 REQUIRE_WEBHOOK_SIGNATURE="${REQUIRE_WEBHOOK_SIGNATURE:-true}"
 CHAT_DELIVERY_MODE="${CHAT_DELIVERY_MODE:-snapshot}"
 POLLING_INTERVAL_MS="${POLLING_INTERVAL_MS:-5000}"
+ENABLE_AUDIO_TRANSCRIPTION=false
+case "${FEATURE_AUDIO_TRANSCRIPTION,,}" in
+  1|true|yes|on) ENABLE_AUDIO_TRANSCRIPTION=true ;;
+esac
 
 require_value "GCP_PROJECT_ID" "$PROJECT_ID"
 require_value "WHATSAPP_TOKEN" "$WHATSAPP_TOKEN"
@@ -112,7 +177,14 @@ if [[ "$DATA_BACKEND" == "sql" ]]; then
   SERVICES+=(sqladmin.googleapis.com)
 fi
 
+if [[ "$ENABLE_AUDIO_TRANSCRIPTION" == "true" ]]; then
+  SERVICES+=(speech.googleapis.com)
+fi
+
 gcloud services enable "${SERVICES[@]}" --project "$PROJECT_ID" --quiet >/dev/null
+
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")"
+COMPUTE_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
 SERVICE_ACCOUNT_EMAIL="${SERVICE_NAME}-run@${PROJECT_ID}.iam.gserviceaccount.com"
 if ! gcloud iam service-accounts describe "$SERVICE_ACCOUNT_EMAIL" --project "$PROJECT_ID" >/dev/null 2>&1; then
@@ -134,6 +206,21 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --role "roles/secretmanager.secretAccessor" \
     --quiet >/dev/null
 
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:${COMPUTE_SERVICE_ACCOUNT}" \
+    --role "roles/storage.objectViewer" \
+    --quiet >/dev/null
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:${COMPUTE_SERVICE_ACCOUNT}" \
+    --role "roles/artifactregistry.writer" \
+    --quiet >/dev/null
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:${COMPUTE_SERVICE_ACCOUNT}" \
+    --role "roles/logging.logWriter" \
+    --quiet >/dev/null
+
 gcloud storage buckets add-iam-policy-binding "gs://${MEDIA_BUCKET}" \
     --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
     --role "roles/storage.objectAdmin" >/dev/null
@@ -147,6 +234,13 @@ else
     gcloud projects add-iam-policy-binding "$PROJECT_ID" \
         --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
         --role "roles/datastore.user" \
+        --quiet >/dev/null
+fi
+
+if [[ "$ENABLE_AUDIO_TRANSCRIPTION" == "true" ]]; then
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+        --role "roles/speech.client" \
         --quiet >/dev/null
 fi
 
@@ -207,7 +301,17 @@ ENV_VARS=(
   "CHAT_DELIVERY_MODE=${CHAT_DELIVERY_MODE}"
   "POLLING_INTERVAL_MS=${POLLING_INTERVAL_MS}"
   "ALLOWED_FIREBASE_EMAIL_DOMAIN=${ALLOWED_FIREBASE_EMAIL_DOMAIN}"
+  "ALLOWED_FIREBASE_EMAILS=${ALLOWED_FIREBASE_EMAILS}"
   "AUTO_PROVISION_FIREBASE_USERS=${AUTO_PROVISION_FIREBASE_USERS}"
+  "FIREBASE_WEB_API_KEY=${FIREBASE_WEB_API_KEY}"
+  "FIREBASE_WEB_AUTH_DOMAIN=${FIREBASE_WEB_AUTH_DOMAIN}"
+  "FIREBASE_WEB_APP_ID=${FIREBASE_WEB_APP_ID}"
+  "FIREBASE_WEB_MESSAGING_SENDER_ID=${FIREBASE_WEB_MESSAGING_SENDER_ID}"
+  "FIREBASE_WEB_MEASUREMENT_ID=${FIREBASE_WEB_MEASUREMENT_ID}"
+  "FEATURE_AUDIO_TRANSCRIPTION=${FEATURE_AUDIO_TRANSCRIPTION}"
+  "STT_LANGUAGE_CODE=${STT_LANGUAGE_CODE}"
+  "STT_TIMEOUT_SECONDS=${STT_TIMEOUT_SECONDS}"
+  "STT_FALLBACK_TEXT=${STT_FALLBACK_TEXT}"
 )
 
 if [[ "$AUTH_MODE" == "firebase" ]]; then
@@ -218,6 +322,9 @@ fi
 
 echo ""
 echo "Iniciando deploy no Cloud Run..."
+
+ENV_FILE="$(new_cloud_run_env_file "${ENV_VARS[@]}")"
+trap 'rm -f "$ENV_FILE"' EXIT
 
 gcloud run deploy "$SERVICE_NAME" \
     --source . \
@@ -230,11 +337,15 @@ gcloud run deploy "$SERVICE_NAME" \
     --memory 512Mi \
     --cpu 1 \
     --min-instances 0 \
-    --max-instances 1 \
+    --max-instances 3 \
+    --concurrency 40 \
     --timeout 300 \
-    --set-env-vars "$(IFS=,; echo "${ENV_VARS[*]}")" \
+    --env-vars-file "$ENV_FILE" \
     --set-secrets "$(IFS=,; echo "${SECRETS[*]}")" \
     "${EXTRA_ARGS[@]}"
+
+rm -f "$ENV_FILE"
+trap - EXIT
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" --format="value(status.url)")"
 

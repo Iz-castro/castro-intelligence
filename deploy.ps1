@@ -1,5 +1,32 @@
 $ErrorActionPreference = "Stop"
 
+function Import-DotEnv {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    Get-Content $Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith("#")) {
+            return
+        }
+        $parts = $line.Split("=", 2)
+        if ($parts.Count -ne 2) {
+            return
+        }
+        $name = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($name) -and -not (Test-Path "Env:$name")) {
+            Set-Item -Path "Env:$name" -Value $value
+        }
+    }
+}
+
 function Require-Value {
     param(
         [string]$Name,
@@ -19,6 +46,20 @@ function New-HexSecret {
     return ($buffer | ForEach-Object { $_.ToString("x2") }) -join ""
 }
 
+function Test-GcloudCall {
+    param([string[]]$Args)
+
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $script:GCLOUD_BIN @Args 1>$null 2>$null
+        return ($LASTEXITCODE -eq 0)
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Set-GcpSecret {
     param(
         [string]$ProjectId,
@@ -31,24 +72,71 @@ function Set-GcpSecret {
     $tmpFile = Join-Path $env:TEMP "$Name-$([guid]::NewGuid().ToString('N')).txt"
     try {
         [System.IO.File]::WriteAllText($tmpFile, $Value)
-        gcloud secrets describe $Name --project $ProjectId *> $null
-        if ($LASTEXITCODE -ne 0) {
+        if (-not (Test-GcloudCall -Args @("secrets", "describe", $Name, "--project", $ProjectId))) {
             gcloud secrets create $Name `
                 --project $ProjectId `
                 --data-file=$tmpFile `
                 --replication-policy=automatic | Out-Null
-            Write-Host "Secret criado: $Name"
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "Secret criado: $Name"
+            }
+            else {
+                gcloud secrets versions add $Name `
+                    --project $ProjectId `
+                    --data-file=$tmpFile | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Falha ao criar ou atualizar o secret $Name."
+                }
+                Write-Host "Nova versao adicionada ao secret: $Name"
+            }
         }
         else {
             gcloud secrets versions add $Name `
                 --project $ProjectId `
                 --data-file=$tmpFile | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Falha ao atualizar o secret $Name."
+            }
             Write-Host "Nova versao adicionada ao secret: $Name"
         }
     }
     finally {
         Remove-Item $tmpFile -ErrorAction SilentlyContinue
     }
+}
+
+function New-CloudRunEnvFile {
+    param([System.Collections.Generic.List[string]]$Entries)
+
+    $path = Join-Path $env:TEMP "cloudrun-env-$([guid]::NewGuid().ToString('N')).yaml"
+    try {
+        $lines = foreach ($entry in $Entries) {
+            $parts = $entry.Split("=", 2)
+            $name = $parts[0]
+            $value = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+            $escaped = $value.Replace("'", "''")
+            "$name : '$escaped'"
+        }
+        [System.IO.File]::WriteAllLines($path, $lines)
+        return $path
+    }
+    catch {
+        Remove-Item $path -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+$SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
+Import-DotEnv -Path (Join-Path $SCRIPT_DIR ".env")
+
+$script:GCLOUD_BIN = (Get-Command gcloud.cmd -ErrorAction SilentlyContinue).Source
+if (-not $script:GCLOUD_BIN) {
+    $script:GCLOUD_BIN = (Get-Command gcloud -ErrorAction Stop).Source
+}
+
+function gcloud {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+    & $script:GCLOUD_BIN @Args
 }
 
 $PROJECT_ID = if ($env:GCP_PROJECT_ID) { $env:GCP_PROJECT_ID } else { (& gcloud config get-value project 2>$null) }
@@ -73,7 +161,17 @@ else {
 $GCS_MEDIA_PREFIX = if ($env:GCS_MEDIA_PREFIX) { $env:GCS_MEDIA_PREFIX } else { "media" }
 $FIRESTORE_COLLECTION_PREFIX = if ($env:FIRESTORE_COLLECTION_PREFIX) { $env:FIRESTORE_COLLECTION_PREFIX } else { "castro_crm" }
 $ALLOWED_FIREBASE_EMAIL_DOMAIN = if ($env:ALLOWED_FIREBASE_EMAIL_DOMAIN) { $env:ALLOWED_FIREBASE_EMAIL_DOMAIN } else { "" }
+$ALLOWED_FIREBASE_EMAILS = if ($env:ALLOWED_FIREBASE_EMAILS) { $env:ALLOWED_FIREBASE_EMAILS } else { "" }
 $AUTO_PROVISION_FIREBASE_USERS = if ($env:AUTO_PROVISION_FIREBASE_USERS) { $env:AUTO_PROVISION_FIREBASE_USERS } else { "true" }
+$FIREBASE_WEB_API_KEY = if ($env:FIREBASE_WEB_API_KEY) { $env:FIREBASE_WEB_API_KEY } else { "" }
+$FIREBASE_WEB_AUTH_DOMAIN = if ($env:FIREBASE_WEB_AUTH_DOMAIN) { $env:FIREBASE_WEB_AUTH_DOMAIN } else { "$PROJECT_ID.firebaseapp.com" }
+$FIREBASE_WEB_APP_ID = if ($env:FIREBASE_WEB_APP_ID) { $env:FIREBASE_WEB_APP_ID } else { "" }
+$FIREBASE_WEB_MESSAGING_SENDER_ID = if ($env:FIREBASE_WEB_MESSAGING_SENDER_ID) { $env:FIREBASE_WEB_MESSAGING_SENDER_ID } else { "" }
+$FIREBASE_WEB_MEASUREMENT_ID = if ($env:FIREBASE_WEB_MEASUREMENT_ID) { $env:FIREBASE_WEB_MEASUREMENT_ID } else { "" }
+$FEATURE_AUDIO_TRANSCRIPTION = if ($env:FEATURE_AUDIO_TRANSCRIPTION) { $env:FEATURE_AUDIO_TRANSCRIPTION } else { "false" }
+$STT_LANGUAGE_CODE = if ($env:STT_LANGUAGE_CODE) { $env:STT_LANGUAGE_CODE } else { "pt-BR" }
+$STT_TIMEOUT_SECONDS = if ($env:STT_TIMEOUT_SECONDS) { $env:STT_TIMEOUT_SECONDS } else { "30.0" }
+$STT_FALLBACK_TEXT = if ($env:STT_FALLBACK_TEXT) { $env:STT_FALLBACK_TEXT } else { "" }
 $SECRET_KEY = if ($env:SECRET_KEY) { $env:SECRET_KEY } else { New-HexSecret }
 $WHATSAPP_TOKEN = $env:WHATSAPP_TOKEN
 $WHATSAPP_VERIFY_TOKEN = $env:WHATSAPP_VERIFY_TOKEN
@@ -91,6 +189,7 @@ $CORS_ORIGINS = if ($env:CORS_ORIGINS) { $env:CORS_ORIGINS } else { "" }
 $REQUIRE_WEBHOOK_SIGNATURE = if ($env:REQUIRE_WEBHOOK_SIGNATURE) { $env:REQUIRE_WEBHOOK_SIGNATURE } else { "true" }
 $CHAT_DELIVERY_MODE = if ($env:CHAT_DELIVERY_MODE) { $env:CHAT_DELIVERY_MODE.Trim().ToLowerInvariant() } else { "snapshot" }
 $POLLING_INTERVAL_MS = if ($env:POLLING_INTERVAL_MS) { $env:POLLING_INTERVAL_MS } else { "5000" }
+$ENABLE_AUDIO_TRANSCRIPTION = $FEATURE_AUDIO_TRANSCRIPTION.Trim().ToLowerInvariant() -in @("1", "true", "yes", "on")
 
 if ($DATA_BACKEND -notin @("firestore", "sql")) {
     throw "DATA_BACKEND deve ser 'firestore' ou 'sql'."
@@ -141,31 +240,51 @@ if ($DATA_BACKEND -eq "sql") {
     $services += "sqladmin.googleapis.com"
 }
 
+if ($ENABLE_AUDIO_TRANSCRIPTION) {
+    $services += "speech.googleapis.com"
+}
+
 $serviceEnableArgs = @("services", "enable")
 $serviceEnableArgs += $services
 $serviceEnableArgs += @("--project", $PROJECT_ID, "--quiet")
 & gcloud @serviceEnableArgs | Out-Null
 
+$PROJECT_NUMBER = (& gcloud projects describe $PROJECT_ID --format="value(projectNumber)").Trim()
+$COMPUTE_SERVICE_ACCOUNT = "$PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+
 $SERVICE_ACCOUNT_EMAIL = "$SERVICE_NAME-run@$PROJECT_ID.iam.gserviceaccount.com"
-gcloud iam service-accounts describe $SERVICE_ACCOUNT_EMAIL --project $PROJECT_ID *> $null
-if ($LASTEXITCODE -ne 0) {
+if (-not (Test-GcloudCall -Args @("iam", "service-accounts", "describe", $SERVICE_ACCOUNT_EMAIL, "--project", $PROJECT_ID))) {
     gcloud iam service-accounts create "$SERVICE_NAME-run" `
         --project $PROJECT_ID `
         --display-name "$SERVICE_NAME runtime" | Out-Null
 }
 
-gcloud storage buckets describe "gs://$MEDIA_BUCKET" --project $PROJECT_ID *> $null
-if ($LASTEXITCODE -ne 0) {
+if (-not (Test-GcloudCall -Args @("storage", "buckets", "describe", "gs://$MEDIA_BUCKET", "--project", $PROJECT_ID))) {
     gcloud storage buckets create "gs://$MEDIA_BUCKET" `
         --project $PROJECT_ID `
         --location $REGION `
         --uniform-bucket-level-access `
-        --public-access-prevention=enforced | Out-Null
+        --public-access-prevention | Out-Null
 }
 
 gcloud projects add-iam-policy-binding $PROJECT_ID `
     --member "serviceAccount:$SERVICE_ACCOUNT_EMAIL" `
     --role "roles/secretmanager.secretAccessor" `
+    --quiet | Out-Null
+
+gcloud projects add-iam-policy-binding $PROJECT_ID `
+    --member "serviceAccount:$COMPUTE_SERVICE_ACCOUNT" `
+    --role "roles/storage.objectViewer" `
+    --quiet | Out-Null
+
+gcloud projects add-iam-policy-binding $PROJECT_ID `
+    --member "serviceAccount:$COMPUTE_SERVICE_ACCOUNT" `
+    --role "roles/artifactregistry.writer" `
+    --quiet | Out-Null
+
+gcloud projects add-iam-policy-binding $PROJECT_ID `
+    --member "serviceAccount:$COMPUTE_SERVICE_ACCOUNT" `
+    --role "roles/logging.logWriter" `
     --quiet | Out-Null
 
 gcloud storage buckets add-iam-policy-binding "gs://$MEDIA_BUCKET" `
@@ -182,6 +301,13 @@ else {
     gcloud projects add-iam-policy-binding $PROJECT_ID `
         --member "serviceAccount:$SERVICE_ACCOUNT_EMAIL" `
         --role "roles/datastore.user" `
+        --quiet | Out-Null
+}
+
+if ($ENABLE_AUDIO_TRANSCRIPTION) {
+    gcloud projects add-iam-policy-binding $PROJECT_ID `
+        --member "serviceAccount:$SERVICE_ACCOUNT_EMAIL" `
+        --role "roles/speech.client" `
         --quiet | Out-Null
 }
 
@@ -244,7 +370,17 @@ $envVars.Add("LOG_TO_FILE=false")
 $envVars.Add("CHAT_DELIVERY_MODE=$CHAT_DELIVERY_MODE")
 $envVars.Add("POLLING_INTERVAL_MS=$POLLING_INTERVAL_MS")
 $envVars.Add("ALLOWED_FIREBASE_EMAIL_DOMAIN=$ALLOWED_FIREBASE_EMAIL_DOMAIN")
+$envVars.Add("ALLOWED_FIREBASE_EMAILS=$ALLOWED_FIREBASE_EMAILS")
 $envVars.Add("AUTO_PROVISION_FIREBASE_USERS=$AUTO_PROVISION_FIREBASE_USERS")
+$envVars.Add("FIREBASE_WEB_API_KEY=$FIREBASE_WEB_API_KEY")
+$envVars.Add("FIREBASE_WEB_AUTH_DOMAIN=$FIREBASE_WEB_AUTH_DOMAIN")
+$envVars.Add("FIREBASE_WEB_APP_ID=$FIREBASE_WEB_APP_ID")
+$envVars.Add("FIREBASE_WEB_MESSAGING_SENDER_ID=$FIREBASE_WEB_MESSAGING_SENDER_ID")
+$envVars.Add("FIREBASE_WEB_MEASUREMENT_ID=$FIREBASE_WEB_MEASUREMENT_ID")
+$envVars.Add("FEATURE_AUDIO_TRANSCRIPTION=$FEATURE_AUDIO_TRANSCRIPTION")
+$envVars.Add("STT_LANGUAGE_CODE=$STT_LANGUAGE_CODE")
+$envVars.Add("STT_TIMEOUT_SECONDS=$STT_TIMEOUT_SECONDS")
+$envVars.Add("STT_FALLBACK_TEXT=$STT_FALLBACK_TEXT")
 
 if ($AUTH_MODE -eq "firebase") {
     $envVars.Add("BOOTSTRAP_ADMIN_EMAIL=$BOOTSTRAP_ADMIN_EMAIL")
@@ -256,29 +392,36 @@ else {
 Write-Host ""
 Write-Host "Iniciando deploy no Cloud Run..."
 
-$gcloudArgs = @(
-    "run", "deploy", $SERVICE_NAME,
-    "--source", ".",
-    "--project", $PROJECT_ID,
-    "--region", $REGION,
-    "--platform", "managed",
-    "--allow-unauthenticated",
-    "--service-account", $SERVICE_ACCOUNT_EMAIL,
-    "--port", "8080",
-    "--memory", "512Mi",
-    "--cpu", "1",
-    "--min-instances", "0",
-    "--max-instances", "1",
-    "--timeout", "300",
-    "--set-env-vars", ($envVars -join ","),
-    "--set-secrets", ($secretMappings -join ",")
-)
+$envFile = New-CloudRunEnvFile -Entries $envVars
+try {
+    $gcloudArgs = @(
+        "run", "deploy", $SERVICE_NAME,
+        "--source", ".",
+        "--project", $PROJECT_ID,
+        "--region", $REGION,
+        "--platform", "managed",
+        "--allow-unauthenticated",
+        "--service-account", $SERVICE_ACCOUNT_EMAIL,
+        "--port", "8080",
+        "--memory", "512Mi",
+        "--cpu", "1",
+        "--min-instances", "0",
+        "--max-instances", "3",
+        "--concurrency", "40",
+        "--timeout", "300",
+        "--env-vars-file", $envFile,
+        "--set-secrets", ($secretMappings -join ",")
+    )
 
-if ($deployArgs.Count -gt 0) {
-    $gcloudArgs += $deployArgs
+    if ($deployArgs.Count -gt 0) {
+        $gcloudArgs += $deployArgs
+    }
+
+    & gcloud @gcloudArgs
 }
-
-& gcloud @gcloudArgs
+finally {
+    Remove-Item $envFile -ErrorAction SilentlyContinue
+}
 
 $SERVICE_URL = (& gcloud run services describe $SERVICE_NAME --project $PROJECT_ID --region $REGION --format="value(status.url)").Trim()
 

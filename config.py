@@ -35,20 +35,10 @@ def _as_int(value, default):
     return int(value)
 
 
-SUPPORTED_DATA_BACKENDS = {"sql", "firestore"}
-DATA_BACKEND = os.getenv("DATA_BACKEND", "sql").strip().lower()
-if DATA_BACKEND not in SUPPORTED_DATA_BACKENDS:
-    raise RuntimeError(f"DATA_BACKEND invalido: {DATA_BACKEND}")
+DATA_BACKEND = "firestore"
+IS_FIRESTORE_BACKEND = True
 
-IS_FIRESTORE_BACKEND = DATA_BACKEND == "firestore"
-
-SUPPORTED_AUTH_MODES = {"legacy", "firebase"}
-AUTH_MODE = os.getenv(
-    "AUTH_MODE",
-    "firebase" if IS_FIRESTORE_BACKEND else "legacy",
-).strip().lower()
-if AUTH_MODE not in SUPPORTED_AUTH_MODES:
-    raise RuntimeError(f"AUTH_MODE invalido: {AUTH_MODE}")
+AUTH_MODE = os.getenv("AUTH_MODE", "firebase").strip().lower()
 USE_FIREBASE_AUTH = AUTH_MODE == "firebase"
 
 FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "").strip()
@@ -57,66 +47,22 @@ FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB = _as_int(os.getenv("FIRESTORE_MEDIA_COMPR
 FIRESTORE_MEDIA_MAX_MB = _as_int(os.getenv("FIRESTORE_MEDIA_MAX_MB"), 8)
 FIRESTORE_MEDIA_CHUNK_KB = _as_int(os.getenv("FIRESTORE_MEDIA_CHUNK_KB"), 768)
 ALLOWED_FIREBASE_EMAIL_DOMAIN = os.getenv("ALLOWED_FIREBASE_EMAIL_DOMAIN", "").strip().lower()
+ALLOWED_FIREBASE_EMAILS = [item.lower() for item in _split_csv(os.getenv("ALLOWED_FIREBASE_EMAILS", ""))]
 AUTO_PROVISION_FIREBASE_USERS = _as_bool(os.getenv("AUTO_PROVISION_FIREBASE_USERS"), default=True)
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "").strip()
+FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY", "").strip()
+FIREBASE_WEB_AUTH_DOMAIN = os.getenv(
+    "FIREBASE_WEB_AUTH_DOMAIN",
+    f"{FIRESTORE_PROJECT_ID}.firebaseapp.com" if FIRESTORE_PROJECT_ID else "",
+).strip()
+FIREBASE_WEB_APP_ID = os.getenv("FIREBASE_WEB_APP_ID", "").strip()
+FIREBASE_WEB_MESSAGING_SENDER_ID = os.getenv("FIREBASE_WEB_MESSAGING_SENDER_ID", "").strip()
+FIREBASE_WEB_MEASUREMENT_ID = os.getenv("FIREBASE_WEB_MEASUREMENT_ID", "").strip()
 
-SUPPORTED_CHAT_DELIVERY_MODES = {"snapshot", "polling"}
-CHAT_DELIVERY_MODE = os.getenv(
-    "CHAT_DELIVERY_MODE",
-    "snapshot" if IS_FIRESTORE_BACKEND else "polling",
-).strip().lower()
-if CHAT_DELIVERY_MODE not in SUPPORTED_CHAT_DELIVERY_MODES:
-    raise RuntimeError(f"CHAT_DELIVERY_MODE invalido: {CHAT_DELIVERY_MODE}")
-POLLING_INTERVAL_MS = _as_int(os.getenv("POLLING_INTERVAL_MS"), 5000)
-
-
-def _default_database_path():
-    raw_path = os.getenv("DATABASE_PATH", str(BASE_DIR / "data" / "castro_crm.db")).strip()
-    path = Path(raw_path)
-    if not path.is_absolute():
-        path = (BASE_DIR / path).resolve()
-    return path
+CHAT_DELIVERY_MODE = os.getenv("CHAT_DELIVERY_MODE", "snapshot").strip().lower()
+POLLING_INTERVAL_MS = _as_int(os.getenv("POLLING_INTERVAL_MS"), 15000)
 
 
-def _get_database_url():
-    value = os.getenv("DATABASE_URL", "").strip()
-    if value:
-        if value.startswith(("sqlite", "postgresql")):
-            return value
-        raise RuntimeError("DATABASE_URL deve apontar para SQLite ou PostgreSQL.")
-    return f"sqlite:///{DATABASE_PATH.as_posix()}"
-
-
-def _database_kind(database_url):
-    if database_url.startswith("sqlite"):
-        return "sqlite"
-    if database_url.startswith("postgresql"):
-        return "postgresql"
-    return "unknown"
-
-
-if DATA_BACKEND == "sql":
-    DATABASE_PATH = _default_database_path()
-    DATABASE_URL = _get_database_url()
-    DATABASE_KIND = _database_kind(DATABASE_URL)
-    IS_SQLITE = DATABASE_KIND == "sqlite"
-    IS_POSTGRES = DATABASE_KIND == "postgresql"
-
-    if DATABASE_KIND == "unknown":
-        raise RuntimeError("DATABASE_URL deve apontar para SQLite ou PostgreSQL.")
-
-    if IS_CLOUD_RUN and IS_SQLITE:
-        raise RuntimeError("Cloud Run nao deve usar SQLite. Use PostgreSQL/Cloud SQL.")
-else:
-    DATABASE_PATH = None
-    DATABASE_URL = ""
-    DATABASE_KIND = "firestore"
-    IS_SQLITE = False
-    IS_POSTGRES = False
-
-
-# -- Banco de dados --
-# variaveis ja definidas acima: DATABASE_PATH, DATABASE_URL, DATABASE_KIND
 
 # -- Seguranca --
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
@@ -164,6 +110,15 @@ AVATAR_ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
 # -- Audio gravado --
 AUDIO_MAX_DURATION_SEC = 120
 AUDIO_ALLOWED_MIME = {"audio/ogg", "audio/webm", "audio/mp4", "audio/mpeg"}
+
+# -- Transcricao de audio (Google Speech-to-Text) --
+def _bool_env(key, default="false"):
+    return os.getenv(key, default).strip().lower() in ("1", "true", "yes")
+
+FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
+STT_LANGUAGE_CODE = os.getenv("STT_LANGUAGE_CODE", "pt-BR").strip()
+STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30.0"))
+STT_FALLBACK_TEXT = os.getenv("STT_FALLBACK_TEXT", "").strip()
 
 # -- Qualificacao de contatos --
 QUALIFICATION_OPTIONS = [
