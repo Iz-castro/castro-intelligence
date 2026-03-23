@@ -341,7 +341,8 @@ export default function App() {
   const [transcribingMessageId, setTranscribingMessageId] = useState<number | null>(null);
   const [messageLimit, setMessageLimit] = useState(10);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings, setShowSettings] = useState<false | "menu" | "chat" | "quick" | "admin">(false);
+  const settingsMenuRef = useRef<HTMLDivElement | null>(null);
   const [systemSettings, setSystemSettings] = useState<{
     chat_prefix_enabled: boolean;
     chat_prefix_roles: string[];
@@ -550,6 +551,15 @@ export default function App() {
     container.addEventListener("scroll", handleScroll, { passive: true });
     return () => container.removeEventListener("scroll", handleScroll);
   }, [selectedContactId, loadingMore]);
+
+  useEffect(() => {
+    if (showSettings !== "menu") return undefined;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!settingsMenuRef.current?.contains(event.target as Node)) setShowSettings(false);
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [showSettings]);
 
   useEffect(() => {
     const input = composerInputRef.current;
@@ -850,7 +860,11 @@ export default function App() {
     setTheme(next);
   }
 
-  async function openSettings() {
+  function toggleSettingsMenu() {
+    setShowSettings((prev) => prev === "menu" ? false : "menu");
+  }
+
+  async function openSettingsPage(page: "chat" | "quick" | "admin") {
     if (!bundle) return;
     try {
       setBusySettings(true);
@@ -860,7 +874,7 @@ export default function App() {
       ]);
       setSystemSettings(sys);
       setUserSettings(usr);
-      setShowSettings(true);
+      setShowSettings(page);
     } catch (currentError) {
       setError(errorText(currentError));
     } finally {
@@ -1166,9 +1180,26 @@ export default function App() {
             <button className="composer-icon" onClick={toggleTheme} title={theme === "dark" ? "Tema claro" : "Tema escuro"} aria-label="Alternar tema">
               {theme === "dark" ? <SunIcon /> : <MoonIcon />}
             </button>
-            <button className="composer-icon" onClick={() => void openSettings()} title="Configuracoes" aria-label="Configuracoes">
-              <GearIcon />
-            </button>
+            <div ref={settingsMenuRef} style={{ position: "relative" }}>
+              <button className="composer-icon" onClick={toggleSettingsMenu} title="Configuracoes" aria-label="Configuracoes">
+                <GearIcon />
+              </button>
+              {showSettings === "menu" && (
+                <div className="settings-dropdown">
+                  <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}>
+                    <span>💬</span><span>Chat</span>
+                  </button>
+                  <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}>
+                    <span>⚡</span><span>Mensagens rapidas</span>
+                  </button>
+                  {sessionUser.role === "admin" && (
+                    <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}>
+                      <span>🔧</span><span>Administracao</span>
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
             <button className="ghost" style={{ padding: "0.55rem 1rem", fontSize: "0.9rem" }} onClick={() => void logout()}>Sair</button>
           </div>
         </header>
@@ -1403,20 +1434,19 @@ export default function App() {
       </div>
       </div>
 
-      {showSettings ? (
-        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Configuracoes do sistema" onClick={() => setShowSettings(false)}>
-          <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar configuracoes">Fechar</button>
+      {/* Modal: Chat */}
+      {showSettings === "chat" ? (
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Configuracoes do Chat" onClick={() => setShowSettings(false)}>
+          <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
           <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: "0 0 1.2rem" }}>Configuracoes do Sistema</h2>
+            <h2 style={{ margin: "0 0 1.2rem" }}>Chat</h2>
             <div className="settings-section">
-              <h3>Chat</h3>
-
-              {/* Prefixo de mensagem - config do usuario */}
+              <h3>Prefixo de mensagem</h3>
               {systemSettings.chat_prefix_roles.includes(sessionUser.role) ? (
                 <div className="settings-block">
                   <label className="settings-toggle">
                     <input type="checkbox" checked={userSettings.chat_prefix_enabled} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} />
-                    <span>Prefixo da mensagem (ex: <strong>Rafael:</strong> Bom dia...)</span>
+                    <span>Usar prefixo (ex: <strong>Rafael:</strong> Bom dia...)</span>
                   </label>
                   {userSettings.chat_prefix_enabled && (
                     <input
@@ -1430,100 +1460,21 @@ export default function App() {
               ) : (
                 <div className="empty" style={{ fontSize: "0.88rem" }}>Prefixo de mensagem nao habilitado para seu cargo.</div>
               )}
-
               <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={busySettings}>
-                {busySettings ? "Salvando..." : "Salvar minhas preferencias"}
+                {busySettings ? "Salvando..." : "Salvar"}
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
 
-            {/* Secao Admin - Controle de roles */}
-            {sessionUser.role === "admin" ? (
-              <div className="settings-section" style={{ marginTop: "1.5rem" }}>
-                <h3>Administracao</h3>
-
-                <div className="settings-block">
-                  <label className="settings-toggle">
-                    <input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} />
-                    <span>Habilitar prefixo de mensagem (padrao do sistema)</span>
-                  </label>
-                </div>
-
-                <div className="settings-block">
-                  <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Cargos que podem usar prefixo:</span>
-                  {["admin", "supervisor", "operador"].map((role) => (
-                    <label key={role} className="settings-toggle" style={{ marginBottom: "0.25rem" }}>
-                      <input
-                        type="checkbox"
-                        checked={systemSettings.chat_prefix_roles.includes(role)}
-                        onChange={(e) => {
-                          setSystemSettings((prev) => ({
-                            ...prev,
-                            chat_prefix_roles: e.target.checked
-                              ? [...prev.chat_prefix_roles, role]
-                              : prev.chat_prefix_roles.filter((r) => r !== role),
-                          }));
-                        }}
-                      />
-                      <span>{role}</span>
-                    </label>
-                  ))}
-                </div>
-
-                <div className="settings-block">
-                  <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Limite de mensagens rapidas por usuario:</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={systemSettings.quick_message_max}
-                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, quick_message_max: Math.max(1, Number(e.target.value) || 1) }))}
-                    style={{ width: 100 }}
-                  />
-                </div>
-
-                {/* Mensagens rapidas globais do admin */}
-                <div className="settings-block">
-                  <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens rapidas globais (padrao para todos):</span>
-                  {systemSettings.quick_messages_global.map((qm, idx) => (
-                    <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
-                      <input
-                        value={qm.shortcut}
-                        onChange={(e) => {
-                          const updated = [...systemSettings.quick_messages_global];
-                          updated[idx] = { ...updated[idx], shortcut: e.target.value };
-                          setSystemSettings((prev) => ({ ...prev, quick_messages_global: updated }));
-                        }}
-                        placeholder="/atalho"
-                        style={{ width: 100 }}
-                      />
-                      <input
-                        value={qm.message}
-                        onChange={(e) => {
-                          const updated = [...systemSettings.quick_messages_global];
-                          updated[idx] = { ...updated[idx], message: e.target.value };
-                          setSystemSettings((prev) => ({ ...prev, quick_messages_global: updated }));
-                        }}
-                        placeholder="Mensagem completa"
-                        style={{ flex: 1 }}
-                      />
-                      <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => {
-                        setSystemSettings((prev) => ({ ...prev, quick_messages_global: prev.quick_messages_global.filter((_, i) => i !== idx) }));
-                      }}>X</button>
-                    </div>
-                  ))}
-                  <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => {
-                    setSystemSettings((prev) => ({ ...prev, quick_messages_global: [...prev.quick_messages_global, { shortcut: "", message: "" }] }));
-                  }}>+ Adicionar mensagem global</button>
-                </div>
-
-                <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>
-                  {busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}
-                </button>
-              </div>
-            ) : null}
-
-            {/* Mensagens rapidas do usuario */}
-            <div className="settings-section" style={{ marginTop: "1.5rem" }}>
+      {/* Modal: Mensagens rapidas */}
+      {showSettings === "quick" ? (
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Mensagens rapidas" onClick={() => setShowSettings(false)}>
+          <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ margin: "0 0 1.2rem" }}>Mensagens rapidas</h2>
+            <div className="settings-section">
               <h3>Minhas mensagens rapidas</h3>
               <div className="settings-block">
                 {userSettings.quick_messages.map((qm, idx) => (
@@ -1562,9 +1513,101 @@ export default function App() {
                 )}
               </div>
               <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={busySettings}>
-                {busySettings ? "Salvando..." : "Salvar minhas mensagens rapidas"}
+                {busySettings ? "Salvando..." : "Salvar"}
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Modal: Administracao (admin only) */}
+      {showSettings === "admin" && sessionUser.role === "admin" ? (
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Administracao" onClick={() => setShowSettings(false)}>
+          <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ margin: "0 0 1.2rem" }}>Administracao</h2>
+
+            <div className="settings-section">
+              <h3>Prefixo de mensagem</h3>
+              <div className="settings-block">
+                <label className="settings-toggle">
+                  <input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} />
+                  <span>Habilitar prefixo de mensagem (padrao do sistema)</span>
+                </label>
+              </div>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Cargos que podem usar prefixo:</span>
+                {["admin", "supervisor", "operador"].map((role) => (
+                  <label key={role} className="settings-toggle" style={{ marginBottom: "0.25rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={systemSettings.chat_prefix_roles.includes(role)}
+                      onChange={(e) => {
+                        setSystemSettings((prev) => ({
+                          ...prev,
+                          chat_prefix_roles: e.target.checked
+                            ? [...prev.chat_prefix_roles, role]
+                            : prev.chat_prefix_roles.filter((r) => r !== role),
+                        }));
+                      }}
+                    />
+                    <span>{role}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+              <h3>Mensagens rapidas</h3>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Limite por usuario:</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={systemSettings.quick_message_max}
+                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, quick_message_max: Math.max(1, Number(e.target.value) || 1) }))}
+                  style={{ width: 100 }}
+                />
+              </div>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens globais (padrao para todos):</span>
+                {systemSettings.quick_messages_global.map((qm, idx) => (
+                  <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
+                    <input
+                      value={qm.shortcut}
+                      onChange={(e) => {
+                        const updated = [...systemSettings.quick_messages_global];
+                        updated[idx] = { ...updated[idx], shortcut: e.target.value };
+                        setSystemSettings((prev) => ({ ...prev, quick_messages_global: updated }));
+                      }}
+                      placeholder="/atalho"
+                      style={{ width: 100 }}
+                    />
+                    <input
+                      value={qm.message}
+                      onChange={(e) => {
+                        const updated = [...systemSettings.quick_messages_global];
+                        updated[idx] = { ...updated[idx], message: e.target.value };
+                        setSystemSettings((prev) => ({ ...prev, quick_messages_global: updated }));
+                      }}
+                      placeholder="Mensagem completa"
+                      style={{ flex: 1 }}
+                    />
+                    <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => {
+                      setSystemSettings((prev) => ({ ...prev, quick_messages_global: prev.quick_messages_global.filter((_, i) => i !== idx) }));
+                    }}>X</button>
+                  </div>
+                ))}
+                <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => {
+                  setSystemSettings((prev) => ({ ...prev, quick_messages_global: [...prev.quick_messages_global, { shortcut: "", message: "" }] }));
+                }}>+ Adicionar mensagem global</button>
+              </div>
+            </div>
+
+            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>
+              {busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}
+            </button>
           </div>
         </div>
       ) : null}

@@ -852,6 +852,19 @@ textarea:focus {
   white-space: nowrap;
 }
 
+.settings-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.5rem);
+  min-width: 200px;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--attach-bg);
+  box-shadow: var(--shadow);
+  z-index: 30;
+}
+
 .settings-modal {
   width: min(640px, 92vw);
   max-height: calc(100vh - 4rem);
