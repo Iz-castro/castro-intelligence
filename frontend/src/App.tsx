@@ -355,7 +355,8 @@ export default function App() {
     quick_messages: { shortcut: string; message: string }[];
   }>({ chat_prefix_enabled: false, chat_prefix_name: "", quick_messages: [] });
   const [busySettings, setBusySettings] = useState(false);
-  const [activeView, setActiveView] = useState<"novos" | "meus" | "nao_qualificados">("novos");
+  const [activeView, setActiveView] = useState<"novos" | "meus" | "nao_qualificados" | "equipe">("novos");
+  const [equipeOperatorFilter, setEquipeOperatorFilter] = useState<string>("");
   const [qualificationFilter, setQualificationFilter] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -379,11 +380,16 @@ export default function App() {
   const novosContacts = contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado");
   const meusContacts = contacts.filter((c) => c.assigned_to === sessionUser?.id);
   const nqContacts = contacts.filter((c) => c.qualification === "nao_qualificado");
+  const equipeContacts = contacts.filter((c) => c.assigned_to && c.assigned_to !== sessionUser?.id);
   const novosUnread = novosContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const meusUnread = meusContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const nqUnread = nqContacts.reduce((s, c) => s + (c.unread || 0), 0);
+  const equipeUnread = equipeContacts.reduce((s, c) => s + (c.unread || 0), 0);
 
-  const viewContacts = activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : nqContacts;
+  const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
+  const equipeFiltered = equipeOperatorFilter ? equipeContacts.filter((c) => String(c.assigned_to) === equipeOperatorFilter) : equipeContacts;
+
+  const viewContacts = activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : activeView === "equipe" ? equipeFiltered : nqContacts;
   const filteredContacts = viewContacts.filter((item) => {
     const matchesSearch = !searchText || [item.display_name, item.phone_formatted || "", item.department_name || "", item.assigned_name || ""].join(" ").toLowerCase().includes(searchText);
     const matchesQual = !qualificationFilter || item.qualification === qualificationFilter;
@@ -1163,7 +1169,7 @@ export default function App() {
     return <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Entrar com Google</h1><p>{config?.allowed_email_domain ? `Use sua conta ${config.allowed_email_domain}.` : "Use uma conta Google autorizada."}</p><button className="primary" onClick={() => void loginWithGoogle()} disabled={!bundle || busyLogin}>{busyLogin ? "Conectando..." : "Entrar com Google"}</button>{error ? <div className="alert danger">{error}</div> : null}</div></div>;
   }
 
-  const viewTitle = activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : "Nao Qualificados";
+  const viewTitle = activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
 
   return (
     <>
@@ -1220,6 +1226,11 @@ export default function App() {
             <span className="nav-label">N/Q</span>
             {nqUnread > 0 && <span className="nav-badge">{nqUnread > 99 ? "99+" : nqUnread}</span>}
           </button>
+          {isManagerRole && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <span className="nav-label">Equipe</span>
+            {equipeUnread > 0 && <span className="nav-badge">{equipeUnread > 99 ? "99+" : equipeUnread}</span>}
+          </button>}
         </nav>
 
         <aside className="panel sidebar">
@@ -1229,8 +1240,9 @@ export default function App() {
         <div className="toolbar">
           <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar contato" />
           {activeView === "meus" && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>}
+          {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
         </div>
-        <div className="contact-list">{filteredContacts.map((contact) => <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""}`} onClick={() => setSelectedContactId(contact.id)}><div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div><div className="contact-copy"><div className="row"><strong>{contact.display_name}</strong><span>{when(contact.last_message_at)}</span></div><div className="sub">{contact.phone_formatted || contact.wa_id}</div><div className="row"><span className="chip">{contact.qualification || "novo"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div></div></button>)}{!filteredContacts.length ? <div className="empty">{activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : "Nenhum contato nao qualificado."}</div> : null}</div>
+        <div className="contact-list">{filteredContacts.map((contact) => <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""}`} onClick={() => setSelectedContactId(contact.id)}><div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div><div className="contact-copy"><div className="row"><strong>{contact.display_name}</strong><span>{when(contact.last_message_at)}</span></div><div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div><div className="row"><span className="chip">{contact.qualification || "novo"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div></div></button>)}{!filteredContacts.length ? <div className="empty">{activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}</div>
         </aside>
 
         <main className="panel chat-panel">
