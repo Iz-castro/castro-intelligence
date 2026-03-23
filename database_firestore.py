@@ -459,6 +459,7 @@ def upsert_wa_contact(wa_id, display_name=""):
         document("wa_contacts", existing["id"]).set({
             "display_name": display_name or "",
             "last_message_at": now,
+            "last_inbound_at": now,
         }, merge=True)
         return existing["id"]
 
@@ -479,6 +480,7 @@ def upsert_wa_contact(wa_id, display_name=""):
         "unread_count": 0,
         "first_seen_at": now,
         "last_message_at": now,
+        "last_inbound_at": now,
     })
     return contact_id
 

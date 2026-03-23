@@ -696,6 +696,31 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
     return {"transcription": transcript}
 
 
+# -- Helper: janela de 24h do WhatsApp --
+
+from datetime import timedelta
+
+_24H = timedelta(hours=24)
+
+
+def _check_24h_window(contact: dict):
+    """Raises 403 if last inbound message is older than 24h (Meta free-form window)."""
+    last_inbound = contact.get("last_inbound_at")
+    if not last_inbound:
+        raise HTTPException(
+            status_code=403,
+            detail="Janela de 24h expirada. O cliente nunca enviou mensagem. Use um template.",
+        )
+    if isinstance(last_inbound, str):
+        last_inbound = datetime.fromisoformat(last_inbound.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    if now - last_inbound > _24H:
+        raise HTTPException(
+            status_code=403,
+            detail="Janela de 24h expirada. Use um template para reabrir a conversa.",
+        )
+
+
 @app.post("/api/wa/send-location")
 async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Depends(get_current_user)):
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
@@ -703,6 +728,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
     contact = get_wa_contact(body.contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _check_24h_window(contact)
 
     wa_id = contact["wa_id"]
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -756,6 +782,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_24h_window(contact)
 
     wa_id = _wa_target(contact["wa_id"])
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -794,6 +821,7 @@ async def wa_send_media(
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_24h_window(contact)
 
     file_content = await file.read()
     if len(file_content) > 16 * 1024 * 1024:
@@ -844,6 +872,7 @@ async def wa_send_audio(
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_24h_window(contact)
 
     raw_content = await file.read()
     if len(raw_content) > 16 * 1024 * 1024:
