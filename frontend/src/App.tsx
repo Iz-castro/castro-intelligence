@@ -201,6 +201,15 @@ function SunIcon() {
   );
 }
 
+function GearIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
 function SearchIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -330,8 +339,26 @@ export default function App() {
   const [editDeptId, setEditDeptId] = useState<number | "">("");
   const [busyRoleUpdate, setBusyRoleUpdate] = useState(false);
   const [transcribingMessageId, setTranscribingMessageId] = useState<number | null>(null);
+  const [messageLimit, setMessageLimit] = useState(10);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [systemSettings, setSystemSettings] = useState<{
+    chat_prefix_enabled: boolean;
+    chat_prefix_roles: string[];
+    quick_message_max: number;
+    quick_messages_global: { shortcut: string; message: string }[];
+  }>({ chat_prefix_enabled: false, chat_prefix_roles: ["admin", "supervisor", "operador"], quick_message_max: 20, quick_messages_global: [] });
+  const [userSettings, setUserSettings] = useState<{
+    chat_prefix_enabled: boolean;
+    chat_prefix_name: string;
+    quick_messages: { shortcut: string; message: string }[];
+  }>({ chat_prefix_enabled: false, chat_prefix_name: "", quick_messages: [] });
+  const [busySettings, setBusySettings] = useState(false);
+  const [activeView, setActiveView] = useState<"novos" | "meus" | "nao_qualificados">("novos");
+  const [qualificationFilter, setQualificationFilter] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [quickSuggestions, setQuickSuggestions] = useState<{ shortcut: string; message: string }[]>([]);
   const searchText = useDeferredValue(search.trim().toLowerCase());
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -347,7 +374,20 @@ export default function App() {
 
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
   const selectedContact = contacts.find((item) => item.id === selectedContactId) || null;
-  const filteredContacts = contacts.filter((item) => !searchText || [item.display_name, item.phone_formatted || "", item.department_name || "", item.assigned_name || ""].join(" ").toLowerCase().includes(searchText));
+
+  const novosContacts = contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado");
+  const meusContacts = contacts.filter((c) => c.assigned_to === sessionUser?.id);
+  const nqContacts = contacts.filter((c) => c.qualification === "nao_qualificado");
+  const novosUnread = novosContacts.reduce((s, c) => s + (c.unread || 0), 0);
+  const meusUnread = meusContacts.reduce((s, c) => s + (c.unread || 0), 0);
+  const nqUnread = nqContacts.reduce((s, c) => s + (c.unread || 0), 0);
+
+  const viewContacts = activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : nqContacts;
+  const filteredContacts = viewContacts.filter((item) => {
+    const matchesSearch = !searchText || [item.display_name, item.phone_formatted || "", item.department_name || "", item.assigned_name || ""].join(" ").toLowerCase().includes(searchText);
+    const matchesQual = !qualificationFilter || item.qualification === qualificationFilter;
+    return matchesSearch && matchesQual;
+  });
   const chatSearchLower = chatSearch.trim().toLowerCase();
   const visibleMessagesFiltered = chatSearchLower
     ? messages.filter((m) => String(m.content || "").toLowerCase().includes(chatSearchLower))
@@ -439,6 +479,14 @@ export default function App() {
         setOperators(nextOperators);
         setDepartments(nextDepartments.departments);
         setError("");
+        // Carregar configuracoes em background
+        Promise.all([
+          getJson<typeof systemSettings>(bundle.auth, "/api/settings/system"),
+          getJson<typeof userSettings>(bundle.auth, "/api/settings/user"),
+        ]).then(([sys, usr]) => {
+          setSystemSettings(sys);
+          setUserSettings(usr);
+        }).catch(() => { /* silenciar erro de settings no login */ });
       } catch (currentError) {
         setError(errorText(currentError));
         await signOut(bundle.auth);
@@ -466,12 +514,42 @@ export default function App() {
     setTransferSummary("");
     setShowAttachMenu(false);
     setLightboxMedia(null);
+    setMessageLimit(10);
     discardRecording();
   }, [contacts, selectedContactId]);
 
+  const prevMessageCountRef = useRef(0);
   useEffect(() => {
-    if (messagesRef.current) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
-  }, [messages, selectedContactId]);
+    const container = messagesRef.current;
+    if (!container) return;
+    const isLoadingOlder = prevMessageCountRef.current > 0 && messages.length > prevMessageCountRef.current && messageLimit > 10;
+    if (isLoadingOlder) {
+      // Manter posicao do scroll ao carregar mensagens antigas
+      const newScrollHeight = container.scrollHeight;
+      const prevScrollHeight = container.dataset.prevScrollHeight;
+      if (prevScrollHeight) {
+        container.scrollTop = newScrollHeight - Number(prevScrollHeight);
+      }
+    } else {
+      container.scrollTop = container.scrollHeight;
+    }
+    prevMessageCountRef.current = messages.length;
+    setLoadingMore(false);
+  }, [messages, selectedContactId, messageLimit]);
+
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container || !selectedContactId) return undefined;
+    const handleScroll = () => {
+      if (container.scrollTop < 40 && !loadingMore) {
+        container.dataset.prevScrollHeight = String(container.scrollHeight);
+        setLoadingMore(true);
+        setMessageLimit((prev) => prev + 15);
+      }
+    };
+    container.addEventListener("scroll", handleScroll, { passive: true });
+    return () => container.removeEventListener("scroll", handleScroll);
+  }, [selectedContactId, loadingMore]);
 
   useEffect(() => {
     const input = composerInputRef.current;
@@ -524,7 +602,7 @@ export default function App() {
     };
 
     const loadMessages = async (contactId: number) => {
-      const response = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${contactId}`);
+      const response = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${contactId}?limit=${messageLimit}`);
       if (!disposed) startTransition(() => setMessages(response.messages));
     };
 
@@ -541,7 +619,7 @@ export default function App() {
             collection(bundle.db, config.firestore.collections.wa_messages),
             where("contact_id", "==", selectedContactId),
             orderBy("created_at", "desc"),
-            firestoreLimit(50),
+            firestoreLimit(messageLimit),
           ),
           (snap) => startTransition(() => setMessages(
             snap.docs
@@ -572,14 +650,14 @@ export default function App() {
       unsubMessages();
       if (intervalId) window.clearInterval(intervalId);
     };
-  }, [bundle, config, sessionUser, selectedContactId, snapshotMode]);
+  }, [bundle, config, sessionUser, selectedContactId, snapshotMode, messageLimit]);
 
   async function refreshPollingViews() {
     if (!bundle) return;
     const contactsResponse = await getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts");
     startTransition(() => setContacts(contactsResponse.contacts));
     if (selectedContactId) {
-      const messagesResponse = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${selectedContactId}`);
+      const messagesResponse = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${selectedContactId}?limit=${messageLimit}`);
       startTransition(() => setMessages(messagesResponse.messages));
     }
   }
@@ -607,7 +685,11 @@ export default function App() {
       setBusySend(true);
       setError("");
       setNotice("");
-      const content = draft.trim();
+      let content = draft.trim();
+      // Aplicar prefixo se habilitado
+      if (userSettings.chat_prefix_enabled && userSettings.chat_prefix_name.trim() && systemSettings.chat_prefix_roles.includes(sessionUser?.role || "")) {
+        content = `${userSettings.chat_prefix_name.trim()}: ${content}`;
+      }
       await sendJson(bundle.auth, "/api/wa/send", { contact_id: selectedContact.id, content });
       setDraft("");
       setNotice("Mensagem enviada.");
@@ -735,13 +817,83 @@ export default function App() {
   }
 
   function handleDraftChange(event: ChangeEvent<HTMLTextAreaElement>) {
-    setDraft(event.target.value);
+    const value = event.target.value;
+    setDraft(value);
+
+    // Detectar atalhos de mensagem rapida
+    const trimmed = value.trim();
+    if (trimmed.startsWith("/") && trimmed.length >= 1) {
+      const typed = trimmed.toLowerCase();
+      const allQuick = [
+        ...systemSettings.quick_messages_global,
+        ...userSettings.quick_messages,
+      ].filter((qm) => qm.shortcut && qm.message);
+      const matches = allQuick.filter((qm) => {
+        const shortcut = qm.shortcut.startsWith("/") ? qm.shortcut.toLowerCase() : `/${qm.shortcut.toLowerCase()}`;
+        return shortcut.startsWith(typed);
+      });
+      setQuickSuggestions(matches);
+    } else {
+      setQuickSuggestions([]);
+    }
+  }
+
+  function applyQuickMessage(qm: { shortcut: string; message: string }) {
+    setDraft(qm.message);
+    setQuickSuggestions([]);
+    composerInputRef.current?.focus();
   }
 
   function toggleTheme() {
     const next = theme === "dark" ? "light" : "dark";
     applyTheme(next);
     setTheme(next);
+  }
+
+  async function openSettings() {
+    if (!bundle) return;
+    try {
+      setBusySettings(true);
+      const [sys, usr] = await Promise.all([
+        getJson<typeof systemSettings>(bundle.auth, "/api/settings/system"),
+        getJson<typeof userSettings>(bundle.auth, "/api/settings/user"),
+      ]);
+      setSystemSettings(sys);
+      setUserSettings(usr);
+      setShowSettings(true);
+    } catch (currentError) {
+      setError(errorText(currentError));
+    } finally {
+      setBusySettings(false);
+    }
+  }
+
+  async function saveSystemSettingsAction() {
+    if (!bundle) return;
+    try {
+      setBusySettings(true);
+      const result = await putJson(bundle.auth, "/api/settings/system", systemSettings) as typeof systemSettings;
+      setSystemSettings(result);
+      setNotice("Configuracoes do sistema salvas.");
+    } catch (currentError) {
+      setError(errorText(currentError));
+    } finally {
+      setBusySettings(false);
+    }
+  }
+
+  async function saveUserSettingsAction() {
+    if (!bundle) return;
+    try {
+      setBusySettings(true);
+      const result = await putJson(bundle.auth, "/api/settings/user", userSettings) as typeof userSettings;
+      setUserSettings(result);
+      setNotice("Suas configuracoes salvas.");
+    } catch (currentError) {
+      setError(errorText(currentError));
+    } finally {
+      setBusySettings(false);
+    }
   }
 
   function toggleAttachMenu() {
@@ -890,7 +1042,11 @@ export default function App() {
           </button>
         );
       }
-      return <video className="media video-media" controls preload="metadata" src={message.media_path} />;
+      return (
+        <a href={message.media_path} download={message.filename || "video"} target="_blank" rel="noreferrer" className="video-download-link">
+          <VideoIcon /> <span>Baixar video{message.filename ? ` — ${message.filename}` : ""}</span>
+        </a>
+      );
     }
 
     if (media.kind === "audio") return (
@@ -993,10 +1149,7 @@ export default function App() {
     return <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Entrar com Google</h1><p>{config?.allowed_email_domain ? `Use sua conta ${config.allowed_email_domain}.` : "Use uma conta Google autorizada."}</p><button className="primary" onClick={() => void loginWithGoogle()} disabled={!bundle || busyLogin}>{busyLogin ? "Conectando..." : "Entrar com Google"}</button>{error ? <div className="alert danger">{error}</div> : null}</div></div>;
   }
 
-  const isAdmin = sessionUser.role === "admin" || sessionUser.role === "supervisor";
-  const scopedContacts = isAdmin
-    ? filteredContacts
-    : filteredContacts.filter((c) => !c.assigned_to || c.assigned_to === sessionUser.id);
+  const viewTitle = activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : "Nao Qualificados";
 
   return (
     <>
@@ -1010,20 +1163,43 @@ export default function App() {
             <span className="sub">{sessionUser.email || sessionUser.username} · <span className="chip">{sessionUser.role}</span></span>
           </div>
           <div className="topbar-actions">
-            <span className={`pill ${snapshotMode ? "ok" : "warn"}`}>{snapshotMode ? "Snapshot" : "Polling"}</span>
             <button className="composer-icon" onClick={toggleTheme} title={theme === "dark" ? "Tema claro" : "Tema escuro"} aria-label="Alternar tema">
               {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+            </button>
+            <button className="composer-icon" onClick={() => void openSettings()} title="Configuracoes" aria-label="Configuracoes">
+              <GearIcon />
             </button>
             <button className="ghost" style={{ padding: "0.55rem 1rem", fontSize: "0.9rem" }} onClick={() => void logout()}>Sair</button>
           </div>
         </header>
         <div className="crm-grid">
+        <nav className="crm-nav">
+          <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); }} title="Novos leads">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="14"/><line x1="9" y1="11" x2="15" y2="11"/></svg>
+            <span className="nav-label">Novos</span>
+            {novosUnread > 0 && <span className="nav-badge">{novosUnread > 99 ? "99+" : novosUnread}</span>}
+          </button>
+          <button className={`nav-item ${activeView === "meus" ? "active" : ""}`} onClick={() => { setActiveView("meus"); setQualificationFilter(""); }} title="Meus atendimentos">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            <span className="nav-label">Meus</span>
+            {meusUnread > 0 && <span className="nav-badge">{meusUnread > 99 ? "99+" : meusUnread}</span>}
+          </button>
+          <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); }} title="Nao qualificados">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
+            <span className="nav-label">N/Q</span>
+            {nqUnread > 0 && <span className="nav-badge">{nqUnread > 99 ? "99+" : nqUnread}</span>}
+          </button>
+        </nav>
+
         <aside className="panel sidebar">
         <div className="panel-head">
-          <div><p className="eyebrow">Fila</p><h2>Conversas</h2></div>
+          <div><p className="eyebrow">{viewTitle}</p><h2>{filteredContacts.length} conversa{filteredContacts.length !== 1 ? "s" : ""}</h2></div>
         </div>
-        <div className="toolbar"><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar contato" /><select value={transportMode} onChange={(event) => { const mode = event.target.value as TransportMode; setTransportPref(mode); setTransportMode(mode); }}><option value="snapshot">Snapshot</option><option value="polling">Polling</option></select></div>
-        <div className="contact-list">{scopedContacts.map((contact) => <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""}`} onClick={() => setSelectedContactId(contact.id)}><div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div><div className="contact-copy"><div className="row"><strong>{contact.display_name}</strong><span>{when(contact.last_message_at)}</span></div><div className="sub">{contact.phone_formatted || contact.wa_id}</div><div className="row"><span className="chip">{contact.department_name || "Sem setor"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div></div></button>)}{!scopedContacts.length ? <div className="empty">Nenhuma conversa encontrada.</div> : null}</div>
+        <div className="toolbar">
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar contato" />
+          {activeView === "meus" && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>}
+        </div>
+        <div className="contact-list">{filteredContacts.map((contact) => <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""}`} onClick={() => setSelectedContactId(contact.id)}><div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div><div className="contact-copy"><div className="row"><strong>{contact.display_name}</strong><span>{when(contact.last_message_at)}</span></div><div className="sub">{contact.phone_formatted || contact.wa_id}</div><div className="row"><span className="chip">{contact.qualification || "novo"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div></div></button>)}{!filteredContacts.length ? <div className="empty">{activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : "Nenhum contato nao qualificado."}</div> : null}</div>
         </aside>
 
         <main className="panel chat-panel">
@@ -1091,6 +1267,7 @@ export default function App() {
           ) : null}
 
           <div className="messages" ref={messagesRef}>
+            {loadingMore && <div className="sub" style={{ textAlign: "center", padding: "0.5rem" }}>Carregando mensagens anteriores...</div>}
             {(visibleMessagesFiltered ?? visibleMessages).map((message) => (
               <article key={message.id} className={`bubble ${message.direction}`}>
                 <header>
@@ -1101,7 +1278,7 @@ export default function App() {
                 {renderMessageMedia(message)}
                 <footer>
                   <span>{messageTypeLabel(message.msg_type)}</span>
-                  <span>{message.status || "ok"}</span>
+                  {config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}
                 </footer>
               </article>
             ))}
@@ -1110,6 +1287,16 @@ export default function App() {
             ) : null}
           </div>
 
+          {quickSuggestions.length > 0 && (
+            <div className="quick-suggestions">
+              {quickSuggestions.map((qm, idx) => (
+                <button key={idx} type="button" className="quick-suggestion-item" onClick={() => applyQuickMessage(qm)}>
+                  <strong>{qm.shortcut.startsWith("/") ? qm.shortcut : `/${qm.shortcut}`}</strong>
+                  <span className="sub">{qm.message.length > 80 ? qm.message.slice(0, 80) + "..." : qm.message}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <form className="composer" onSubmit={submitText}>
             <div className={`composer-shell ${recording ? "is-recording" : ""}`}>
               <div className="composer-menu" ref={attachMenuRef}>
@@ -1174,7 +1361,7 @@ export default function App() {
             </section>
           </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
 
-          {isAdmin ? (
+          {sessionUser?.role === "admin" ? (
             <section className="card">
               <h3>Usuarios e Roles</h3>
               <div className="admin-user-list">
@@ -1215,6 +1402,172 @@ export default function App() {
         </aside>
       </div>
       </div>
+
+      {showSettings ? (
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Configuracoes do sistema" onClick={() => setShowSettings(false)}>
+          <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar configuracoes">Fechar</button>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ margin: "0 0 1.2rem" }}>Configuracoes do Sistema</h2>
+            <div className="settings-section">
+              <h3>Chat</h3>
+
+              {/* Prefixo de mensagem - config do usuario */}
+              {systemSettings.chat_prefix_roles.includes(sessionUser.role) ? (
+                <div className="settings-block">
+                  <label className="settings-toggle">
+                    <input type="checkbox" checked={userSettings.chat_prefix_enabled} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} />
+                    <span>Prefixo da mensagem (ex: <strong>Rafael:</strong> Bom dia...)</span>
+                  </label>
+                  {userSettings.chat_prefix_enabled && (
+                    <input
+                      value={userSettings.chat_prefix_name}
+                      onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_name: e.target.value }))}
+                      placeholder="Nome que aparecera como prefixo"
+                      style={{ marginTop: "0.5rem" }}
+                    />
+                  )}
+                </div>
+              ) : (
+                <div className="empty" style={{ fontSize: "0.88rem" }}>Prefixo de mensagem nao habilitado para seu cargo.</div>
+              )}
+
+              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={busySettings}>
+                {busySettings ? "Salvando..." : "Salvar minhas preferencias"}
+              </button>
+            </div>
+
+            {/* Secao Admin - Controle de roles */}
+            {sessionUser.role === "admin" ? (
+              <div className="settings-section" style={{ marginTop: "1.5rem" }}>
+                <h3>Administracao</h3>
+
+                <div className="settings-block">
+                  <label className="settings-toggle">
+                    <input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} />
+                    <span>Habilitar prefixo de mensagem (padrao do sistema)</span>
+                  </label>
+                </div>
+
+                <div className="settings-block">
+                  <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Cargos que podem usar prefixo:</span>
+                  {["admin", "supervisor", "operador"].map((role) => (
+                    <label key={role} className="settings-toggle" style={{ marginBottom: "0.25rem" }}>
+                      <input
+                        type="checkbox"
+                        checked={systemSettings.chat_prefix_roles.includes(role)}
+                        onChange={(e) => {
+                          setSystemSettings((prev) => ({
+                            ...prev,
+                            chat_prefix_roles: e.target.checked
+                              ? [...prev.chat_prefix_roles, role]
+                              : prev.chat_prefix_roles.filter((r) => r !== role),
+                          }));
+                        }}
+                      />
+                      <span>{role}</span>
+                    </label>
+                  ))}
+                </div>
+
+                <div className="settings-block">
+                  <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Limite de mensagens rapidas por usuario:</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={systemSettings.quick_message_max}
+                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, quick_message_max: Math.max(1, Number(e.target.value) || 1) }))}
+                    style={{ width: 100 }}
+                  />
+                </div>
+
+                {/* Mensagens rapidas globais do admin */}
+                <div className="settings-block">
+                  <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens rapidas globais (padrao para todos):</span>
+                  {systemSettings.quick_messages_global.map((qm, idx) => (
+                    <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
+                      <input
+                        value={qm.shortcut}
+                        onChange={(e) => {
+                          const updated = [...systemSettings.quick_messages_global];
+                          updated[idx] = { ...updated[idx], shortcut: e.target.value };
+                          setSystemSettings((prev) => ({ ...prev, quick_messages_global: updated }));
+                        }}
+                        placeholder="/atalho"
+                        style={{ width: 100 }}
+                      />
+                      <input
+                        value={qm.message}
+                        onChange={(e) => {
+                          const updated = [...systemSettings.quick_messages_global];
+                          updated[idx] = { ...updated[idx], message: e.target.value };
+                          setSystemSettings((prev) => ({ ...prev, quick_messages_global: updated }));
+                        }}
+                        placeholder="Mensagem completa"
+                        style={{ flex: 1 }}
+                      />
+                      <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => {
+                        setSystemSettings((prev) => ({ ...prev, quick_messages_global: prev.quick_messages_global.filter((_, i) => i !== idx) }));
+                      }}>X</button>
+                    </div>
+                  ))}
+                  <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => {
+                    setSystemSettings((prev) => ({ ...prev, quick_messages_global: [...prev.quick_messages_global, { shortcut: "", message: "" }] }));
+                  }}>+ Adicionar mensagem global</button>
+                </div>
+
+                <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>
+                  {busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}
+                </button>
+              </div>
+            ) : null}
+
+            {/* Mensagens rapidas do usuario */}
+            <div className="settings-section" style={{ marginTop: "1.5rem" }}>
+              <h3>Minhas mensagens rapidas</h3>
+              <div className="settings-block">
+                {userSettings.quick_messages.map((qm, idx) => (
+                  <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
+                    <input
+                      value={qm.shortcut}
+                      onChange={(e) => {
+                        const updated = [...userSettings.quick_messages];
+                        updated[idx] = { ...updated[idx], shortcut: e.target.value };
+                        setUserSettings((prev) => ({ ...prev, quick_messages: updated }));
+                      }}
+                      placeholder="/atalho"
+                      style={{ width: 100 }}
+                    />
+                    <input
+                      value={qm.message}
+                      onChange={(e) => {
+                        const updated = [...userSettings.quick_messages];
+                        updated[idx] = { ...updated[idx], message: e.target.value };
+                        setUserSettings((prev) => ({ ...prev, quick_messages: updated }));
+                      }}
+                      placeholder="Mensagem completa"
+                      style={{ flex: 1 }}
+                    />
+                    <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => {
+                      setUserSettings((prev) => ({ ...prev, quick_messages: prev.quick_messages.filter((_, i) => i !== idx) }));
+                    }}>X</button>
+                  </div>
+                ))}
+                {userSettings.quick_messages.length < systemSettings.quick_message_max ? (
+                  <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => {
+                    setUserSettings((prev) => ({ ...prev, quick_messages: [...prev.quick_messages, { shortcut: "", message: "" }] }));
+                  }}>+ Adicionar mensagem rapida</button>
+                ) : (
+                  <div className="sub" style={{ fontSize: "0.82rem" }}>Limite de {systemSettings.quick_message_max} mensagens rapidas atingido.</div>
+                )}
+              </div>
+              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={busySettings}>
+                {busySettings ? "Salvando..." : "Salvar minhas mensagens rapidas"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {lightboxMedia ? <div className="lightbox" role="dialog" aria-modal="true" aria-label="Visualizacao de midia" onClick={closeLightbox}><button type="button" className="lightbox-close" onClick={closeLightbox} aria-label="Fechar visualizacao">Fechar</button><div className="lightbox-content" onClick={(event) => event.stopPropagation()}>{lightboxMedia.kind === "image" ? <img className="lightbox-media" src={lightboxMedia.src} alt={lightboxMedia.alt} /> : <video className="lightbox-media" src={lightboxMedia.src} controls={!lightboxMedia.gifLike} autoPlay loop={lightboxMedia.gifLike} muted={lightboxMedia.gifLike} playsInline />}</div></div> : null}
     </>

@@ -16,6 +16,7 @@ export type ClientConfig = {
   polling_interval_ms: number;
   data_backend: "firestore" | "sql" | string;
   media_storage_backend: string;
+  feature_message_status: boolean;
   allowed_email_domain: string;
   firebase_web_config: FirebaseWebConfig;
   firestore: {

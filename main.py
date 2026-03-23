@@ -18,7 +18,7 @@ from pydantic import BaseModel, field_validator
 from bootstrap_data import ensure_default_departments
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
-    FEATURE_AUDIO_TRANSCRIPTION,
+    FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
@@ -48,6 +48,8 @@ from database import (
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message, set_attendance_protocol,
     get_wa_message_by_id, update_wa_message_transcription,
+    get_system_settings, save_system_settings,
+    get_user_settings, save_user_settings,
 )
 from auth import authenticate, authenticate_firebase_token, decode_token, hash_password
 from firestore_common import collection_name
@@ -413,6 +415,7 @@ async def client_config():
             "messagingSenderId": FIREBASE_WEB_MESSAGING_SENDER_ID,
             "measurementId": FIREBASE_WEB_MEASUREMENT_ID,
         },
+        "feature_message_status": FEATURE_MESSAGE_STATUS,
         "firestore": {
             "collections": {
                 "departments": collection_name("departments"),
@@ -543,6 +546,36 @@ async def list_roles(current_user: dict = Depends(get_current_user)):
     return {"roles": ROLE_OPTIONS}
 
 
+# -- API: Configuracoes do sistema --
+
+@app.get("/api/settings/system")
+async def get_settings_system(current_user: dict = Depends(get_current_user)):
+    return get_system_settings()
+
+
+@app.put("/api/settings/system")
+async def update_settings_system(request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode alterar configuracoes do sistema")
+    body = await request.json()
+    result = save_system_settings(body)
+    log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(body))
+    return result
+
+
+@app.get("/api/settings/user")
+async def get_settings_user(current_user: dict = Depends(get_current_user)):
+    return get_user_settings(current_user["id"])
+
+
+@app.put("/api/settings/user")
+async def update_settings_user(request: Request, current_user: dict = Depends(get_current_user)):
+    body = await request.json()
+    result = save_user_settings(current_user["id"], body)
+    log_audit(current_user["id"], "USER_SETTINGS_UPDATE", str(body))
+    return result
+
+
 # -- API: Chat Interno --
 
 @app.get("/api/users")
@@ -606,8 +639,8 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/api/wa/messages/{contact_id}")
-async def wa_messages(contact_id: int, current_user: dict = Depends(get_current_user)):
-    messages = get_wa_conversation(contact_id)
+async def wa_messages(contact_id: int, limit: int = Query(default=10, ge=1, le=200), current_user: dict = Depends(get_current_user)):
+    messages = get_wa_conversation(contact_id, limit=limit)
     mark_wa_conversation_read(contact_id)
     return {"messages": messages}
 

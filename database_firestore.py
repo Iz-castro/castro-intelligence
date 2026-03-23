@@ -808,3 +808,54 @@ def normalize_br_phone(wa_id):
         if local and local[0] in ("6", "7", "8", "9"):
             return f"55{ddd}9{local}"
     return s
+
+
+# ---------------------------------------------------------------------------
+# Configuracoes do sistema e do usuario
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SYSTEM_SETTINGS = {
+    "chat_prefix_enabled": False,
+    "chat_prefix_roles": ["admin", "supervisor", "operador"],
+    "quick_message_max": 20,
+    "quick_messages_global": [],
+}
+
+
+def get_system_settings():
+    doc = _get_doc("system_settings", "chat")
+    if not doc:
+        return dict(_DEFAULT_SYSTEM_SETTINGS)
+    result = dict(_DEFAULT_SYSTEM_SETTINGS)
+    result.update({k: v for k, v in doc.items() if k in _DEFAULT_SYSTEM_SETTINGS})
+    return result
+
+
+def save_system_settings(settings: dict):
+    allowed = set(_DEFAULT_SYSTEM_SETTINGS.keys())
+    filtered = {k: v for k, v in settings.items() if k in allowed}
+    filtered["updated_at"] = utcnow()
+    document("system_settings", "chat").set(filtered, merge=True)
+    return get_system_settings()
+
+
+def get_user_settings(user_id: int):
+    doc = _get_doc("user_settings", user_id)
+    defaults = {
+        "chat_prefix_enabled": False,
+        "chat_prefix_name": "",
+        "quick_messages": [],
+    }
+    if not doc:
+        return defaults
+    result = dict(defaults)
+    result.update({k: v for k, v in doc.items() if k in defaults})
+    return result
+
+
+def save_user_settings(user_id: int, settings: dict):
+    allowed = {"chat_prefix_enabled", "chat_prefix_name", "quick_messages"}
+    filtered = {k: v for k, v in settings.items() if k in allowed}
+    filtered["updated_at"] = utcnow()
+    document("user_settings", user_id).set(filtered, merge=True)
+    return get_user_settings(user_id)

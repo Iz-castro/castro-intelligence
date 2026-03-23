@@ -10,7 +10,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from config import REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET, FEATURE_AUDIO_TRANSCRIPTION, STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS, STT_FALLBACK_TEXT
+from config import REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET, FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS, STT_FALLBACK_TEXT
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit,
     update_wa_message_transcription,
@@ -57,7 +57,7 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
             if "messages" in value:
                 await _process_messages(value, ws_notify_callback)
 
-            if "statuses" in value:
+            if "statuses" in value and FEATURE_MESSAGE_STATUS:
                 _process_statuses(value)
 
 
