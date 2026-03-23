@@ -526,23 +526,24 @@ export default function App() {
   }, [contacts, selectedContactId]);
 
   const prevMessageCountRef = useRef(0);
+  const scrollIntentRef = useRef<"load_older" | "normal">("normal");
   useEffect(() => {
     const container = messagesRef.current;
     if (!container) return;
-    const isLoadingOlder = prevMessageCountRef.current > 0 && messages.length > prevMessageCountRef.current && messageLimit > 10;
-    if (isLoadingOlder) {
+    if (scrollIntentRef.current === "load_older" && messages.length > prevMessageCountRef.current) {
       // Manter posicao do scroll ao carregar mensagens antigas
       const newScrollHeight = container.scrollHeight;
       const prevScrollHeight = container.dataset.prevScrollHeight;
       if (prevScrollHeight) {
         container.scrollTop = newScrollHeight - Number(prevScrollHeight);
       }
-    } else {
+      scrollIntentRef.current = "normal";
+    } else if (scrollIntentRef.current === "normal") {
       container.scrollTop = container.scrollHeight;
     }
     prevMessageCountRef.current = messages.length;
     setLoadingMore(false);
-  }, [messages, selectedContactId, messageLimit]);
+  }, [messages, selectedContactId]);
 
   useEffect(() => {
     const container = messagesRef.current;
@@ -550,6 +551,7 @@ export default function App() {
     const handleScroll = () => {
       if (container.scrollTop < 40 && !loadingMore) {
         container.dataset.prevScrollHeight = String(container.scrollHeight);
+        scrollIntentRef.current = "load_older";
         setLoadingMore(true);
         setMessageLimit((prev) => prev + 15);
       }
