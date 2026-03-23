@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel } from "./utils/formatting";
@@ -127,8 +128,40 @@ function MessageMedia({ message }: { message: ChatMessage }) {
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { selectedContact, sessionUser, error, notice, config, messagesRef, loadingMore, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   const hasDraft = Boolean(draft.trim());
+
+  // Scroll management — must live here (not in CrmProvider) because messagesRef is attached to a DOM node inside this component
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container) return;
+    if (scrollIntentRef.current === "load_older" && messages.length > prevMessageCountRef.current) {
+      const newH = container.scrollHeight;
+      const prevH = container.dataset.prevScrollHeight;
+      if (prevH) container.scrollTop = newH - Number(prevH);
+      scrollIntentRef.current = "normal";
+    } else if (scrollIntentRef.current === "normal") {
+      container.scrollTop = container.scrollHeight;
+    }
+    prevMessageCountRef.current = messages.length;
+    setLoadingMore(false);
+  }, [messages, selectedContactId]);
+
+  // Infinite scroll — attach scroll listener to load older messages
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container || !selectedContactId) return undefined;
+    const handleScroll = () => {
+      if (container.scrollTop < 40 && !loadingMore) {
+        container.dataset.prevScrollHeight = String(container.scrollHeight);
+        scrollIntentRef.current = "load_older";
+        setLoadingMore(true);
+        setMessageLimit((prev) => prev + 15);
+      }
+    };
+    container.addEventListener("scroll", handleScroll, { passive: true });
+    return () => container.removeEventListener("scroll", handleScroll);
+  }, [selectedContactId, loadingMore]);
 
   return (
     <main className="panel chat-panel">

@@ -448,38 +448,6 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     discardRecording();
   }, [contacts, selectedContactId]);
 
-  // Scroll management
-  useEffect(() => {
-    const container = messagesRef.current;
-    if (!container) return;
-    if (scrollIntentRef.current === "load_older" && messages.length > prevMessageCountRef.current) {
-      const newH = container.scrollHeight;
-      const prevH = container.dataset.prevScrollHeight;
-      if (prevH) container.scrollTop = newH - Number(prevH);
-      scrollIntentRef.current = "normal";
-    } else if (scrollIntentRef.current === "normal") {
-      container.scrollTop = container.scrollHeight;
-    }
-    prevMessageCountRef.current = messages.length;
-    setLoadingMore(false);
-  }, [messages, selectedContactId]);
-
-  // Infinite scroll
-  useEffect(() => {
-    const container = messagesRef.current;
-    if (!container || !selectedContactId) return undefined;
-    const handleScroll = () => {
-      if (container.scrollTop < 40 && !loadingMore) {
-        container.dataset.prevScrollHeight = String(container.scrollHeight);
-        scrollIntentRef.current = "load_older";
-        setLoadingMore(true);
-        setMessageLimit((prev) => prev + 15);
-      }
-    };
-    container.addEventListener("scroll", handleScroll, { passive: true });
-    return () => container.removeEventListener("scroll", handleScroll);
-  }, [selectedContactId, loadingMore]);
-
   // Composer auto-resize
   useEffect(() => {
     const input = composerInputRef.current;
