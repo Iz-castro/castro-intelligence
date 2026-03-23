@@ -1,7 +1,7 @@
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel } from "./utils/formatting";
-import { resolveMessageMedia, type LightboxMedia } from "./utils/media";
+import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import type { ChatMessage } from "./types";
 
@@ -25,8 +25,8 @@ function LoginScreen() {
 }
 
 function TopBar() {
-  const { sessionUser, theme, toggleTheme, showSettings, toggleSettingsMenu, openSettingsPage, busySettings, settingsMenuRef, logout } = useCrm();
-  useClickOutside(settingsMenuRef, showSettings === "menu", () => useCrm().setShowSettings(false));
+  const { sessionUser, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout } = useCrm();
+  useClickOutside(settingsMenuRef, showSettings === "menu", () => setShowSettings(false));
   if (!sessionUser) return null;
   return (
     <header className="crm-topbar">
@@ -100,7 +100,7 @@ function ContactList() {
 }
 
 function MessageMedia({ message }: { message: ChatMessage }) {
-  const { config, transcribingMessageId, transcribeMessage, openLightbox } = useCrm();
+  const { transcribingMessageId, transcribeMessage, openLightbox } = useCrm();
   const media = resolveMessageMedia(message);
   if (!media || !message.media_path) return null;
 

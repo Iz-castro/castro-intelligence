@@ -1,6 +1,6 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect } from "react";
 
-export function useClickOutside(ref: RefObject<HTMLElement | null>, active: boolean, onClose: () => void) {
+export function useClickOutside(ref: { current: HTMLElement | null }, active: boolean, onClose: () => void) {
   useEffect(() => {
     if (!active) return undefined;
     const handlePointerDown = (event: PointerEvent) => {

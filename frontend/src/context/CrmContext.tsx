@@ -69,7 +69,7 @@ type CrmContextValue = {
   setMessageLimit: React.Dispatch<React.SetStateAction<number>>;
   loadingMore: boolean;
   setLoadingMore: (v: boolean) => void;
-  messagesRef: React.RefObject<HTMLDivElement | null>;
+  messagesRef: React.MutableRefObject<HTMLDivElement | null>;
   scrollIntentRef: React.MutableRefObject<"load_older" | "normal">;
   prevMessageCountRef: React.MutableRefObject<number>;
 
@@ -95,10 +95,10 @@ type CrmContextValue = {
   applyQuickMessage: (qm: { shortcut: string; message: string }) => void;
   handlePrimaryAction: () => void;
   handleImageSelected: (e: ChangeEvent<HTMLInputElement>) => void;
-  composerInputRef: React.RefObject<HTMLTextAreaElement | null>;
-  imageInputRef: React.RefObject<HTMLInputElement | null>;
-  videoInputRef: React.RefObject<HTMLInputElement | null>;
-  documentInputRef: React.RefObject<HTMLInputElement | null>;
+  composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
+  imageInputRef: React.MutableRefObject<HTMLInputElement | null>;
+  videoInputRef: React.MutableRefObject<HTMLInputElement | null>;
+  documentInputRef: React.MutableRefObject<HTMLInputElement | null>;
 
   // Attach menu
   showAttachMenu: boolean;
@@ -107,7 +107,7 @@ type CrmContextValue = {
   openImagePicker: () => void;
   openVideoPicker: () => void;
   openDocPicker: () => void;
-  attachMenuRef: React.RefObject<HTMLDivElement | null>;
+  attachMenuRef: React.MutableRefObject<HTMLDivElement | null>;
 
   // Recording
   recording: boolean;
@@ -127,7 +127,7 @@ type CrmContextValue = {
   showDotsMenu: boolean;
   toggleDotsMenu: () => void;
   closeDotsMenu: () => void;
-  dotsMenuRef: React.RefObject<HTMLDivElement | null>;
+  dotsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
 
   // Lightbox
   lightboxMedia: LightboxMedia | null;
@@ -177,7 +177,7 @@ type CrmContextValue = {
   openSettingsPage: (page: "chat" | "quick" | "admin") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
-  settingsMenuRef: React.RefObject<HTMLDivElement | null>;
+  settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
 
   // Sidebar search
   search: string;
