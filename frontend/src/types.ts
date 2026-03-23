@@ -104,3 +104,22 @@ export type TransferRequest = {
   reason: string;
   summary: string;
 };
+
+export type SystemSettings = {
+  chat_prefix_enabled: boolean;
+  chat_prefix_roles: string[];
+  quick_message_max: number;
+  quick_messages_global: { shortcut: string; message: string }[];
+};
+
+export type UserSettings = {
+  chat_prefix_enabled: boolean;
+  chat_prefix_name: string;
+  quick_messages: { shortcut: string; message: string }[];
+};
+
+export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe";
+
+export type SettingsPage = false | "menu" | "chat" | "quick" | "admin";
+
+export type QuickMessage = { shortcut: string; message: string };
