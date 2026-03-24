@@ -445,6 +445,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setShowAttachMenu(false);
     setLightboxMedia(null);
     setMessageLimit(10);
+    prevMessageCountRef.current = 0;
+    scrollIntentRef.current = "normal";
     discardRecording();
   }, [contacts, selectedContactId]);
 

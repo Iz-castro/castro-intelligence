@@ -135,13 +135,21 @@ function ChatPanel() {
   useEffect(() => {
     const container = messagesRef.current;
     if (!container) return;
-    if (scrollIntentRef.current === "load_older" && messages.length > prevMessageCountRef.current) {
-      const newH = container.scrollHeight;
-      const prevH = container.dataset.prevScrollHeight;
-      if (prevH) container.scrollTop = newH - Number(prevH);
+    if (scrollIntentRef.current === "load_older") {
+      // Older messages loaded (or all messages already fetched — count unchanged)
+      if (messages.length > prevMessageCountRef.current) {
+        const newH = container.scrollHeight;
+        const prevH = container.dataset.prevScrollHeight;
+        if (prevH) container.scrollTop = newH - Number(prevH);
+      }
       scrollIntentRef.current = "normal";
     } else if (scrollIntentRef.current === "normal") {
-      container.scrollTop = container.scrollHeight;
+      // Only auto-scroll to bottom when user is already near the bottom
+      // or on initial load for this contact (prevCount === 0)
+      const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (prevMessageCountRef.current === 0 || distFromBottom < 150) {
+        container.scrollTop = container.scrollHeight;
+      }
     }
     prevMessageCountRef.current = messages.length;
     setLoadingMore(false);
