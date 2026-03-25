@@ -30,6 +30,13 @@ $env:POLLING_INTERVAL_MS="5000"
 $env:FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB="256"
 $env:FIRESTORE_MEDIA_MAX_MB="8"
 $env:FIRESTORE_MEDIA_CHUNK_KB="768"
+$env:FEATURE_AUDIO_TRANSCRIPTION="true"
+$env:STT_LANGUAGE_CODE="pt-BR"
+$env:STT_TIMEOUT_SECONDS="30.0"
+$env:STT_FALLBACK_TEXT=""
+$env:WHISPER_MODEL_SIZE="base"
+$env:WHISPER_DEVICE="cpu"
+$env:WHISPER_COMPUTE_TYPE="int8"
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan

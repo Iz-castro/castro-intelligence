@@ -111,7 +111,7 @@ AVATAR_ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
 AUDIO_MAX_DURATION_SEC = 120
 AUDIO_ALLOWED_MIME = {"audio/ogg", "audio/webm", "audio/mp4", "audio/mpeg"}
 
-# -- Transcricao de audio (Google Speech-to-Text) --
+# -- Transcricao de audio (Faster Whisper) --
 def _bool_env(key, default="false"):
     return os.getenv(key, default).strip().lower() in ("1", "true", "yes")
 

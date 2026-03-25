@@ -119,6 +119,9 @@ FEATURE_AUDIO_TRANSCRIPTION="${FEATURE_AUDIO_TRANSCRIPTION:-false}"
 STT_LANGUAGE_CODE="${STT_LANGUAGE_CODE:-pt-BR}"
 STT_TIMEOUT_SECONDS="${STT_TIMEOUT_SECONDS:-30.0}"
 STT_FALLBACK_TEXT="${STT_FALLBACK_TEXT:-}"
+WHISPER_MODEL_SIZE="${WHISPER_MODEL_SIZE:-base}"
+WHISPER_DEVICE="${WHISPER_DEVICE:-cpu}"
+WHISPER_COMPUTE_TYPE="${WHISPER_COMPUTE_TYPE:-int8}"
 SECRET_KEY="${SECRET_KEY:-$(openssl rand -hex 32)}"
 WHATSAPP_TOKEN="${WHATSAPP_TOKEN:-}"
 WHATSAPP_VERIFY_TOKEN="${WHATSAPP_VERIFY_TOKEN:-}"
@@ -136,11 +139,6 @@ CORS_ORIGINS="${CORS_ORIGINS:-}"
 REQUIRE_WEBHOOK_SIGNATURE="${REQUIRE_WEBHOOK_SIGNATURE:-true}"
 CHAT_DELIVERY_MODE="${CHAT_DELIVERY_MODE:-snapshot}"
 POLLING_INTERVAL_MS="${POLLING_INTERVAL_MS:-5000}"
-ENABLE_AUDIO_TRANSCRIPTION=false
-case "${FEATURE_AUDIO_TRANSCRIPTION,,}" in
-  1|true|yes|on) ENABLE_AUDIO_TRANSCRIPTION=true ;;
-esac
-
 require_value "GCP_PROJECT_ID" "$PROJECT_ID"
 require_value "WHATSAPP_TOKEN" "$WHATSAPP_TOKEN"
 require_value "WHATSAPP_VERIFY_TOKEN" "$WHATSAPP_VERIFY_TOKEN"
@@ -175,10 +173,6 @@ SERVICES=(
 
 if [[ "$DATA_BACKEND" == "sql" ]]; then
   SERVICES+=(sqladmin.googleapis.com)
-fi
-
-if [[ "$ENABLE_AUDIO_TRANSCRIPTION" == "true" ]]; then
-  SERVICES+=(speech.googleapis.com)
 fi
 
 gcloud services enable "${SERVICES[@]}" --project "$PROJECT_ID" --quiet >/dev/null
@@ -234,13 +228,6 @@ else
     gcloud projects add-iam-policy-binding "$PROJECT_ID" \
         --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
         --role "roles/datastore.user" \
-        --quiet >/dev/null
-fi
-
-if [[ "$ENABLE_AUDIO_TRANSCRIPTION" == "true" ]]; then
-    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-        --role "roles/speech.client" \
         --quiet >/dev/null
 fi
 
@@ -312,6 +299,9 @@ ENV_VARS=(
   "STT_LANGUAGE_CODE=${STT_LANGUAGE_CODE}"
   "STT_TIMEOUT_SECONDS=${STT_TIMEOUT_SECONDS}"
   "STT_FALLBACK_TEXT=${STT_FALLBACK_TEXT}"
+  "WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE}"
+  "WHISPER_DEVICE=${WHISPER_DEVICE}"
+  "WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}"
 )
 
 if [[ "$AUTH_MODE" == "firebase" ]]; then
@@ -334,11 +324,11 @@ gcloud run deploy "$SERVICE_NAME" \
     --allow-unauthenticated \
     --service-account "$SERVICE_ACCOUNT_EMAIL" \
     --port 8080 \
-    --memory 512Mi \
+    --memory 1Gi \
     --cpu 1 \
     --min-instances 0 \
     --max-instances 3 \
-    --concurrency 40 \
+    --concurrency 1 \
     --timeout 300 \
     --env-vars-file "$ENV_FILE" \
     --set-secrets "$(IFS=,; echo "${SECRETS[*]}")" \

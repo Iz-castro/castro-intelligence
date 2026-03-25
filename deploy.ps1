@@ -172,6 +172,9 @@ $FEATURE_AUDIO_TRANSCRIPTION = if ($env:FEATURE_AUDIO_TRANSCRIPTION) { $env:FEAT
 $STT_LANGUAGE_CODE = if ($env:STT_LANGUAGE_CODE) { $env:STT_LANGUAGE_CODE } else { "pt-BR" }
 $STT_TIMEOUT_SECONDS = if ($env:STT_TIMEOUT_SECONDS) { $env:STT_TIMEOUT_SECONDS } else { "30.0" }
 $STT_FALLBACK_TEXT = if ($env:STT_FALLBACK_TEXT) { $env:STT_FALLBACK_TEXT } else { "" }
+$WHISPER_MODEL_SIZE = if ($env:WHISPER_MODEL_SIZE) { $env:WHISPER_MODEL_SIZE } else { "base" }
+$WHISPER_DEVICE = if ($env:WHISPER_DEVICE) { $env:WHISPER_DEVICE } else { "cpu" }
+$WHISPER_COMPUTE_TYPE = if ($env:WHISPER_COMPUTE_TYPE) { $env:WHISPER_COMPUTE_TYPE } else { "int8" }
 $SECRET_KEY = if ($env:SECRET_KEY) { $env:SECRET_KEY } else { New-HexSecret }
 $WHATSAPP_TOKEN = $env:WHATSAPP_TOKEN
 $WHATSAPP_VERIFY_TOKEN = $env:WHATSAPP_VERIFY_TOKEN
@@ -189,8 +192,6 @@ $CORS_ORIGINS = if ($env:CORS_ORIGINS) { $env:CORS_ORIGINS } else { "" }
 $REQUIRE_WEBHOOK_SIGNATURE = if ($env:REQUIRE_WEBHOOK_SIGNATURE) { $env:REQUIRE_WEBHOOK_SIGNATURE } else { "true" }
 $CHAT_DELIVERY_MODE = if ($env:CHAT_DELIVERY_MODE) { $env:CHAT_DELIVERY_MODE.Trim().ToLowerInvariant() } else { "snapshot" }
 $POLLING_INTERVAL_MS = if ($env:POLLING_INTERVAL_MS) { $env:POLLING_INTERVAL_MS } else { "5000" }
-$ENABLE_AUDIO_TRANSCRIPTION = $FEATURE_AUDIO_TRANSCRIPTION.Trim().ToLowerInvariant() -in @("1", "true", "yes", "on")
-
 if ($DATA_BACKEND -notin @("firestore", "sql")) {
     throw "DATA_BACKEND deve ser 'firestore' ou 'sql'."
 }
@@ -238,10 +239,6 @@ $services = @(
 
 if ($DATA_BACKEND -eq "sql") {
     $services += "sqladmin.googleapis.com"
-}
-
-if ($ENABLE_AUDIO_TRANSCRIPTION) {
-    $services += "speech.googleapis.com"
 }
 
 $serviceEnableArgs = @("services", "enable")
@@ -301,13 +298,6 @@ else {
     gcloud projects add-iam-policy-binding $PROJECT_ID `
         --member "serviceAccount:$SERVICE_ACCOUNT_EMAIL" `
         --role "roles/datastore.user" `
-        --quiet | Out-Null
-}
-
-if ($ENABLE_AUDIO_TRANSCRIPTION) {
-    gcloud projects add-iam-policy-binding $PROJECT_ID `
-        --member "serviceAccount:$SERVICE_ACCOUNT_EMAIL" `
-        --role "roles/speech.client" `
         --quiet | Out-Null
 }
 
@@ -381,6 +371,9 @@ $envVars.Add("FEATURE_AUDIO_TRANSCRIPTION=$FEATURE_AUDIO_TRANSCRIPTION")
 $envVars.Add("STT_LANGUAGE_CODE=$STT_LANGUAGE_CODE")
 $envVars.Add("STT_TIMEOUT_SECONDS=$STT_TIMEOUT_SECONDS")
 $envVars.Add("STT_FALLBACK_TEXT=$STT_FALLBACK_TEXT")
+$envVars.Add("WHISPER_MODEL_SIZE=$WHISPER_MODEL_SIZE")
+$envVars.Add("WHISPER_DEVICE=$WHISPER_DEVICE")
+$envVars.Add("WHISPER_COMPUTE_TYPE=$WHISPER_COMPUTE_TYPE")
 
 if ($AUTH_MODE -eq "firebase") {
     $envVars.Add("BOOTSTRAP_ADMIN_EMAIL=$BOOTSTRAP_ADMIN_EMAIL")
@@ -403,11 +396,11 @@ try {
         "--allow-unauthenticated",
         "--service-account", $SERVICE_ACCOUNT_EMAIL,
         "--port", "8080",
-        "--memory", "512Mi",
+        "--memory", "1Gi",
         "--cpu", "1",
         "--min-instances", "0",
         "--max-instances", "3",
-        "--concurrency", "40",
+        "--concurrency", "1",
         "--timeout", "300",
         "--env-vars-file", $envFile,
         "--set-secrets", ($secretMappings -join ",")

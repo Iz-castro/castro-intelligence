@@ -301,9 +301,9 @@ async def startup():
     if FEATURE_AUDIO_TRANSCRIPTION:
         from transcription_service import init_speech_client
         if init_speech_client():
-            logger.info("Transcricao de audio habilitada (Google STT)")
+            logger.info("Transcricao de audio habilitada (Faster Whisper)")
         else:
-            logger.warning("Transcricao de audio desabilitada (SpeechClient falhou)")
+            logger.warning("Transcricao de audio desabilitada (Faster Whisper falhou)")
     logger.info("CRM iniciado | host=%s port=%d", HOST, PORT)
     if WHATSAPP_TOKEN:
         logger.info("WABA configurado | phone_id=%s", WHATSAPP_PHONE_NUMBER_ID)
@@ -656,7 +656,7 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
             from transcription_service import init_speech_client
             speech_client = init_speech_client() and get_speech_client()
         if not speech_client:
-            raise HTTPException(status_code=503, detail="Servico de transcricao nao disponivel. Verifique FEATURE_AUDIO_TRANSCRIPTION e credenciais GCP.")
+            raise HTTPException(status_code=503, detail="Servico de transcricao nao disponivel. Verifique FEATURE_AUDIO_TRANSCRIPTION, dependencias e configuracao WHISPER_*.")
 
     msg = get_wa_message_by_id(message_id)
     if not msg:
