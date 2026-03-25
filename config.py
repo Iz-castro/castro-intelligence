@@ -5,6 +5,15 @@ import secrets
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - uvicorn[standard] instala python-dotenv
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv(BASE_DIR / ".env", override=False)
+
 IS_CLOUD_RUN = bool(os.getenv("K_SERVICE"))
 
 
@@ -14,21 +23,46 @@ def _as_bool(value, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _default_database_path():
-    raw_path = os.getenv("DATABASE_PATH", str(BASE_DIR / "castro_crm.db"))
-    return Path(raw_path).resolve()
+def _split_csv(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _default_database_url():
-    value = os.getenv("DATABASE_URL", "").strip()
-    if value:
-        return value
-    return f"sqlite:///{DATABASE_PATH.as_posix()}"
+def _as_int(value, default):
+    if value is None or str(value).strip() == "":
+        return default
+    return int(value)
 
 
-# -- Banco de dados --
-DATABASE_PATH = _default_database_path()
-DATABASE_URL = _default_database_url()
+DATA_BACKEND = "firestore"
+IS_FIRESTORE_BACKEND = True
+
+AUTH_MODE = os.getenv("AUTH_MODE", "firebase").strip().lower()
+USE_FIREBASE_AUTH = AUTH_MODE == "firebase"
+
+FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "").strip()
+FIRESTORE_COLLECTION_PREFIX = os.getenv("FIRESTORE_COLLECTION_PREFIX", "castro_crm").strip().strip("_")
+FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB = _as_int(os.getenv("FIRESTORE_MEDIA_COMPRESS_THRESHOLD_KB"), 256)
+FIRESTORE_MEDIA_MAX_MB = _as_int(os.getenv("FIRESTORE_MEDIA_MAX_MB"), 8)
+FIRESTORE_MEDIA_CHUNK_KB = _as_int(os.getenv("FIRESTORE_MEDIA_CHUNK_KB"), 768)
+ALLOWED_FIREBASE_EMAIL_DOMAIN = os.getenv("ALLOWED_FIREBASE_EMAIL_DOMAIN", "").strip().lower()
+ALLOWED_FIREBASE_EMAILS = [item.lower() for item in _split_csv(os.getenv("ALLOWED_FIREBASE_EMAILS", ""))]
+AUTO_PROVISION_FIREBASE_USERS = _as_bool(os.getenv("AUTO_PROVISION_FIREBASE_USERS"), default=True)
+FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "").strip()
+FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY", "").strip()
+FIREBASE_WEB_AUTH_DOMAIN = os.getenv(
+    "FIREBASE_WEB_AUTH_DOMAIN",
+    f"{FIRESTORE_PROJECT_ID}.firebaseapp.com" if FIRESTORE_PROJECT_ID else "",
+).strip()
+FIREBASE_WEB_APP_ID = os.getenv("FIREBASE_WEB_APP_ID", "").strip()
+FIREBASE_WEB_MESSAGING_SENDER_ID = os.getenv("FIREBASE_WEB_MESSAGING_SENDER_ID", "").strip()
+FIREBASE_WEB_MEASUREMENT_ID = os.getenv("FIREBASE_WEB_MEASUREMENT_ID", "").strip()
+
+CHAT_DELIVERY_MODE = os.getenv("CHAT_DELIVERY_MODE", "snapshot").strip().lower()
+POLLING_INTERVAL_MS = _as_int(os.getenv("POLLING_INTERVAL_MS"), 15000)
+
+
 
 # -- Seguranca --
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
@@ -49,6 +83,10 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_WABA_ID = os.getenv("WHATSAPP_WABA_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+REQUIRE_WEBHOOK_SIGNATURE = _as_bool(
+    os.getenv("REQUIRE_WEBHOOK_SIGNATURE"),
+    default=IS_CLOUD_RUN,
+)
 
 GRAPH_API_VERSION = "v22.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -56,11 +94,11 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # -- Media --
 DEFAULT_MEDIA_DIR = Path("/tmp/castro_crm_media") if IS_CLOUD_RUN else BASE_DIR / "media"
 MEDIA_DIR = os.getenv("MEDIA_DIR", str(DEFAULT_MEDIA_DIR))
-GCS_MEDIA_BUCKET = os.getenv("GCS_MEDIA_BUCKET", "").strip()
+GCS_MEDIA_BUCKET = os.getenv("GCS_MEDIA_BUCKET", FIREBASE_STORAGE_BUCKET).strip()
 GCS_MEDIA_PREFIX = os.getenv("GCS_MEDIA_PREFIX", "media").strip().strip("/")
 MEDIA_STORAGE_BACKEND = os.getenv(
     "MEDIA_STORAGE_BACKEND",
-    "gcs" if GCS_MEDIA_BUCKET else "local",
+    "gcs" if GCS_MEDIA_BUCKET else ("local" if not IS_FIRESTORE_BACKEND else "firestore"),
 ).strip().lower()
 MAX_MEDIA_SIZE_MB = 16
 
@@ -72,6 +110,16 @@ AVATAR_ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
 # -- Audio gravado --
 AUDIO_MAX_DURATION_SEC = 120
 AUDIO_ALLOWED_MIME = {"audio/ogg", "audio/webm", "audio/mp4", "audio/mpeg"}
+
+# -- Transcricao de audio (Google Speech-to-Text) --
+def _bool_env(key, default="false"):
+    return os.getenv(key, default).strip().lower() in ("1", "true", "yes")
+
+FEATURE_MESSAGE_STATUS = _bool_env("FEATURE_MESSAGE_STATUS", "true")
+FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
+STT_LANGUAGE_CODE = os.getenv("STT_LANGUAGE_CODE", "pt-BR").strip()
+STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30.0"))
+STT_FALLBACK_TEXT = os.getenv("STT_FALLBACK_TEXT", "").strip()
 
 # -- Qualificacao de contatos --
 QUALIFICATION_OPTIONS = [
@@ -91,6 +139,7 @@ ROLE_OPTIONS = [
 
 # -- Bootstrap inicial --
 BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip().lower()
+BOOTSTRAP_ADMIN_EMAIL = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 BOOTSTRAP_ADMIN_PASSWORD = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
 BOOTSTRAP_ADMIN_DISPLAY_NAME = os.getenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Administrador")
 BOOTSTRAP_ADMIN_DEPARTMENT = os.getenv("BOOTSTRAP_ADMIN_DEPARTMENT", "Geral")
@@ -100,3 +149,7 @@ DEFAULT_LOG_FILE = Path("/tmp/logs/castro_crm.log") if IS_CLOUD_RUN else BASE_DI
 LOG_FILE = os.getenv("LOG_FILE", str(DEFAULT_LOG_FILE))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_TO_FILE = _as_bool(os.getenv("LOG_TO_FILE"), default=not IS_CLOUD_RUN)
+
+# -- CORS --
+DEFAULT_CORS_ORIGINS = "http://localhost:8080,http://127.0.0.1:8080"
+CORS_ORIGINS = _split_csv(os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS))

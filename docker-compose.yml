@@ -1,0 +1,19 @@
+services:
+  crm:
+    build:
+      context: .
+    container_name: castro-intelligence-crm
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      MEDIA_DIR: /data/media
+      LOG_FILE: /data/logs/castro_crm.log
+      LOG_TO_FILE: "true"
+    volumes:
+      - castro_crm_data:/data
+
+volumes:
+  castro_crm_data:

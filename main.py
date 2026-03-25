@@ -15,30 +15,44 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
+from bootstrap_data import ensure_default_departments
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
+    FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS,
     BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_PASSWORD,
-    BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
+    BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
+    CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
+    MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
+    CHAT_DELIVERY_MODE, POLLING_INTERVAL_MS, AUTH_MODE, USE_FIREBASE_AUTH,
+    FIRESTORE_PROJECT_ID, FIREBASE_STORAGE_BUCKET,
+    FIREBASE_WEB_API_KEY, FIREBASE_WEB_AUTH_DOMAIN, FIREBASE_WEB_APP_ID,
+    FIREBASE_WEB_MESSAGING_SENDER_ID, FIREBASE_WEB_MEASUREMENT_ID,
+    ALLOWED_FIREBASE_EMAIL_DOMAIN,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
     save_internal_message, get_internal_conversation,
     mark_messages_as_read, get_unread_count,
-    get_all_wa_contacts, get_wa_conversation, get_wa_unread_count,
+    get_all_wa_contacts, get_wa_conversation,
     mark_wa_conversation_read, save_wa_message, get_wa_contact,
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
     assign_wa_contact, get_transfer_history,
     update_user_avatar, get_user_avatar,
     create_user, update_user, deactivate_user, get_user_by_username,
+    upsert_firebase_user, get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
-    update_contact_avatar, insert_transfer_system_message,
+    update_contact_avatar, insert_transfer_system_message, set_attendance_protocol,
+    get_wa_message_by_id, update_wa_message_transcription,
+    get_system_settings, save_system_settings,
+    get_user_settings, save_user_settings,
 )
-from auth import authenticate, decode_token, hash_password
+from auth import authenticate, authenticate_firebase_token, decode_token, hash_password
+from firestore_common import collection_name
 from webhook import process_webhook_payload, validate_signature
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
@@ -62,6 +76,10 @@ logger = logging.getLogger("castro_crm.main")
 
 # -- App --
 
+FRONTEND_DIST_DIR = os.path.join(BASE_DIR, "frontend_dist")
+FRONTEND_ASSETS_DIR = os.path.join(FRONTEND_DIST_DIR, "assets")
+FRONTEND_INDEX_FILE = os.path.join(FRONTEND_DIST_DIR, "index.html")
+
 app = FastAPI(
     title="Castro Intelligence CRM",
     version="0.4.0",
@@ -71,12 +89,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+if os.path.isdir(FRONTEND_ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS_DIR), name="frontend-assets")
 
 # -- Modelos --
 
@@ -124,6 +143,14 @@ class WaSendRequest(BaseModel):
         return v
 
 
+class WaSendLocationRequest(BaseModel):
+    contact_id: int
+    latitude: float
+    longitude: float
+    name: str = ""
+    address: str = ""
+
+
 # -- Dependencias --
 
 def get_current_user(request: Request):
@@ -131,6 +158,14 @@ def get_current_user(request: Request):
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token ausente")
     token = auth_header.split(" ", 1)[1]
+    ip = request.client.host if request.client else "unknown"
+
+    if USE_FIREBASE_AUTH:
+        result = authenticate_firebase_token(token, ip)
+        if not result["success"]:
+            raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
+        return result["user"]
+
     payload = decode_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Token invalido ou expirado")
@@ -147,6 +182,12 @@ AVATAR_MAGIC_BYTES = {
     b"\x89PNG": "image/png",
     b"RIFF": "image/webp",
 }
+
+
+def _wa_target(wa_id):
+    # Para respostas, use exatamente o identificador telefonico recebido/salvo no contato.
+    # Inserir digitos extras aqui faz a Meta rejeitar o envio com HTTP 400.
+    return "".join(ch for ch in str(wa_id or "").strip() if ch.isdigit())
 
 
 def _validate_image_bytes(content):
@@ -167,7 +208,39 @@ def _remove_old_avatar(old_path):
     delete_media(old_path)
 
 
+def _frontend_build_available():
+    return USE_FIREBASE_AUTH and os.path.isfile(FRONTEND_INDEX_FILE)
+
+
+def _serve_frontend_or_static(_filename):
+    if not os.path.isfile(FRONTEND_INDEX_FILE):
+        return HTMLResponse(content="<h1>Frontend nao compilado. Execute: cd frontend && npm run build</h1>", status_code=503)
+    return FileResponse(FRONTEND_INDEX_FILE)
+
+
 def bootstrap_admin_user():
+    if USE_FIREBASE_AUTH:
+        if not BOOTSTRAP_ADMIN_EMAIL:
+            logger.info("Bootstrap admin Firebase nao configurado")
+            return
+
+        department_id = create_department(
+            BOOTSTRAP_ADMIN_DEPARTMENT,
+            "Setor criado automaticamente no primeiro deploy",
+        )
+        user = upsert_firebase_user(
+            firebase_uid="",
+            email=BOOTSTRAP_ADMIN_EMAIL,
+            display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
+            role="admin",
+            department_id=department_id,
+        )
+        if user:
+            logger.info("Bootstrap admin Firebase sincronizado | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        else:
+            logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        return
+
     if not BOOTSTRAP_ADMIN_USERNAME or not BOOTSTRAP_ADMIN_PASSWORD:
         logger.info("Bootstrap admin nao configurado")
         return
@@ -194,13 +267,43 @@ def bootstrap_admin_user():
         logger.warning("Falha ao criar bootstrap admin | username=%s", BOOTSTRAP_ADMIN_USERNAME)
 
 
+def bootstrap_departments():
+    dept_map = ensure_default_departments(create_department)
+    logger.info("Departamentos padrao sincronizados | total=%d", len(dept_map))
+
+
+def validate_runtime_config():
+    if not IS_CLOUD_RUN:
+        return
+
+    if MEDIA_STORAGE_BACKEND == "gcs":
+        if not GCS_MEDIA_BUCKET:
+            raise RuntimeError("Cloud Run com GCS requer GCS_MEDIA_BUCKET configurado")
+    elif MEDIA_STORAGE_BACKEND != "firestore":
+        raise RuntimeError("Cloud Run requer MEDIA_STORAGE_BACKEND=gcs ou firestore")
+
+    if REQUIRE_WEBHOOK_SIGNATURE and not WHATSAPP_APP_SECRET:
+        raise RuntimeError("Cloud Run requer WHATSAPP_APP_SECRET quando REQUIRE_WEBHOOK_SIGNATURE=true")
+
+    if not WHATSAPP_VERIFY_TOKEN:
+        raise RuntimeError("Cloud Run requer WHATSAPP_VERIFY_TOKEN configurado")
+
+
 # -- Startup --
 
 @app.on_event("startup")
 async def startup():
+    validate_runtime_config()
     init_database()
+    bootstrap_departments()
     bootstrap_admin_user()
     ensure_media_dir()
+    if FEATURE_AUDIO_TRANSCRIPTION:
+        from transcription_service import init_speech_client
+        if init_speech_client():
+            logger.info("Transcricao de audio habilitada (Google STT)")
+        else:
+            logger.warning("Transcricao de audio desabilitada (SpeechClient falhou)")
     logger.info("CRM iniciado | host=%s port=%d", HOST, PORT)
     if WHATSAPP_TOKEN:
         logger.info("WABA configurado | phone_id=%s", WHATSAPP_PHONE_NUMBER_ID)
@@ -212,14 +315,19 @@ async def startup():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    with open(os.path.join(BASE_DIR, "static", "index.html"), "r", encoding="utf-8") as f:
-        return HTMLResponse(content=f.read())
+    return _serve_frontend_or_static("index.html")
 
 
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_page():
-    with open(os.path.join(BASE_DIR, "static", "chat.html"), "r", encoding="utf-8") as f:
-        return HTMLResponse(content=f.read())
+    return _serve_frontend_or_static("chat.html")
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def app_shell():
+    if not _frontend_build_available():
+        raise HTTPException(status_code=404, detail="Frontend React nao buildado")
+    return FileResponse(FRONTEND_INDEX_FILE)
 
 
 # -- Servir midia --
@@ -267,6 +375,8 @@ async def webhook_receive(request: Request):
 
 @app.post("/api/login")
 async def login(body: LoginRequest, request: Request):
+    if USE_FIREBASE_AUTH:
+        raise HTTPException(status_code=405, detail="Use Firebase Auth no frontend e envie o ID token nas chamadas da API")
     ip = request.client.host if request.client else "unknown"
     result = authenticate(body.username, body.password, ip)
     if not result["success"]:
@@ -277,6 +387,46 @@ async def login(body: LoginRequest, request: Request):
     full_user = get_user_by_id(result["user"]["id"])
     user_data["role"] = full_user.get("role", "operador") if full_user else "operador"
     return {"token": result["token"], "user": user_data}
+
+
+@app.get("/api/session")
+async def session_info(current_user: dict = Depends(get_current_user)):
+    return {
+        "user": current_user,
+        "auth_mode": AUTH_MODE,
+    }
+
+
+@app.get("/api/client-config")
+async def client_config():
+    return {
+        "auth_mode": AUTH_MODE,
+        "chat_delivery_mode": CHAT_DELIVERY_MODE,
+        "polling_interval_ms": POLLING_INTERVAL_MS,
+        "data_backend": "firestore",
+        "media_storage_backend": MEDIA_STORAGE_BACKEND,
+        "allowed_email_domain": ALLOWED_FIREBASE_EMAIL_DOMAIN,
+        "firebase_web_config": {
+            "apiKey": FIREBASE_WEB_API_KEY,
+            "authDomain": FIREBASE_WEB_AUTH_DOMAIN,
+            "projectId": FIRESTORE_PROJECT_ID,
+            "storageBucket": FIREBASE_STORAGE_BUCKET,
+            "appId": FIREBASE_WEB_APP_ID,
+            "messagingSenderId": FIREBASE_WEB_MESSAGING_SENDER_ID,
+            "measurementId": FIREBASE_WEB_MEASUREMENT_ID,
+        },
+        "feature_message_status": FEATURE_MESSAGE_STATUS,
+        "firestore": {
+            "collections": {
+                "departments": collection_name("departments"),
+                "operator_profiles": collection_name("operator_profiles"),
+                "wa_contacts": collection_name("wa_contacts"),
+                "wa_messages": collection_name("wa_messages"),
+                "wa_transfer_log": collection_name("wa_transfer_log"),
+            },
+            "snapshot_enabled": True,
+        },
+    }
 
 
 # -- API: Avatar do operador --
@@ -396,6 +546,36 @@ async def list_roles(current_user: dict = Depends(get_current_user)):
     return {"roles": ROLE_OPTIONS}
 
 
+# -- API: Configuracoes do sistema --
+
+@app.get("/api/settings/system")
+async def get_settings_system(current_user: dict = Depends(get_current_user)):
+    return get_system_settings()
+
+
+@app.put("/api/settings/system")
+async def update_settings_system(request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode alterar configuracoes do sistema")
+    body = await request.json()
+    result = save_system_settings(body)
+    log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(body))
+    return result
+
+
+@app.get("/api/settings/user")
+async def get_settings_user(current_user: dict = Depends(get_current_user)):
+    return get_user_settings(current_user["id"])
+
+
+@app.put("/api/settings/user")
+async def update_settings_user(request: Request, current_user: dict = Depends(get_current_user)):
+    body = await request.json()
+    result = save_user_settings(current_user["id"], body)
+    log_audit(current_user["id"], "USER_SETTINGS_UPDATE", str(body))
+    return result
+
+
 # -- API: Chat Interno --
 
 @app.get("/api/users")
@@ -453,17 +633,144 @@ async def send_internal_message(body: SendMessageRequest, current_user: dict = D
 @app.get("/api/wa/contacts")
 async def wa_contacts(current_user: dict = Depends(get_current_user)):
     contacts = get_all_wa_contacts()
-    unread_counts = get_wa_unread_count()
     for c in contacts:
-        c["unread"] = unread_counts.get(c["id"], 0)
+        c["unread"] = int(c.get("unread_count", 0))
     return {"contacts": contacts}
 
 
 @app.get("/api/wa/messages/{contact_id}")
-async def wa_messages(contact_id: int, current_user: dict = Depends(get_current_user)):
-    messages = get_wa_conversation(contact_id)
+async def wa_messages(contact_id: int, limit: int = Query(default=10, ge=1, le=200), current_user: dict = Depends(get_current_user)):
+    messages = get_wa_conversation(contact_id, limit=limit)
     mark_wa_conversation_read(contact_id)
     return {"messages": messages}
+
+
+@app.post("/api/wa/messages/{message_id}/transcribe")
+async def wa_transcribe_message(message_id: int, current_user: dict = Depends(get_current_user)):
+    from transcription_service import get_speech_client, transcribe_audio_bytes
+    from media import get_media_asset
+
+    speech_client = get_speech_client()
+    if not speech_client:
+        if FEATURE_AUDIO_TRANSCRIPTION:
+            from transcription_service import init_speech_client
+            speech_client = init_speech_client() and get_speech_client()
+        if not speech_client:
+            raise HTTPException(status_code=503, detail="Servico de transcricao nao disponivel. Verifique FEATURE_AUDIO_TRANSCRIPTION e credenciais GCP.")
+
+    msg = get_wa_message_by_id(message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Mensagem nao encontrada")
+    if msg.get("msg_type") != "audio":
+        raise HTTPException(status_code=400, detail="Mensagem nao e do tipo audio")
+
+    media_path = msg.get("media_path", "")
+    if not media_path:
+        raise HTTPException(status_code=400, detail="Mensagem sem arquivo de audio")
+
+    asset = get_media_asset(media_path)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Arquivo de audio nao encontrado no storage")
+
+    if "content" in asset:
+        audio_bytes = asset["content"]
+    elif "file_path" in asset:
+        with open(asset["file_path"], "rb") as fh:
+            audio_bytes = fh.read()
+    else:
+        raise HTTPException(status_code=500, detail="Nao foi possivel ler os bytes do audio")
+
+    mime = asset.get("mime_type") or msg.get("media_mime") or "audio/ogg"
+    transcript = transcribe_audio_bytes(
+        audio_bytes,
+        media_mime=mime,
+        language_code=STT_LANGUAGE_CODE,
+        timeout_s=STT_TIMEOUT_SECONDS,
+    )
+
+    if not transcript:
+        raise HTTPException(status_code=422, detail="Nao foi possivel transcrever o audio. Verifique qualidade ou idioma.")
+
+    update_wa_message_transcription(message_id, transcript)
+    log_audit(current_user["id"], "WA_TRANSCRIBE", f"msg_id={message_id}")
+    return {"transcription": transcript}
+
+
+# -- Helper: janela de 24h do WhatsApp --
+
+from datetime import timedelta
+
+_24H = timedelta(hours=24)
+
+
+def _check_24h_window(contact: dict):
+    """Raises 403 if last inbound message is older than 24h (Meta free-form window)."""
+    last_inbound = contact.get("last_inbound_at")
+    if not last_inbound:
+        raise HTTPException(
+            status_code=403,
+            detail="Janela de 24h expirada. O cliente nunca enviou mensagem. Use um template.",
+        )
+    if isinstance(last_inbound, str):
+        last_inbound = datetime.fromisoformat(last_inbound.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    if now - last_inbound > _24H:
+        raise HTTPException(
+            status_code=403,
+            detail="Janela de 24h expirada. Use um template para reabrir a conversa.",
+        )
+
+
+@app.post("/api/wa/send-location")
+async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Depends(get_current_user)):
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        raise HTTPException(status_code=503, detail="WABA nao configurado")
+    contact = get_wa_contact(body.contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _check_24h_window(contact)
+
+    wa_id = contact["wa_id"]
+    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+
+    location_obj: dict = {"latitude": body.latitude, "longitude": body.longitude}
+    if body.name:
+        location_obj["name"] = body.name
+    if body.address:
+        location_obj["address"] = body.address
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": wa_id,
+        "type": "location",
+        "location": location_obj,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        result = resp.json()
+
+    if resp.status_code == 200:
+        wa_msg_id = result.get("messages", [{}])[0].get("id", "")
+        content = f"{body.name} {body.address}".strip()
+        save_wa_message(
+            wa_message_id=wa_msg_id,
+            contact_id=body.contact_id,
+            direction="outbound",
+            msg_type="location",
+            content=content,
+            latitude=body.latitude,
+            longitude=body.longitude,
+            status="sent",
+            timestamp_wa=datetime.now(timezone.utc).isoformat(),
+            operator_id=current_user["id"],
+        )
+        log_audit(current_user["id"], "WA_SEND_LOCATION", f"Para {wa_id}: {body.latitude},{body.longitude}")
+        return {"status": "sent", "wa_message_id": wa_msg_id}
+
+    error_msg = result.get("error", {}).get("message", "Erro desconhecido")
+    raise HTTPException(status_code=502, detail=error_msg)
 
 
 @app.post("/api/wa/send")
@@ -475,8 +782,9 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_24h_window(contact)
 
-    wa_id = normalize_br_phone(contact["wa_id"])
+    wa_id = _wa_target(contact["wa_id"])
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": body.content}}
@@ -496,6 +804,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
         error_msg = result.get("error", {}).get("message", "Erro desconhecido")
+        logger.warning("Falha ao enviar texto para %s | status=%s | erro=%s", wa_id, resp.status_code, error_msg)
         raise HTTPException(status_code=502, detail=error_msg)
 
 
@@ -512,6 +821,7 @@ async def wa_send_media(
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_24h_window(contact)
 
     file_content = await file.read()
     if len(file_content) > 16 * 1024 * 1024:
@@ -519,7 +829,10 @@ async def wa_send_media(
 
     mime_type = file.content_type or "application/octet-stream"
     filename = file.filename or "upload"
-    local_result = await save_upload_media(file_content, filename, mime_type)
+    try:
+        local_result = await save_upload_media(file_content, filename, mime_type)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     msg_type = local_result["msg_type"]
 
     media_id = await upload_media_to_whatsapp(file_content, mime_type, filename)
@@ -559,6 +872,7 @@ async def wa_send_audio(
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_24h_window(contact)
 
     raw_content = await file.read()
     if len(raw_content) > 16 * 1024 * 1024:
@@ -572,7 +886,10 @@ async def wa_send_audio(
         raise HTTPException(status_code=500, detail="Falha na conversao do audio. Verifique se o FFmpeg esta instalado.")
 
     # Salvar versao convertida localmente
-    local_result = await save_upload_media(converted, "gravacao.ogg", "audio/ogg")
+    try:
+        local_result = await save_upload_media(converted, "gravacao.ogg", "audio/ogg")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
     # Upload do OGG convertido para a Meta
     media_id = await upload_media_to_whatsapp(converted, "audio/ogg", "audio.ogg")
@@ -610,7 +927,7 @@ async def wa_send_template(
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
-        "messaging_product": "whatsapp", "to": normalize_br_phone(contact["wa_id"]),
+        "messaging_product": "whatsapp", "to": _wa_target(contact["wa_id"]),
         "type": "template", "template": {"name": template_name, "language": {"code": language}},
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -735,6 +1052,36 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
     return {"status": "transferred", "to_user": to_name}
 
 
+@app.post("/api/wa/assume/{contact_id}")
+async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_current_user)):
+    """Operador assume o atendimento de um contato nao atribuido."""
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    try:
+        existing_id = int(contact.get("assigned_to") or 0) or None
+        current_id = int(current_user["id"])
+    except (TypeError, ValueError):
+        existing_id = None
+        current_id = None
+    if existing_id is not None and existing_id != current_id:
+        raise HTTPException(status_code=409, detail="Atendimento ja assumido por outro operador")
+    result = assign_wa_contact(contact_id, current_user["id"], contact.get("department_id"), current_user["id"], reason="Assumido pelo operador", summary="Assumido pelo operador")
+    if result is None:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    now = datetime.now(timezone.utc)
+    protocol = f"ATD-{now.strftime('%Y%m%d%H%M%S')}-{contact_id:05d}"
+    set_attendance_protocol(contact_id, protocol, now.isoformat())
+    sys_content = f"Atendimento assumido por {current_user['display_name']} | Protocolo: {protocol}"
+    insert_transfer_system_message(contact_id, sys_content, current_user["id"])
+    log_audit(current_user["id"], "WA_ASSUME", f"Contato {contact_id} | Protocolo {protocol}")
+    await broadcast_to_operators({
+        "event": "wa_contact_reassigned",
+        "data": {"contact_id": contact_id, "assigned_to": current_user["id"], "assigned_name": current_user["display_name"]},
+    })
+    return {"status": "assumed", "assigned_to": current_user["id"], "assigned_name": current_user["display_name"], "protocol": protocol}
+
+
 @app.get("/api/wa/transfer-history/{contact_id}")
 async def wa_transfer_hist(contact_id: int, current_user: dict = Depends(get_current_user)):
     return {"history": get_transfer_history(contact_id)}
@@ -750,6 +1097,8 @@ async def list_operators(current_user: dict = Depends(get_current_user)):
             "department_id": u.get("department_id"),
             "avatar_path": u.get("avatar_path", ""),
             "role": u.get("role", "operador"),
+            "email": u.get("email", ""),
+            "firebase_uid": u.get("firebase_uid", ""),
         }
         for u in users if u.get("is_active")
     ]

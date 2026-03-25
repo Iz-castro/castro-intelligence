@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Estas rules precisam usar o mesmo prefixo definido em FIRESTORE_COLLECTION_PREFIX.
+    // No ambiente atual, as collections reais sao "castro_crm_*".
+    // Regra temporaria de teste:
+    // libera somente o email abaixo. Depois troque para o dominio oficial da empresa.
+    function signedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+
+    function emailAllowed() {
+      return signedIn() && (
+        request.auth.token.email == 'rafaluisc@outlook.com' ||
+        request.auth.token.email == 'izaeldecastro@gmail.com' ||
+        request.auth.token.email.matches('.*@centralloc\\.com\\.br')
+      );
+    }
+
+    function myProfileExists() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/castro_crm_operator_profiles/$(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/castro_crm_operator_profiles/$(request.auth.uid));
+    }
+
+    function operatorActive() {
+      return emailAllowed() &&
+        myProfileExists() &&
+        myProfile().data.is_active == 1;
+    }
+
+    function isPrivileged() {
+      return operatorActive() &&
+        (myProfile().data.role == 'admin' || myProfile().data.role == 'supervisor');
+    }
+
+    function canSeeConversation(assignedUid, departmentId) {
+      return operatorActive() && (
+        isPrivileged() ||
+        assignedUid == request.auth.uid ||
+        assignedUid == '' ||
+        departmentId == null ||
+        departmentId == myProfile().data.department_id
+      );
+    }
+
+    match /castro_crm_operator_profiles/{uid} {
+      allow read: if emailAllowed() && (uid == request.auth.uid || operatorActive());
+      allow write: if false;
+    }
+
+    match /castro_crm_departments/{departmentId} {
+      allow read: if operatorActive();
+      allow write: if false;
+    }
+
+    match /castro_crm_wa_contacts/{contactId} {
+      // Regra temporaria de demo: para os emails explicitamente liberados,
+      // permita leitura completa das conversas no snapshot sem depender de
+      // filtros por atribuicao/departamento.
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_wa_messages/{messageId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_wa_transfer_log/{transferId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_messages/{messageId} {
+      allow read: if operatorActive() && (
+        resource.data.sender_id == myProfile().data.user_id ||
+        resource.data.receiver_id == myProfile().data.user_id
+      );
+      allow write: if false;
+    }
+
+    match /castro_crm_internal_unread/{docId} {
+      allow read: if operatorActive() &&
+        resource.data.receiver_id == myProfile().data.user_id;
+      allow write: if false;
+    }
+
+    match /castro_crm_users/{userId} {
+      allow read, write: if false;
+    }
+
+    match /castro_crm_audit_log/{docId} {
+      allow read, write: if false;
+    }
+
+    match /castro_crm_wa_message_status/{docId} {
+      allow read, write: if false;
+    }
+
+    match /castro_crm__meta/{docId} {
+      allow read, write: if false;
+    }
+  }
+}
