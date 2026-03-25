@@ -955,4 +955,350 @@ textarea:focus {
   .recording-status { flex-wrap: wrap; }
   .recording-cancel { margin-left: 0; }
   .bubble { max-width: 100%; }
+  .gc-panel { width: 100vw; }
+}
+
+/* ---------------------------------------------------------------------------
+   Google Chat Panel (slide-in)
+--------------------------------------------------------------------------- */
+
+.gc-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 370px;
+  height: 100vh;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.08);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.gc-panel--open {
+  transform: translateX(0);
+}
+
+/* Header */
+.gc-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-strong);
+  min-height: 52px;
+}
+
+.gc-panel__title {
+  flex: 1;
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gc-panel__back,
+.gc-panel__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+  transition: background 0.15s;
+}
+
+.gc-panel__back:hover,
+.gc-panel__close:hover {
+  background: var(--border);
+}
+
+/* Conversation list */
+.gc-panel__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.25rem 0;
+}
+
+.gc-panel__empty {
+  padding: 2rem 1.25rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.gc-conv-item {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  padding: 0.7rem 1rem;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s;
+  border-bottom: 1px solid var(--border);
+}
+
+.gc-conv-item:hover {
+  background: var(--panel-card);
+}
+
+.gc-conv-item__avatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.gc-conv-item__avatar svg {
+  stroke: #fff;
+}
+
+.gc-conv-item__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.gc-conv-item__name {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gc-conv-item__preview {
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gc-conv-item__meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.gc-conv-item__time {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.gc-conv-item__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+/* Messages */
+.gc-panel__messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.gc-msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 85%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 12px;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.gc-msg--in {
+  align-self: flex-start;
+  background: var(--bubble-in);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+
+.gc-msg--out {
+  align-self: flex-end;
+  background: var(--bubble-out);
+  border-bottom-right-radius: 4px;
+}
+
+.gc-msg__sender {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 0.15rem;
+}
+
+.gc-msg__text {
+  color: var(--text);
+}
+
+.gc-msg__time {
+  font-size: 0.68rem;
+  color: var(--muted);
+  align-self: flex-end;
+  margin-top: 0.2rem;
+}
+
+.gc-msg__audio {
+  max-width: 100%;
+  height: 36px;
+}
+
+.gc-msg__image {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 0.25rem 0;
+}
+
+/* Composer */
+.gc-panel__composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.4rem;
+  padding: 0.6rem 0.75rem;
+  border-top: 1px solid var(--border);
+  background: var(--composer-bg);
+}
+
+.gc-panel__input {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.88rem;
+  font-family: inherit;
+  background: var(--panel);
+  color: var(--text);
+  outline: none;
+  max-height: 100px;
+  line-height: 1.4;
+}
+
+.gc-panel__input:focus {
+  border-color: var(--accent);
+}
+
+.gc-panel__send {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.gc-panel__send:hover:not(:disabled) {
+  background: var(--accent-dark);
+}
+
+.gc-panel__send:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* TopBar badge */
+.gc-topbar-badge {
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.62rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+/* Toast notification */
+.gc-toast {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  min-width: 280px;
+  max-width: 380px;
+  padding: 0.75rem 1rem;
+  background: var(--panel-strong);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  cursor: pointer;
+  animation: gc-toast-in 0.3s ease;
+}
+
+.gc-toast__text {
+  flex: 1;
+}
+
+.gc-toast__title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.gc-toast__body {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes gc-toast-in {
+  from { transform: translateY(20px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
 }

@@ -150,6 +150,11 @@ LOG_FILE = os.getenv("LOG_FILE", str(DEFAULT_LOG_FILE))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_TO_FILE = _as_bool(os.getenv("LOG_TO_FILE"), default=not IS_CLOUD_RUN)
 
+# -- Google Chat Integration --
+FEATURE_GOOGLE_CHAT = _bool_env("FEATURE_GOOGLE_CHAT", "false")
+GOOGLE_CHAT_PROJECT_NUMBER = os.getenv("GOOGLE_CHAT_PROJECT_NUMBER", "").strip()
+GOOGLE_CHAT_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_CHAT_SERVICE_ACCOUNT_FILE", "").strip()
+
 # -- CORS --
 DEFAULT_CORS_ORIGINS = "http://localhost:8080,http://127.0.0.1:8080"
 CORS_ORIGINS = _split_csv(os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS))

@@ -18,7 +18,7 @@ from pydantic import BaseModel, field_validator
 from bootstrap_data import ensure_default_departments
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
-    FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS,
+    FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
@@ -50,10 +50,13 @@ from database import (
     get_wa_message_by_id, update_wa_message_transcription,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
+    get_all_gc_conversations, get_gc_messages, save_gc_message,
+    mark_gc_conversation_read, upsert_gc_conversation,
 )
 from auth import authenticate, authenticate_firebase_token, decode_token, hash_password
 from firestore_common import collection_name
 from webhook import process_webhook_payload, validate_signature
+from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
     save_upload_media, convert_audio_to_ogg_opus,
@@ -416,6 +419,7 @@ async def client_config():
             "measurementId": FIREBASE_WEB_MEASUREMENT_ID,
         },
         "feature_message_status": FEATURE_MESSAGE_STATUS,
+        "feature_google_chat": FEATURE_GOOGLE_CHAT,
         "firestore": {
             "collections": {
                 "departments": collection_name("departments"),
@@ -423,6 +427,8 @@ async def client_config():
                 "wa_contacts": collection_name("wa_contacts"),
                 "wa_messages": collection_name("wa_messages"),
                 "wa_transfer_log": collection_name("wa_transfer_log"),
+                "gc_conversations": collection_name("gc_conversations"),
+                "gc_messages": collection_name("gc_messages"),
             },
             "snapshot_enabled": True,
         },
@@ -1217,6 +1223,123 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                 await conn.send_json({"event": "user_offline", "data": {"user_id": user_id}})
             except Exception:
                 pass
+
+
+# -- API: Google Chat (comunicacao interna) --
+
+
+class GcSendRequest(BaseModel):
+    conversation_id: int
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Mensagem vazia")
+        if len(v) > MAX_MESSAGE_LENGTH:
+            raise ValueError(f"Excede {MAX_MESSAGE_LENGTH} caracteres")
+        return v
+
+
+@app.get("/api/gc/conversations")
+async def gc_list_conversations(current_user: dict = Depends(get_current_user)):
+    """Lista todas as conversas do Google Chat."""
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    conversations = get_all_gc_conversations()
+    return {"conversations": conversations}
+
+
+@app.get("/api/gc/messages/{conversation_id}")
+async def gc_get_messages(
+    conversation_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna mensagens de uma conversa."""
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    messages = get_gc_messages(conversation_id, limit=limit, offset=offset)
+    return {"messages": messages}
+
+
+@app.post("/api/gc/send")
+async def gc_send_message(body: GcSendRequest, current_user: dict = Depends(get_current_user)):
+    """Envia mensagem do CRM para o Google Chat."""
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+
+    from database import get_gc_conversation
+    conversation = get_gc_conversation(body.conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversa nao encontrada")
+
+    space_id = conversation.get("space_id")
+    if not space_id:
+        raise HTTPException(status_code=400, detail="Space ID nao configurado")
+
+    # Enviar via Google Chat API
+    from google_chat import send_text_message
+    result = send_text_message(space_id, body.content)
+    if not result:
+        raise HTTPException(status_code=502, detail="Falha ao enviar para Google Chat")
+
+    # Salvar no Firestore
+    sender_email = current_user.get("email", "")
+    sender_name = current_user.get("display_name", "")
+    message_id = save_gc_message(
+        conversation_id=body.conversation_id,
+        gchat_message_id=result.get("gchat_message_id", ""),
+        sender_email=sender_email,
+        sender_name=sender_name,
+        msg_type="text",
+        content=body.content,
+        source="crm",
+        create_time=result.get("create_time", ""),
+    )
+
+    log_audit(current_user["id"], "gc_send_message", f"conv={body.conversation_id} msg_id={message_id}")
+    return {"message_id": message_id, "gchat_message_id": result.get("gchat_message_id", "")}
+
+
+@app.post("/api/gc/mark-read/{conversation_id}")
+async def gc_mark_read(conversation_id: int, current_user: dict = Depends(get_current_user)):
+    """Marca conversa como lida para o usuario atual."""
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    user_identifier = current_user.get("email", str(current_user["id"]))
+    mark_gc_conversation_read(conversation_id, user_identifier)
+    return {"status": "ok"}
+
+
+@app.get("/api/gc/spaces")
+async def gc_list_spaces(current_user: dict = Depends(get_current_user)):
+    """Lista spaces disponiveis no Google Chat."""
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    from google_chat import list_spaces
+    spaces = list_spaces()
+    return {"spaces": spaces}
+
+
+@app.post("/webhooks/google-chat")
+async def webhook_google_chat(request: Request):
+    """Recebe eventos do Google Chat (mensagens, bot adicionado/removido)."""
+    if not FEATURE_GOOGLE_CHAT:
+        return JSONResponse(status_code=404, content={"error": "Google Chat desabilitado"})
+
+    auth_header = request.headers.get("Authorization", "")
+    is_valid = await validate_google_chat_token(auth_header)
+    if not is_valid:
+        logger.warning("Webhook Google Chat: token invalido")
+        return JSONResponse(status_code=403, content={"error": "Token invalido"})
+
+    event = await request.json()
+    response = await process_google_chat_event(event)
+    return response or {}
 
 
 # -- Execucao --

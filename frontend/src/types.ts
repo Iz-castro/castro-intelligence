@@ -17,6 +17,7 @@ export type ClientConfig = {
   data_backend: "firestore" | "sql" | string;
   media_storage_backend: string;
   feature_message_status: boolean;
+  feature_google_chat: boolean;
   allowed_email_domain: string;
   firebase_web_config: FirebaseWebConfig;
   firestore: {
@@ -123,3 +124,31 @@ export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe";
 export type SettingsPage = false | "menu" | "chat" | "quick" | "admin";
 
 export type QuickMessage = { shortcut: string; message: string };
+
+// -- Google Chat (comunicacao interna) --
+
+export type GcConversation = {
+  id: number;
+  space_id: string;
+  space_name: string;
+  participants: string[];
+  last_message: string;
+  last_message_at?: string;
+  unread_count: Record<string, number>;
+  created_at?: string;
+};
+
+export type GcMessage = {
+  id: number;
+  conversation_id: number;
+  gchat_message_id: string;
+  sender_email: string;
+  sender_name: string;
+  msg_type: "text" | "audio" | "image" | "video" | "document" | string;
+  content?: string;
+  media_path?: string;
+  media_mime?: string;
+  source: "google_chat" | "crm" | string;
+  create_time?: string;
+  created_at?: string;
+};

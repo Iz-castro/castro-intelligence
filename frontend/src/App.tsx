@@ -1,9 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
+import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import type { ChatMessage } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -26,9 +27,11 @@ function LoginScreen() {
 }
 
 function TopBar() {
-  const { sessionUser, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout } = useCrm();
+  const { sessionUser, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout } = useCrm();
+  const [gcOpen, setGcOpen] = useState(false);
   useClickOutside(settingsMenuRef, showSettings === "menu", () => setShowSettings(false));
   if (!sessionUser) return null;
+  const gcEnabled = config?.feature_google_chat ?? false;
   return (
     <header className="crm-topbar">
       <div className="topbar-brand"><p className="eyebrow">Hubloc CRM</p></div>
@@ -40,6 +43,11 @@ function TopBar() {
         <button className="composer-icon" onClick={toggleTheme} title={theme === "dark" ? "Tema claro" : "Tema escuro"} aria-label="Alternar tema">
           {theme === "dark" ? <SunIcon /> : <MoonIcon />}
         </button>
+        {gcEnabled && (
+          <button className="composer-icon" onClick={() => setGcOpen((v) => !v)} title="Chat Interno" aria-label="Chat Interno">
+            <GcBadgeIcon totalUnread={0} />
+          </button>
+        )}
         <div ref={settingsMenuRef} style={{ position: "relative" }}>
           <button className="composer-icon" onClick={toggleSettingsMenu} title="Configuracoes" aria-label="Configuracoes"><GearIcon /></button>
           {showSettings === "menu" && (
@@ -52,6 +60,7 @@ function TopBar() {
         </div>
         <button className="ghost" style={{ padding: "0.55rem 1rem", fontSize: "0.9rem" }} onClick={() => void logout()}>Sair</button>
       </div>
+      {gcEnabled && <InternalChatPanel open={gcOpen} onClose={() => setGcOpen(false)} />}
     </header>
   );
 }

@@ -861,3 +861,129 @@ def save_user_settings(user_id: int, settings: dict):
     filtered["updated_at"] = utcnow()
     document("user_settings", user_id).set(filtered, merge=True)
     return get_user_settings(user_id)
+
+
+# ---------------------------------------------------------------------------
+# Google Chat - Comunicacao interna
+# ---------------------------------------------------------------------------
+
+def upsert_gc_conversation(space_id, space_name=""):
+    """Cria ou atualiza conversa do Google Chat. Retorna conversation_id."""
+    now = utcnow()
+    existing = _get_first_by_field("gc_conversations", "space_id", space_id)
+    if existing:
+        updates = {"last_message_at": now}
+        if space_name:
+            updates["space_name"] = space_name
+        document("gc_conversations", existing["id"]).set(updates, merge=True)
+        return existing["id"]
+
+    conversation_id = next_sequence("gc_conversations")
+    document("gc_conversations", conversation_id).set({
+        "id": conversation_id,
+        "space_id": space_id,
+        "space_name": space_name or space_id,
+        "participants": [],
+        "last_message": "",
+        "last_message_at": now,
+        "unread_count": {},
+        "created_at": now,
+    })
+    return conversation_id
+
+
+def get_gc_conversation(conversation_id):
+    """Retorna uma conversa pelo ID."""
+    return normalize_record(_get_doc("gc_conversations", conversation_id))
+
+
+def get_gc_conversation_by_space(space_id):
+    """Retorna conversa pelo space_id do Google Chat."""
+    row = _get_first_by_field("gc_conversations", "space_id", space_id)
+    return normalize_record(row) if row else None
+
+
+def get_all_gc_conversations():
+    """Lista todas as conversas do Google Chat."""
+    rows = [row for row in _all_docs("gc_conversations") if row]
+    rows = _sort_records(rows, "last_message_at", reverse=True)
+    return _normalize_many(rows)
+
+
+def save_gc_message(conversation_id, gchat_message_id, sender_email, sender_name,
+                    msg_type="text", content="", media_path="", media_mime="",
+                    source="google_chat", create_time=""):
+    """Salva mensagem do Google Chat no Firestore."""
+    existing = _get_first_by_field("gc_messages", "gchat_message_id", gchat_message_id)
+    if existing:
+        return existing["id"]
+
+    message_id = next_sequence("gc_messages")
+    now = utcnow()
+    document("gc_messages", message_id).set({
+        "id": message_id,
+        "conversation_id": conversation_id,
+        "gchat_message_id": gchat_message_id,
+        "sender_email": sender_email,
+        "sender_name": sender_name,
+        "msg_type": msg_type,
+        "content": content or "",
+        "media_path": media_path or "",
+        "media_mime": media_mime or "",
+        "source": source,
+        "create_time": _coerce_timestamp(create_time),
+        "created_at": now,
+    })
+
+    # Atualizar preview e timestamp na conversa
+    conversation = _get_doc("gc_conversations", conversation_id)
+    if conversation:
+        preview = content[:100] if content else f"[{msg_type}]"
+        updates = {
+            "last_message": preview,
+            "last_message_at": now,
+        }
+        # Incrementar unread para todos os participantes exceto o remetente
+        unread = conversation.get("unread_count", {}) or {}
+        for participant_id in (conversation.get("participants") or []):
+            pid = str(participant_id)
+            if pid != sender_email:
+                unread[pid] = int(unread.get(pid, 0)) + 1
+        updates["unread_count"] = unread
+        document("gc_conversations", conversation_id).set(updates, merge=True)
+
+    return message_id
+
+
+def get_gc_messages(conversation_id, limit=50, offset=0):
+    """Retorna mensagens de uma conversa do Google Chat."""
+    q = (
+        collection("gc_messages")
+        .where("conversation_id", "==", conversation_id)
+        .order_by("created_at", direction="DESCENDING")
+    )
+    if limit:
+        q = q.limit(limit + offset)
+
+    rows = []
+    for snapshot in q.stream():
+        row = _raw_doc(snapshot)
+        if row:
+            rows.append(row)
+
+    if offset:
+        rows = rows[offset:]
+    rows.reverse()
+    return _normalize_many(rows)
+
+
+def mark_gc_conversation_read(conversation_id, user_identifier):
+    """Reseta o contador de nao-lidas para um usuario em uma conversa."""
+    conversation = _get_doc("gc_conversations", conversation_id)
+    if not conversation:
+        return
+    unread = conversation.get("unread_count", {}) or {}
+    uid = str(user_identifier)
+    if uid in unread:
+        unread[uid] = 0
+        document("gc_conversations", conversation_id).set({"unread_count": unread}, merge=True)
