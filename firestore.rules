@@ -75,6 +75,16 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    match /castro_crm_gc_conversations/{convId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_gc_messages/{msgId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
     match /castro_crm_messages/{messageId} {
       allow read: if operatorActive() && (
         resource.data.sender_id == myProfile().data.user_id ||
