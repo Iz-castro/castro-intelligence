@@ -1,4 +1,4 @@
-import type { ChatMessage } from "../types";
+import type { ChatMessage, MessageReplyReference } from "../types";
 
 const dtf = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 
@@ -29,6 +29,52 @@ export function messageContentLabel(message: ChatMessage) {
     return "Midia nao suportada pelo payload recebido do WhatsApp.";
   }
   return content;
+}
+
+export function messageSenderLabel(message: ChatMessage) {
+  if (message.direction === "outbound") return message.operator_name || "Equipe";
+  if (message.direction === "inbound") return "Cliente";
+  return "Sistema";
+}
+
+export function messageCopyText(message: ChatMessage) {
+  const content = messageContentLabel(message);
+  if (content) return content;
+  return String(message.transcription || "").trim();
+}
+
+export function messagePreviewText(message: ChatMessage) {
+  const copyText = messageCopyText(message);
+  if (copyText) return copyText;
+
+  const filename = String(message.filename || "").trim();
+  const kind = String(message.msg_type || "").trim().toLowerCase();
+  if (filename && kind === "document") return `Documento: ${filename}`;
+  if (filename && kind === "video") return `Video: ${filename}`;
+  if (filename && kind === "image") return `Imagem: ${filename}`;
+  if (filename && kind === "audio") return `Audio: ${filename}`;
+
+  if (kind === "audio") return "Audio";
+  if (kind === "image") return "Imagem";
+  if (kind === "video" || kind === "gif") return "Video";
+  if (kind === "sticker") return "Figurinha";
+  if (kind === "document") return "Documento";
+  if (kind === "location") return "Localizacao";
+  if (kind === "template") return "Template";
+  return "Mensagem";
+}
+
+function truncateText(value: string, maxLength: number) {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+export function buildMessageReplyReference(message: ChatMessage): MessageReplyReference {
+  return {
+    message_id: message.id,
+    preview: truncateText(messagePreviewText(message), 280),
+    sender_name: truncateText(messageSenderLabel(message), 80),
+  };
 }
 
 export function messageMoment(value?: string) {

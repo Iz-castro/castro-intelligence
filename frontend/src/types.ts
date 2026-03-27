@@ -79,6 +79,12 @@ export type Contact = {
   attendance_started_at?: string;
 };
 
+export type MessageReplyReference = {
+  message_id: number;
+  preview: string;
+  sender_name: string;
+};
+
 export type ChatMessage = {
   id: number;
   wa_message_id?: string;
@@ -96,6 +102,9 @@ export type ChatMessage = {
   created_at?: string;
   timestamp_wa?: string;
   transcription?: string;
+  reply_to_message_id?: number | null;
+  reply_to_preview?: string;
+  reply_to_sender_name?: string;
 };
 
 export type TransferRequest = {

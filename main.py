@@ -134,6 +134,9 @@ class SendMessageRequest(BaseModel):
 class WaSendRequest(BaseModel):
     contact_id: int
     content: str
+    reply_to_message_id: int | None = None
+    reply_to_preview: str = ""
+    reply_to_sender_name: str = ""
 
     @field_validator("content")
     @classmethod
@@ -145,6 +148,11 @@ class WaSendRequest(BaseModel):
             raise ValueError(f"Excede {MAX_MESSAGE_LENGTH} caracteres")
         return v
 
+    @field_validator("reply_to_preview", "reply_to_sender_name")
+    @classmethod
+    def trim_reply_fields(cls, v):
+        return v.strip()
+
 
 class WaSendLocationRequest(BaseModel):
     contact_id: int
@@ -152,6 +160,14 @@ class WaSendLocationRequest(BaseModel):
     longitude: float
     name: str = ""
     address: str = ""
+    reply_to_message_id: int | None = None
+    reply_to_preview: str = ""
+    reply_to_sender_name: str = ""
+
+    @field_validator("reply_to_preview", "reply_to_sender_name")
+    @classmethod
+    def trim_reply_fields(cls, v):
+        return v.strip()
 
 
 # -- Dependencias --
@@ -191,6 +207,60 @@ def _wa_target(wa_id):
     # Para respostas, use exatamente o identificador telefonico recebido/salvo no contato.
     # Inserir digitos extras aqui faz a Meta rejeitar o envio com HTTP 400.
     return "".join(ch for ch in str(wa_id or "").strip() if ch.isdigit())
+
+
+def _fallback_reply_preview(message: dict) -> str:
+    content = str(message.get("content") or "").strip()
+    if content:
+        return content
+
+    transcription = str(message.get("transcription") or "").strip()
+    if transcription:
+        return transcription
+
+    filename = str(message.get("filename") or "").strip()
+    msg_type = str(message.get("msg_type") or "").strip().lower()
+    labels = {
+        "audio": "Audio",
+        "document": "Documento",
+        "gif": "Video",
+        "image": "Imagem",
+        "location": "Localizacao",
+        "sticker": "Figurinha",
+        "template": "Template",
+        "video": "Video",
+    }
+    if filename and msg_type in labels:
+        return f"{labels[msg_type]}: {filename}"
+    return labels.get(msg_type, "Mensagem")
+
+
+def _fallback_reply_sender(message: dict) -> str:
+    direction = str(message.get("direction") or "").strip().lower()
+    if direction == "inbound":
+        return "Cliente"
+    if direction == "system":
+        return "Sistema"
+    operator_id = message.get("operator_id")
+    operator = get_user_by_id(operator_id) if operator_id else None
+    return str((operator or {}).get("display_name") or "Equipe")
+
+
+def _build_reply_fields(contact_id: int, reply_to_message_id: int | None, reply_to_preview: str = "", reply_to_sender_name: str = "") -> dict:
+    if reply_to_message_id is None:
+        return {}
+
+    reply_message = get_wa_message_by_id(reply_to_message_id)
+    if not reply_message or int(reply_message.get("contact_id") or 0) != int(contact_id):
+        raise HTTPException(status_code=400, detail="Mensagem de resposta invalida para este contato")
+
+    preview = (reply_to_preview or _fallback_reply_preview(reply_message)).strip()
+    sender_name = (reply_to_sender_name or _fallback_reply_sender(reply_message)).strip()
+    return {
+        "reply_to_message_id": int(reply_message.get("id") or reply_to_message_id),
+        "reply_to_preview": preview[:280],
+        "reply_to_sender_name": sender_name[:80],
+    }
 
 
 def _validate_image_bytes(content):
@@ -735,6 +805,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _check_24h_window(contact)
+    reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
 
     wa_id = contact["wa_id"]
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -771,6 +842,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
             status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=current_user["id"],
+            **reply_fields,
         )
         log_audit(current_user["id"], "WA_SEND_LOCATION", f"Para {wa_id}: {body.latitude},{body.longitude}")
         return {"status": "sent", "wa_message_id": wa_msg_id}
@@ -789,6 +861,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
+    reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
 
     wa_id = _wa_target(contact["wa_id"])
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -805,6 +878,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
             wa_message_id=wa_msg_id, contact_id=body.contact_id, direction="outbound",
             msg_type="text", content=body.content, status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
+            **reply_fields,
         )
         log_audit(current_user["id"], "WA_SEND", f"Para {wa_id}: {body.content[:80]}")
         return {"status": "sent", "wa_message_id": wa_msg_id}
@@ -818,6 +892,9 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
 async def wa_send_media(
     request: Request, contact_id: int = Form(...),
     caption: str = Form(""), file: UploadFile = File(...),
+    reply_to_message_id: int | None = Form(None),
+    reply_to_preview: str = Form(""),
+    reply_to_sender_name: str = Form(""),
 ):
     current_user = get_current_user(request)
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
@@ -828,6 +905,7 @@ async def wa_send_media(
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
+    reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
 
     file_content = await file.read()
     if len(file_content) > 16 * 1024 * 1024:
@@ -857,6 +935,7 @@ async def wa_send_media(
         media_mime=mime_type, media_id=media_id, filename=filename,
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        **reply_fields,
     )
     log_audit(current_user["id"], "WA_SEND_MEDIA", f"{msg_type} para {contact['wa_id']}: {filename}")
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": msg_type, "media_path": local_result["path"]}
@@ -865,6 +944,9 @@ async def wa_send_media(
 @app.post("/api/wa/send-audio")
 async def wa_send_audio(
     request: Request, contact_id: int = Form(...), file: UploadFile = File(...),
+    reply_to_message_id: int | None = Form(None),
+    reply_to_preview: str = Form(""),
+    reply_to_sender_name: str = Form(""),
 ):
     """Envia audio gravado pelo microfone para contato WhatsApp.
     Converte WebM/Opus do navegador para OGG/Opus via FFmpeg."""
@@ -879,6 +961,7 @@ async def wa_send_audio(
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
+    reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
 
     raw_content = await file.read()
     if len(raw_content) > 16 * 1024 * 1024:
@@ -915,6 +998,7 @@ async def wa_send_audio(
         media_mime="audio/ogg", media_id=media_id, filename="gravacao.ogg",
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        **reply_fields,
     )
     log_audit(current_user["id"], "WA_SEND_AUDIO", f"Para {contact['wa_id']}")
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": "audio", "media_path": local_result["path"]}

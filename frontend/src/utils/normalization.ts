@@ -57,5 +57,8 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     created_at: iso(record.created_at),
     timestamp_wa: iso(record.timestamp_wa),
     transcription: String(record.transcription || ""),
+    reply_to_message_id: record.reply_to_message_id == null ? null : num(record.reply_to_message_id),
+    reply_to_preview: String(record.reply_to_preview || ""),
+    reply_to_sender_name: String(record.reply_to_sender_name || ""),
   };
 }

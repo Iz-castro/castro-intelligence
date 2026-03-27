@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
-import { when, formatRecordingTime, messageTypeLabel, messageContentLabel } from "./utils/formatting";
+import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
@@ -135,10 +135,24 @@ function MessageMedia({ message }: { message: ChatMessage }) {
   return <a href={message.media_path} target="_blank" rel="noreferrer">Abrir {message.filename || "arquivo"}</a>;
 }
 
+function ReplyQuote({ senderName, preview, compact = false }: { senderName: string; preview: string; compact?: boolean }) {
+  if (!preview.trim()) return null;
+  return (
+    <div className={`reply-quote ${compact ? "compact" : ""}`}>
+      <span className="reply-quote__sender">{senderName.trim() || "Mensagem"}</span>
+      <p>{preview}</p>
+    </div>
+  );
+}
+
 function ChatPanel() {
   const ctx = useCrm();
-  const { selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   const hasDraft = Boolean(draft.trim());
+  const [openMessageMenuId, setOpenMessageMenuId] = useState<number | null>(null);
+  const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
+  const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
+  useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
 
   // Scroll management — must live here (not in CrmProvider) because messagesRef is attached to a DOM node inside this component
   useEffect(() => {
@@ -181,6 +195,43 @@ function ChatPanel() {
     return () => container.removeEventListener("scroll", handleScroll);
   }, [selectedContactId, loadingMore, messageLimit, messages.length]);
 
+  useEffect(() => {
+    setOpenMessageMenuId(null);
+  }, [selectedContactId]);
+
+  useEffect(() => {
+    if (openMessageMenuId === null) {
+      setOpenMessageMenuDirection("down");
+      return undefined;
+    }
+
+    const updateMenuDirection = () => {
+      const anchor = activeMessageMenuRef.current;
+      const container = messagesRef.current;
+      const menu = anchor?.querySelector<HTMLElement>(".bubble-menu");
+      if (!anchor || !container || !menu) return;
+
+      const anchorRect = anchor.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const menuHeight = menu.offsetHeight;
+      const gap = 8;
+      const spaceBelow = containerRect.bottom - anchorRect.bottom;
+      const spaceAbove = anchorRect.top - containerRect.top;
+      setOpenMessageMenuDirection(spaceBelow < menuHeight + gap && spaceAbove > spaceBelow ? "up" : "down");
+    };
+
+    const frameId = window.requestAnimationFrame(updateMenuDirection);
+    const scrollContainer = messagesRef.current;
+    scrollContainer?.addEventListener("scroll", updateMenuDirection, { passive: true });
+    window.addEventListener("resize", updateMenuDirection);
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      scrollContainer?.removeEventListener("scroll", updateMenuDirection);
+      window.removeEventListener("resize", updateMenuDirection);
+    };
+  }, [messagesRef, openMessageMenuId]);
+
   return (
     <main className="panel chat-panel">
       {error ? <div className="alert danger">{error}</div> : null}
@@ -219,14 +270,30 @@ function ChatPanel() {
 
         <div className="messages" ref={messagesRef}>
           {loadingMore && <div className="sub" style={{ textAlign: "center", padding: "0.5rem" }}>Carregando mensagens anteriores...</div>}
-          {(visibleMessagesFiltered ?? visibleMessages).map((message) => (
-            <article key={message.id} className={`bubble ${message.direction}`}>
-              <header><strong>{message.direction === "outbound" ? (message.operator_name || "Equipe") : message.direction === "inbound" ? "Cliente" : "Sistema"}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
-              {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
-              <MessageMedia message={message} />
-              <footer><span>{messageTypeLabel(message.msg_type)}</span>{config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}</footer>
-            </article>
-          ))}
+          {(visibleMessagesFiltered ?? visibleMessages).map((message) => {
+            const canInteract = message.direction !== "system";
+            const isMenuOpen = openMessageMenuId === message.id;
+            return (
+              <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""}`}>
+                {canInteract ? (
+                  <div className="bubble-menu-anchor" ref={isMenuOpen ? activeMessageMenuRef : null}>
+                    <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Acoes da mensagem" aria-expanded={isMenuOpen}>v</button>
+                    {isMenuOpen ? (
+                      <div className={`bubble-menu attach-menu ${openMessageMenuDirection === "up" ? "open-upward" : ""}`}>
+                        <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }}><span>Responder</span></button>
+                        <button type="button" className="attach-option" onClick={() => { void copyMessageText(message); setOpenMessageMenuId(null); }}><span>Copiar</span></button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+                <header><strong>{messageSenderLabel(message)}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
+                {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
+                {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
+                <MessageMedia message={message} />
+                <footer><span>{messageTypeLabel(message.msg_type)}</span>{config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}</footer>
+              </article>
+            );
+          })}
           {visibleMessagesFiltered !== null && visibleMessagesFiltered.length === 0 ? <div className="empty" style={{ alignSelf: "center" }}>Nenhuma mensagem encontrada para "{chatSearch}".</div> : null}
         </div>
 
@@ -240,6 +307,12 @@ function ChatPanel() {
         )}
 
         <form className="composer" onSubmit={submitText}>
+          {replyTarget ? (
+            <div className="composer-reply-preview">
+              <ReplyQuote senderName={replyTarget.sender_name} preview={replyTarget.preview} compact />
+              <button type="button" className="reply-preview-close" onClick={cancelReply} aria-label="Cancelar resposta">x</button>
+            </div>
+          ) : null}
           <div className={`composer-shell ${recording ? "is-recording" : ""}`}>
             <div className="composer-menu" ref={attachMenuRef}>
               <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busyUpload || busyAudio} aria-label="Abrir menu de anexos"><PlusIcon /></button>

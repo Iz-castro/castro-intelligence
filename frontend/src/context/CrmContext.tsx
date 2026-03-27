@@ -6,11 +6,11 @@ import { getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
   ActiveView, ChatMessage, ClientConfig, Contact, Department,
-  Operator, SessionUser, SettingsPage, SystemSettings, TransportMode, UserSettings,
+  MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings, TransportMode, UserSettings,
 } from "../types";
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
-import { formatRecordingTime, messageMoment } from "../utils/formatting";
+import { buildMessageReplyReference, formatRecordingTime, messageCopyText, messageMoment } from "../utils/formatting";
 import { normalizeContact, normalizeMessage } from "../utils/normalization";
 import { applyTheme, themePref, transportPref } from "../utils/storage";
 import type { LightboxMedia } from "../utils/media";
@@ -78,6 +78,10 @@ type CrmContextValue = {
   transcribeMessage: (messageId: number) => Promise<void>;
 
   // Composer
+  replyTarget: MessageReplyReference | null;
+  startReplyToMessage: (message: ChatMessage) => void;
+  cancelReply: () => void;
+  copyMessageText: (message: ChatMessage) => Promise<void>;
   draft: string;
   setDraft: (v: string) => void;
   busySend: boolean;
@@ -256,6 +260,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // -- Composer --
   const [draft, setDraft] = useState("");
+  const [replyTarget, setReplyTarget] = useState<MessageReplyReference | null>(null);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [quickSuggestions, setQuickSuggestions] = useState<{ shortcut: string; message: string }[]>([]);
   const [busySend, setBusySend] = useState(false);
@@ -442,6 +447,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setToDepartmentId(contact?.department_id || "");
     setTransferReason("");
     setTransferSummary("");
+    setReplyTarget(null);
     setShowAttachMenu(false);
     setLightboxMedia(null);
     setMessageLimit(10);
@@ -529,6 +535,53 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Actions
   // =========================================================================
 
+  function buildReplyPayload() {
+    if (!replyTarget) return {};
+    return {
+      reply_to_message_id: replyTarget.message_id,
+      reply_to_preview: replyTarget.preview,
+      reply_to_sender_name: replyTarget.sender_name,
+    };
+  }
+
+  function appendReplyFields(form: FormData) {
+    if (!replyTarget) return;
+    form.append("reply_to_message_id", String(replyTarget.message_id));
+    form.append("reply_to_preview", replyTarget.preview);
+    form.append("reply_to_sender_name", replyTarget.sender_name);
+  }
+
+  function startReplyToMessage(message: ChatMessage) {
+    setReplyTarget(buildMessageReplyReference(message));
+    setShowAttachMenu(false);
+    setQuickSuggestions([]);
+    composerInputRef.current?.focus();
+  }
+
+  function cancelReply() {
+    setReplyTarget(null);
+  }
+
+  async function copyMessageTextAction(message: ChatMessage) {
+    const text = messageCopyText(message);
+    if (!text) {
+      setError("");
+      setNotice("Essa mensagem nao tem texto para copiar.");
+      return;
+    }
+    if (!navigator.clipboard?.writeText) {
+      setError("Nao foi possivel copiar a mensagem neste navegador.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setError("");
+      setNotice("Texto copiado.");
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }
+
   async function refreshPollingViews() {
     if (!bundle) return;
     const cr = await getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts");
@@ -556,8 +609,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (userSettings.chat_prefix_enabled && userSettings.chat_prefix_name.trim() && systemSettings.chat_prefix_roles.includes(sessionUser?.role || "")) {
         content = `${userSettings.chat_prefix_name.trim()}: ${content}`;
       }
-      await sendJson(bundle.auth, "/api/wa/send", { contact_id: selectedContact.id, content });
-      setDraft(""); setNotice("Mensagem enviada.");
+      await sendJson(bundle.auth, "/api/wa/send", { contact_id: selectedContact.id, content, ...buildReplyPayload() });
+      setDraft(""); setReplyTarget(null); setNotice("Mensagem enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusySend(false); }
@@ -572,8 +625,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       const form = new FormData();
       form.append("contact_id", String(selectedContact.id));
       form.append("caption", ""); form.append("file", file);
+      appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-media", form);
-      setNotice("Foto enviada.");
+      setReplyTarget(null); setNotice("Foto enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusyUpload(false); }
@@ -611,8 +665,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       const form = new FormData();
       form.append("contact_id", String(selectedContact.id));
       form.append("file", audioBlob, "gravacao.webm");
+      appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-audio", form);
-      setNotice("Audio enviado.");
+      setReplyTarget(null); setNotice("Audio enviado.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); discardRecording(); }
     finally { releaseAudioStream(); mediaRecorderRef.current = null; audioChunksRef.current = []; setRecording(false); setRecordingSeconds(0); setBusyAudio(false); }
@@ -649,8 +704,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setBusyUpload(true); setError(""); setNotice("");
       const form = new FormData();
       form.append("contact_id", String(selectedContact.id)); form.append("caption", ""); form.append("file", file);
+      appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-media", form);
-      setNotice(`${label} enviado.`);
+      setReplyTarget(null); setNotice(`${label} enviado.`);
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusyUpload(false); }
@@ -663,7 +719,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setError(""); setNotice("");
       const pos = await new Promise<GeolocationPosition>((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 10000 }));
-      await sendJson(bundle.auth, "/api/wa/send-location", { contact_id: selectedContact.id, latitude: pos.coords.latitude, longitude: pos.coords.longitude });
+      await sendJson(bundle.auth, "/api/wa/send-location", { contact_id: selectedContact.id, latitude: pos.coords.latitude, longitude: pos.coords.longitude, ...buildReplyPayload() });
       setNotice("Localização enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { const geo = e as { code?: number }; setError(geo.code ? "Permissão de localização negada ou tempo esgotado." : errorText(e)); }
@@ -770,6 +826,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, novosUnread, meusUnread, nqUnread, equipeUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
+    replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,
     draft, setDraft, busySend, busyUpload, busyAudio, quickSuggestions, setQuickSuggestions,
     sendTextMessage, submitText, submitMedia, submitFile, sendLocation,
     handleDraftKeyDown, handleDraftChange, applyQuickMessage, handlePrimaryAction, handleImageSelected,

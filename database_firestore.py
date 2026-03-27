@@ -630,7 +630,8 @@ def get_transfer_history(contact_id, limit=50):
 def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     media_path="", media_mime="", media_id="",
                     latitude=None, longitude=None, filename="",
-                    status="received", timestamp_wa="", operator_id=None):
+                    status="received", timestamp_wa="", operator_id=None,
+                    reply_to_message_id=None, reply_to_preview="", reply_to_sender_name=""):
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
         if existing:
@@ -646,6 +647,9 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                 "status": status or existing.get("status", "received"),
                 "operator_id": operator_id if operator_id is not None else existing.get("operator_id"),
                 "timestamp_wa": _coerce_timestamp(timestamp_wa) or existing.get("timestamp_wa"),
+                "reply_to_message_id": reply_to_message_id if reply_to_message_id is not None else existing.get("reply_to_message_id"),
+                "reply_to_preview": reply_to_preview or existing.get("reply_to_preview", ""),
+                "reply_to_sender_name": reply_to_sender_name or existing.get("reply_to_sender_name", ""),
             }, merge=True)
             return existing["id"]
 
@@ -674,6 +678,9 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "department_id": (contact or {}).get("department_id"),
         "timestamp_wa": _coerce_timestamp(timestamp_wa),
         "created_at": created_at,
+        "reply_to_message_id": reply_to_message_id,
+        "reply_to_preview": reply_to_preview or "",
+        "reply_to_sender_name": reply_to_sender_name or "",
     })
 
     if contact:
