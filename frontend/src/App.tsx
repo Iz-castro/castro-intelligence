@@ -1,11 +1,57 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
-import type { ChatMessage } from "./types";
+import type { ChatMessage, Contact, Operator } from "./types";
+
+const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
+
+function withAlpha(hex: string, alpha: string) {
+  return `${hex}${alpha}`;
+}
+
+function operatorColor(seed: number | string) {
+  const text = String(seed || "operator");
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) hash = ((hash << 5) - hash + text.charCodeAt(index)) | 0;
+  return TEAM_OPERATOR_COLORS[Math.abs(hash) % TEAM_OPERATOR_COLORS.length];
+}
+
+function operatorLogin(operator: Partial<Operator> | null | undefined) {
+  return String(operator?.username || operator?.email?.split("@")[0] || operator?.display_name || "").trim();
+}
+
+function operatorInitial(operator: Partial<Operator> | null | undefined) {
+  return (operatorLogin(operator) || "?").slice(0, 1).toUpperCase();
+}
+
+function findAssignedOperator(contact: Contact | null | undefined, operators: Operator[]) {
+  if (!contact?.assigned_to) return null;
+  return operators.find((operator) => operator.id === contact.assigned_to) || null;
+}
+
+function findMessageOperator(message: ChatMessage, operators: Operator[], selectedContact: Contact | null) {
+  if (message.operator_id) {
+    const operator = operators.find((item) => item.id === message.operator_id);
+    if (operator) return operator;
+  }
+  if (message.operator_name) {
+    const byName = operators.find((item) => item.display_name === message.operator_name);
+    if (byName) return byName;
+  }
+  return findAssignedOperator(selectedContact, operators);
+}
+
+function operatorAccentStyle(color: string | null): CSSProperties | undefined {
+  if (!color) return undefined;
+  return {
+    borderColor: withAlpha(color, "55"),
+    boxShadow: `inset 4px 0 0 ${color}`,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Small inline sub-components (consume context via useCrm)
@@ -96,15 +142,71 @@ function NavBar() {
 function ContactList() {
   const { activeView, filteredContacts, selectedContactId, setSelectedContactId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
   const viewTitle = activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
+  const visibleTeamOperators = activeView === "equipe"
+    ? operators
+      .filter((operator) => operator.id !== sessionUser?.id && filteredContacts.some((contact) => contact.assigned_to === operator.id))
+      .sort((left, right) => left.display_name.localeCompare(right.display_name))
+    : [];
   return (
     <aside className="panel sidebar">
-      <div className="panel-head"><div><p className="eyebrow">{viewTitle}</p><h2>{filteredContacts.length} conversa{filteredContacts.length !== 1 ? "s" : ""}</h2></div></div>
+      <div className={`panel-head ${activeView === "equipe" ? "panel-head--stacked" : ""}`}>
+        <div><p className="eyebrow">{viewTitle}</p><h2>{filteredContacts.length} conversa{filteredContacts.length !== 1 ? "s" : ""}</h2></div>
+        {activeView === "equipe" && visibleTeamOperators.length ? (
+          <div className="operator-presence-strip" aria-label="Operadores com conversas visiveis">
+            {visibleTeamOperators.map((operator) => {
+              const color = operatorColor(operator.id);
+              return (
+                <span
+                  key={operator.id}
+                  className="operator-presence-dot"
+                  title={operator.display_name}
+                  aria-label={operator.display_name}
+                  style={{ borderColor: withAlpha(color, "55"), background: `linear-gradient(135deg, ${withAlpha(color, "2e")}, ${withAlpha(color, "14")})`, color }}
+                >
+                  {operatorInitial(operator)}
+                </span>
+              );
+            })}
+          </div>
+        ) : null}
+      </div>
       <div className="toolbar">
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar contato" />
         {activeView === "meus" && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
       </div>
-      <div className="contact-list">{filteredContacts.map((contact) => <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""}`} onClick={() => setSelectedContactId(contact.id)}><div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div><div className="contact-copy"><div className="row"><strong>{contact.display_name}</strong><span>{when(contact.last_message_at)}</span></div><div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div><div className="row"><span className="chip">{contact.qualification || "novo"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div></div></button>)}{!filteredContacts.length ? <div className="empty">{activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}</div>
+      <div className="contact-list">
+        {filteredContacts.map((contact) => {
+          const assignedOperator = activeView === "equipe" ? findAssignedOperator(contact, operators) : null;
+          const accent = assignedOperator ? operatorColor(assignedOperator.id) : null;
+          return (
+            <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={() => setSelectedContactId(contact.id)} style={operatorAccentStyle(accent)}>
+              <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
+              <div className="contact-copy">
+                <div className="row">
+                  <strong>{contact.display_name}</strong>
+                  <div className="contact-meta">
+                    {assignedOperator ? (
+                      <span
+                        className="contact-operator-dot"
+                        title={assignedOperator.display_name}
+                        aria-label={assignedOperator.display_name}
+                        style={{ borderColor: withAlpha(accent || "#0f766e", "55"), background: withAlpha(accent || "#0f766e", "18"), color: accent || "#0f766e" }}
+                      >
+                        {operatorInitial(assignedOperator)}
+                      </span>
+                    ) : null}
+                    <span>{when(contact.last_message_at)}</span>
+                  </div>
+                </div>
+                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div>
+                <div className="row"><span className="chip">{contact.qualification || "novo"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div>
+              </div>
+            </button>
+          );
+        })}
+        {!filteredContacts.length ? <div className="empty">{activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
+      </div>
     </aside>
   );
 }
@@ -147,11 +249,13 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   const hasDraft = Boolean(draft.trim());
   const [openMessageMenuId, setOpenMessageMenuId] = useState<number | null>(null);
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
   const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
+  const selectedOperator = activeView === "equipe" ? findAssignedOperator(selectedContact, operators) : null;
+  const selectedOperatorColor = selectedOperator ? operatorColor(selectedOperator.id) : null;
   useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
 
   // Scroll management — must live here (not in CrmProvider) because messagesRef is attached to a DOM node inside this component
@@ -240,6 +344,19 @@ function ChatPanel() {
         <div className="contact-banner">
           <div>
             <strong>{selectedContact.display_name}</strong>
+            {selectedOperator ? (
+              <div className="contact-operator-chip">
+                <span
+                  className="contact-operator-dot"
+                  title={selectedOperator.display_name}
+                  aria-label={selectedOperator.display_name}
+                  style={{ borderColor: withAlpha(selectedOperatorColor || "#0f766e", "55"), background: withAlpha(selectedOperatorColor || "#0f766e", "18"), color: selectedOperatorColor || "#0f766e" }}
+                >
+                  {operatorInitial(selectedOperator)}
+                </span>
+                <span className="sub" style={{ color: selectedOperatorColor || undefined }}>{selectedOperator.display_name}</span>
+              </div>
+            ) : null}
             <div className="sub">{selectedContact.phone_formatted || selectedContact.wa_id} · {selectedContact.assigned_name || "Fila aberta"}</div>
             {selectedContact.attendance_protocol ? <div className="sub" style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "0.72rem", marginTop: "0.2rem" }}>{selectedContact.attendance_protocol}{selectedContact.attendance_started_at ? ` · inicio ${when(selectedContact.attendance_started_at)}` : ""}</div> : null}
           </div>
@@ -273,8 +390,10 @@ function ChatPanel() {
           {(visibleMessagesFiltered ?? visibleMessages).map((message) => {
             const canInteract = message.direction !== "system";
             const isMenuOpen = openMessageMenuId === message.id;
+            const bubbleOperator = activeView === "equipe" && message.direction === "outbound" ? findMessageOperator(message, operators, selectedContact) : null;
+            const bubbleColor = bubbleOperator ? operatorColor(bubbleOperator.id) : null;
             return (
-              <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""}`}>
+              <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""}`} style={operatorAccentStyle(bubbleColor)}>
                 {canInteract ? (
                   <div className="bubble-menu-anchor" ref={isMenuOpen ? activeMessageMenuRef : null}>
                     <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Acoes da mensagem" aria-expanded={isMenuOpen}>v</button>
@@ -286,7 +405,7 @@ function ChatPanel() {
                     ) : null}
                   </div>
                 ) : null}
-                <header><strong>{messageSenderLabel(message)}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
+                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message)}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
                 {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
                 <MessageMedia message={message} />

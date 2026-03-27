@@ -1209,7 +1209,7 @@ async def list_operators(current_user: dict = Depends(get_current_user)):
     users = get_all_users()
     return [
         {
-            "id": u["id"], "display_name": u["display_name"],
+            "id": u["id"], "username": u.get("username", ""), "display_name": u["display_name"],
             "department_name": u.get("department_name", ""),
             "department_id": u.get("department_id"),
             "avatar_path": u.get("avatar_path", ""),

@@ -253,6 +253,33 @@ button { cursor: pointer; }
   gap: 0.75rem;
 }
 
+.panel-head--stacked {
+  align-items: flex-start;
+}
+
+.operator-presence-strip {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.operator-presence-dot,
+.contact-operator-dot {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .panel-head h2,
 .card h3 { margin: 0; }
 
@@ -347,6 +374,10 @@ textarea:focus {
   color: inherit;
 }
 
+.contact--team-accent {
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
 .contact.active {
   border-color: rgba(15, 118, 110, 0.2);
   background: rgba(15, 118, 110, 0.08);
@@ -367,6 +398,22 @@ textarea:focus {
 .avatar img { width: 100%; height: 100%; object-fit: cover; }
 .contact-copy { min-width: 0; }
 .contact-copy strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.contact-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.contact-operator-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
+}
 
 .alert {
   border-radius: 16px;
@@ -480,6 +527,10 @@ textarea:focus {
   align-self: center;
   max-width: 100%;
   background: var(--bubble-sys);
+}
+
+.bubble--team-accent {
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 .bubble header,
 .bubble footer {

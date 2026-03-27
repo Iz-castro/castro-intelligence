@@ -47,6 +47,7 @@ export type Department = {
 
 export type Operator = {
   id: number;
+  username?: string;
   display_name: string;
   department_id?: number | null;
   department_name?: string;

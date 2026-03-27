@@ -53,6 +53,7 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     media_mime: String(record.media_mime || ""),
     filename: String(record.filename || ""),
     status: String(record.status || ""),
+    operator_id: record.operator_id == null ? null : num(record.operator_id),
     operator_name: String(record.operator_name || ""),
     created_at: iso(record.created_at),
     timestamp_wa: iso(record.timestamp_wa),
