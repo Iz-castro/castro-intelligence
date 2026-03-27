@@ -1,0 +1,12 @@
+# This file specifies files that are not uploaded to Google Cloud.
+# It follows the same pattern syntax as .gitignore, with the addition of
+# "#!include" directives for including the contents of another file.
+#
+# For more information, run:
+#   gcloud topic gcloudignore
+
+.gcloudignore
+.git
+.gitignore
+docs/
+#!include:.gitignore
