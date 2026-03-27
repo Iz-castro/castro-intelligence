@@ -776,9 +776,11 @@ def mark_wa_conversation_read(contact_id):
     )
     batch = get_firestore_client().batch()
     count = 0
+    total_updated = 0
     for snapshot in q.stream():
         batch.set(snapshot.reference, {"status": "read"}, merge=True)
         count += 1
+        total_updated += 1
         if count >= 400:  # Firestore batch limit = 500
             batch.commit()
             batch = get_firestore_client().batch()
@@ -786,6 +788,7 @@ def mark_wa_conversation_read(contact_id):
     if count > 0:
         batch.commit()
     document("wa_contacts", contact_id).set({"unread_count": 0}, merge=True)
+    return total_updated
 
 
 def log_audit(user_id, action, detail="", ip_address=""):

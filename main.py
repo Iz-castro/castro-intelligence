@@ -717,7 +717,6 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
 @app.get("/api/wa/messages/{contact_id}")
 async def wa_messages(contact_id: int, limit: int = Query(default=10, ge=1, le=200), current_user: dict = Depends(get_current_user)):
     messages = get_wa_conversation(contact_id, limit=limit)
-    mark_wa_conversation_read(contact_id)
     return {"messages": messages}
 
 
@@ -1051,6 +1050,17 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
     update_wa_contact_qualification(contact_id, qualification, notes)
     log_audit(current_user["id"], "CONTACT_QUALIFY", f"Contato {contact_id}: {qualification}")
     return {"status": "ok"}
+
+
+@app.post("/api/wa/contact/{contact_id}/read")
+async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_current_user)):
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    if int(contact.get("unread_count", 0) or 0) <= 0:
+        return {"status": "ok", "updated_count": 0}
+    updated_count = mark_wa_conversation_read(contact_id)
+    return {"status": "ok", "updated_count": updated_count}
 
 
 @app.delete("/api/wa/contact/{contact_id}")

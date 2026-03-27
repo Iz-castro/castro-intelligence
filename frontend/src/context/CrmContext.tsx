@@ -226,6 +226,10 @@ const DEFAULT_USER_SETTINGS: UserSettings = {
   quick_messages: [],
 };
 
+const CONVERSATION_OPEN_DEBOUNCE_MS = 350;
+const CONVERSATION_READ_DEBOUNCE_MS = 1200;
+const RECENT_CONVERSATION_CACHE_LIMIT = 12;
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -241,6 +245,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
@@ -328,10 +333,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const settingsMenuRef = useRef<HTMLDivElement | null>(null);
   const prevMessageCountRef = useRef(0);
   const scrollIntentRef = useRef<"load_older" | "normal">("normal");
+  const markingReadContactIdRef = useRef<number | null>(null);
+  const selectedContactIdRef = useRef<number | null>(null);
+  const messageCacheRef = useRef<Map<number, ChatMessage[]>>(new Map());
 
   // -- Derived --
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
   const selectedContact = contacts.find((c) => c.id === selectedContactId) || null;
+  const activeContact = contacts.find((c) => c.id === activeConversationId) || null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
 
   const novosContacts = contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado");
@@ -388,6 +397,60 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setRecordingSeconds(0);
   }
 
+  function rememberConversationMessages(contactId: number, nextMessages: ChatMessage[]) {
+    const cache = messageCacheRef.current;
+    if (cache.has(contactId)) cache.delete(contactId);
+    cache.set(contactId, nextMessages);
+    while (cache.size > RECENT_CONVERSATION_CACHE_LIMIT) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey == null) break;
+      cache.delete(oldestKey);
+    }
+  }
+
+  function commitConversationMessages(contactId: number, nextMessages: ChatMessage[]) {
+    rememberConversationMessages(contactId, nextMessages);
+    if (selectedContactIdRef.current === contactId) {
+      startTransition(() => setMessages(nextMessages));
+    }
+  }
+
+  function restoreConversationFromCache(contactId: number | null) {
+    if (!contactId) {
+      startTransition(() => setMessages([]));
+      return;
+    }
+    const cachedMessages = messageCacheRef.current.get(contactId) || [];
+    startTransition(() => setMessages(cachedMessages));
+  }
+
+  function applyConversationReadLocally(contactId: number) {
+    const cachedMessages = messageCacheRef.current.get(contactId);
+    if (cachedMessages) {
+      rememberConversationMessages(contactId, cachedMessages.map((message) => (
+        message.direction === "inbound" && message.status === "received"
+          ? { ...message, status: "read" }
+          : message
+      )));
+    }
+    startTransition(() => {
+      setContacts((prev) => prev.map((contact) => (
+        contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
+      )));
+      if (selectedContactIdRef.current === contactId) {
+        setMessages((prev) => {
+          const nextMessages = prev.map((message) => (
+            message.contact_id === contactId && message.direction === "inbound" && message.status === "received"
+              ? { ...message, status: "read" }
+              : message
+          ));
+          rememberConversationMessages(contactId, nextMessages);
+          return nextMessages;
+        });
+      }
+    });
+  }
+
   // =========================================================================
   // Effects
   // =========================================================================
@@ -437,6 +500,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!contacts.length) { setSelectedContactId(null); return; }
     if (!selectedContactId || !contacts.some((c) => c.id === selectedContactId)) setSelectedContactId(contacts[0].id);
   }, [contacts, selectedContactId]);
+
+  // Track the selected conversation and restore its recent in-memory cache immediately.
+  useEffect(() => {
+    selectedContactIdRef.current = selectedContactId;
+    restoreConversationFromCache(selectedContactId);
+    if (!selectedContactId) {
+      setActiveConversationId(null);
+      return undefined;
+    }
+    const timeoutId = window.setTimeout(() => setActiveConversationId(selectedContactId), CONVERSATION_OPEN_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [selectedContactId]);
 
   // Reset detail state on contact change
   useEffect(() => {
@@ -489,13 +564,41 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     releaseAudioStream();
   }, []);
 
-  // Data subscription (contacts + messages)
+  // Snapshot: contacts
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
     let disposed = false;
+    if (!snapshotMode || !config.firestore.collections.wa_contacts) return undefined;
+    const unsubscribe = onSnapshot(
+      query(collection(bundle.db, config.firestore.collections.wa_contacts), orderBy("last_message_at", "desc"), firestoreLimit(50)),
+      (snap) => startTransition(() => setContacts(snap.docs.map((doc) => normalizeContact(doc.data(), doc.id)))),
+      (e) => !disposed && setError(`Snapshot de contatos falhou: ${errorText(e)}`),
+    );
+    return () => { disposed = true; unsubscribe(); };
+  }, [bundle, config, sessionUser, snapshotMode]);
+
+  // Snapshot: selected conversation
+  useEffect(() => {
+    if (!bundle || !sessionUser || !config) return undefined;
+    if (!snapshotMode) return undefined;
+    if (!activeConversationId || !config.firestore.collections.wa_messages) return undefined;
+    let disposed = false;
+    const unsubscribe = onSnapshot(
+      query(collection(bundle.db, config.firestore.collections.wa_messages), where("contact_id", "==", activeConversationId), orderBy("created_at", "desc"), firestoreLimit(messageLimit)),
+      (snap) => {
+        const nextMessages = snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
+        commitConversationMessages(activeConversationId, nextMessages);
+      },
+      (e) => !disposed && setError(`Snapshot da conversa falhou: ${errorText(e)}`),
+    );
+    return () => { disposed = true; unsubscribe(); };
+  }, [activeConversationId, bundle, config, sessionUser, snapshotMode, messageLimit]);
+
+  // Polling fallback
+  useEffect(() => {
+    if (!bundle || !sessionUser || !config || snapshotMode) return undefined;
+    let disposed = false;
     let intervalId = 0;
-    let unsubContacts: () => void = () => {};
-    let unsubMessages: () => void = () => {};
 
     const loadContacts = async () => {
       const r = await getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts");
@@ -503,33 +606,58 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     };
     const loadMessages = async (cid: number) => {
       const r = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${cid}?limit=${messageLimit}`);
-      if (!disposed) startTransition(() => setMessages(r.messages));
+      if (!disposed) commitConversationMessages(cid, r.messages);
+    };
+    const tick = async () => {
+      try {
+        await loadContacts();
+        if (activeConversationId) await loadMessages(activeConversationId);
+      } catch (e) {
+        if (!disposed) setError(errorText(e));
+      }
     };
 
-    if (snapshotMode && config.firestore.collections.wa_contacts) {
-      unsubContacts = onSnapshot(
-        query(collection(bundle.db, config.firestore.collections.wa_contacts), orderBy("last_message_at", "desc"), firestoreLimit(50)),
-        (snap) => startTransition(() => setContacts(snap.docs.map((doc) => normalizeContact(doc.data(), doc.id)))),
-        (e) => !disposed && setError(`Snapshot de contatos falhou: ${errorText(e)}`),
-      );
-      if (selectedContactId && config.firestore.collections.wa_messages) {
-        void loadMessages(selectedContactId);
-        unsubMessages = onSnapshot(
-          query(collection(bundle.db, config.firestore.collections.wa_messages), where("contact_id", "==", selectedContactId), orderBy("created_at", "desc"), firestoreLimit(messageLimit)),
-          (snap) => startTransition(() => setMessages(snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => (a.created_at || "").localeCompare(b.created_at || "")))),
-          (e) => !disposed && setError(`Snapshot da conversa falhou: ${errorText(e)}`),
-        );
-      } else {
-        startTransition(() => setMessages([]));
-      }
-    } else {
-      const tick = async () => { try { await loadContacts(); if (selectedContactId) await loadMessages(selectedContactId); } catch (e) { if (!disposed) setError(errorText(e)); } };
-      void tick();
-      intervalId = window.setInterval(() => { void tick(); }, config.polling_interval_ms || 15000);
-    }
+    void tick();
+    intervalId = window.setInterval(() => { void tick(); }, config.polling_interval_ms || 15000);
+    return () => { disposed = true; if (intervalId) window.clearInterval(intervalId); };
+  }, [activeConversationId, bundle, config, sessionUser, snapshotMode, messageLimit]);
 
-    return () => { disposed = true; unsubContacts(); unsubMessages(); if (intervalId) window.clearInterval(intervalId); };
-  }, [bundle, config, sessionUser, selectedContactId, snapshotMode, messageLimit]);
+  // Mark selected conversation as read explicitly
+  useEffect(() => {
+    if (!bundle || !sessionUser || !activeConversationId) return undefined;
+    if (selectedContactId !== activeConversationId) return undefined;
+    const unreadCount = activeContact?.unread_count ?? activeContact?.unread ?? 0;
+    if (markingReadContactIdRef.current && markingReadContactIdRef.current !== activeConversationId) {
+      markingReadContactIdRef.current = null;
+    }
+    if (unreadCount <= 0) {
+      if (markingReadContactIdRef.current === activeConversationId) markingReadContactIdRef.current = null;
+      return undefined;
+    }
+    if (markingReadContactIdRef.current === activeConversationId) return undefined;
+
+    let cancelled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (cancelled) return;
+      markingReadContactIdRef.current = activeConversationId;
+      void sendJson<{ status: string; updated_count: number }>(bundle.auth, `/api/wa/contact/${activeConversationId}/read`, {})
+        .then(() => {
+          if (cancelled) return;
+          markingReadContactIdRef.current = null;
+          applyConversationReadLocally(activeConversationId);
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          markingReadContactIdRef.current = null;
+          setError(errorText(e));
+        });
+    }, CONVERSATION_READ_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, bundle, selectedContactId, sessionUser]);
 
   // =========================================================================
   // Actions
@@ -588,7 +716,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     startTransition(() => setContacts(cr.contacts));
     if (selectedContactId) {
       const mr = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${selectedContactId}?limit=${messageLimit}`);
-      startTransition(() => setMessages(mr.messages));
+      commitConversationMessages(selectedContactId, mr.messages);
     }
   }
 

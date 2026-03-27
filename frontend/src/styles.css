@@ -25,6 +25,9 @@
   --menu-solid-bg: #fffdf9;
   --menu-solid-border: rgba(67, 49, 30, 0.18);
   --menu-solid-shadow: 0 20px 44px rgba(63, 44, 24, 0.22);
+  --panel-solid-bg: #faf6ef;
+  --panel-solid-strong: #fffdf9;
+  --panel-solid-soft: #f3ede3;
   --hero-bg: linear-gradient(180deg, rgba(255, 251, 244, 0.96), rgba(255, 248, 238, 0.82));
   --page-bg:
     radial-gradient(circle at top left, rgba(154, 89, 39, 0.18), transparent 30%),
@@ -60,6 +63,9 @@
   --menu-solid-bg: #1b232d;
   --menu-solid-border: rgba(255, 255, 255, 0.14);
   --menu-solid-shadow: 0 20px 44px rgba(0, 0, 0, 0.42);
+  --panel-solid-bg: #18202a;
+  --panel-solid-strong: #1b232d;
+  --panel-solid-soft: #222c37;
   --hero-bg: linear-gradient(180deg, rgba(22, 27, 34, 0.98), rgba(18, 22, 30, 0.96));
   --page-bg: linear-gradient(145deg, #0f1117, #131820);
 }
@@ -769,10 +775,10 @@ textarea:focus {
   bottom: calc(100% + 0.7rem);
   min-width: 190px;
   padding: 0.35rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--menu-solid-border);
   border-radius: 18px;
-  background: var(--attach-bg);
-  box-shadow: var(--shadow);
+  background: var(--menu-solid-bg);
+  box-shadow: var(--menu-solid-shadow);
 }
 
 .bubble-menu.attach-menu {
@@ -979,10 +985,10 @@ textarea:focus {
   top: calc(100% + 0.5rem);
   min-width: 200px;
   padding: 0.35rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--menu-solid-border);
   border-radius: 18px;
-  background: var(--attach-bg);
-  box-shadow: var(--shadow);
+  background: var(--menu-solid-bg);
+  box-shadow: var(--menu-solid-shadow);
   z-index: 30;
 }
 
@@ -1089,9 +1095,9 @@ textarea:focus {
   right: 0;
   width: 370px;
   height: 100vh;
-  background: var(--panel);
+  background: var(--panel-solid-bg);
   border-left: 1px solid var(--border);
-  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.08);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.18);
   z-index: 50;
   display: flex;
   flex-direction: column;
@@ -1110,7 +1116,7 @@ textarea:focus {
   gap: 0.5rem;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--border);
-  background: var(--panel-strong);
+  background: var(--panel-solid-strong);
   min-height: 52px;
 }
 
@@ -1174,7 +1180,7 @@ textarea:focus {
 }
 
 .gc-conv-item:hover {
-  background: var(--panel-card);
+  background: var(--panel-solid-soft);
 }
 
 .gc-conv-item__avatar {
@@ -1315,7 +1321,7 @@ textarea:focus {
   gap: 0.4rem;
   padding: 0.6rem 0.75rem;
   border-top: 1px solid var(--border);
-  background: var(--composer-bg);
+  background: var(--panel-solid-strong);
 }
 
 .gc-panel__input {
@@ -1326,7 +1332,7 @@ textarea:focus {
   padding: 0.5rem 0.65rem;
   font-size: 0.88rem;
   font-family: inherit;
-  background: var(--panel);
+  background: var(--panel-solid-bg);
   color: var(--text);
   outline: none;
   max-height: 100px;
