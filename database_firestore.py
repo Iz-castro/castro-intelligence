@@ -731,6 +731,14 @@ def get_wa_message_by_id(message_id: int):
     return None
 
 
+def get_wa_message_by_wa_message_id(wa_message_id):
+    if not wa_message_id:
+        return None
+    for snap in collection("wa_messages").where("wa_message_id", "==", wa_message_id).limit(1).stream():
+        return _raw_doc(snap)
+    return None
+
+
 def update_wa_message_transcription(db_id: int, transcription: str):
     document("wa_messages", db_id).set({"transcription": transcription}, merge=True)
 

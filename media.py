@@ -553,7 +553,7 @@ async def upload_media_to_whatsapp(file_content, mime_type, filename=""):
             return None
 
 
-async def send_media_message(wa_id, media_id, msg_type, caption=""):
+async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_message_id=""):
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         return None
 
@@ -574,6 +574,8 @@ async def send_media_message(wa_id, media_id, msg_type, caption=""):
         "type": msg_type,
         msg_type: media_object,
     }
+    if reply_wa_message_id:
+        payload["context"] = {"message_id": reply_wa_message_id}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:

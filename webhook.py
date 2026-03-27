@@ -14,10 +14,74 @@ from config import REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET, FEATURE_AUDIO
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit,
     update_wa_message_transcription,
+    get_user_by_id, get_wa_message_by_wa_message_id,
 )
 from media import download_media
 
 logger = logging.getLogger("castro_crm.webhook")
+
+
+def _fallback_reply_preview(message):
+    content = str(message.get("content") or "").strip()
+    if content:
+        return content
+
+    transcription = str(message.get("transcription") or "").strip()
+    if transcription:
+        return transcription
+
+    filename = str(message.get("filename") or "").strip()
+    msg_type = str(message.get("msg_type") or "").strip().lower()
+    labels = {
+        "audio": "Audio",
+        "document": "Documento",
+        "gif": "Video",
+        "image": "Imagem",
+        "location": "Localizacao",
+        "sticker": "Figurinha",
+        "template": "Template",
+        "video": "Video",
+    }
+    if filename and msg_type in labels:
+        return f"{labels[msg_type]}: {filename}"
+    return labels.get(msg_type, "Mensagem")
+
+
+def _fallback_reply_sender(message):
+    direction = str(message.get("direction") or "").strip().lower()
+    if direction == "inbound":
+        return "Cliente"
+    if direction == "system":
+        return "Sistema"
+    operator_id = message.get("operator_id")
+    operator = get_user_by_id(operator_id) if operator_id else None
+    return str((operator or {}).get("display_name") or "Equipe")
+
+
+def _resolve_reply_reference(contact_id, message_context):
+    context = message_context if isinstance(message_context, dict) else {}
+    original_wa_message_id = str(context.get("id") or "").strip()
+    if not original_wa_message_id:
+        return {}
+
+    original_message = get_wa_message_by_wa_message_id(original_wa_message_id)
+    if not original_message:
+        logger.info("Resposta recebida sem mensagem original local | wa_context_id=%s", original_wa_message_id[:32])
+        return {}
+    if int(original_message.get("contact_id") or 0) != int(contact_id):
+        logger.warning(
+            "Resposta recebida com contexto de outro contato | contact_id=%s original_contact_id=%s wa_context_id=%s",
+            contact_id,
+            original_message.get("contact_id"),
+            original_wa_message_id[:32],
+        )
+        return {}
+
+    return {
+        "reply_to_message_id": int(original_message.get("id") or 0) or None,
+        "reply_to_preview": _fallback_reply_preview(original_message)[:280],
+        "reply_to_sender_name": _fallback_reply_sender(original_message)[:80],
+    }
 
 
 def validate_signature(payload_bytes, signature_header):
@@ -84,6 +148,7 @@ async def _process_messages(value, ws_notify_callback):
 
         # Registrar ou atualizar contato
         contact_id = upsert_wa_contact(wa_id, contact_name)
+        reply_fields = _resolve_reply_reference(contact_id, msg.get("context"))
 
         # Extrair conteudo conforme o tipo
         content = ""
@@ -206,6 +271,7 @@ async def _process_messages(value, ws_notify_callback):
             filename=filename,
             status="received",
             timestamp_wa=ts_iso,
+            **reply_fields,
         )
 
         logger.info(
@@ -250,6 +316,7 @@ async def _process_messages(value, ws_notify_callback):
                     "longitude": longitude,
                     "filename": filename,
                     "timestamp": ts_iso,
+                    **reply_fields,
                 },
             })
 

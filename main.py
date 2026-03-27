@@ -263,6 +263,18 @@ def _build_reply_fields(contact_id: int, reply_to_message_id: int | None, reply_
     }
 
 
+def _build_reply_context(contact_id: int, reply_to_message_id: int | None) -> dict:
+    if reply_to_message_id is None:
+        return {}
+    reply_message = get_wa_message_by_id(reply_to_message_id)
+    if not reply_message or int(reply_message.get("contact_id") or 0) != int(contact_id):
+        raise HTTPException(status_code=400, detail="Mensagem de resposta invalida para este contato")
+    wa_message_id = str(reply_message.get("wa_message_id") or "").strip()
+    if not wa_message_id:
+        return {}
+    return {"context": {"message_id": wa_message_id}}
+
+
 def _validate_image_bytes(content):
     for magic, mime in AVATAR_MAGIC_BYTES.items():
         if content[:len(magic)] == magic:
@@ -805,6 +817,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
+    reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
 
     wa_id = contact["wa_id"]
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -821,6 +834,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
         "to": wa_id,
         "type": "location",
         "location": location_obj,
+        **reply_context,
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -861,11 +875,12 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
+    reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
 
     wa_id = _wa_target(contact["wa_id"])
     url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": body.content}}
+    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": body.content}, **reply_context}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
@@ -905,6 +920,7 @@ async def wa_send_media(
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
+    reply_context = _build_reply_context(contact_id, reply_to_message_id)
 
     file_content = await file.read()
     if len(file_content) > 16 * 1024 * 1024:
@@ -922,7 +938,7 @@ async def wa_send_media(
     if not media_id:
         raise HTTPException(status_code=502, detail="Falha no upload para a Meta")
 
-    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption)
+    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption, reply_context.get("context", {}).get("message_id", ""))
     if not send_result or "error" in send_result:
         error = send_result.get("error", "Erro desconhecido") if send_result else "Sem resposta"
         raise HTTPException(status_code=502, detail=str(error))
@@ -961,6 +977,7 @@ async def wa_send_audio(
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
+    reply_context = _build_reply_context(contact_id, reply_to_message_id)
 
     raw_content = await file.read()
     if len(raw_content) > 16 * 1024 * 1024:
@@ -985,7 +1002,7 @@ async def wa_send_audio(
         raise HTTPException(status_code=502, detail="Falha no upload de audio para a Meta")
 
     # Enviar mensagem de audio
-    send_result = await send_media_message(contact["wa_id"], media_id, "audio")
+    send_result = await send_media_message(contact["wa_id"], media_id, "audio", reply_wa_message_id=reply_context.get("context", {}).get("message_id", ""))
     if not send_result or "error" in send_result:
         error = send_result.get("error", "Erro desconhecido") if send_result else "Sem resposta"
         raise HTTPException(status_code=502, detail=str(error))
