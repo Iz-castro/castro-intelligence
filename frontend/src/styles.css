@@ -825,6 +825,7 @@ textarea:focus {
   left: 0;
   bottom: calc(100% + 0.7rem);
   min-width: 190px;
+  z-index: 30;
   padding: 0.35rem;
   border: 1px solid var(--menu-solid-border);
   border-radius: 18px;
