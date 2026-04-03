@@ -27,6 +27,26 @@ Em termos práticos:
 - o runtime atual serve apenas o build React em `frontend_dist/`
 - o chat interno legado por WebSocket/HTML saiu do caminho operacional
 
+## Stack principal
+
+Backend:
+
+- `FastAPI`
+- `httpx`
+- `google-cloud-firestore`
+- `google-cloud-storage`
+- `firebase-admin`
+- `google-api-python-client`
+- `faster-whisper`
+- `ffmpeg`
+
+Frontend:
+
+- `React 18`
+- `TypeScript`
+- `Vite`
+- `firebase` SDK
+
 ## Camadas do sistema
 
 ### Frontend
@@ -40,6 +60,22 @@ Responsabilidades:
 - consumir `GET /api/client-config`
 - assinar colecoes Firestore liberadas pelas rules
 - chamar rotas REST para envio, handoff, admin e operacoes que exigem segredo de servidor
+
+Capacidades ativas no frontend:
+
+- login com Google
+- listagem de contatos WhatsApp
+- views `novos`, `meus`, `nao_qualificados` e `equipe`
+- leitura de mensagens por snapshot ou polling
+- envio de texto, imagem, video, documento, audio e localizacao
+- reply com contexto
+- transcricao manual de audio
+- qualificacao, notas e assumir atendimento
+- transferencia entre operadores e departamentos
+- edicao basica de role e departamento por admin
+- configuracoes de prefixo de mensagem
+- mensagens rapidas por usuario e globais
+- painel slide-in de Google Chat
 
 Rotas HTML entregues pelo backend:
 
@@ -92,6 +128,16 @@ Colecoes backend principais:
 - `media_assets`
 - `_meta`
 
+Entidades que mais importam no dia a dia:
+
+- `users`: cadastro interno do operador
+- `operator_profiles`: espelho seguro do operador autenticado
+- `wa_contacts`: resumo do atendimento por contato
+- `wa_messages`: historico completo de mensagens WhatsApp
+- `wa_transfer_log`: historico de handoff
+- `gc_conversations`: conversas do Google Chat com preview e nao lidas
+- `gc_messages`: mensagens e anexos do Google Chat
+
 ## Colecoes lidas pelo React
 
 O frontend recebe os nomes finais das colecoes por `/api/client-config`.
@@ -139,10 +185,32 @@ Entrada:
 - baixa midia quando necessario
 - pode transcrever audio inbound conforme feature flag
 
+Tipos tratados no inbound:
+
+- `text`
+- `image`
+- `audio`
+- `video`
+- `gif`
+- `sticker`
+- `document`
+- `location`
+- `contacts`
+- `reaction`
+- `unsupported`
+
 Saida:
 
 - o frontend usa rotas REST para enviar texto, midia, audio, localizacao e templates
 - o backend aplica regras de atribuicao, janela de 24h e contexto de reply
+
+Operacoes de atendimento mais importantes:
+
+- qualificar contato
+- assumir atendimento
+- transferir atendimento
+- marcar conversa como lida
+- arquivar e restaurar contato
 
 ### Midia
 
@@ -218,6 +286,51 @@ Conclusao:
 
 - o maior risco arquitetural restante nao e mais o legado
 - o ponto que mais pede maturidade agora e seguranca das rules e o desenho futuro do chat interno
+
+## Rotas de referencia
+
+Autenticacao:
+
+- `GET /api/session`
+- `GET /api/client-config`
+- `POST /api/login` apenas para responder `410 Gone`
+
+WhatsApp:
+
+- `GET /api/wa/contacts`
+- `GET /api/wa/messages/{contact_id}`
+- `POST /api/wa/send`
+- `POST /api/wa/send-media`
+- `POST /api/wa/send-audio`
+- `POST /api/wa/send-location`
+- `POST /api/wa/send-template`
+- `POST /api/wa/messages/{message_id}/transcribe`
+- `PUT /api/wa/contact/{contact_id}/qualify`
+- `POST /api/wa/contact/{contact_id}/read`
+- `POST /api/wa/transfer`
+- `POST /api/wa/assume/{contact_id}`
+- `GET /api/wa/transfer-history/{contact_id}`
+
+Usuarios e configuracoes:
+
+- `GET /api/operators`
+- `GET /api/departments`
+- `POST /api/admin/users`
+- `PUT /api/admin/users/{user_id}`
+- `DELETE /api/admin/users/{user_id}`
+- `GET /api/settings/system`
+- `PUT /api/settings/system`
+- `GET /api/settings/user`
+- `PUT /api/settings/user`
+
+Google Chat:
+
+- `GET /api/gc/conversations`
+- `GET /api/gc/messages/{conversation_id}`
+- `POST /api/gc/send`
+- `POST /api/gc/mark-read/{conversation_id}`
+- `GET /api/gc/spaces`
+- `POST /webhooks/google-chat`
 
 ## Leitura curta para quem chegar depois
 

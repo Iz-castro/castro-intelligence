@@ -49,4 +49,3 @@ frontend_dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
-docs/AI_AGENT_CONTEXT.md
