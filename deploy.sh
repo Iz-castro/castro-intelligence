@@ -98,12 +98,9 @@ import_dotenv "${SCRIPT_DIR}/.env"
 PROJECT_ID="${GCP_PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
 REGION="${GCP_REGION:-southamerica-east1}"
 SERVICE_NAME="${CLOUD_RUN_SERVICE:-castro-crm}"
-DATA_BACKEND="${DATA_BACKEND:-firestore}"
-AUTH_MODE="${AUTH_MODE:-firebase}"
-SQL_INSTANCE_NAME="${SQL_INSTANCE_NAME:-castro-crm-db}"
-DB_NAME="${DB_NAME:-castro_crm}"
-DB_USER="${DB_USER:-castro_app}"
-DB_PASSWORD="${DB_PASSWORD:-}"
+# O runtime foi consolidado em Firestore + Firebase Auth.
+DATA_BACKEND="firestore"
+AUTH_MODE="firebase"
 MEDIA_BUCKET="${FIREBASE_STORAGE_BUCKET:-${GCS_MEDIA_BUCKET:-${PROJECT_ID}-castro-crm-media}}"
 GCS_MEDIA_PREFIX="${GCS_MEDIA_PREFIX:-media}"
 FIRESTORE_COLLECTION_PREFIX="${FIRESTORE_COLLECTION_PREFIX:-castro_crm}"
@@ -129,8 +126,6 @@ WHATSAPP_APP_SECRET="${WHATSAPP_APP_SECRET:-}"
 WHATSAPP_PHONE_NUMBER_ID="${WHATSAPP_PHONE_NUMBER_ID:-}"
 WHATSAPP_WABA_ID="${WHATSAPP_WABA_ID:-}"
 BOOTSTRAP_ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-}"
-BOOTSTRAP_ADMIN_USERNAME="${BOOTSTRAP_ADMIN_USERNAME:-admin}"
-BOOTSTRAP_ADMIN_PASSWORD="${BOOTSTRAP_ADMIN_PASSWORD:-}"
 BOOTSTRAP_ADMIN_DISPLAY_NAME="${BOOTSTRAP_ADMIN_DISPLAY_NAME:-Administrador}"
 BOOTSTRAP_ADMIN_DEPARTMENT="${BOOTSTRAP_ADMIN_DEPARTMENT:-Geral}"
 JWT_EXPIRATION_MINUTES="${JWT_EXPIRATION_MINUTES:-480}"
@@ -144,14 +139,6 @@ require_value "WHATSAPP_TOKEN" "$WHATSAPP_TOKEN"
 require_value "WHATSAPP_VERIFY_TOKEN" "$WHATSAPP_VERIFY_TOKEN"
 require_value "WHATSAPP_APP_SECRET" "$WHATSAPP_APP_SECRET"
 require_value "WHATSAPP_PHONE_NUMBER_ID" "$WHATSAPP_PHONE_NUMBER_ID"
-
-if [[ "$DATA_BACKEND" == "sql" ]]; then
-    require_value "DB_PASSWORD" "$DB_PASSWORD"
-fi
-
-if [[ "$AUTH_MODE" == "legacy" ]]; then
-    require_value "BOOTSTRAP_ADMIN_PASSWORD" "$BOOTSTRAP_ADMIN_PASSWORD"
-fi
 
 echo "Projeto:  $PROJECT_ID"
 echo "Regiao:   $REGION"
@@ -170,10 +157,6 @@ SERVICES=(
   storage.googleapis.com
   firestore.googleapis.com
 )
-
-if [[ "$DATA_BACKEND" == "sql" ]]; then
-  SERVICES+=(sqladmin.googleapis.com)
-fi
 
 gcloud services enable "${SERVICES[@]}" --project "$PROJECT_ID" --quiet >/dev/null
 
@@ -219,17 +202,10 @@ gcloud storage buckets add-iam-policy-binding "gs://${MEDIA_BUCKET}" \
     --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
     --role "roles/storage.objectAdmin" >/dev/null
 
-if [[ "$DATA_BACKEND" == "sql" ]]; then
-    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-        --role "roles/cloudsql.client" \
-        --quiet >/dev/null
-else
-    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-        --role "roles/datastore.user" \
-        --quiet >/dev/null
-fi
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role "roles/datastore.user" \
+    --quiet >/dev/null
 
 APP_SECRET_NAME="${SERVICE_NAME}-secret-key"
 WA_TOKEN_SECRET_NAME="${SERVICE_NAME}-whatsapp-token"
@@ -248,24 +224,6 @@ set_gcp_secret "$PROJECT_ID" "$WA_VERIFY_SECRET_NAME" "$WHATSAPP_VERIFY_TOKEN"
 set_gcp_secret "$PROJECT_ID" "$WA_APP_SECRET_NAME" "$WHATSAPP_APP_SECRET"
 
 EXTRA_ARGS=()
-
-if [[ "$DATA_BACKEND" == "sql" ]]; then
-    INSTANCE_CONNECTION_NAME="$(gcloud sql instances describe "$SQL_INSTANCE_NAME" --project "$PROJECT_ID" --format="value(connectionName)")"
-    require_value "SQL_INSTANCE_NAME" "$INSTANCE_CONNECTION_NAME"
-    DB_USER_ENCODED="$(urlencode "$DB_USER")"
-    DB_PASSWORD_ENCODED="$(urlencode "$DB_PASSWORD")"
-    DATABASE_URL="postgresql+pg8000://${DB_USER_ENCODED}:${DB_PASSWORD_ENCODED}@/${DB_NAME}?unix_sock=/cloudsql/${INSTANCE_CONNECTION_NAME}/.s.PGSQL.5432"
-    DB_SECRET_NAME="${SERVICE_NAME}-database-url"
-    set_gcp_secret "$PROJECT_ID" "$DB_SECRET_NAME" "$DATABASE_URL"
-    SECRETS+=("DATABASE_URL=${DB_SECRET_NAME}:latest")
-    EXTRA_ARGS+=(--add-cloudsql-instances "$INSTANCE_CONNECTION_NAME")
-fi
-
-if [[ "$AUTH_MODE" == "legacy" ]]; then
-    BOOTSTRAP_PASSWORD_SECRET_NAME="${SERVICE_NAME}-bootstrap-admin-password"
-    set_gcp_secret "$PROJECT_ID" "$BOOTSTRAP_PASSWORD_SECRET_NAME" "$BOOTSTRAP_ADMIN_PASSWORD"
-    SECRETS+=("BOOTSTRAP_ADMIN_PASSWORD=${BOOTSTRAP_PASSWORD_SECRET_NAME}:latest")
-fi
 
 ENV_VARS=(
   "DATA_BACKEND=${DATA_BACKEND}"
@@ -302,13 +260,8 @@ ENV_VARS=(
   "WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE}"
   "WHISPER_DEVICE=${WHISPER_DEVICE}"
   "WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE}"
+  "BOOTSTRAP_ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL}"
 )
-
-if [[ "$AUTH_MODE" == "firebase" ]]; then
-  ENV_VARS+=("BOOTSTRAP_ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL}")
-else
-  ENV_VARS+=("BOOTSTRAP_ADMIN_USERNAME=${BOOTSTRAP_ADMIN_USERNAME}")
-fi
 
 echo ""
 echo "Iniciando deploy no Cloud Run..."

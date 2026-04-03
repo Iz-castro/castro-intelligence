@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 
-import html
 import logging
 import os
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import (
-    FastAPI, WebSocket, WebSocketDisconnect, Request,
+    FastAPI, Request,
     HTTPException, Depends, Query, UploadFile, File, Form,
 )
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse, Response
@@ -23,27 +22,25 @@ from config import (
     WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS,
-    BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_PASSWORD,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
-    CHAT_DELIVERY_MODE, POLLING_INTERVAL_MS, AUTH_MODE, USE_FIREBASE_AUTH,
+    CHAT_DELIVERY_MODE, POLLING_INTERVAL_MS, AUTH_MODE,
     FIRESTORE_PROJECT_ID, FIREBASE_STORAGE_BUCKET,
     FIREBASE_WEB_API_KEY, FIREBASE_WEB_AUTH_DOMAIN, FIREBASE_WEB_APP_ID,
     FIREBASE_WEB_MESSAGING_SENDER_ID, FIREBASE_WEB_MEASUREMENT_ID,
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
+    STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
-    save_internal_message, get_internal_conversation,
-    mark_messages_as_read, get_unread_count,
     get_all_wa_contacts, get_wa_conversation,
     mark_wa_conversation_read, save_wa_message, get_wa_contact,
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
     assign_wa_contact, get_transfer_history,
     update_user_avatar, get_user_avatar,
-    create_user, update_user, deactivate_user, get_user_by_username,
+    update_user, deactivate_user,
     upsert_firebase_user, get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message, set_attendance_protocol,
@@ -53,7 +50,7 @@ from database import (
     get_all_gc_conversations, get_gc_messages, save_gc_message,
     mark_gc_conversation_read, upsert_gc_conversation,
 )
-from auth import authenticate, authenticate_firebase_token, decode_token, hash_password
+from auth import authenticate_firebase_token
 from firestore_common import collection_name
 from webhook import process_webhook_payload, validate_signature
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
@@ -99,37 +96,6 @@ app.add_middleware(
 
 if os.path.isdir(FRONTEND_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS_DIR), name="frontend-assets")
-
-# -- Modelos --
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-    @field_validator("username")
-    @classmethod
-    def sanitize_username(cls, v):
-        v = v.strip().lower()
-        if not v or len(v) > 50:
-            raise ValueError("Nome de usuario invalido")
-        return v
-
-
-class SendMessageRequest(BaseModel):
-    receiver_id: int
-    content: str
-    msg_type: str = "text"
-
-    @field_validator("content")
-    @classmethod
-    def validate_content(cls, v):
-        v = v.strip()
-        if not v:
-            raise ValueError("Mensagem vazia")
-        if len(v) > MAX_MESSAGE_LENGTH:
-            raise ValueError(f"Mensagem excede {MAX_MESSAGE_LENGTH} caracteres")
-        return v
-
 
 class WaSendRequest(BaseModel):
     contact_id: int
@@ -178,20 +144,10 @@ def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token ausente")
     token = auth_header.split(" ", 1)[1]
     ip = request.client.host if request.client else "unknown"
-
-    if USE_FIREBASE_AUTH:
-        result = authenticate_firebase_token(token, ip)
-        if not result["success"]:
-            raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
-        return result["user"]
-
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Token invalido ou expirado")
-    user = get_user_by_id(payload["sub"])
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuario nao encontrado")
-    return user
+    result = authenticate_firebase_token(token, ip)
+    if not result["success"]:
+        raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
+    return result["user"]
 
 
 # -- Validacao de imagem --
@@ -294,62 +250,38 @@ def _remove_old_avatar(old_path):
 
 
 def _frontend_build_available():
-    return USE_FIREBASE_AUTH and os.path.isfile(FRONTEND_INDEX_FILE)
+    return os.path.isfile(FRONTEND_INDEX_FILE)
 
 
-def _serve_frontend_or_static(_filename):
+def _serve_frontend_app():
     if not os.path.isfile(FRONTEND_INDEX_FILE):
-        return HTMLResponse(content="<h1>Frontend nao compilado. Execute: cd frontend && npm run build</h1>", status_code=503)
+        return HTMLResponse(
+            content="<h1>Frontend React nao compilado. Execute: cd frontend && npm run build</h1>",
+            status_code=503,
+        )
     return FileResponse(FRONTEND_INDEX_FILE)
 
 
 def bootstrap_admin_user():
-    if USE_FIREBASE_AUTH:
-        if not BOOTSTRAP_ADMIN_EMAIL:
-            logger.info("Bootstrap admin Firebase nao configurado")
-            return
-
-        department_id = create_department(
-            BOOTSTRAP_ADMIN_DEPARTMENT,
-            "Setor criado automaticamente no primeiro deploy",
-        )
-        user = upsert_firebase_user(
-            firebase_uid="",
-            email=BOOTSTRAP_ADMIN_EMAIL,
-            display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
-            role="admin",
-            department_id=department_id,
-        )
-        if user:
-            logger.info("Bootstrap admin Firebase sincronizado | email=%s", BOOTSTRAP_ADMIN_EMAIL)
-        else:
-            logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
-        return
-
-    if not BOOTSTRAP_ADMIN_USERNAME or not BOOTSTRAP_ADMIN_PASSWORD:
-        logger.info("Bootstrap admin nao configurado")
-        return
-
-    existing = get_user_by_username(BOOTSTRAP_ADMIN_USERNAME)
-    if existing:
-        logger.info("Bootstrap admin ja existe | username=%s", BOOTSTRAP_ADMIN_USERNAME)
+    if not BOOTSTRAP_ADMIN_EMAIL:
+        logger.info("Bootstrap admin Firebase nao configurado")
         return
 
     department_id = create_department(
         BOOTSTRAP_ADMIN_DEPARTMENT,
         "Setor criado automaticamente no primeiro deploy",
     )
-    user_id = create_user(
-        BOOTSTRAP_ADMIN_USERNAME,
-        BOOTSTRAP_ADMIN_DISPLAY_NAME,
-        hash_password(BOOTSTRAP_ADMIN_PASSWORD),
-        department_id,
-        "admin",
+    user = upsert_firebase_user(
+        firebase_uid="",
+        email=BOOTSTRAP_ADMIN_EMAIL,
+        display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
+        role="admin",
+        department_id=department_id,
     )
-    if user_id:
-        logger.info("Bootstrap admin criado | username=%s", BOOTSTRAP_ADMIN_USERNAME)
+    if user:
+        logger.info("Bootstrap admin Firebase sincronizado | email=%s", BOOTSTRAP_ADMIN_EMAIL)
     else:
-        logger.warning("Falha ao criar bootstrap admin | username=%s", BOOTSTRAP_ADMIN_USERNAME)
+        logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
 
 
 def bootstrap_departments():
@@ -400,18 +332,18 @@ async def startup():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return _serve_frontend_or_static("index.html")
+    return _serve_frontend_app()
 
 
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_page():
-    return _serve_frontend_or_static("chat.html")
+    return _serve_frontend_app()
 
 
 @app.get("/app", response_class=HTMLResponse)
 async def app_shell():
     if not _frontend_build_available():
-        raise HTTPException(status_code=404, detail="Frontend React nao buildado")
+        raise HTTPException(status_code=503, detail="Frontend React nao buildado")
     return FileResponse(FRONTEND_INDEX_FILE)
 
 
@@ -459,19 +391,11 @@ async def webhook_receive(request: Request):
 # -- API: Autenticacao --
 
 @app.post("/api/login")
-async def login(body: LoginRequest, request: Request):
-    if USE_FIREBASE_AUTH:
-        raise HTTPException(status_code=405, detail="Use Firebase Auth no frontend e envie o ID token nas chamadas da API")
-    ip = request.client.host if request.client else "unknown"
-    result = authenticate(body.username, body.password, ip)
-    if not result["success"]:
-        return JSONResponse(status_code=401, content={"error": result["error"]})
-    avatar = get_user_avatar(result["user"]["id"])
-    user_data = result["user"]
-    user_data["avatar_path"] = avatar or ""
-    full_user = get_user_by_id(result["user"]["id"])
-    user_data["role"] = full_user.get("role", "operador") if full_user else "operador"
-    return {"token": result["token"], "user": user_data}
+async def login_removed():
+    raise HTTPException(
+        status_code=410,
+        detail="Login legado removido. Use Firebase Auth no frontend e envie o ID token nas chamadas da API.",
+    )
 
 
 @app.get("/api/session")
@@ -576,25 +500,32 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
     if current_user.get("role") not in ("admin", "supervisor"):
         raise HTTPException(status_code=403, detail="Permissao negada")
     body = await request.json()
-    username = (body.get("username", "")).strip().lower()
+    email = (body.get("email", "")).strip().lower()
     display_name = (body.get("display_name", "")).strip()
-    password = body.get("password", "")
     department_id = body.get("department_id")
     role = body.get("role", "operador")
-    if not username or not display_name or not password:
-        raise HTTPException(status_code=400, detail="Campos obrigatorios: username, display_name, password")
-    if len(username) > 50 or len(display_name) > 100:
-        raise HTTPException(status_code=400, detail="Nome excede limite de caracteres")
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
+    if not email or not display_name:
+        raise HTTPException(status_code=400, detail="Campos obrigatorios: email, display_name")
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Email invalido")
+    if len(display_name) > 100:
+        raise HTTPException(status_code=400, detail="Display name excede limite de caracteres")
     if role not in ROLE_OPTIONS:
         raise HTTPException(status_code=400, detail=f"Cargo invalido. Opcoes: {', '.join(ROLE_OPTIONS)}")
-    pw_hash = hash_password(password)
-    user_id = create_user(username, display_name, pw_hash, department_id, role)
-    if not user_id:
+    existing = get_user_by_email(email)
+    if existing:
         raise HTTPException(status_code=409, detail="Usuario ja existe")
-    log_audit(current_user["id"], "USER_CREATE", f"{username} ({role})")
-    return {"status": "ok", "user_id": user_id}
+    user = upsert_firebase_user(
+        firebase_uid="",
+        email=email,
+        display_name=display_name,
+        role=role,
+        department_id=department_id,
+    )
+    if not user:
+        raise HTTPException(status_code=500, detail="Falha ao provisionar usuario Firebase")
+    log_audit(current_user["id"], "USER_CREATE", f"{email} ({role})")
+    return {"status": "ok", "user_id": user["id"]}
 
 
 @app.put("/api/admin/users/{user_id}")
@@ -662,58 +593,6 @@ async def update_settings_user(request: Request, current_user: dict = Depends(ge
     result = save_user_settings(current_user["id"], body)
     log_audit(current_user["id"], "USER_SETTINGS_UPDATE", str(body))
     return result
-
-
-# -- API: Chat Interno --
-
-@app.get("/api/users")
-async def list_users(current_user: dict = Depends(get_current_user)):
-    users = get_all_users()
-    return [
-        {
-            "id": u["id"], "display_name": u["display_name"],
-            "last_login": u["last_login"], "avatar_path": u.get("avatar_path", ""),
-            "role": u.get("role", "operador"), "department_name": u.get("department_name", ""),
-        }
-        for u in users if u["id"] != current_user["id"] and u.get("is_active")
-    ]
-
-
-@app.get("/api/messages/{contact_id}")
-async def get_messages(contact_id: int, current_user: dict = Depends(get_current_user)):
-    messages = get_internal_conversation(current_user["id"], contact_id)
-    mark_messages_as_read(current_user["id"], contact_id)
-    return {"messages": messages}
-
-
-@app.get("/api/unread")
-async def unread(current_user: dict = Depends(get_current_user)):
-    return {"unread": get_unread_count(current_user["id"])}
-
-
-@app.post("/api/messages")
-async def send_internal_message(body: SendMessageRequest, current_user: dict = Depends(get_current_user)):
-    receiver = get_user_by_id(body.receiver_id)
-    if not receiver:
-        raise HTTPException(status_code=404, detail="Destinatario nao encontrado")
-    sanitized = html.escape(body.content)
-    msg_id = save_internal_message(current_user["id"], body.receiver_id, sanitized, body.msg_type)
-    ws_conn = operator_connections.get(body.receiver_id)
-    if ws_conn:
-        try:
-            await ws_conn.send_json({
-                "event": "new_message",
-                "data": {
-                    "id": msg_id, "sender_id": current_user["id"],
-                    "sender_name": current_user["display_name"],
-                    "sender_avatar": current_user.get("avatar_path", ""),
-                    "content": sanitized, "msg_type": body.msg_type,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                },
-            })
-        except Exception:
-            pass
-    return {"id": msg_id, "status": "sent"}
 
 
 # -- API: WhatsApp --
@@ -1150,18 +1029,6 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
     insert_transfer_system_message(contact_id, sys_content, current_user["id"])
     log_audit(current_user["id"], "WA_TRANSFER", f"Contato {contact_id} -> {to_name} (dept={to_department_id}): {reason}")
 
-    if to_user_id and to_user_id in operator_connections:
-        try:
-            await operator_connections[to_user_id].send_json({
-                "event": "wa_transfer_received",
-                "data": {
-                    "contact_id": contact_id, "contact_name": contact.get("display_name", ""),
-                    "from_user": current_user["display_name"], "reason": reason, "summary": summary,
-                },
-            })
-        except Exception:
-            pass
-
     await broadcast_to_operators({
         "event": "wa_contact_reassigned",
         "data": {"contact_id": contact_id, "assigned_to": to_user_id, "assigned_name": to_name},
@@ -1221,119 +1088,10 @@ async def list_operators(current_user: dict = Depends(get_current_user)):
     ]
 
 
-# -- WebSocket --
-
-operator_connections: dict[int, WebSocket] = {}
-
-
 async def broadcast_to_operators(message: dict):
-    disconnected = []
-    for uid, conn in operator_connections.items():
-        try:
-            await conn.send_json(message)
-        except Exception:
-            disconnected.append(uid)
-    for uid in disconnected:
-        operator_connections.pop(uid, None)
-
-
-@app.websocket("/ws/{token}")
-async def websocket_endpoint(websocket: WebSocket, token: str):
-    payload = decode_token(token)
-    if not payload:
-        await websocket.close(code=4001, reason="Token invalido")
-        return
-    user_id = payload["sub"]
-    user = get_user_by_id(user_id)
-    if not user:
-        await websocket.close(code=4001, reason="Usuario invalido")
-        return
-
-    await websocket.accept()
-    operator_connections[user_id] = websocket
-    logger.info("WS conectado: %s (id=%d)", user["display_name"], user_id)
-
-    for uid, conn in operator_connections.items():
-        if uid != user_id:
-            try:
-                await conn.send_json({
-                    "event": "user_online",
-                    "data": {
-                        "user_id": user_id, "display_name": user["display_name"],
-                        "avatar_path": user.get("avatar_path", ""), "role": user.get("role", ""),
-                    },
-                })
-            except Exception:
-                pass
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            event = data.get("event")
-
-            if event == "send_message":
-                receiver_id = data.get("receiver_id")
-                content = data.get("content", "").strip()
-                if not content or len(content) > MAX_MESSAGE_LENGTH:
-                    await websocket.send_json({"event": "error", "data": {"detail": "Mensagem invalida"}})
-                    continue
-                receiver = get_user_by_id(receiver_id)
-                if not receiver:
-                    await websocket.send_json({"event": "error", "data": {"detail": "Destinatario invalido"}})
-                    continue
-                sanitized = html.escape(content)
-                msg_id = save_internal_message(user_id, receiver_id, sanitized)
-                now = datetime.now(timezone.utc).isoformat()
-                await websocket.send_json({
-                    "event": "message_sent",
-                    "data": {"id": msg_id, "receiver_id": receiver_id, "content": sanitized, "created_at": now},
-                })
-                ws_dest = operator_connections.get(receiver_id)
-                if ws_dest:
-                    try:
-                        await ws_dest.send_json({
-                            "event": "new_message",
-                            "data": {
-                                "id": msg_id, "sender_id": user_id,
-                                "sender_name": user["display_name"],
-                                "sender_avatar": user.get("avatar_path", ""),
-                                "content": sanitized, "msg_type": "text", "created_at": now,
-                            },
-                        })
-                    except Exception:
-                        pass
-
-            elif event == "mark_read":
-                sender_id = data.get("sender_id")
-                if sender_id:
-                    mark_messages_as_read(user_id, sender_id)
-                    ws_sender = operator_connections.get(sender_id)
-                    if ws_sender:
-                        try:
-                            await ws_sender.send_json({"event": "messages_read", "data": {"reader_id": user_id}})
-                        except Exception:
-                            pass
-
-            elif event == "typing":
-                receiver_id = data.get("receiver_id")
-                ws_dest = operator_connections.get(receiver_id)
-                if ws_dest:
-                    try:
-                        await ws_dest.send_json({"event": "typing", "data": {"user_id": user_id, "display_name": user["display_name"]}})
-                    except Exception:
-                        pass
-
-    except WebSocketDisconnect:
-        logger.info("WS desconectado: %s (id=%d)", user["display_name"], user_id)
-    except Exception as exc:
-        logger.error("Erro WS (user_id=%d): %s", user_id, exc)
-    finally:
-        operator_connections.pop(user_id, None)
-        for uid, conn in operator_connections.items():
-            try:
-                await conn.send_json({"event": "user_offline", "data": {"user_id": user_id}})
-            except Exception:
-                pass
+    # Mantido como no-op porque o fluxo legado de notificacao via WebSocket
+    # foi removido. O webhook ainda pode chamar este callback sem efeito colateral.
+    return None
 
 
 # -- API: Google Chat (comunicacao interna) --

@@ -234,7 +234,7 @@ def get_user_by_id(user_id):
         "is_active": row.get("is_active", 1),
         "email": row.get("email", ""),
         "firebase_uid": row.get("firebase_uid", ""),
-        "auth_provider": row.get("auth_provider", "legacy"),
+        "auth_provider": row.get("auth_provider", "firebase"),
         "created_at": row.get("created_at"),
         "last_login": row.get("last_login"),
         "avatar_path": row.get("avatar_path", ""),
@@ -269,7 +269,7 @@ def create_user(username, display_name, password_hash, department_id=None, role=
         "role": role,
         "email": "",
         "firebase_uid": "",
-        "auth_provider": "legacy",
+        "auth_provider": "firebase",
         "avatar_path": "",
         "is_active": 1,
         "created_at": utcnow(),
@@ -885,12 +885,39 @@ def save_user_settings(user_id: int, settings: dict):
 # Google Chat - Comunicacao interna
 # ---------------------------------------------------------------------------
 
+def _active_gc_participants():
+    participants = {
+        str((row or {}).get("email") or "").strip().lower()
+        for row in _all_docs("users")
+        if row and row.get("is_active", 1)
+    }
+    participants.discard("")
+    return sorted(participants)
+
+
+def _gc_unread_recipients(conversation):
+    recipients = set(_active_gc_participants())
+    recipients.update(
+        str(participant or "").strip().lower()
+        for participant in (conversation or {}).get("participants", [])
+        if str(participant or "").strip()
+    )
+    recipients.update(
+        str(identifier or "").strip().lower()
+        for identifier in ((conversation or {}).get("unread_count", {}) or {}).keys()
+        if str(identifier or "").strip()
+    )
+    recipients.discard("")
+    return sorted(recipients)
+
+
 def upsert_gc_conversation(space_id, space_name=""):
     """Cria ou atualiza conversa do Google Chat. Retorna conversation_id."""
     now = utcnow()
     existing = _get_first_by_field("gc_conversations", "space_id", space_id)
+    participants = _active_gc_participants()
     if existing:
-        updates = {"last_message_at": now}
+        updates = {"last_message_at": now, "participants": participants}
         if space_name:
             updates["space_name"] = space_name
         document("gc_conversations", existing["id"]).set(updates, merge=True)
@@ -901,7 +928,7 @@ def upsert_gc_conversation(space_id, space_name=""):
         "id": conversation_id,
         "space_id": space_id,
         "space_name": space_name or space_id,
-        "participants": [],
+        "participants": participants,
         "last_message": "",
         "last_message_at": now,
         "unread_count": {},
@@ -956,17 +983,19 @@ def save_gc_message(conversation_id, gchat_message_id, sender_email, sender_name
     # Atualizar preview e timestamp na conversa
     conversation = _get_doc("gc_conversations", conversation_id)
     if conversation:
+        participants = _gc_unread_recipients(conversation)
+        sender_key = str(sender_email or "").strip().lower()
         preview = content[:100] if content else f"[{msg_type}]"
         updates = {
             "last_message": preview,
             "last_message_at": now,
+            "participants": participants,
         }
-        # Incrementar unread para todos os participantes exceto o remetente
         unread = conversation.get("unread_count", {}) or {}
-        for participant_id in (conversation.get("participants") or []):
-            pid = str(participant_id)
-            if pid != sender_email:
-                unread[pid] = int(unread.get(pid, 0)) + 1
+        for participant_id in participants:
+            unread.setdefault(participant_id, 0)
+            if participant_id != sender_key:
+                unread[participant_id] = int(unread.get(participant_id, 0)) + 1
         updates["unread_count"] = unread
         document("gc_conversations", conversation_id).set(updates, merge=True)
 
@@ -1001,7 +1030,8 @@ def mark_gc_conversation_read(conversation_id, user_identifier):
     if not conversation:
         return
     unread = conversation.get("unread_count", {}) or {}
-    uid = str(user_identifier)
-    if uid in unread:
-        unread[uid] = 0
-        document("gc_conversations", conversation_id).set({"unread_count": unread}, merge=True)
+    uid = str(user_identifier or "").strip().lower()
+    if not uid:
+        return
+    unread[uid] = 0
+    document("gc_conversations", conversation_id).set({"unread_count": unread}, merge=True)

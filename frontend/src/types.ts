@@ -11,10 +11,10 @@ export type FirebaseWebConfig = {
 };
 
 export type ClientConfig = {
-  auth_mode: "firebase" | "legacy" | string;
+  auth_mode: "firebase" | string;
   chat_delivery_mode: TransportMode;
   polling_interval_ms: number;
-  data_backend: "firestore" | "sql" | string;
+  data_backend: "firestore" | string;
   media_storage_backend: string;
   feature_message_status: boolean;
   feature_google_chat: boolean;

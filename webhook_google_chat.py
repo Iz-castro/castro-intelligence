@@ -194,7 +194,7 @@ async def _process_gchat_message(message, space_id, space_name, sender_email, se
                 if content_bytes:
                     ext = _mime_to_ext(content_type)
                     filename = f"gchat_{gchat_message_id.split('/')[-1]}{ext}"
-                    result = save_upload_media(content_bytes, "google_chat", filename, content_type)
+                    result = await save_upload_media(content_bytes, filename, content_type)
                     if result:
                         media_path = result.get("path", "")
             except Exception as exc:

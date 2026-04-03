@@ -38,8 +38,9 @@ def _as_int(value, default):
 DATA_BACKEND = "firestore"
 IS_FIRESTORE_BACKEND = True
 
-AUTH_MODE = os.getenv("AUTH_MODE", "firebase").strip().lower()
-USE_FIREBASE_AUTH = AUTH_MODE == "firebase"
+# O CRM React depende de Firebase Auth e o runtime do backend nao expõe
+# mais caminhos legados de autenticacao.
+AUTH_MODE = "firebase"
 
 FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "").strip()
 FIRESTORE_COLLECTION_PREFIX = os.getenv("FIRESTORE_COLLECTION_PREFIX", "castro_crm").strip().strip("_")
@@ -138,9 +139,7 @@ ROLE_OPTIONS = [
 ]
 
 # -- Bootstrap inicial --
-BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip().lower()
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
-BOOTSTRAP_ADMIN_PASSWORD = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
 BOOTSTRAP_ADMIN_DISPLAY_NAME = os.getenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Administrador")
 BOOTSTRAP_ADMIN_DEPARTMENT = os.getenv("BOOTSTRAP_ADMIN_DEPARTMENT", "Geral")
 

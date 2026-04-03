@@ -624,7 +624,7 @@ function CrmApp() {
   const { booting, config, firebaseUser, sessionUser, error } = useCrm();
 
   if (booting) return <BootScreen />;
-  if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Modo legado</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "Defina AUTH_MODE=firebase para usar o CRM React."}</p></div></div>;
+  if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Configuracao invalida</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "O backend deve operar em modo Firebase."}</p></div></div>;
   if (!firebaseUser || !sessionUser) return <LoginScreen />;
 
   return (
