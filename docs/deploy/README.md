@@ -49,10 +49,19 @@ Transcricao:
 
 WhatsApp:
 
-- `WHATSAPP_TOKEN`
 - `WHATSAPP_PHONE_NUMBER_ID`
+- `WHATSAPP_WABA_ID`
+- `WHATSAPP_TOKEN`
 - `WHATSAPP_VERIFY_TOKEN`
 - `WHATSAPP_APP_SECRET`
+
+Observacao:
+
+- `WHATSAPP_WABA_ID` identifica a conta do WhatsApp Business no Meta.
+- `WHATSAPP_PHONE_NUMBER_ID` identifica o numero conectado e e o valor usado nas rotas `/messages` e `/media`.
+- Em cenarios de `coexistence`, nao confundir os dois ids durante o provisionamento.
+- No Cloud Run atual, `WHATSAPP_PHONE_NUMBER_ID` e `WHATSAPP_WABA_ID` entram como variaveis de ambiente.
+- No Cloud Run atual, `WHATSAPP_TOKEN`, `WHATSAPP_VERIFY_TOKEN` e `WHATSAPP_APP_SECRET` entram via Secret Manager.
 
 Google Chat:
 

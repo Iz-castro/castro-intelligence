@@ -19,7 +19,7 @@ from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
-    WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE,
+    WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
@@ -323,7 +323,14 @@ async def startup():
             logger.warning("Transcricao de audio desabilitada (Faster Whisper falhou)")
     logger.info("CRM iniciado | host=%s port=%d", HOST, PORT)
     if WHATSAPP_TOKEN:
-        logger.info("WABA configurado | phone_id=%s", WHATSAPP_PHONE_NUMBER_ID)
+        if WHATSAPP_WABA_ID:
+            logger.info(
+                "WABA configurado | waba_id=%s phone_id=%s",
+                WHATSAPP_WABA_ID,
+                WHATSAPP_PHONE_NUMBER_ID,
+            )
+        else:
+            logger.info("WABA configurado | phone_id=%s", WHATSAPP_PHONE_NUMBER_ID)
     else:
         logger.warning("WHATSAPP_TOKEN nao definido - webhook ativo mas envio desabilitado")
 
