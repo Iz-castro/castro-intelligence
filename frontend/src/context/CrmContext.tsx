@@ -345,10 +345,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const activeContact = contacts.find((c) => c.id === activeConversationId) || null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
 
+  // Novos: sem atribuicao (fila do bot), exclui nao qualificados
   const novosContacts = contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado");
+  // Meus: atribuidos ao usuario logado (inclui coexistence auto-atribuidos)
   const meusContacts = contacts.filter((c) => c.assigned_to === sessionUser?.id);
+  // Nao qualificados
   const nqContacts = contacts.filter((c) => c.qualification === "nao_qualificado");
-  const equipeContacts = contacts.filter((c) => c.assigned_to && c.assigned_to !== sessionUser?.id);
+  // Equipe: atribuidos a outros operadores
+  // Operadores comuns NAO veem coexistence de outros; admin/supervisor veem tudo
+  const equipeContacts = contacts.filter((c) => {
+    if (!c.assigned_to || c.assigned_to === sessionUser?.id) return false;
+    if (!isManagerRole && c.source_channel_type === "coexistence") return false;
+    return true;
+  });
 
   const novosUnread = novosContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const meusUnread = meusContacts.reduce((s, c) => s + (c.unread || 0), 0);
@@ -369,6 +378,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const busyComposerAction = busyAudio || busySend;
 
   const visibleMessages = messages.filter((message, index, allMessages) => {
+    // Filtrar mensagens admin_only para operadores comuns
+    if (message.visibility === "admin_only" && !isManagerRole) return false;
     const kind = String(message.msg_type || "").trim().toLowerCase();
     if (kind !== "unsupported" && kind !== "unknown") return true;
     const nextMessage = allMessages[index + 1];

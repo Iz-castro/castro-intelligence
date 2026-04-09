@@ -666,6 +666,50 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
     return {"from_user_id": from_user, "to_user_id": to_user_id}
 
 
+def return_contact_to_bot(contact_id, returned_by_user_id):
+    """Devolve o contato para a fila do bot (remove atribuicao)."""
+    current = _get_doc("wa_contacts", contact_id)
+    if not current:
+        return None
+    from_user = current.get("assigned_to")
+    from_dept = current.get("department_id")
+    document("wa_contacts", contact_id).set({
+        "assigned_to": None,
+        "assigned_to_uid": "",
+        "qualification": "novo",
+        "attendance_protocol": "",
+        "attendance_started_at": "",
+    }, merge=True)
+    # Log na transfer_log
+    transfer_id = next_sequence("wa_transfer_log")
+    document("wa_transfer_log", transfer_id).set({
+        "id": transfer_id,
+        "contact_id": contact_id,
+        "contact_doc_id": str(contact_id),
+        "from_user_id": from_user,
+        "to_user_id": None,
+        "to_user_uid": "",
+        "from_department_id": from_dept,
+        "to_department_id": None,
+        "department_id": None,
+        "reason": "Devolvido ao bot",
+        "summary": "Contato devolvido para a fila do bot",
+        "transferred_by": returned_by_user_id,
+        "created_at": utcnow(),
+    })
+    return True
+
+
+def get_contacts_by_assigned_user(user_id):
+    """Retorna todos os contatos atribuidos a um usuario."""
+    rows = []
+    for snapshot in collection("wa_contacts").where("assigned_to", "==", user_id).stream():
+        row = _raw_doc(snapshot)
+        if row:
+            rows.append(row)
+    return _normalize_many(rows)
+
+
 def insert_transfer_system_message(contact_id, content, operator_id=None):
     return save_wa_message(
         wa_message_id=f"sys_{utcnow().isoformat()}_{contact_id}",

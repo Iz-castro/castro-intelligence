@@ -89,6 +89,12 @@ export type Contact = {
   assigned_to_uid?: string;
   department_id?: number | null;
   department_name?: string;
+  channel_id?: number | null;
+  phone_number_id?: string;
+  source_channel_type?: "standard" | "coexistence" | string;
+  original_operator_id?: number | null;
+  converted_by_user_id?: number | null;
+  rating?: number | null;
   unread_count?: number;
   unread?: number;
   is_archived?: number;
@@ -125,6 +131,10 @@ export type ChatMessage = {
   reply_to_message_id?: number | null;
   reply_to_preview?: string;
   reply_to_sender_name?: string;
+  channel_id?: number | null;
+  phone_number_id?: string;
+  is_rating_message?: boolean;
+  visibility?: "all" | "admin_only" | string;
 };
 
 export type TransferRequest = {

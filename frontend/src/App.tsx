@@ -202,7 +202,11 @@ function ContactList() {
                   </div>
                 </div>
                 <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div>
-                <div className="row"><span className="chip">{contact.qualification || "novo"}</span>{contact.unread ? <b className="badge">{contact.unread}</b> : null}</div>
+                <div className="row">
+                  <span className="chip">{contact.qualification || "novo"}</span>
+                  {contact.source_channel_type === "coexistence" ? <span className="chip" style={{ fontSize: "0.65rem", opacity: 0.7 }}>coex</span> : null}
+                  {contact.unread ? <b className="badge">{contact.unread}</b> : null}
+                </div>
               </div>
             </button>
           );
@@ -463,17 +467,63 @@ function ChatPanel() {
 }
 
 function DetailPanel() {
-  const { selectedContact, sessionUser, operators, departments, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole } = useCrm();
+  const { bundle, selectedContact, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, setError, setNotice, refreshPollingViews } = useCrm();
+  const [busyReturnBot, setBusyReturnBot] = useState(false);
+  const [bulkFromUser, setBulkFromUser] = useState<number | "">("");
+  const [bulkAction, setBulkAction] = useState<"return_to_bot" | "transfer">("return_to_bot");
+  const [bulkToUser, setBulkToUser] = useState<number | "">("");
+  const [busyBulk, setBusyBulk] = useState(false);
+
+  const returnToBot = useCallback(async (contactId: number) => {
+    if (!bundle) return;
+    setBusyReturnBot(true);
+    try {
+      await sendJson(bundle.auth, `/api/wa/contact/${contactId}/return-to-bot`);
+      setNotice("Contato devolvido ao bot");
+      await refreshPollingViews();
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusyReturnBot(false);
+  }, [bundle, setError, setNotice, refreshPollingViews]);
+
+  const executeBulkReassign = useCallback(async () => {
+    if (!bundle || !bulkFromUser) return;
+    setBusyBulk(true);
+    try {
+      const res = await sendJson<{ count: number }>(bundle.auth, "/api/admin/bulk-reassign", {
+        from_user_id: bulkFromUser,
+        action: bulkAction,
+        to_user_id: bulkAction === "transfer" ? bulkToUser || undefined : undefined,
+      });
+      setNotice(`${res.count} contato(s) reatribuido(s)`);
+      setBulkFromUser("");
+      await refreshPollingViews();
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusyBulk(false);
+  }, [bundle, bulkFromUser, bulkAction, bulkToUser, setError, setNotice, refreshPollingViews]);
+
+  const contactChannel = selectedContact?.channel_id ? channels.find((ch) => ch.id === selectedContact.channel_id) : null;
+
   return (
     <aside className="panel detail-panel">
       <div className="panel-head"><div><p className="eyebrow">Contato</p><h2>Operacao</h2></div><span className="sub">{operators.length} operadores - {departments.length} setores</span></div>
       <div className="detail-scroll">
         {selectedContact ? <>
+          {/* Info do canal */}
+          {contactChannel ? (
+            <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", opacity: 0.7, display: "flex", gap: "0.3rem", alignItems: "center" }}>
+              <span className="chip" style={{ fontSize: "0.65rem" }}>{contactChannel.channel_type === "standard" ? "Cloud API" : "Coexistence"}</span>
+              <span>{contactChannel.label}</span>
+            </div>
+          ) : null}
+
           <section className="card">
             <h3>Qualificacao</h3>
-            <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="">Sem classificacao</option><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option></select>
+            <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option></select>
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={5} placeholder="Notas do atendimento" />
             <button className="primary" onClick={() => void saveQualification()} disabled={busySave}>{busySave ? "Salvando..." : "Salvar"}</button>
+            {isManagerRole && selectedContact.assigned_to ? (
+              <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={busyReturnBot} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
+            ) : null}
           </section>
           <section className="card">
             <h3>Transferencia</h3>
@@ -508,6 +558,28 @@ function DetailPanel() {
                 )}
               </div>
             ))}</div>
+          </section>
+        ) : null}
+
+        {isManagerRole ? (
+          <section className="card">
+            <h3>Reatribuicao em lote</h3>
+            <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Reatribuir todos os contatos de um operador:</span>
+            <select value={bulkFromUser} onChange={(e) => setBulkFromUser(e.target.value ? Number(e.target.value) : "")}>
+              <option value="">Selecione operador de origem</option>
+              {operators.map((op) => <option key={op.id} value={op.id}>{op.display_name}</option>)}
+            </select>
+            <select value={bulkAction} onChange={(e) => setBulkAction(e.target.value as "return_to_bot" | "transfer")}>
+              <option value="return_to_bot">Devolver ao bot</option>
+              <option value="transfer">Transferir para operador</option>
+            </select>
+            {bulkAction === "transfer" ? (
+              <select value={bulkToUser} onChange={(e) => setBulkToUser(e.target.value ? Number(e.target.value) : "")}>
+                <option value="">Selecione operador destino</option>
+                {operators.filter((op) => op.id !== bulkFromUser).map((op) => <option key={op.id} value={op.id}>{op.display_name}</option>)}
+              </select>
+            ) : null}
+            <button className="primary" style={{ marginTop: "0.4rem" }} disabled={!bulkFromUser || (bulkAction === "transfer" && !bulkToUser) || busyBulk} onClick={() => { if (confirm("Reatribuir TODOS os contatos deste operador?")) void executeBulkReassign(); }}>{busyBulk ? "Processando..." : "Executar reatribuicao"}</button>
           </section>
         ) : null}
       </div>

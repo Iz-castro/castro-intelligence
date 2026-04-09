@@ -41,6 +41,7 @@ from database import (
     get_all_departments, create_department,
     get_department_by_id, update_department, deactivate_department,
     assign_wa_contact, get_transfer_history,
+    return_contact_to_bot, get_contacts_by_assigned_user,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user,
     upsert_firebase_user, get_user_by_email,
@@ -1215,6 +1216,59 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
 @app.get("/api/wa/transfer-history/{contact_id}")
 async def wa_transfer_hist(contact_id: int, current_user: dict = Depends(get_current_user)):
     return {"history": get_transfer_history(contact_id)}
+
+
+@app.post("/api/wa/contact/{contact_id}/return-to-bot")
+async def wa_return_to_bot(contact_id: int, current_user: dict = Depends(get_current_user)):
+    """Devolve o contato para a fila do bot. Apenas admin/supervisor."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    result = return_contact_to_bot(contact_id, current_user["id"])
+    if not result:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    sys_content = f"Devolvido ao bot por {current_user['display_name']}"
+    insert_transfer_system_message(contact_id, sys_content, current_user["id"])
+    log_audit(current_user["id"], "WA_RETURN_TO_BOT", f"Contato {contact_id}")
+    return {"status": "returned_to_bot"}
+
+
+@app.post("/api/admin/bulk-reassign")
+async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get_current_user)):
+    """Reatribuicao em lote de contatos de um operador.
+
+    Body: { from_user_id, action: "return_to_bot" | "transfer", to_user_id? }
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    body = await request.json()
+    from_user_id = body.get("from_user_id")
+    action = body.get("action", "return_to_bot")
+    to_user_id = body.get("to_user_id")
+
+    if not from_user_id:
+        raise HTTPException(status_code=400, detail="from_user_id obrigatorio")
+
+    contacts = get_contacts_by_assigned_user(from_user_id)
+    if not contacts:
+        return {"status": "ok", "count": 0}
+
+    count = 0
+    for contact in contacts:
+        cid = contact["id"]
+        if action == "return_to_bot":
+            return_contact_to_bot(cid, current_user["id"])
+            insert_transfer_system_message(cid, f"Devolvido ao bot (reatribuicao em lote) por {current_user['display_name']}", current_user["id"])
+        elif action == "transfer" and to_user_id:
+            to_user = get_user_by_id(to_user_id)
+            assign_wa_contact(cid, to_user_id, (to_user or {}).get("department_id"), current_user["id"], reason="Reatribuicao em lote", summary=f"Reatribuido de operador {from_user_id}")
+            insert_transfer_system_message(cid, f"Reatribuido para {(to_user or {}).get('display_name', '?')} por {current_user['display_name']} (lote)", current_user["id"])
+        count += 1
+
+    log_audit(current_user["id"], "BULK_REASSIGN", f"from={from_user_id} action={action} to={to_user_id} count={count}")
+    return {"status": "ok", "count": count}
 
 
 @app.get("/api/operators")
