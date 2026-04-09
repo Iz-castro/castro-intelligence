@@ -490,19 +490,42 @@ def get_unread_count(user_id):
     return {int(row["sender_id"]): int(row.get("count", 0)) for row in rows if int(row.get("count", 0)) > 0}
 
 
-def upsert_wa_contact(wa_id, display_name=""):
+def upsert_wa_contact(wa_id, display_name="", channel_id=None,
+                      phone_number_id="", source_channel_type="",
+                      auto_assign_user_id=None):
+    """Cria ou atualiza um contato WhatsApp.
+
+    Para canais coexistence, auto_assign_user_id atribui automaticamente
+    ao operador dono do numero.
+    """
     now = utcnow()
     existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
     if existing:
-        document("wa_contacts", existing["id"]).set({
-            "display_name": display_name or "",
+        updates = {
+            "display_name": display_name or existing.get("display_name", ""),
             "last_message_at": now,
             "last_inbound_at": now,
-        }, merge=True)
+        }
+        # Atualizar canal se ainda nao definido ou se mudou
+        if channel_id is not None and not existing.get("channel_id"):
+            updates["channel_id"] = channel_id
+            updates["phone_number_id"] = phone_number_id
+            updates["source_channel_type"] = source_channel_type
+        # Auto-atribuir para coexistence se nao atribuido
+        if auto_assign_user_id and not existing.get("assigned_to"):
+            user = _get_doc("users", auto_assign_user_id)
+            if user:
+                updates["assigned_to"] = auto_assign_user_id
+                updates["assigned_to_uid"] = user.get("firebase_uid", "")
+                if not existing.get("department_id") and user.get("department_id"):
+                    updates["department_id"] = user["department_id"]
+                if existing.get("qualification") == "novo":
+                    updates["qualification"] = "em_atendimento"
+        document("wa_contacts", existing["id"]).set(updates, merge=True)
         return existing["id"]
 
     contact_id = next_sequence("wa_contacts")
-    document("wa_contacts", contact_id).set({
+    new_contact = {
         "id": contact_id,
         "wa_id": wa_id,
         "display_name": display_name or "",
@@ -514,12 +537,29 @@ def upsert_wa_contact(wa_id, display_name=""):
         "assigned_to": None,
         "assigned_to_uid": "",
         "department_id": None,
+        "channel_id": channel_id,
+        "phone_number_id": phone_number_id,
+        "source_channel_type": source_channel_type,
+        "original_operator_id": None,
+        "converted_by_user_id": None,
+        "rating": None,
+        "rating_requested_at": None,
         "is_archived": 0,
         "unread_count": 0,
         "first_seen_at": now,
         "last_message_at": now,
         "last_inbound_at": now,
-    })
+    }
+    # Auto-atribuir para coexistence
+    if auto_assign_user_id:
+        user = _get_doc("users", auto_assign_user_id)
+        if user:
+            new_contact["assigned_to"] = auto_assign_user_id
+            new_contact["assigned_to_uid"] = user.get("firebase_uid", "")
+            new_contact["qualification"] = "em_atendimento"
+            if user.get("department_id"):
+                new_contact["department_id"] = user["department_id"]
+    document("wa_contacts", contact_id).set(new_contact)
     return contact_id
 
 
@@ -669,7 +709,9 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     media_path="", media_mime="", media_id="",
                     latitude=None, longitude=None, filename="",
                     status="received", timestamp_wa="", operator_id=None,
-                    reply_to_message_id=None, reply_to_preview="", reply_to_sender_name=""):
+                    reply_to_message_id=None, reply_to_preview="", reply_to_sender_name="",
+                    channel_id=None, phone_number_id="",
+                    is_rating_message=False, visibility="all"):
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
         if existing:
@@ -714,6 +756,10 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
         "department_id": (contact or {}).get("department_id"),
+        "channel_id": channel_id or (contact or {}).get("channel_id"),
+        "phone_number_id": phone_number_id or (contact or {}).get("phone_number_id", ""),
+        "is_rating_message": is_rating_message,
+        "visibility": visibility,
         "timestamp_wa": _coerce_timestamp(timestamp_wa),
         "created_at": created_at,
         "reply_to_message_id": reply_to_message_id,

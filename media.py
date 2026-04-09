@@ -415,13 +415,14 @@ def convert_audio_to_ogg_opus(input_bytes, input_mime="audio/webm"):
                 pass
 
 
-async def get_media_url(media_id):
-    if not WHATSAPP_TOKEN:
+async def get_media_url(media_id, token=None):
+    token = token or WHATSAPP_TOKEN
+    if not token:
         logger.error("WHATSAPP_TOKEN nao configurado")
         return None
 
     endpoint = f"{GRAPH_API_BASE}/{media_id}"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    headers = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -441,10 +442,11 @@ async def get_media_url(media_id):
             return None
 
 
-async def download_media(media_id, msg_type, original_filename=""):
+async def download_media(media_id, msg_type, original_filename="", token=None):
     ensure_media_dir()
 
-    media_info = await get_media_url(media_id)
+    token = token or WHATSAPP_TOKEN
+    media_info = await get_media_url(media_id, token=token)
     if not media_info or not media_info["url"]:
         return None
 
@@ -453,7 +455,7 @@ async def download_media(media_id, msg_type, original_filename=""):
         logger.warning("Midia %s excede limite de %dMB", media_id, MAX_MEDIA_SIZE_MB)
         return None
 
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    headers = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
@@ -522,13 +524,15 @@ async def save_upload_locally(file_content, filename, mime_type):
     return await save_upload_media(file_content, filename, mime_type)
 
 
-async def upload_media_to_whatsapp(file_content, mime_type, filename=""):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+async def upload_media_to_whatsapp(file_content, mime_type, filename="", token=None, phone_id=None):
+    token = token or WHATSAPP_TOKEN
+    phone_id = phone_id or WHATSAPP_PHONE_NUMBER_ID
+    if not token or not phone_id:
         logger.error("WABA nao configurado para upload")
         return None
 
-    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/media"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    url = f"{GRAPH_API_BASE}/{phone_id}/media"
+    headers = {"Authorization": f"Bearer {token}"}
 
     if not filename:
         ext = MIME_EXTENSIONS.get(mime_type, ".bin")
@@ -553,14 +557,16 @@ async def upload_media_to_whatsapp(file_content, mime_type, filename=""):
             return None
 
 
-async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_message_id=""):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_message_id="", token=None, phone_id=None):
+    token = token or WHATSAPP_TOKEN
+    phone_id = phone_id or WHATSAPP_PHONE_NUMBER_ID
+    if not token or not phone_id:
         return None
 
     wa_id = _normalize_wa_target(wa_id)
-    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    url = f"{GRAPH_API_BASE}/{phone_id}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 

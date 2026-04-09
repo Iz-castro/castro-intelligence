@@ -704,20 +704,36 @@ def _check_24h_window(contact: dict):
         )
 
 
+def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
+    """Resolve credenciais do canal a partir do contato.
+
+    Tenta channel_id do contato, senao usa canal default.
+    Returns (token, phone_number_id, graph_api_base).
+    """
+    from channel_service import get_send_credentials
+    channel_id = contact.get("channel_id")
+    try:
+        return get_send_credentials(channel_id)
+    except ValueError:
+        # Fallback para env vars legadas
+        if WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID:
+            return WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, GRAPH_API_BASE
+        raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
+
+
 @app.post("/api/wa/send-location")
 async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Depends(get_current_user)):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise HTTPException(status_code=503, detail="WABA nao configurado")
     contact = get_wa_contact(body.contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    token, phone_id, api_base = _resolve_channel_creds(contact)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
 
     wa_id = contact["wa_id"]
-    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    url = f"{api_base}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     location_obj: dict = {"latitude": body.latitude, "longitude": body.longitude}
     if body.name:
@@ -762,11 +778,10 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
 
 @app.post("/api/wa/send")
 async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_user)):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise HTTPException(status_code=503, detail="WABA nao configurado")
     contact = get_wa_contact(body.contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    token, phone_id, api_base = _resolve_channel_creds(contact)
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
@@ -774,8 +789,8 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
 
     wa_id = _wa_target(contact["wa_id"])
-    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    url = f"{api_base}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": body.content}, **reply_context}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -807,11 +822,10 @@ async def wa_send_media(
     reply_to_sender_name: str = Form(""),
 ):
     current_user = get_current_user(request)
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise HTTPException(status_code=503, detail="WABA nao configurado")
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    token, phone_id, api_base = _resolve_channel_creds(contact)
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
@@ -830,11 +844,11 @@ async def wa_send_media(
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     msg_type = local_result["msg_type"]
 
-    media_id = await upload_media_to_whatsapp(file_content, mime_type, filename)
+    media_id = await upload_media_to_whatsapp(file_content, mime_type, filename, token=token, phone_id=phone_id)
     if not media_id:
         raise HTTPException(status_code=502, detail="Falha no upload para a Meta")
 
-    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption, reply_context.get("context", {}).get("message_id", ""))
+    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption, reply_context.get("context", {}).get("message_id", ""), token=token, phone_id=phone_id)
     if not send_result or "error" in send_result:
         error = send_result.get("error", "Erro desconhecido") if send_result else "Sem resposta"
         raise HTTPException(status_code=502, detail=str(error))
@@ -863,12 +877,10 @@ async def wa_send_audio(
     Converte WebM/Opus do navegador para OGG/Opus via FFmpeg."""
     current_user = get_current_user(request)
 
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise HTTPException(status_code=503, detail="WABA nao configurado")
-
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    token, phone_id, api_base = _resolve_channel_creds(contact)
     if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     _check_24h_window(contact)
@@ -893,12 +905,12 @@ async def wa_send_audio(
         raise HTTPException(status_code=413, detail=str(exc)) from exc
 
     # Upload do OGG convertido para a Meta
-    media_id = await upload_media_to_whatsapp(converted, "audio/ogg", "audio.ogg")
+    media_id = await upload_media_to_whatsapp(converted, "audio/ogg", "audio.ogg", token=token, phone_id=phone_id)
     if not media_id:
         raise HTTPException(status_code=502, detail="Falha no upload de audio para a Meta")
 
     # Enviar mensagem de audio
-    send_result = await send_media_message(contact["wa_id"], media_id, "audio", reply_wa_message_id=reply_context.get("context", {}).get("message_id", ""))
+    send_result = await send_media_message(contact["wa_id"], media_id, "audio", reply_wa_message_id=reply_context.get("context", {}).get("message_id", ""), token=token, phone_id=phone_id)
     if not send_result or "error" in send_result:
         error = send_result.get("error", "Erro desconhecido") if send_result else "Sem resposta"
         raise HTTPException(status_code=502, detail=str(error))
@@ -921,13 +933,12 @@ async def wa_send_template(
     contact_id: int, template_name: str = "hello_world",
     language: str = "pt_BR", current_user: dict = Depends(get_current_user),
 ):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise HTTPException(status_code=503, detail="WABA nao configurado")
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    token, phone_id, api_base = _resolve_channel_creds(contact)
+    url = f"{api_base}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp", "to": _wa_target(contact["wa_id"]),
         "type": "template", "template": {"name": template_name, "language": {"code": language}},
@@ -1365,6 +1376,10 @@ async def embedded_signup_config(current_user: dict = Depends(get_current_user))
 
 class EmbeddedSignupExchange(BaseModel):
     code: str
+    channel_type: str = "coexistence"
+    owner_user_id: int | None = None
+    label: str = ""
+    default_department_id: int | None = None
 
 
 @app.post("/api/admin/embedded-signup/exchange")
@@ -1459,14 +1474,42 @@ async def embedded_signup_exchange(
     webhook_subscribed = sub_data.get("success", False)
     logger.info("Embedded Signup: webhook subscription = %s", webhook_subscribed)
 
+    # 5. Criar canal no registry
+    # Determinar tipo: coexistence se platform_type indica app onboarding
+    is_coexistence = platform_type in ("CLOUD_API",) and body.channel_type == "coexistence"
+    channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
+    owner_id = body.owner_user_id if is_coexistence else None
+
+    owner_user = get_user_by_id(owner_id) if owner_id else None
+    channel_label = body.label or (
+        f"{(owner_user or {}).get('display_name', 'Operador')} - {display_phone}"
+        if is_coexistence
+        else f"Canal {display_phone}"
+    )
+
+    new_channel_id = create_channel(
+        channel_type=channel_type,
+        label=channel_label,
+        waba_id=waba_id,
+        phone_number_id=phone_number_id,
+        display_phone_number=display_phone,
+        access_token=access_token,
+        owner_user_id=owner_id,
+        owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
+        default_department_id=body.default_department_id,
+        is_bot_enabled=not is_coexistence,
+    )
+
     log_audit(
         current_user["id"],
         "EMBEDDED_SIGNUP",
-        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status}",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id}",
     )
 
     return {
         "status": "ok",
+        "channel_id": new_channel_id,
+        "channel_type": channel_type,
         "access_token": access_token,
         "waba_id": waba_id,
         "phone_number_id": phone_number_id,
