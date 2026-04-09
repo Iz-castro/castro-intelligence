@@ -52,6 +52,7 @@ from database import (
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
     mark_gc_conversation_read, upsert_gc_conversation,
+    get_audit_metrics, get_all_ratings,
 )
 from channel_service import (
     get_all_active_channels, get_channels_for_user,
@@ -1464,6 +1465,132 @@ async def webhook_google_chat(request: Request):
     event = await request.json()
     response = await process_google_chat_event(event)
     return response or {}
+
+
+# -- API: Dashboard de Auditoria --
+
+
+@app.get("/api/admin/dashboard/summary")
+async def dashboard_summary(
+    date_from: str = Query(""),
+    date_to: str = Query(""),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna metricas agregadas para o periodo."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    if not date_from:
+        date_from = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+    if not date_to:
+        date_to = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    metrics = get_audit_metrics(date_from, date_to)
+
+    # Separar global vs per-operator
+    global_metrics = [m for m in metrics if "_" not in str(m.get("doc_id", ""))[11:]]
+    operator_metrics = [m for m in metrics if "_" in str(m.get("doc_id", ""))[11:]]
+
+    # Agregar global
+    total_inbound = sum(int(m.get("total_messages_inbound") or 0) for m in global_metrics)
+    total_outbound = sum(int(m.get("total_messages_outbound") or 0) for m in global_metrics)
+    total_leads = sum(int(m.get("total_leads_received") or 0) for m in global_metrics)
+    total_assumed = sum(int(m.get("total_leads_assumed") or 0) for m in global_metrics)
+
+    # Agregar por operador
+    operators_agg: dict[str, dict] = {}
+    for m in operator_metrics:
+        doc_id = str(m.get("doc_id", ""))
+        parts = doc_id.split("_", 1)
+        if len(parts) < 2:
+            continue
+        uid = parts[1]
+        if uid not in operators_agg:
+            operators_agg[uid] = {"user_id": int(uid) if uid.isdigit() else uid, "inbound": 0, "outbound": 0, "leads_assumed": 0, "first_activity": None, "last_activity": None}
+        agg = operators_agg[uid]
+        agg["inbound"] += int(m.get("total_messages_inbound") or 0)
+        agg["outbound"] += int(m.get("total_messages_outbound") or 0)
+        agg["leads_assumed"] += int(m.get("total_leads_assumed") or 0)
+        fa = m.get("first_activity_at")
+        la = m.get("last_activity_at")
+        if fa and (not agg["first_activity"] or fa < agg["first_activity"]):
+            agg["first_activity"] = fa
+        if la and (not agg["last_activity"] or la > agg["last_activity"]):
+            agg["last_activity"] = la
+
+    # Peak chart: agregar messages_by_half_hour
+    peak: dict[str, int] = {}
+    for m in global_metrics:
+        half_hours = m.get("messages_by_half_hour") or {}
+        if isinstance(half_hours, dict):
+            for slot, count in half_hours.items():
+                peak[slot] = peak.get(slot, 0) + int(count or 0)
+
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "total_messages_inbound": total_inbound,
+        "total_messages_outbound": total_outbound,
+        "total_messages": total_inbound + total_outbound,
+        "total_leads_received": total_leads,
+        "total_leads_assumed": total_assumed,
+        "operators": list(operators_agg.values()),
+        "peak_chart": peak,
+    }
+
+
+@app.get("/api/admin/dashboard/ratings")
+async def dashboard_ratings(
+    date_from: str = Query(""),
+    date_to: str = Query(""),
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ratings = get_all_ratings(date_from or None, date_to or None)
+    return {"ratings": ratings}
+
+
+# -- API: Export --
+
+
+@app.get("/api/admin/export")
+async def export_data(
+    date_from: str = Query(""),
+    date_to: str = Query(""),
+    format: str = Query("json"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Exporta conversas e contatos em JSON ou CSV."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+
+    contacts = get_all_wa_contacts(include_archived=True)
+    # Filtrar por data se especificado
+    if date_from:
+        contacts = [c for c in contacts if str(c.get("first_seen_at", ""))[:10] >= date_from]
+    if date_to:
+        contacts = [c for c in contacts if str(c.get("first_seen_at", ""))[:10] <= date_to]
+
+    if format == "csv":
+        import csv
+        import io
+        output = io.StringIO()
+        if contacts:
+            fields = ["id", "wa_id", "display_name", "phone_formatted", "qualification",
+                       "assigned_to", "assigned_name", "department_name", "channel_id",
+                       "source_channel_type", "rating", "first_seen_at", "last_message_at",
+                       "notes"]
+            writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for c in contacts:
+                writer.writerow(c)
+        csv_content = output.getvalue()
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=export_{date_from}_{date_to}.csv"},
+        )
+    else:
+        return {"contacts": contacts, "count": len(contacts), "date_from": date_from, "date_to": date_to}
 
 
 # -- API: Embedded Signup (Coexistence) --

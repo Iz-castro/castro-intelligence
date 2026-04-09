@@ -816,6 +816,12 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         if direction == "inbound" and status == "received":
             updates["unread_count"] = int(contact.get("unread_count", 0)) + 1
         document("wa_contacts", contact_id).set(updates, merge=True)
+
+    # Atualizar metricas de auditoria (fire-and-forget)
+    increment_audit_metrics(
+        direction=direction,
+        operator_id=operator_id or (contact or {}).get("assigned_to"),
+    )
     return message_id
 
 
@@ -925,6 +931,91 @@ def mark_wa_conversation_read(contact_id):
         batch.commit()
     document("wa_contacts", contact_id).set({"unread_count": 0}, merge=True)
     return total_updated
+
+
+# ---------------------------------------------------------------------------
+# Audit metrics (pre-aggregated daily counters)
+# ---------------------------------------------------------------------------
+
+def _audit_metric_doc_id(date_str, user_id=None):
+    return f"{date_str}_{user_id}" if user_id else date_str
+
+
+def increment_audit_metrics(direction, operator_id=None, is_new_lead=False, is_assumed=False):
+    """Incrementa metricas diarias. Chamada a cada save_wa_message."""
+    now = utcnow()
+    date_str = now.strftime("%Y-%m-%d")
+    half_hour = f"{now.strftime('%H')}:{('00' if now.minute < 30 else '30')}"
+
+    def _increment(doc_id):
+        ref = document("audit_metrics", doc_id)
+        snap = ref.get()
+        data = snap.to_dict() if snap.exists else {}
+
+        updates = {
+            "date": date_str,
+            "updated_at": now,
+        }
+
+        if direction == "inbound":
+            updates["total_messages_inbound"] = int(data.get("total_messages_inbound", 0)) + 1
+        elif direction == "outbound":
+            updates["total_messages_outbound"] = int(data.get("total_messages_outbound", 0)) + 1
+
+        if is_new_lead:
+            updates["total_leads_received"] = int(data.get("total_leads_received", 0)) + 1
+        if is_assumed:
+            updates["total_leads_assumed"] = int(data.get("total_leads_assumed", 0)) + 1
+
+        # Messages by half hour
+        by_half = data.get("messages_by_half_hour", {})
+        by_half[half_hour] = int(by_half.get(half_hour, 0)) + 1
+        updates["messages_by_half_hour"] = by_half
+
+        # Activity tracking
+        if not data.get("first_activity_at"):
+            updates["first_activity_at"] = now
+        updates["last_activity_at"] = now
+
+        ref.set(updates, merge=True)
+
+    try:
+        # Global aggregate
+        _increment(_audit_metric_doc_id(date_str))
+        # Per-operator aggregate
+        if operator_id:
+            _increment(_audit_metric_doc_id(date_str, operator_id))
+    except Exception as exc:
+        logger.warning("Falha ao atualizar audit_metrics: %s", exc)
+
+
+def get_audit_metrics(date_from, date_to):
+    """Retorna metricas agregadas para o periodo."""
+    rows = []
+    for snap in collection("audit_metrics").stream():
+        data = snap.to_dict() or {}
+        date_str = data.get("date", "")
+        if date_from <= date_str <= date_to:
+            data["doc_id"] = snap.id
+            rows.append(normalize_record(data))
+    return rows
+
+
+def get_all_ratings(date_from=None, date_to=None):
+    """Retorna contatos convertidos com rating."""
+    rows = []
+    for snap in collection("wa_contacts").where("qualification", "==", "convertido").stream():
+        data = _raw_doc(snap)
+        if not data or data.get("rating") is None:
+            continue
+        if date_from or date_to:
+            rated_at = str(data.get("rating_received_at", ""))[:10]
+            if date_from and rated_at < date_from:
+                continue
+            if date_to and rated_at > date_to:
+                continue
+        rows.append(normalize_record(data))
+    return rows
 
 
 def log_audit(user_id, action, detail="", ip_address=""):

@@ -103,6 +103,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
+              {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
         </div>
@@ -819,7 +820,176 @@ function SettingsModals() {
       {showSettings === "whatsapp" && sessionUser.role === "admin" ? <WhatsAppSignupModal /> : null}
 
       {showSettings === "admin" && sessionUser.role === "admin" ? <AdminSettingsModal /> : null}
+
+      {showSettings === "dashboard" && (sessionUser.role === "admin" || sessionUser.role === "supervisor") ? <DashboardModal /> : null}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard Modal (audit metrics, export)
+// ---------------------------------------------------------------------------
+
+function DashboardModal() {
+  const { bundle, setShowSettings, operators, setError } = useCrm();
+  const [dateFrom, setDateFrom] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0, 10);
+  });
+  const [dateTo, setDateTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
+  const [ratings, setRatings] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const loadDashboard = useCallback(async () => {
+    if (!bundle) return;
+    setLoading(true);
+    try {
+      const [sumRes, ratRes] = await Promise.all([
+        getJson<Record<string, unknown>>(bundle.auth, `/api/admin/dashboard/summary?date_from=${dateFrom}&date_to=${dateTo}`),
+        getJson<{ ratings: Record<string, unknown>[] }>(bundle.auth, `/api/admin/dashboard/ratings?date_from=${dateFrom}&date_to=${dateTo}`),
+      ]);
+      setSummary(sumRes);
+      setRatings(ratRes.ratings || []);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setLoading(false);
+  }, [bundle, dateFrom, dateTo, setError]);
+
+  useEffect(() => { void loadDashboard(); }, [loadDashboard]);
+
+  const operatorName = (uid: unknown) => {
+    const id = typeof uid === "number" ? uid : Number(uid);
+    return operators.find((o) => o.id === id)?.display_name || `#${uid}`;
+  };
+
+  const exportCsv = useCallback(async () => {
+    if (!bundle) return;
+    try {
+      const token = await bundle.auth.currentUser?.getIdToken();
+      const resp = await fetch(`/api/admin/export?date_from=${dateFrom}&date_to=${dateTo}&format=csv`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href = url; a.download = `export_${dateFrom}_${dateTo}.csv`; a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+  }, [bundle, dateFrom, dateTo, setError]);
+
+  const peakData = summary?.peak_chart as Record<string, number> | undefined;
+  const peakSlots = peakData ? Object.entries(peakData).sort(([a], [b]) => a.localeCompare(b)) : [];
+  const peakMax = peakSlots.length ? Math.max(...peakSlots.map(([, v]) => v)) : 1;
+  const opsData = (summary?.operators || []) as { user_id: unknown; inbound: number; outbound: number; leads_assumed: number; first_activity: string | null; last_activity: string | null }[];
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Dashboard" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 750, maxHeight: "90vh", overflow: "auto" }}>
+        <h2 style={{ margin: "0 0 0.8rem" }}>Dashboard de Auditoria</h2>
+
+        {/* Date range */}
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "1rem", flexWrap: "wrap" }}>
+          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+          <span>ate</span>
+          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+          <button className="primary" style={{ padding: "0.4rem 0.8rem" }} onClick={() => void loadDashboard()} disabled={loading}>{loading ? "..." : "Atualizar"}</button>
+          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => void exportCsv()}>Exportar CSV</button>
+        </div>
+
+        {summary ? (
+          <>
+            {/* Summary cards */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "0.6rem", marginBottom: "1.2rem" }}>
+              {([
+                ["Leads recebidos", summary.total_leads_received],
+                ["Leads assumidos", summary.total_leads_assumed],
+                ["Msgs recebidas", summary.total_messages_inbound],
+                ["Msgs enviadas", summary.total_messages_outbound],
+                ["Total mensagens", summary.total_messages],
+              ] as [string, unknown][]).map(([label, value]) => (
+                <div key={label} style={{ background: "var(--card-bg, var(--bg-alt))", borderRadius: 8, padding: "0.8rem", textAlign: "center" }}>
+                  <div style={{ fontSize: "1.6rem", fontWeight: 700 }}>{String(value ?? 0)}</div>
+                  <div className="sub" style={{ fontSize: "0.75rem" }}>{label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Peak chart (bar chart with CSS) */}
+            {peakSlots.length > 0 && (
+              <div className="settings-section" style={{ marginBottom: "1.2rem" }}>
+                <h3>Pico de mensagens (por meia hora)</h3>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 100, overflow: "auto" }}>
+                  {peakSlots.map(([slot, count]) => (
+                    <div key={slot} style={{ flex: "0 0 auto", display: "flex", flexDirection: "column", alignItems: "center", minWidth: 28 }}>
+                      <div style={{ width: 20, height: Math.max(2, (count / peakMax) * 80), background: "var(--accent)", borderRadius: "3px 3px 0 0" }} title={`${slot}: ${count}`} />
+                      <span style={{ fontSize: "0.55rem", marginTop: 2, transform: "rotate(-45deg)", whiteSpace: "nowrap" }}>{slot}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Per-operator table */}
+            {opsData.length > 0 && (
+              <div className="settings-section" style={{ marginBottom: "1.2rem" }}>
+                <h3>Por operador</h3>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", fontSize: "0.8rem", borderCollapse: "collapse" }}>
+                    <thead><tr style={{ borderBottom: "1px solid var(--border)" }}>
+                      <th style={{ textAlign: "left", padding: "0.4rem" }}>Operador</th>
+                      <th style={{ textAlign: "right", padding: "0.4rem" }}>Recebidas</th>
+                      <th style={{ textAlign: "right", padding: "0.4rem" }}>Enviadas</th>
+                      <th style={{ textAlign: "right", padding: "0.4rem" }}>Assumidos</th>
+                    </tr></thead>
+                    <tbody>
+                      {opsData.map((op) => (
+                        <tr key={String(op.user_id)} style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td style={{ padding: "0.4rem" }}>{operatorName(op.user_id)}</td>
+                          <td style={{ textAlign: "right", padding: "0.4rem" }}>{op.inbound}</td>
+                          <td style={{ textAlign: "right", padding: "0.4rem" }}>{op.outbound}</td>
+                          <td style={{ textAlign: "right", padding: "0.4rem" }}>{op.leads_assumed}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Ratings table */}
+            {ratings.length > 0 && (
+              <div className="settings-section">
+                <h3>Avaliacoes de atendimento</h3>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", fontSize: "0.8rem", borderCollapse: "collapse" }}>
+                    <thead><tr style={{ borderBottom: "1px solid var(--border)" }}>
+                      <th style={{ textAlign: "left", padding: "0.4rem" }}>Contato</th>
+                      <th style={{ textAlign: "right", padding: "0.4rem" }}>Nota</th>
+                      <th style={{ textAlign: "left", padding: "0.4rem" }}>Operador</th>
+                      <th style={{ textAlign: "left", padding: "0.4rem" }}>Data</th>
+                    </tr></thead>
+                    <tbody>
+                      {ratings.map((r, i) => (
+                        <tr key={i} style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td style={{ padding: "0.4rem" }}>{String(r.display_name || r.wa_id || "")}</td>
+                          <td style={{ textAlign: "right", padding: "0.4rem" }}>
+                            <span className="chip" style={{ fontSize: "0.75rem", background: Number(r.rating) >= 7 ? "var(--success)" : Number(r.rating) >= 4 ? "#e6a817" : "var(--danger)", color: "#fff" }}>{String(r.rating)}/10</span>
+                          </td>
+                          <td style={{ padding: "0.4rem" }}>{r.converted_by_user_id ? operatorName(r.converted_by_user_id) : "-"}</td>
+                          <td style={{ padding: "0.4rem" }}>{String(r.rating_received_at || "").slice(0, 10)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </>
+        ) : loading ? (
+          <p className="sub">Carregando...</p>
+        ) : null}
+      </div>
+    </div>
   );
 }
 

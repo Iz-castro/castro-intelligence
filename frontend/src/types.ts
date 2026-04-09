@@ -160,7 +160,7 @@ export type UserSettings = {
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "whatsapp";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "whatsapp" | "dashboard";
 
 export type QuickMessage = { shortcut: string; message: string };
 
