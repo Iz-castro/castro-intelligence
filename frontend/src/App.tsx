@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
-import type { ChatMessage, Contact, Operator } from "./types";
+import { getJson, sendJson, putJson, deleteJson } from "./api";
+import type { Channel, ChatMessage, Contact, Department, Operator } from "./types";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
 
@@ -101,6 +102,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
+              {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
             </div>
           )}
         </div>
@@ -513,6 +515,175 @@ function DetailPanel() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// WhatsApp Embedded Signup (Coexistence)
+// ---------------------------------------------------------------------------
+
+declare global {
+  interface Window {
+    fbAsyncInit?: () => void;
+    FB?: {
+      init: (params: { appId: string; autoLogAppEvents: boolean; xfbml: boolean; version: string }) => void;
+      login: (callback: (response: { authResponse?: { code?: string } }) => void, params: { config_id: string; response_type: string; override_default_response_type: boolean; extras: Record<string, unknown> }) => void;
+    };
+  }
+}
+
+function WhatsAppSignupModal() {
+  const { bundle, setShowSettings } = useCrm();
+  const [step, setStep] = useState<"loading" | "ready" | "signing" | "exchanging" | "done" | "error">("loading");
+  const [signupConfig, setSignupConfig] = useState<{ app_id: string; config_id: string; graph_api_version: string } | null>(null);
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [errorMsg, setErrorMsg] = useState("");
+  const fbLoaded = useRef(false);
+
+  useEffect(() => {
+    if (!bundle) return;
+    getJson<{ app_id: string; config_id: string; graph_api_version: string }>(bundle.auth, "/api/admin/embedded-signup/config")
+      .then((cfg) => {
+        setSignupConfig(cfg);
+        loadFacebookSDK(cfg.app_id, cfg.graph_api_version);
+      })
+      .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
+  }, [bundle]);
+
+  function loadFacebookSDK(appId: string, version: string) {
+    if (fbLoaded.current || window.FB) {
+      setStep("ready");
+      return;
+    }
+    window.fbAsyncInit = () => {
+      window.FB!.init({ appId, autoLogAppEvents: true, xfbml: false, version });
+      fbLoaded.current = true;
+      setStep("ready");
+    };
+    const script = document.createElement("script");
+    script.src = "https://connect.facebook.net/pt_BR/sdk.js";
+    script.async = true;
+    script.defer = true;
+    script.crossOrigin = "anonymous";
+    document.body.appendChild(script);
+  }
+
+  const launchSignup = useCallback(() => {
+    if (!window.FB || !signupConfig) return;
+    setStep("signing");
+    window.FB.login(
+      (response) => {
+        const code = response.authResponse?.code;
+        if (!code) {
+          setErrorMsg("Signup cancelado ou nenhum codigo retornado.");
+          setStep("error");
+          return;
+        }
+        setStep("exchanging");
+        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code })
+          .then((data) => { setResult(data); setStep("done"); })
+          .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
+      },
+      {
+        config_id: signupConfig.config_id,
+        response_type: "code",
+        override_default_response_type: true,
+        extras: {
+          setup: {},
+          featureType: "whatsapp_business_app_onboarding",
+          sessionInfoVersion: "3",
+        },
+      },
+    );
+  }, [signupConfig, bundle]);
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="WhatsApp Coexistence" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 600 }}>
+        <h2 style={{ margin: "0 0 1.2rem" }}>WhatsApp Coexistence</h2>
+
+        {step === "loading" && <p>Carregando configuracao...</p>}
+
+        {step === "error" && (
+          <div className="settings-section">
+            <div style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 8, padding: "1rem", color: "#991b1b" }}>
+              <strong>Erro:</strong> {errorMsg}
+            </div>
+            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => setStep("ready")}>Tentar novamente</button>
+          </div>
+        )}
+
+        {step === "ready" && (
+          <div className="settings-section">
+            <p style={{ marginBottom: "1rem", lineHeight: 1.6 }}>
+              Conecte um numero do WhatsApp Business App ao CRM via Coexistence.
+              O administrador do portfolio <strong>cliente</strong> deve fazer login no popup do Facebook.
+            </p>
+            <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginBottom: "1rem", fontSize: "0.9rem" }}>
+              <strong>Requisitos:</strong>
+              <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
+                <li>Numero ativo no WhatsApp Business App (Android/iOS)</li>
+                <li>App versao 2.24.17 ou superior</li>
+                <li>Portfolio do cliente verificado no Meta Business Manager</li>
+                <li>Camera do celular pronta para escanear QR Code</li>
+              </ul>
+            </div>
+            <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup}>
+              Iniciar Embedded Signup
+            </button>
+          </div>
+        )}
+
+        {step === "signing" && (
+          <div className="settings-section" style={{ textAlign: "center" }}>
+            <p>Aguardando conclusao do signup no popup do Facebook...</p>
+            <p style={{ fontSize: "0.85rem", color: "#666" }}>Complete o fluxo no popup: login, selecao do WABA, e escaneamento do QR Code no celular.</p>
+          </div>
+        )}
+
+        {step === "exchanging" && (
+          <div className="settings-section" style={{ textAlign: "center" }}>
+            <p>Trocando credenciais e configurando webhooks...</p>
+          </div>
+        )}
+
+        {step === "done" && result && (
+          <div className="settings-section">
+            <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: "1rem", marginBottom: "1rem" }}>
+              <strong>Conexao realizada com sucesso!</strong>
+            </div>
+            <table style={{ width: "100%", fontSize: "0.9rem", borderCollapse: "collapse" }}>
+              <tbody>
+                {[
+                  ["WABA ID", result.waba_id],
+                  ["Phone Number ID", result.phone_number_id],
+                  ["Numero", result.display_phone_number],
+                  ["Nome Verificado", result.verified_name],
+                  ["Status", result.phone_status],
+                  ["Plataforma", result.platform_type],
+                  ["Qualidade", result.quality_rating],
+                  ["Webhook", result.webhook_subscribed ? "Inscrito" : "Falhou"],
+                ].map(([label, value]) => (
+                  <tr key={String(label)}>
+                    <td style={{ padding: "0.4rem 0.8rem 0.4rem 0", fontWeight: 600, whiteSpace: "nowrap" }}>{String(label)}</td>
+                    <td style={{ padding: "0.4rem 0", fontFamily: "monospace" }}>{String(value ?? "—")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginTop: "1rem", fontSize: "0.85rem" }}>
+              <strong>Proximo passo:</strong> Atualize o <code>.env</code> do servidor com os novos valores:
+              <pre style={{ margin: "0.5rem 0 0", whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
+{`WHATSAPP_TOKEN=${result.access_token || "???"}
+WHATSAPP_PHONE_NUMBER_ID=${result.phone_number_id || "???"}
+WHATSAPP_WABA_ID=${result.waba_id || "???"}`}
+              </pre>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsModals() {
   const { showSettings, setShowSettings, sessionUser, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, saveUserSettingsAction, saveSystemSettingsAction } = useCrm();
   if (!sessionUser) return null;
@@ -562,11 +733,112 @@ function SettingsModals() {
         </div>
       ) : null}
 
-      {showSettings === "admin" && sessionUser.role === "admin" ? (
-        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Administracao" onClick={() => setShowSettings(false)}>
-          <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
-          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: "0 0 1.2rem" }}>Administracao</h2>
+      {showSettings === "whatsapp" && sessionUser.role === "admin" ? <WhatsAppSignupModal /> : null}
+
+      {showSettings === "admin" && sessionUser.role === "admin" ? <AdminSettingsModal /> : null}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Admin Settings Modal (departments, channels, system config)
+// ---------------------------------------------------------------------------
+
+function AdminSettingsModal() {
+  const {
+    bundle, setShowSettings, departments, channels, operators,
+    systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction,
+    setError, setNotice,
+  } = useCrm();
+  const [adminTab, setAdminTab] = useState<"system" | "departments" | "channels">("system");
+
+  // -- Department state --
+  const [depts, setDepts] = useState<Department[]>(departments);
+  const [newDeptName, setNewDeptName] = useState("");
+  const [newDeptDesc, setNewDeptDesc] = useState("");
+  const [editingDeptId, setEditingDeptId] = useState<number | null>(null);
+  const [editDeptName, setEditDeptName] = useState("");
+  const [editDeptDesc, setEditDeptDesc] = useState("");
+  const [busyDept, setBusyDept] = useState(false);
+
+  // -- Channel state --
+  const [chans, setChans] = useState<Channel[]>(channels);
+
+  useEffect(() => { setDepts(departments); }, [departments]);
+  useEffect(() => { setChans(channels); }, [channels]);
+
+  const reloadDepts = useCallback(async () => {
+    if (!bundle) return;
+    const res = await getJson<{ departments: Department[] }>(bundle.auth, "/api/departments");
+    setDepts(res.departments);
+  }, [bundle]);
+
+  const reloadChans = useCallback(async () => {
+    if (!bundle) return;
+    const res = await getJson<{ channels: Channel[] }>(bundle.auth, "/api/admin/channels").catch(() => ({ channels: [] as Channel[] }));
+    setChans(res.channels);
+  }, [bundle]);
+
+  const createDept = useCallback(async () => {
+    if (!bundle || !newDeptName.trim()) return;
+    setBusyDept(true);
+    try {
+      await sendJson(bundle.auth, "/api/admin/departments", { name: newDeptName.trim(), description: newDeptDesc.trim() });
+      setNewDeptName(""); setNewDeptDesc("");
+      await reloadDepts();
+      setNotice("Departamento criado");
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusyDept(false);
+  }, [bundle, newDeptName, newDeptDesc, reloadDepts, setError, setNotice]);
+
+  const saveDeptEdit = useCallback(async (deptId: number) => {
+    if (!bundle || !editDeptName.trim()) return;
+    setBusyDept(true);
+    try {
+      await putJson(bundle.auth, `/api/admin/departments/${deptId}`, { name: editDeptName.trim(), description: editDeptDesc.trim() });
+      setEditingDeptId(null);
+      await reloadDepts();
+      setNotice("Departamento atualizado");
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusyDept(false);
+  }, [bundle, editDeptName, editDeptDesc, reloadDepts, setError, setNotice]);
+
+  const deleteDept = useCallback(async (deptId: number) => {
+    if (!bundle) return;
+    setBusyDept(true);
+    try {
+      await deleteJson(bundle.auth, `/api/admin/departments/${deptId}`);
+      await reloadDepts();
+      setNotice("Departamento removido");
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusyDept(false);
+  }, [bundle, reloadDepts, setError, setNotice]);
+
+  const deactivateChannel = useCallback(async (channelId: number) => {
+    if (!bundle) return;
+    try {
+      await deleteJson(bundle.auth, `/api/admin/channels/${channelId}`);
+      await reloadChans();
+      setNotice("Canal desativado");
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+  }, [bundle, reloadChans, setError, setNotice]);
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Administracao" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
+        <h2 style={{ margin: "0 0 1rem" }}>Administracao</h2>
+
+        {/* Tabs */}
+        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.2rem", borderBottom: "1px solid var(--border)", paddingBottom: "0.5rem" }}>
+          <button className={adminTab === "system" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("system")}>Sistema</button>
+          <button className={adminTab === "departments" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("departments")}>Departamentos</button>
+          <button className={adminTab === "channels" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("channels")}>Canais WhatsApp</button>
+        </div>
+
+        {/* Tab: Sistema */}
+        {adminTab === "system" && (
+          <>
             <div className="settings-section">
               <h3>Prefixo de mensagem</h3>
               <div className="settings-block"><label className="settings-toggle"><input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} /><span>Habilitar prefixo de mensagem (padrao do sistema)</span></label></div>
@@ -596,10 +868,91 @@ function SettingsModals() {
               </div>
             </div>
             <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
+          </>
+        )}
+
+        {/* Tab: Departamentos */}
+        {adminTab === "departments" && (
+          <div className="settings-section">
+            <h3>Departamentos</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+              {depts.map((dept) => (
+                <div key={dept.id} className="admin-user-row" style={{ padding: "0.5rem 0.6rem" }}>
+                  {editingDeptId === dept.id ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", flex: 1 }}>
+                      <input value={editDeptName} onChange={(e) => setEditDeptName(e.target.value)} placeholder="Nome" />
+                      <input value={editDeptDesc} onChange={(e) => setEditDeptDesc(e.target.value)} placeholder="Descricao (opcional)" />
+                      <div style={{ display: "flex", gap: "0.4rem" }}>
+                        <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={busyDept} onClick={() => void saveDeptEdit(dept.id)}>{busyDept ? "..." : "Salvar"}</button>
+                        <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setEditingDeptId(null)}>Cancelar</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="admin-user-info">
+                        <strong>{dept.name}</strong>
+                        {dept.description ? <span className="sub">{dept.description}</span> : null}
+                      </div>
+                      <div style={{ display: "flex", gap: "0.3rem" }}>
+                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} onClick={() => { setEditingDeptId(dept.id); setEditDeptName(dept.name); setEditDeptDesc(dept.description || ""); }}>Editar</button>
+                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Remover departamento "${dept.name}"?`)) void deleteDept(dept.id); }}>Remover</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: "1rem", display: "flex", flexDirection: "column", gap: "0.4rem", borderTop: "1px solid var(--border)", paddingTop: "0.8rem" }}>
+              <span className="sub">Novo departamento:</span>
+              <input value={newDeptName} onChange={(e) => setNewDeptName(e.target.value)} placeholder="Nome do departamento" />
+              <input value={newDeptDesc} onChange={(e) => setNewDeptDesc(e.target.value)} placeholder="Descricao (opcional)" />
+              <button className="primary" style={{ padding: "0.5rem" }} disabled={!newDeptName.trim() || busyDept} onClick={() => void createDept()}>{busyDept ? "Criando..." : "Criar departamento"}</button>
+            </div>
           </div>
-        </div>
-      ) : null}
-    </>
+        )}
+
+        {/* Tab: Canais WhatsApp */}
+        {adminTab === "channels" && (
+          <div className="settings-section">
+            <h3>Canais WhatsApp conectados</h3>
+            {chans.length === 0 ? (
+              <p className="sub">Nenhum canal configurado. Use o Embedded Signup para conectar um numero.</p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                {chans.map((ch) => {
+                  const owner = ch.owner_user_id ? operators.find((o) => o.id === ch.owner_user_id) : null;
+                  return (
+                    <div key={ch.id} className="admin-user-row" style={{ padding: "0.6rem" }}>
+                      <div className="admin-user-info">
+                        <strong>{ch.label}</strong>
+                        <span className="sub">
+                          {ch.display_phone_number || ch.phone_number_id}
+                          {" | "}
+                          <span className="chip" style={{ fontSize: "0.7rem" }}>{ch.channel_type === "standard" ? "Cloud API" : "Coexistence"}</span>
+                          {ch.is_bot_enabled ? <span className="chip" style={{ fontSize: "0.7rem", marginLeft: "0.3rem" }}>Bot</span> : null}
+                        </span>
+                        {owner ? <span className="sub">Operador: {owner.display_name}</span> : null}
+                      </div>
+                      <div style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
+                        <span className="chip" style={{ fontSize: "0.7rem", background: ch.is_active ? "var(--success)" : "var(--danger)", color: "#fff" }}>
+                          {ch.is_active ? "Ativo" : "Inativo"}
+                        </span>
+                        {ch.channel_type !== "standard" && (
+                          <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Desativar canal "${ch.label}"?`)) void deactivateChannel(ch.id); }}>Desativar</button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div style={{ marginTop: "1rem", borderTop: "1px solid var(--border)", paddingTop: "0.8rem" }}>
+              <p className="sub">Para adicionar um canal coexistence, use a opcao <strong>WhatsApp Coexistence</strong> no menu de configuracoes.</p>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

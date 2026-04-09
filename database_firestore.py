@@ -183,10 +183,48 @@ def create_department(name, description=""):
     return department_id
 
 
-def get_all_departments():
-    rows = [row for row in _all_docs("departments") if row and row.get("is_active", 1)]
-    rows.sort(key=lambda row: row.get("name", "").lower())
+def get_all_departments(include_inactive=False):
+    if include_inactive:
+        rows = [row for row in _all_docs("departments") if row]
+    else:
+        rows = [row for row in _all_docs("departments") if row and row.get("is_active", 1)]
+    rows.sort(key=lambda row: (row.get("sort_order", 0), row.get("name", "").lower()))
     return _normalize_many(rows)
+
+
+def get_department_by_id(department_id):
+    return normalize_record(_get_doc("departments", department_id))
+
+
+def update_department(department_id, name=None, description=None, is_active=None, sort_order=None):
+    fields = {}
+    if name is not None:
+        # Verifica duplicata de nome (excluindo o proprio)
+        existing = _get_first_by_field("departments", "name", name)
+        if existing and existing["id"] != department_id:
+            return False, "Ja existe um departamento com este nome"
+        fields["name"] = name
+    if description is not None:
+        fields["description"] = description
+    if is_active is not None:
+        fields["is_active"] = 1 if is_active else 0
+    if sort_order is not None:
+        fields["sort_order"] = sort_order
+    if not fields:
+        return False, "Nenhum campo para atualizar"
+    fields["updated_at"] = utcnow()
+    document("departments", department_id).set(fields, merge=True)
+    _department_cache.pop(department_id, None)
+    return True, None
+
+
+def deactivate_department(department_id):
+    document("departments", department_id).set({
+        "is_active": 0,
+        "updated_at": utcnow(),
+    }, merge=True)
+    _department_cache.pop(department_id, None)
+    return True
 
 
 def get_user_by_username(username):

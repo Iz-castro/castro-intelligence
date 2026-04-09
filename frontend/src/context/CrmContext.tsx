@@ -5,7 +5,7 @@ import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where 
 import { getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
-  ActiveView, ChatMessage, ClientConfig, Contact, Department,
+  ActiveView, Channel, ChatMessage, ClientConfig, Contact, Department,
   MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings, TransportMode, UserSettings,
 } from "../types";
 import { errorText } from "../utils/errors";
@@ -27,6 +27,7 @@ type CrmContextValue = {
   sessionUser: SessionUser | null;
   operators: Operator[];
   departments: Department[];
+  channels: Channel[];
   booting: boolean;
   busyLogin: boolean;
   snapshotMode: boolean;
@@ -178,7 +179,7 @@ type CrmContextValue = {
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
   toggleSettingsMenu: () => void;
-  openSettingsPage: (page: "chat" | "quick" | "admin") => Promise<void>;
+  openSettingsPage: (page: "chat" | "quick" | "admin" | "whatsapp") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
   settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -242,6 +243,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
   const [operators, setOperators] = useState<Operator[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
+  const [channels, setChannels] = useState<Channel[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
@@ -479,13 +481,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (!user) { setSessionUser(null); setContacts([]); setMessages([]); return; }
       try {
         const session = await getJson<{ user: SessionUser }>(bundle.auth, "/api/session");
-        const [ops, deps] = await Promise.all([
+        const [ops, deps, chs] = await Promise.all([
           getJson<Operator[]>(bundle.auth, "/api/operators"),
           getJson<{ departments: Department[] }>(bundle.auth, "/api/departments"),
+          getJson<{ channels: Channel[] }>(bundle.auth, "/api/admin/channels").catch(() => ({ channels: [] as Channel[] })),
         ]);
         setSessionUser(session.user);
         setOperators(ops);
         setDepartments(deps.departments);
+        setChannels(chs.channels);
         setError("");
         Promise.all([
           getJson<SystemSettings>(bundle.auth, "/api/settings/system"),
@@ -918,8 +922,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
-  async function openSettingsPage(page: "chat" | "quick" | "admin") {
+  async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp") {
     if (!bundle) return;
+    if (page === "whatsapp") {
+      setShowSettings(page);
+      return;
+    }
     try {
       setBusySettings(true);
       const [sys, usr] = await Promise.all([getJson<SystemSettings>(bundle.auth, "/api/settings/system"), getJson<UserSettings>(bundle.auth, "/api/settings/user")]);
@@ -947,7 +955,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, operators, departments, booting, busyLogin, snapshotMode, isManagerRole,
+    config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
     theme, toggleTheme,
     loginWithGoogle, logout,
     contacts, selectedContactId, setSelectedContactId, selectedContact,

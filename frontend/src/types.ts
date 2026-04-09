@@ -43,6 +43,25 @@ export type Department = {
   id: number;
   name: string;
   description?: string;
+  is_active?: number;
+  sort_order?: number;
+};
+
+export type Channel = {
+  id: number;
+  channel_type: "standard" | "coexistence";
+  label: string;
+  waba_id: string;
+  phone_number_id: string;
+  display_phone_number: string;
+  owner_user_id?: number | null;
+  owner_firebase_uid?: string;
+  default_department_id?: number | null;
+  is_bot_enabled?: boolean;
+  is_active?: boolean;
+  webhook_subscribed?: boolean;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type Operator = {
@@ -131,7 +150,7 @@ export type UserSettings = {
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "admin";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "whatsapp";
 
 export type QuickMessage = { shortcut: string; message: string };
 

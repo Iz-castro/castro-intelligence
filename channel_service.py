@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+"""
+Servico de canais WhatsApp.
+
+Substitui as referencias hardcoded a WHATSAPP_TOKEN / WHATSAPP_PHONE_NUMBER_ID
+por um registry que suporta multiplos canais (standard + coexistence).
+
+Uso:
+    from channel_service import (
+        get_channel, get_channel_by_phone_id, get_default_channel,
+        get_channels_for_user, get_send_credentials, refresh_channels,
+    )
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from firestore_common import collection, document, next_sequence, utcnow, normalize_record
+
+logger = logging.getLogger("castro_crm.channels")
+
+CHANNEL_TYPE_STANDARD = "standard"
+CHANNEL_TYPE_COEXISTENCE = "coexistence"
+
+# ---------------------------------------------------------------------------
+# In-memory cache (thread-safe via lock)
+# ---------------------------------------------------------------------------
+
+_lock = threading.Lock()
+_channels_by_id: dict[int, dict] = {}
+_channels_by_phone_id: dict[str, dict] = {}
+_default_channel_id: int | None = None
+_last_refresh: float = 0
+_CACHE_TTL_SECONDS = 60
+
+
+def _needs_refresh() -> bool:
+    return time.monotonic() - _last_refresh > _CACHE_TTL_SECONDS
+
+
+def refresh_channels() -> None:
+    """Recarrega todos os canais ativos do Firestore para o cache."""
+    global _last_refresh, _default_channel_id
+
+    rows = []
+    for snap in collection("channels").stream():
+        data = snap.to_dict() or {}
+        if "id" not in data:
+            try:
+                data["id"] = int(snap.id)
+            except ValueError:
+                data["id"] = snap.id
+        if data.get("is_active"):
+            rows.append(data)
+
+    by_id: dict[int, dict] = {}
+    by_phone: dict[str, dict] = {}
+    default_id: int | None = None
+
+    for row in rows:
+        cid = row["id"]
+        by_id[cid] = row
+        phone_id = str(row.get("phone_number_id", "")).strip()
+        if phone_id:
+            by_phone[phone_id] = row
+        if row.get("channel_type") == CHANNEL_TYPE_STANDARD and default_id is None:
+            default_id = cid
+
+    with _lock:
+        _channels_by_id.clear()
+        _channels_by_id.update(by_id)
+        _channels_by_phone_id.clear()
+        _channels_by_phone_id.update(by_phone)
+        _default_channel_id = default_id
+        _last_refresh = time.monotonic()
+
+    logger.info("Channel cache refreshed: %d active channels", len(by_id))
+
+
+def _ensure_cache() -> None:
+    if _needs_refresh():
+        refresh_channels()
+
+
+# ---------------------------------------------------------------------------
+# Leitura
+# ---------------------------------------------------------------------------
+
+def get_channel(channel_id: int) -> dict | None:
+    """Retorna um canal pelo ID."""
+    _ensure_cache()
+    with _lock:
+        return _channels_by_id.get(channel_id)
+
+
+def get_channel_by_phone_id(phone_number_id: str) -> dict | None:
+    """Retorna um canal pelo phone_number_id da Meta."""
+    if not phone_number_id:
+        return None
+    _ensure_cache()
+    with _lock:
+        return _channels_by_phone_id.get(str(phone_number_id).strip())
+
+
+def get_default_channel() -> dict | None:
+    """Retorna o canal standard (bot) padrao."""
+    _ensure_cache()
+    with _lock:
+        if _default_channel_id is not None:
+            return _channels_by_id.get(_default_channel_id)
+    return None
+
+
+def get_all_active_channels() -> list[dict]:
+    """Retorna todos os canais ativos."""
+    _ensure_cache()
+    with _lock:
+        return [normalize_record(ch) for ch in _channels_by_id.values()]
+
+
+def get_channels_for_user(user_id: int) -> list[dict]:
+    """Retorna canais que o usuario pode acessar.
+
+    - Canal standard (bot): acessivel por todos
+    - Canal coexistence: acessivel apenas pelo owner + admin/supervisor
+    """
+    _ensure_cache()
+    with _lock:
+        result = []
+        for ch in _channels_by_id.values():
+            if ch.get("channel_type") == CHANNEL_TYPE_STANDARD:
+                result.append(ch)
+            elif ch.get("owner_user_id") == user_id:
+                result.append(ch)
+        return [normalize_record(ch) for ch in result]
+
+
+def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
+    """Retorna (access_token, phone_number_id, graph_api_base) para envio.
+
+    Se channel_id for None, usa o canal default.
+    Raises ValueError se o canal nao for encontrado.
+    """
+    from config import GRAPH_API_BASE
+
+    channel = None
+    if channel_id is not None:
+        channel = get_channel(channel_id)
+    if channel is None:
+        channel = get_default_channel()
+    if channel is None:
+        raise ValueError("Nenhum canal WhatsApp configurado.")
+
+    token = str(channel.get("access_token", "")).strip()
+    phone_id = str(channel.get("phone_number_id", "")).strip()
+
+    if not token or not phone_id:
+        raise ValueError(f"Canal {channel.get('id')} sem token ou phone_number_id.")
+
+    return token, phone_id, GRAPH_API_BASE
+
+
+# ---------------------------------------------------------------------------
+# Escrita (CRUD)
+# ---------------------------------------------------------------------------
+
+def create_channel(
+    channel_type: str,
+    label: str,
+    waba_id: str,
+    phone_number_id: str,
+    display_phone_number: str,
+    access_token: str,
+    owner_user_id: int | None = None,
+    owner_firebase_uid: str = "",
+    default_department_id: int | None = None,
+    is_bot_enabled: bool = False,
+) -> int:
+    """Cria um novo canal e retorna o ID."""
+    channel_id = next_sequence("channels")
+    now = utcnow()
+    document("channels", channel_id).set({
+        "id": channel_id,
+        "channel_type": channel_type,
+        "label": label,
+        "waba_id": str(waba_id).strip(),
+        "phone_number_id": str(phone_number_id).strip(),
+        "display_phone_number": display_phone_number,
+        "access_token": access_token,
+        "owner_user_id": owner_user_id,
+        "owner_firebase_uid": owner_firebase_uid,
+        "default_department_id": default_department_id,
+        "is_bot_enabled": is_bot_enabled,
+        "is_active": True,
+        "webhook_subscribed": False,
+        "created_at": now,
+        "updated_at": now,
+    })
+    refresh_channels()
+    logger.info("Channel created: id=%d type=%s label=%s phone=%s", channel_id, channel_type, label, phone_number_id)
+    return channel_id
+
+
+def update_channel(channel_id: int, **fields: Any) -> bool:
+    """Atualiza campos de um canal existente."""
+    allowed = {
+        "label", "access_token", "owner_user_id", "owner_firebase_uid",
+        "default_department_id", "is_bot_enabled", "is_active",
+        "webhook_subscribed", "display_phone_number",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    updates["updated_at"] = utcnow()
+    document("channels", channel_id).set(updates, merge=True)
+    refresh_channels()
+    return True
+
+
+def deactivate_channel(channel_id: int) -> bool:
+    """Desativa um canal."""
+    return update_channel(channel_id, is_active=False)
+
+
+def get_channel_by_id_from_db(channel_id: int) -> dict | None:
+    """Leitura direta do Firestore (sem cache)."""
+    snap = document("channels", channel_id).get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+    if "id" not in data:
+        data["id"] = channel_id
+    return normalize_record(data)
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap: cria canal default a partir das env vars legadas
+# ---------------------------------------------------------------------------
+
+def bootstrap_default_channel() -> int | None:
+    """Cria o canal standard default se nao existir, usando env vars.
+
+    Chamado no startup do app. Retorna o channel_id ou None se nao ha
+    credenciais configuradas.
+    """
+    from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID
+
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        logger.info("Bootstrap channel: sem WHATSAPP_TOKEN/PHONE_NUMBER_ID, pulando")
+        return None
+
+    # Verifica se ja existe um canal standard
+    refresh_channels()
+    existing = get_default_channel()
+    if existing:
+        logger.info("Bootstrap channel: canal default ja existe (id=%s)", existing["id"])
+        return existing["id"]
+
+    channel_id = create_channel(
+        channel_type=CHANNEL_TYPE_STANDARD,
+        label="Canal Principal",
+        waba_id=WHATSAPP_WABA_ID,
+        phone_number_id=WHATSAPP_PHONE_NUMBER_ID,
+        display_phone_number="",
+        access_token=WHATSAPP_TOKEN,
+        owner_user_id=None,
+        is_bot_enabled=True,
+    )
+    logger.info("Bootstrap channel: canal default criado (id=%d)", channel_id)
+    return channel_id

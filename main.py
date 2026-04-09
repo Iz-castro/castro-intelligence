@@ -19,7 +19,7 @@ from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
-    WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE,
+    WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
@@ -31,6 +31,7 @@ from config import (
     FIREBASE_WEB_MESSAGING_SENDER_ID, FIREBASE_WEB_MEASUREMENT_ID,
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
     STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS,
+    META_APP_ID, META_APP_SECRET, EMBEDDED_SIGNUP_CONFIG_ID,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
@@ -38,6 +39,7 @@ from database import (
     mark_wa_conversation_read, save_wa_message, get_wa_contact,
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
+    get_department_by_id, update_department, deactivate_department,
     assign_wa_contact, get_transfer_history,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user,
@@ -49,6 +51,12 @@ from database import (
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
     mark_gc_conversation_read, upsert_gc_conversation,
+)
+from channel_service import (
+    get_all_active_channels, get_channels_for_user,
+    create_channel, update_channel, deactivate_channel,
+    get_channel_by_id_from_db,
+    CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
 from auth import authenticate_firebase_token
 from firestore_common import collection_name
@@ -315,6 +323,8 @@ async def startup():
     bootstrap_departments()
     bootstrap_admin_user()
     ensure_media_dir()
+    from channel_service import bootstrap_default_channel
+    bootstrap_default_channel()
     if FEATURE_AUDIO_TRANSCRIPTION:
         from transcription_service import init_speech_client
         if init_speech_client():
@@ -995,6 +1005,124 @@ async def list_departments(current_user: dict = Depends(get_current_user)):
     return {"departments": get_all_departments()}
 
 
+@app.post("/api/admin/departments")
+async def create_department_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nome obrigatorio")
+    department_id = create_department(name, body.get("description", ""))
+    log_audit(current_user["id"], "DEPARTMENT_CREATE", f"name={name} id={department_id}")
+    return {"id": department_id, "name": name}
+
+
+@app.put("/api/admin/departments/{department_id}")
+async def update_department_endpoint(department_id: int, request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    existing = get_department_by_id(department_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Departamento nao encontrado")
+    body = await request.json()
+    ok, error = update_department(
+        department_id,
+        name=body.get("name"),
+        description=body.get("description"),
+        is_active=body.get("is_active"),
+        sort_order=body.get("sort_order"),
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=error)
+    log_audit(current_user["id"], "DEPARTMENT_UPDATE", f"id={department_id} fields={list(body.keys())}")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/departments/{department_id}")
+async def delete_department_endpoint(department_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    existing = get_department_by_id(department_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Departamento nao encontrado")
+    deactivate_department(department_id)
+    log_audit(current_user["id"], "DEPARTMENT_DELETE", f"id={department_id} name={existing.get('name')}")
+    return {"ok": True}
+
+
+# -- API: Canais WhatsApp --
+
+@app.get("/api/admin/channels")
+async def list_channels(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") in ("admin", "supervisor"):
+        channels = get_all_active_channels()
+    else:
+        channels = get_channels_for_user(current_user["id"])
+    # Nao expor access_token na resposta
+    safe = []
+    for ch in channels:
+        c = dict(ch)
+        c.pop("access_token", None)
+        safe.append(c)
+    return {"channels": safe}
+
+
+@app.post("/api/admin/channels")
+async def create_channel_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    body = await request.json()
+    channel_type = body.get("channel_type", CHANNEL_TYPE_COEXISTENCE)
+    label = (body.get("label") or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Label obrigatorio")
+    phone_number_id = (body.get("phone_number_id") or "").strip()
+    if not phone_number_id:
+        raise HTTPException(status_code=400, detail="phone_number_id obrigatorio")
+    channel_id = create_channel(
+        channel_type=channel_type,
+        label=label,
+        waba_id=body.get("waba_id", ""),
+        phone_number_id=phone_number_id,
+        display_phone_number=body.get("display_phone_number", ""),
+        access_token=body.get("access_token", ""),
+        owner_user_id=body.get("owner_user_id"),
+        owner_firebase_uid=body.get("owner_firebase_uid", ""),
+        default_department_id=body.get("default_department_id"),
+        is_bot_enabled=body.get("is_bot_enabled", False),
+    )
+    log_audit(current_user["id"], "CHANNEL_CREATE", f"id={channel_id} type={channel_type} label={label}")
+    return {"id": channel_id, "channel_type": channel_type, "label": label}
+
+
+@app.put("/api/admin/channels/{channel_id}")
+async def update_channel_endpoint(channel_id: int, request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    existing = get_channel_by_id_from_db(channel_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+    body = await request.json()
+    ok = update_channel(channel_id, **body)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Nenhum campo valido para atualizar")
+    log_audit(current_user["id"], "CHANNEL_UPDATE", f"id={channel_id} fields={list(body.keys())}")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/channels/{channel_id}")
+async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    existing = get_channel_by_id_from_db(channel_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+    deactivate_channel(channel_id)
+    log_audit(current_user["id"], "CHANNEL_DELETE", f"id={channel_id} label={existing.get('label')}")
+    return {"ok": True}
+
+
 @app.get("/api/wa/contact/{contact_id}")
 async def wa_contact_detail(contact_id: int, current_user: dict = Depends(get_current_user)):
     contact = get_wa_contact(contact_id)
@@ -1216,6 +1344,149 @@ async def webhook_google_chat(request: Request):
     event = await request.json()
     response = await process_google_chat_event(event)
     return response or {}
+
+
+# -- API: Embedded Signup (Coexistence) --
+
+
+@app.get("/api/admin/embedded-signup/config")
+async def embedded_signup_config(current_user: dict = Depends(get_current_user)):
+    """Retorna configuracao necessaria para o frontend iniciar o Embedded Signup."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Permissao negada")
+    if not META_APP_ID:
+        raise HTTPException(status_code=503, detail="META_APP_ID nao configurado no servidor")
+    return {
+        "app_id": META_APP_ID,
+        "config_id": EMBEDDED_SIGNUP_CONFIG_ID,
+        "graph_api_version": GRAPH_API_VERSION,
+    }
+
+
+class EmbeddedSignupExchange(BaseModel):
+    code: str
+
+
+@app.post("/api/admin/embedded-signup/exchange")
+async def embedded_signup_exchange(
+    body: EmbeddedSignupExchange,
+    current_user: dict = Depends(get_current_user),
+):
+    """Troca o code do Embedded Signup por token e descobre WABA/Phone IDs."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Permissao negada")
+    if not META_APP_ID or not META_APP_SECRET:
+        raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
+
+    # 1. Trocar code por access token
+    token_url = (
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/oauth/access_token"
+        f"?client_id={META_APP_ID}"
+        f"&client_secret={META_APP_SECRET}"
+        f"&code={body.code}"
+    )
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        token_resp = await client.get(token_url)
+        token_data = token_resp.json()
+
+    if "access_token" not in token_data:
+        error_msg = token_data.get("error", {}).get("message", "Falha ao trocar code por token")
+        logger.error("Embedded Signup token exchange falhou: %s", error_msg)
+        raise HTTPException(status_code=502, detail=f"Erro na troca do code: {error_msg}")
+
+    access_token = token_data["access_token"]
+    logger.info("Embedded Signup: token obtido com sucesso")
+
+    # 2. Buscar shared WABAs para descobrir WABA ID e Phone Number ID
+    debug_url = (
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/debug_token"
+        f"?input_token={access_token}&access_token={META_APP_ID}|{META_APP_SECRET}"
+    )
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        debug_resp = await client.get(debug_url)
+        debug_data = debug_resp.json()
+
+    granular_scopes = debug_data.get("data", {}).get("granular_scopes", [])
+    waba_ids = []
+    for scope in granular_scopes:
+        if scope.get("scope") == "whatsapp_business_management":
+            waba_ids = scope.get("target_ids", [])
+            break
+
+    if not waba_ids:
+        logger.warning("Embedded Signup: nenhum WABA encontrado nos scopes")
+        raise HTTPException(status_code=400, detail="Nenhuma conta WhatsApp Business retornada pelo signup")
+
+    waba_id = waba_ids[0]
+    logger.info("Embedded Signup: WABA ID descoberto = %s", waba_id)
+
+    # 3. Buscar Phone Number ID dentro do WABA
+    phones_url = f"{GRAPH_API_BASE}/{waba_id}/phone_numbers"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        phones_resp = await client.get(
+            phones_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        phones_data = phones_resp.json()
+
+    phone_numbers = phones_data.get("data", [])
+    if not phone_numbers:
+        logger.warning("Embedded Signup: nenhum numero encontrado no WABA %s", waba_id)
+        raise HTTPException(status_code=400, detail="Nenhum numero de telefone encontrado na conta")
+
+    phone_info = phone_numbers[0]
+    phone_number_id = phone_info.get("id", "")
+    display_phone = phone_info.get("display_phone_number", "")
+    verified_name = phone_info.get("verified_name", "")
+    quality_rating = phone_info.get("quality_rating", "")
+    platform_type = phone_info.get("platform_type", "")
+    status = phone_info.get("status", "")
+
+    logger.info(
+        "Embedded Signup concluido | waba=%s phone_id=%s display=%s status=%s platform=%s",
+        waba_id, phone_number_id, display_phone, status, platform_type,
+    )
+
+    # 4. Registrar o webhook do app no WABA
+    subscribe_url = f"{GRAPH_API_BASE}/{waba_id}/subscribed_apps"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        sub_resp = await client.post(
+            subscribe_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        sub_data = sub_resp.json()
+
+    webhook_subscribed = sub_data.get("success", False)
+    logger.info("Embedded Signup: webhook subscription = %s", webhook_subscribed)
+
+    log_audit(
+        current_user["id"],
+        "EMBEDDED_SIGNUP",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status}",
+    )
+
+    return {
+        "status": "ok",
+        "access_token": access_token,
+        "waba_id": waba_id,
+        "phone_number_id": phone_number_id,
+        "display_phone_number": display_phone,
+        "verified_name": verified_name,
+        "quality_rating": quality_rating,
+        "platform_type": platform_type,
+        "phone_status": status,
+        "webhook_subscribed": webhook_subscribed,
+        "all_phones": [
+            {
+                "id": p.get("id"),
+                "display_phone_number": p.get("display_phone_number"),
+                "verified_name": p.get("verified_name"),
+                "status": p.get("status"),
+                "platform_type": p.get("platform_type"),
+            }
+            for p in phone_numbers
+        ],
+    }
 
 
 # -- Execucao --
