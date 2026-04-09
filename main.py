@@ -974,7 +974,58 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     update_wa_contact_qualification(contact_id, qualification, notes)
     log_audit(current_user["id"], "CONTACT_QUALIFY", f"Contato {contact_id}: {qualification}")
-    return {"status": "ok"}
+
+    result = {"status": "ok"}
+
+    # Ao marcar como convertido: gravar quem converteu e enviar template de avaliacao
+    if qualification == "convertido":
+        from firestore_common import document as fs_document, utcnow as fs_utcnow
+        fs_document("wa_contacts", contact_id).set({
+            "converted_by_user_id": current_user["id"],
+            "rating_requested_at": fs_utcnow().isoformat(),
+        }, merge=True)
+
+        # Enviar template de avaliacao (mensagem visivel apenas para admin)
+        try:
+            token, phone_id, api_base = _resolve_channel_creds(contact)
+            wa_id = _wa_target(contact["wa_id"])
+            rating_url = f"{api_base}/{phone_id}/messages"
+            rating_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            rating_payload = {
+                "messaging_product": "whatsapp",
+                "to": wa_id,
+                "type": "template",
+                "template": {
+                    "name": "rating_request",
+                    "language": {"code": "pt_BR"},
+                },
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(rating_url, json=rating_payload, headers=rating_headers)
+                resp_data = resp.json()
+
+            if resp.status_code == 200:
+                wa_msg_id = resp_data.get("messages", [{}])[0].get("id", "")
+                save_wa_message(
+                    wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+                    msg_type="template", content="[avaliacao: responda de 1 a 10]",
+                    status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
+                    operator_id=current_user["id"],
+                    is_rating_message=True, visibility="admin_only",
+                )
+                result["rating_sent"] = True
+                logger.info("Rating template enviado para contato %d", contact_id)
+            else:
+                # Template pode nao existir ainda — nao bloqueia a conversao
+                error_msg = resp_data.get("error", {}).get("message", "")
+                logger.warning("Falha ao enviar rating template: %s", error_msg)
+                result["rating_sent"] = False
+                result["rating_error"] = error_msg
+        except Exception as exc:
+            logger.warning("Erro ao enviar rating template: %s", exc)
+            result["rating_sent"] = False
+
+    return result
 
 
 @app.post("/api/wa/contact/{contact_id}/read")
@@ -1200,6 +1251,10 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     result = assign_wa_contact(contact_id, current_user["id"], contact.get("department_id"), current_user["id"], reason="Assumido pelo operador", summary="Assumido pelo operador")
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # Gravar original_operator_id se ainda nao definido (para roteamento de lead retornante)
+    if not contact.get("original_operator_id"):
+        from firestore_common import document as fs_document, utcnow as fs_utcnow
+        fs_document("wa_contacts", contact_id).set({"original_operator_id": current_user["id"]}, merge=True)
     now = datetime.now(timezone.utc)
     protocol = f"ATD-{now.strftime('%Y%m%d%H%M%S')}-{contact_id:05d}"
     set_attendance_protocol(contact_id, protocol, now.isoformat())

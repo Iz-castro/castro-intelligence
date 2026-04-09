@@ -19,7 +19,8 @@ from config import (
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit,
     update_wa_message_transcription,
-    get_user_by_id, get_wa_message_by_wa_message_id,
+    get_user_by_id, get_wa_message_by_wa_message_id, get_wa_contact,
+    assign_wa_contact, update_wa_contact_qualification,
     normalize_br_phone,
 )
 from media import download_media
@@ -340,6 +341,49 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             "[WA IN] %s (%s) | tipo=%s | id=%s",
             contact_name, wa_id, effective_msg_type, msg_id[:20]
         )
+
+        # -- Lead convertido: capturar rating ou rerouting --
+        _contact_fresh = get_wa_contact(contact_id)
+        if _contact_fresh and _contact_fresh.get("qualification") == "convertido":
+            _has_pending_rating = (
+                _contact_fresh.get("rating_requested_at")
+                and _contact_fresh.get("rating") is None
+            )
+
+            if _has_pending_rating and effective_msg_type == "text" and content.strip().isdigit():
+                _rating_val = int(content.strip())
+                if 1 <= _rating_val <= 10:
+                    # Capturar avaliacao
+                    from firestore_common import document as _fs_doc, utcnow as _fs_now
+                    _fs_doc("wa_contacts", contact_id).set({
+                        "rating": _rating_val,
+                        "rating_received_at": _fs_now().isoformat(),
+                    }, merge=True)
+                    # Marcar a mensagem de resposta como admin_only
+                    if db_id:
+                        _fs_doc("wa_messages", db_id).set({
+                            "is_rating_message": True,
+                            "visibility": "admin_only",
+                        }, merge=True)
+                    logger.info("[RATING] Contato %d avaliou com nota %d", contact_id, _rating_val)
+            else:
+                # Nao eh rating — lead convertido retornando, reatribuir ao operador original
+                _original_op = _contact_fresh.get("original_operator_id") or _contact_fresh.get("converted_by_user_id")
+                if _original_op:
+                    _op_user = get_user_by_id(_original_op)
+                    if _op_user:
+                        assign_wa_contact(
+                            contact_id, _original_op,
+                            _contact_fresh.get("department_id"),
+                            transferred_by=None,
+                            reason="Lead convertido retornou",
+                            summary="Reatribuido automaticamente ao operador original",
+                        )
+                        update_wa_contact_qualification(contact_id, "em_atendimento")
+                        logger.info(
+                            "[REROUTE] Lead convertido %d reatribuido ao operador %d (%s)",
+                            contact_id, _original_op, _op_user.get("display_name"),
+                        )
 
         # Transcricao de audio inbound
         if FEATURE_AUDIO_TRANSCRIPTION and _audio_bytes_for_stt and db_id:

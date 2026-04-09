@@ -516,6 +516,17 @@ function DetailPanel() {
             </div>
           ) : null}
 
+          {/* Rating (visivel apenas para admin/supervisor) */}
+          {isManagerRole && selectedContact.qualification === "convertido" ? (
+            <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
+              {selectedContact.rating != null ? (
+                <><span style={{ fontWeight: 600 }}>Avaliacao:</span><span className="chip" style={{ fontSize: "0.8rem", background: selectedContact.rating >= 7 ? "var(--success)" : selectedContact.rating >= 4 ? "#e6a817" : "var(--danger)", color: "#fff" }}>{selectedContact.rating}/10</span></>
+              ) : (
+                <span className="sub">Avaliacao pendente...</span>
+              )}
+            </div>
+          ) : null}
+
           <section className="card">
             <h3>Qualificacao</h3>
             <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option></select>
