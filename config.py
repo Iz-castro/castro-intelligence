@@ -92,6 +92,11 @@ REQUIRE_WEBHOOK_SIGNATURE = _as_bool(
 GRAPH_API_VERSION = "v22.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
+# -- Embedded Signup (Coexistence) --
+META_APP_ID = os.getenv("META_APP_ID", "").strip()
+META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
+EMBEDDED_SIGNUP_CONFIG_ID = os.getenv("EMBEDDED_SIGNUP_CONFIG_ID", "").strip()
+
 # -- Media --
 DEFAULT_MEDIA_DIR = Path("/tmp/castro_crm_media") if IS_CLOUD_RUN else BASE_DIR / "media"
 MEDIA_DIR = os.getenv("MEDIA_DIR", str(DEFAULT_MEDIA_DIR))

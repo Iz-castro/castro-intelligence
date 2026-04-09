@@ -53,6 +53,9 @@ from database import (
     get_all_gc_conversations, get_gc_messages, save_gc_message,
     mark_gc_conversation_read, upsert_gc_conversation,
     get_audit_metrics, get_all_ratings,
+    get_assume_counter, decrement_assume_counter, increment_assume_counter,
+    mark_contact_pending_response, clear_contact_pending_response,
+    reset_assume_counter,
 )
 from channel_service import (
     get_all_active_channels, get_channels_for_user,
@@ -61,13 +64,14 @@ from channel_service import (
     CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
 from auth import authenticate_firebase_token
-from firestore_common import collection_name
+from firestore_common import collection_name, document as fs_document, utcnow as fs_utcnow
 from webhook import process_webhook_payload, validate_signature
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
     save_upload_media, convert_audio_to_ogg_opus,
     save_avatar_media, delete_media, get_media_asset,
+    _write_media_bytes,
 )
 
 # -- Logging --
@@ -614,6 +618,39 @@ async def update_settings_user(request: Request, current_user: dict = Depends(ge
     return result
 
 
+ALARM_ALLOWED_MIME = {"audio/mpeg", "audio/wav", "audio/ogg", "audio/webm", "audio/mp3"}
+ALARM_MAX_SIZE_KB = 500
+
+
+@app.post("/api/admin/upload-alarm-sound")
+async def upload_alarm_sound(
+    request: Request,
+    file: UploadFile = File(...),
+    kind: str = Form("alarm"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upload de som personalizado para notificacao ou alarme. Apenas admin."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    content = await file.read()
+    if len(content) > ALARM_MAX_SIZE_KB * 1024:
+        raise HTTPException(status_code=413, detail=f"Arquivo excede {ALARM_MAX_SIZE_KB}KB")
+    mime = file.content_type or "audio/mpeg"
+    if mime not in ALARM_ALLOWED_MIME:
+        raise HTTPException(status_code=400, detail=f"Tipo nao permitido: {mime}. Use MP3, WAV ou OGG.")
+    filename = file.filename or "alarm.mp3"
+    ext = os.path.splitext(filename)[1] or ".mp3"
+    safe_kind = "alarm" if kind == "alarm" else "notification"
+    dest_name = f"{safe_kind}_custom{ext}"
+    path = _write_media_bytes(content, "sounds", dest_name, mime)
+    settings = get_system_settings()
+    field = "alarm_sound_path" if safe_kind == "alarm" else "notification_sound_path"
+    settings[field] = path
+    save_system_settings(settings)
+    log_audit(current_user["id"], "UPLOAD_ALARM_SOUND", f"{safe_kind}: {filename}")
+    return {"status": "ok", "path": path, "kind": safe_kind}
+
+
 # -- API: WhatsApp --
 
 @app.get("/api/wa/contacts")
@@ -778,6 +815,13 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
     raise HTTPException(status_code=502, detail=error_msg)
 
 
+def _maybe_credit_assume_counter(contact: dict, operator_id: int):
+    """Incrementa o contador do operador se esta e a primeira resposta apos assumir."""
+    if contact.get("assume_pending_response") and contact.get("assigned_to") == operator_id:
+        clear_contact_pending_response(contact["id"])
+        increment_assume_counter(operator_id)
+
+
 @app.post("/api/wa/send")
 async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_user)):
     contact = get_wa_contact(body.contact_id)
@@ -807,6 +851,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
             timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
             **reply_fields,
         )
+        _maybe_credit_assume_counter(contact, current_user["id"])
         log_audit(current_user["id"], "WA_SEND", f"Para {wa_id}: {body.content[:80]}")
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
@@ -864,6 +909,7 @@ async def wa_send_media(
         operator_id=current_user["id"],
         **reply_fields,
     )
+    _maybe_credit_assume_counter(contact, current_user["id"])
     log_audit(current_user["id"], "WA_SEND_MEDIA", f"{msg_type} para {contact['wa_id']}: {filename}")
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": msg_type, "media_path": local_result["path"]}
 
@@ -926,6 +972,7 @@ async def wa_send_audio(
         operator_id=current_user["id"],
         **reply_fields,
     )
+    _maybe_credit_assume_counter(contact, current_user["id"])
     log_audit(current_user["id"], "WA_SEND_AUDIO", f"Para {contact['wa_id']}")
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": "audio", "media_path": local_result["path"]}
 
@@ -980,7 +1027,7 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
     # Ao marcar como convertido: gravar quem converteu e enviar template de avaliacao
     if qualification == "convertido":
-        from firestore_common import document as fs_document, utcnow as fs_utcnow
+
         fs_document("wa_contacts", contact_id).set({
             "converted_by_user_id": current_user["id"],
             "rating_requested_at": fs_utcnow().isoformat(),
@@ -1249,12 +1296,22 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
         current_id = None
     if existing_id is not None and existing_id != current_id:
         raise HTTPException(status_code=409, detail="Atendimento ja assumido por outro operador")
+    # -- Regra do contador de assumidas sem resposta --
+    assume_counter = get_assume_counter(current_user["id"])
+    if assume_counter <= -2:
+        raise HTTPException(
+            status_code=403,
+            detail="Voce atingiu o limite de atendimentos assumidos sem resposta. Responda as conversas pendentes antes de assumir novas.",
+        )
     result = assign_wa_contact(contact_id, current_user["id"], contact.get("department_id"), current_user["id"], reason="Assumido pelo operador", summary="Assumido pelo operador")
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # Decrementar contador e marcar contato como pendente de resposta
+    decrement_assume_counter(current_user["id"])
+    mark_contact_pending_response(contact_id)
     # Gravar original_operator_id se ainda nao definido (para roteamento de lead retornante)
     if not contact.get("original_operator_id"):
-        from firestore_common import document as fs_document, utcnow as fs_utcnow
+
         fs_document("wa_contacts", contact_id).set({"original_operator_id": current_user["id"]}, merge=True)
     now = datetime.now(timezone.utc)
     protocol = f"ATD-{now.strftime('%Y%m%d%H%M%S')}-{contact_id:05d}"
@@ -1267,6 +1324,19 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
         "data": {"contact_id": contact_id, "assigned_to": current_user["id"], "assigned_name": current_user["display_name"]},
     })
     return {"status": "assumed", "assigned_to": current_user["id"], "assigned_name": current_user["display_name"], "protocol": protocol}
+
+
+@app.post("/api/admin/operator/{user_id}/reset-assume-counter")
+async def admin_reset_assume_counter(user_id: int, current_user: dict = Depends(get_current_user)):
+    """Reseta o contador de assumidas sem resposta de um operador. Apenas admin/supervisor."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Operador nao encontrado")
+    reset_assume_counter(user_id)
+    log_audit(current_user["id"], "RESET_ASSUME_COUNTER", f"Operador {target.get('display_name', user_id)} (id={user_id})")
+    return {"status": "reset", "user_id": user_id, "counter": 0}
 
 
 @app.get("/api/wa/transfer-history/{contact_id}")
@@ -1599,8 +1669,6 @@ async def export_data(
 @app.get("/api/admin/embedded-signup/config")
 async def embedded_signup_config(current_user: dict = Depends(get_current_user)):
     """Retorna configuracao necessaria para o frontend iniciar o Embedded Signup."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Permissao negada")
     if not META_APP_ID:
         raise HTTPException(status_code=503, detail="META_APP_ID nao configurado no servidor")
     return {
@@ -1624,8 +1692,6 @@ async def embedded_signup_exchange(
     current_user: dict = Depends(get_current_user),
 ):
     """Troca o code do Embedded Signup por token e descobre WABA/Phone IDs."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Permissao negada")
     if not META_APP_ID or not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
 

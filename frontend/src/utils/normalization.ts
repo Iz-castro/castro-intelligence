@@ -39,6 +39,8 @@ export function normalizeContact(record: Record<string, unknown>, docId: string)
     contact_avatar_path: String(record.contact_avatar_path || ""),
     attendance_protocol: String(record.attendance_protocol || ""),
     attendance_started_at: iso(record.attendance_started_at),
+    bot_completed: Boolean(record.bot_completed),
+    bot_setor_nome: String(record.bot_setor_nome || ""),
   };
 }
 

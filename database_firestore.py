@@ -4,6 +4,8 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from google.cloud import firestore
+
 from firestore_common import (
     collection,
     document,
@@ -1058,6 +1060,13 @@ _DEFAULT_SYSTEM_SETTINGS = {
     "chat_prefix_roles": ["admin", "supervisor", "operador"],
     "quick_message_max": 20,
     "quick_messages_global": [],
+    "notification_sound_enabled": True,
+    "alarm_enabled": True,
+    "alarm_threshold_minutes": 5,
+    "alarm_department_ids": [],
+    "alarm_sound_path": "",
+    "notification_sound_path": "",
+    "bot_enabled": False,
 }
 
 
@@ -1254,3 +1263,76 @@ def mark_gc_conversation_read(conversation_id, user_identifier):
         return
     unread[uid] = 0
     document("gc_conversations", conversation_id).set({"unread_count": unread}, merge=True)
+
+
+# ---------------------------------------------------------------------------
+# Contador de assumidas sem resposta (operador)
+# ---------------------------------------------------------------------------
+
+_ASSUME_COUNTER_MIN = -2
+_ASSUME_COUNTER_MAX = 0
+
+
+def get_assume_counter(user_id: int) -> int:
+    """Retorna o contador de assumidas sem resposta do operador (entre -2 e 0)."""
+    doc = _get_doc("operator_assume_counters", user_id)
+    if not doc:
+        return 0
+    return max(_ASSUME_COUNTER_MIN, min(_ASSUME_COUNTER_MAX, doc.get("counter", 0)))
+
+
+@firestore.transactional
+def _transactional_decrement(transaction, ref, user_id):
+    snapshot = ref.get(transaction=transaction)
+    data = snapshot.to_dict() or {} if snapshot.exists else {}
+    current = max(_ASSUME_COUNTER_MIN, min(_ASSUME_COUNTER_MAX, data.get("counter", 0)))
+    new_val = max(_ASSUME_COUNTER_MIN, current - 1)
+    transaction.set(ref, {"user_id": user_id, "counter": new_val, "updated_at": utcnow()}, merge=True)
+    return new_val
+
+
+def decrement_assume_counter(user_id: int) -> int:
+    """Decrementa o contador ao assumir sem ter respondido. Usa transacao atomica."""
+    ref = document("operator_assume_counters", user_id)
+    client = get_firestore_client()
+    return _transactional_decrement(client.transaction(), ref, user_id)
+
+
+@firestore.transactional
+def _transactional_increment(transaction, ref, user_id):
+    snapshot = ref.get(transaction=transaction)
+    data = snapshot.to_dict() or {} if snapshot.exists else {}
+    current = max(_ASSUME_COUNTER_MIN, min(_ASSUME_COUNTER_MAX, data.get("counter", 0)))
+    new_val = min(_ASSUME_COUNTER_MAX, current + 1)
+    transaction.set(ref, {"user_id": user_id, "counter": new_val, "updated_at": utcnow()}, merge=True)
+    return new_val
+
+
+def increment_assume_counter(user_id: int) -> int:
+    """Incrementa o contador ao responder uma conversa assumida. Usa transacao atomica."""
+    ref = document("operator_assume_counters", user_id)
+    client = get_firestore_client()
+    return _transactional_increment(client.transaction(), ref, user_id)
+
+
+def mark_contact_pending_response(contact_id: int):
+    """Marca o contato como pendente de resposta do operador apos assumir."""
+    document("wa_contacts", contact_id).set({
+        "assume_pending_response": True,
+    }, merge=True)
+
+
+def clear_contact_pending_response(contact_id: int):
+    """Remove a flag de pendente de resposta apos o operador responder."""
+    document("wa_contacts", contact_id).set({
+        "assume_pending_response": False,
+    }, merge=True)
+
+
+def reset_assume_counter(user_id: int):
+    """Reseta o contador de assumidas sem resposta para 0."""
+    document("operator_assume_counters", user_id).set({
+        "user_id": user_id,
+        "counter": 0,
+        "updated_at": utcnow(),
+    }, merge=True)

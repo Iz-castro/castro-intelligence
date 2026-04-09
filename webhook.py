@@ -25,6 +25,7 @@ from database import (
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
+from bot_service import process_bot_message
 
 logger = logging.getLogger("castro_crm.webhook")
 
@@ -129,6 +130,45 @@ def _resolve_webhook_channel(value):
 
     # Fallback: canal default
     return get_default_channel()
+
+
+async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str):
+    """Envia resposta do bot via WhatsApp Cloud API e salva no banco."""
+    import httpx
+    from config import GRAPH_API_BASE
+    from database import save_wa_message
+
+    wa_target = "".join(ch for ch in str(wa_id) if ch.isdigit())
+    url = f"{GRAPH_API_BASE}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload_msg = {
+        "messaging_product": "whatsapp",
+        "to": wa_target,
+        "type": "text",
+        "text": {"body": text},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload_msg, headers=headers)
+            result = resp.json()
+        wa_msg_id = result.get("messages", [{}])[0].get("id", "") if resp.status_code == 200 else ""
+        save_wa_message(
+            wa_message_id=wa_msg_id,
+            contact_id=contact_id,
+            direction="outbound",
+            msg_type="text",
+            content=text,
+            status="sent" if resp.status_code == 200 else "failed",
+            timestamp_wa=datetime.now(timezone.utc).isoformat(),
+            operator_id=None,
+            operator_name="Bot",
+        )
+        if resp.status_code == 200:
+            logger.info("[BOT] Resposta enviada para %s | contact=%d", wa_id, contact_id)
+        else:
+            logger.warning("[BOT] Falha ao enviar resposta | status=%s | erro=%s", resp.status_code, result)
+    except Exception as e:
+        logger.error("[BOT] Erro ao enviar resposta: %s", e, exc_info=True)
 
 
 async def process_webhook_payload(payload, ws_notify_callback=None):
@@ -341,6 +381,16 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             "[WA IN] %s (%s) | tipo=%s | id=%s",
             contact_name, wa_id, effective_msg_type, msg_id[:20]
         )
+
+        # -- Bot: processar mensagem se ativo e contato sem operador --
+        if effective_msg_type == "text" and content.strip():
+            _contact_for_bot = get_wa_contact(contact_id)
+            if _contact_for_bot and not _contact_for_bot.get("assigned_to"):
+                bot_reply = process_bot_message(contact_id, content, contact_name)
+                if bot_reply:
+                    _bot_token = channel_token or WHATSAPP_TOKEN
+                    _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
+                    await _send_bot_reply(wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id)
 
         # -- Lead convertido: capturar rating ou rerouting --
         _contact_fresh = get_wa_contact(contact_id)

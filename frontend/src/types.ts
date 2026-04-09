@@ -103,6 +103,8 @@ export type Contact = {
   contact_avatar_path?: string;
   attendance_protocol?: string;
   attendance_started_at?: string;
+  bot_completed?: boolean;
+  bot_setor_nome?: string;
 };
 
 export type MessageReplyReference = {
@@ -150,6 +152,13 @@ export type SystemSettings = {
   chat_prefix_roles: string[];
   quick_message_max: number;
   quick_messages_global: { shortcut: string; message: string }[];
+  notification_sound_enabled: boolean;
+  alarm_enabled: boolean;
+  alarm_threshold_minutes: number;
+  alarm_department_ids: number[];
+  alarm_sound_path: string;
+  notification_sound_path: string;
+  bot_enabled: boolean;
 };
 
 export type UserSettings = {
@@ -158,7 +167,7 @@ export type UserSettings = {
   quick_messages: { shortcut: string; message: string }[];
 };
 
-export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe";
+export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot";
 
 export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "whatsapp" | "dashboard";
 

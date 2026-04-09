@@ -5,7 +5,7 @@ import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messa
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
-import { getJson, sendJson, putJson, deleteJson } from "./api";
+import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import type { Channel, ChatMessage, Contact, Department, Operator } from "./types";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -102,7 +102,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
-              {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
+              <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>
               {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
@@ -115,9 +115,14 @@ function TopBar() {
 }
 
 function NavBar() {
-  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, isManagerRole, novosUnread, meusUnread, nqUnread, equipeUnread } = useCrm();
+  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, isManagerRole, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, systemSettings } = useCrm();
   return (
     <nav className="crm-nav">
+      {isManagerRole && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); }} title="Contatos no bot">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><line x1="8" y1="16" x2="8" y2="16.01"/><line x1="16" y1="16" x2="16" y2="16.01"/><line x1="12" y1="19" x2="12" y2="19.01"/></svg>
+        <span className="nav-label">Bot</span>
+        {botUnread > 0 && <span className="nav-badge">{botUnread > 99 ? "99+" : botUnread}</span>}
+      </button>}
       <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); }} title="Novos leads">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="14"/><line x1="9" y1="11" x2="15" y2="11"/></svg>
         <span className="nav-label">Novos</span>
@@ -144,7 +149,7 @@ function NavBar() {
 
 function ContactList() {
   const { activeView, filteredContacts, selectedContactId, setSelectedContactId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
-  const viewTitle = activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
+  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
   const visibleTeamOperators = activeView === "equipe"
     ? operators
       .filter((operator) => operator.id !== sessionUser?.id && filteredContacts.some((contact) => contact.assigned_to === operator.id))
@@ -212,7 +217,7 @@ function ContactList() {
             </button>
           );
         })}
-        {!filteredContacts.length ? <div className="empty">{activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
+        {!filteredContacts.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
       </div>
     </aside>
   );
@@ -345,8 +350,8 @@ function ChatPanel() {
 
   return (
     <main className="panel chat-panel">
-      {error ? <div className="alert danger">{error}</div> : null}
-      {notice ? <div className="alert success">{notice}</div> : null}
+      {error ? <div className="alert danger"><span>{error}</span><button type="button" className="alert-close" onClick={() => ctx.setError("")}>&#10005;</button></div> : null}
+      {notice ? <div className="alert success"><span>{notice}</span><button type="button" className="alert-close" onClick={() => ctx.setNotice("")}>&#10005;</button></div> : null}
       {selectedContact ? <>
         <div className="contact-banner">
           <div>
@@ -467,6 +472,19 @@ function ChatPanel() {
   );
 }
 
+function CollapsibleCard({ title, defaultOpen = true, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className="card collapsible-card">
+      <button type="button" className="collapsible-header" onClick={() => setOpen((v) => !v)}>
+        <h3>{title}</h3>
+        <span className={`collapsible-arrow ${open ? "open" : ""}`}>&#9662;</span>
+      </button>
+      {open && <div className="collapsible-body">{children}</div>}
+    </section>
+  );
+}
+
 function DetailPanel() {
   const { bundle, selectedContact, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
@@ -474,6 +492,17 @@ function DetailPanel() {
   const [bulkAction, setBulkAction] = useState<"return_to_bot" | "transfer">("return_to_bot");
   const [bulkToUser, setBulkToUser] = useState<number | "">("");
   const [busyBulk, setBusyBulk] = useState(false);
+  const [busyResetCounter, setBusyResetCounter] = useState<number | null>(null);
+
+  const resetAssumeCounter = useCallback(async (userId: number, displayName: string) => {
+    if (!bundle) return;
+    setBusyResetCounter(userId);
+    try {
+      await sendJson(bundle.auth, `/api/admin/operator/${userId}/reset-assume-counter`, {});
+      setNotice(`Contador de ${displayName} resetado.`);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusyResetCounter(null);
+  }, [bundle, setError, setNotice]);
 
   const returnToBot = useCallback(async (contactId: number) => {
     if (!bundle) return;
@@ -528,32 +557,29 @@ function DetailPanel() {
             </div>
           ) : null}
 
-          <section className="card">
-            <h3>Qualificacao</h3>
+          <CollapsibleCard title="Qualificacao">
             <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option></select>
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={5} placeholder="Notas do atendimento" />
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" />
             <button className="primary" onClick={() => void saveQualification()} disabled={busySave}>{busySave ? "Salvando..." : "Salvar"}</button>
             {isManagerRole && selectedContact.assigned_to ? (
               <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={busyReturnBot} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
             ) : null}
-          </section>
-          <section className="card">
-            <h3>Transferencia</h3>
+          </CollapsibleCard>
+          <CollapsibleCard title="Transferencia" defaultOpen={false}>
             <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
             <select value={toDepartmentId} onChange={(e) => setToDepartmentId(e.target.value ? Number(e.target.value) : "")}><option value="">Manter departamento atual</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
             <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferencia" />
-            <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={4} placeholder="Resumo obrigatorio" />
+            <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatorio" />
             <button className="primary" onClick={() => void transferContact()} disabled={!toUserId || !transferSummary.trim() || busyTransfer}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
-          </section>
+          </CollapsibleCard>
         </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
 
-        {sessionUser?.role === "admin" ? (
-          <section className="card">
-            <h3>Usuarios e Roles</h3>
+        {isManagerRole ? (
+          <CollapsibleCard title={sessionUser?.role === "admin" ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
             <div className="admin-user-list">{operators.map((op) => (
               <div key={op.id} className="admin-user-row">
                 <div className="admin-user-info"><strong>{op.display_name}</strong><span className="sub">{op.email || ""}</span></div>
-                {editingUserId === op.id ? (
+                {sessionUser?.role === "admin" && editingUserId === op.id ? (
                   <div className="admin-user-edit">
                     <select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="admin">admin</option><option value="supervisor">supervisor</option><option value="operador">operador</option></select>
                     <select value={editDeptId} onChange={(e) => setEditDeptId(e.target.value ? Number(e.target.value) : "")}><option value="">Sem setor</option>{departments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>
@@ -563,19 +589,19 @@ function DetailPanel() {
                     </div>
                   </div>
                 ) : (
-                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-                    <span className="chip">{op.role}</span>
-                    <button className="ghost" style={{ padding: "0.35rem 0.6rem", fontSize: "0.8rem" }} onClick={() => startEditUser(op)}>Editar</button>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.25rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    <span className="chip" style={{ fontSize: "0.68rem" }}>{op.role}</span>
+                    {sessionUser?.role === "admin" && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)}>Editar</button>}
+                    <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} disabled={busyResetCounter === op.id} onClick={() => void resetAssumeCounter(op.id, op.display_name)} title="Resetar contador">{busyResetCounter === op.id ? "..." : "Reset"}</button>
                   </div>
                 )}
               </div>
             ))}</div>
-          </section>
+          </CollapsibleCard>
         ) : null}
 
         {isManagerRole ? (
-          <section className="card">
-            <h3>Reatribuicao em lote</h3>
+          <CollapsibleCard title="Reatribuicao em lote" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Reatribuir todos os contatos de um operador:</span>
             <select value={bulkFromUser} onChange={(e) => setBulkFromUser(e.target.value ? Number(e.target.value) : "")}>
               <option value="">Selecione operador de origem</option>
@@ -592,7 +618,7 @@ function DetailPanel() {
               </select>
             ) : null}
             <button className="primary" style={{ marginTop: "0.4rem" }} disabled={!bulkFromUser || (bulkAction === "transfer" && !bulkToUser) || busyBulk} onClick={() => { if (confirm("Reatribuir TODOS os contatos deste operador?")) void executeBulkReassign(); }}>{busyBulk ? "Processando..." : "Executar reatribuicao"}</button>
-          </section>
+          </CollapsibleCard>
         ) : null}
       </div>
     </aside>
@@ -817,7 +843,7 @@ function SettingsModals() {
         </div>
       ) : null}
 
-      {showSettings === "whatsapp" && sessionUser.role === "admin" ? <WhatsAppSignupModal /> : null}
+      {showSettings === "whatsapp" ? <WhatsAppSignupModal /> : null}
 
       {showSettings === "admin" && sessionUser.role === "admin" ? <AdminSettingsModal /> : null}
 
@@ -1003,7 +1029,7 @@ function AdminSettingsModal() {
     systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction,
     setError, setNotice,
   } = useCrm();
-  const [adminTab, setAdminTab] = useState<"system" | "departments" | "channels">("system");
+  const [adminTab, setAdminTab] = useState<"system" | "departments" | "channels" | "notifications">("system");
 
   // -- Department state --
   const [depts, setDepts] = useState<Department[]>(departments);
@@ -1087,6 +1113,7 @@ function AdminSettingsModal() {
           <button className={adminTab === "system" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("system")}>Sistema</button>
           <button className={adminTab === "departments" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("departments")}>Departamentos</button>
           <button className={adminTab === "channels" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("channels")}>Canais WhatsApp</button>
+          <button className={adminTab === "notifications" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("notifications")}>Notificacoes</button>
         </div>
 
         {/* Tab: Sistema */}
@@ -1118,6 +1145,16 @@ function AdminSettingsModal() {
                   </div>
                 ))}
                 <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => setSystemSettings((prev) => ({ ...prev, quick_messages_global: [...prev.quick_messages_global, { shortcut: "", message: "" }] }))}>+ Adicionar mensagem global</button>
+              </div>
+            </div>
+            <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+              <h3>Bot de atendimento</h3>
+              <div className="settings-block">
+                <label className="settings-toggle">
+                  <input type="checkbox" checked={systemSettings.bot_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, bot_enabled: e.target.checked }))} />
+                  <span>Habilitar bot (coleta nome, equipamento e setor antes de encaminhar)</span>
+                </label>
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Quando desabilitado, mensagens novas caem direto para "Novos".</p>
               </div>
             </div>
             <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
@@ -1204,8 +1241,131 @@ function AdminSettingsModal() {
             </div>
           </div>
         )}
+
+        {/* Tab: Notificacoes */}
+        {adminTab === "notifications" && (
+          <NotificationsTab />
+        )}
       </div>
     </div>
+  );
+}
+
+function NotificationsTab() {
+  const { bundle, departments, systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction, setError, setNotice } = useCrm();
+  const [uploadingNotif, setUploadingNotif] = useState(false);
+  const [uploadingAlarm, setUploadingAlarm] = useState(false);
+  const notifFileRef = useRef<HTMLInputElement | null>(null);
+  const alarmFileRef = useRef<HTMLInputElement | null>(null);
+
+  const uploadSound = useCallback(async (file: File, kind: "alarm" | "notification") => {
+    if (!bundle) return;
+    const setter = kind === "alarm" ? setUploadingAlarm : setUploadingNotif;
+    setter(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("kind", kind);
+      const res = await sendForm<{ path: string }>(bundle.auth, "/api/admin/upload-alarm-sound", form);
+      setSystemSettings((prev) => ({
+        ...prev,
+        [kind === "alarm" ? "alarm_sound_path" : "notification_sound_path"]: res.path,
+      }));
+      setNotice(`Som de ${kind === "alarm" ? "alarme" : "notificacao"} atualizado`);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setter(false);
+  }, [bundle, setError, setNotice, setSystemSettings]);
+
+  const testSound = useCallback((path: string, fallbackFreq: number) => {
+    if (path) {
+      const audio = new Audio(path);
+      audio.volume = 0.5;
+      audio.play().catch(() => {});
+    } else {
+      try {
+        const ctx = new AudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = fallbackFreq;
+        osc.type = fallbackFreq > 800 ? "sine" : "square";
+        gain.gain.value = 0.3;
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+        osc.stop(ctx.currentTime + 0.4);
+        setTimeout(() => ctx.close(), 600);
+      } catch { /* audio not available */ }
+    }
+  }, []);
+
+  return (
+    <>
+      <div className="settings-section">
+        <h3>Notificacao de nova mensagem</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Todos os usuarios ouvem um beep quando chega uma nova mensagem.</p>
+        <div className="settings-block">
+          <label className="settings-toggle">
+            <input type="checkbox" checked={systemSettings.notification_sound_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, notification_sound_enabled: e.target.checked }))} />
+            <span>Habilitar som de notificacao</span>
+          </label>
+        </div>
+        <div className="settings-block" style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.4rem" }}>
+          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => notifFileRef.current?.click()} disabled={uploadingNotif}>
+            {uploadingNotif ? "Enviando..." : systemSettings.notification_sound_path ? "Trocar som" : "Upload som personalizado"}
+          </button>
+          {systemSettings.notification_sound_path && <span className="sub" style={{ fontSize: "0.75rem" }}>Personalizado ativo</span>}
+          <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => testSound(systemSettings.notification_sound_path, 880)} title="Testar som">Testar</button>
+          {systemSettings.notification_sound_path && (
+            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, notification_sound_path: "" }))}>Usar padrao</button>
+          )}
+          <input ref={notifFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "notification"); }} />
+        </div>
+      </div>
+
+      <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+        <h3>Alarme de mensagens sem resposta</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Alarme sonoro repetitivo para operadores dos departamentos selecionados quando ha mensagens sem visualizar.</p>
+        <div className="settings-block">
+          <label className="settings-toggle">
+            <input type="checkbox" checked={systemSettings.alarm_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_enabled: e.target.checked }))} />
+            <span>Habilitar alarme</span>
+          </label>
+        </div>
+        <div className="settings-block" style={{ marginTop: "0.6rem" }}>
+          <span className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Tempo sem resposta (minutos):</span>
+          <input type="number" min={1} max={60} value={systemSettings.alarm_threshold_minutes} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_threshold_minutes: Math.max(1, Number(e.target.value) || 5) }))} style={{ width: 100 }} />
+        </div>
+        <div className="settings-block" style={{ marginTop: "0.6rem" }}>
+          <span className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Departamentos que recebem alarme:</span>
+          {departments.map((dept) => (
+            <label key={dept.id} className="settings-toggle" style={{ marginBottom: "0.25rem" }}>
+              <input type="checkbox" checked={(systemSettings.alarm_department_ids || []).includes(dept.id)} onChange={(e) => setSystemSettings((prev) => ({
+                ...prev,
+                alarm_department_ids: e.target.checked
+                  ? [...(prev.alarm_department_ids || []), dept.id]
+                  : (prev.alarm_department_ids || []).filter((id) => id !== dept.id),
+              }))} />
+              <span>{dept.name}</span>
+            </label>
+          ))}
+          {departments.length === 0 && <span className="sub">Nenhum departamento cadastrado.</span>}
+        </div>
+        <div className="settings-block" style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.6rem" }}>
+          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => alarmFileRef.current?.click()} disabled={uploadingAlarm}>
+            {uploadingAlarm ? "Enviando..." : systemSettings.alarm_sound_path ? "Trocar alarme" : "Upload alarme personalizado"}
+          </button>
+          {systemSettings.alarm_sound_path && <span className="sub" style={{ fontSize: "0.75rem" }}>Personalizado ativo</span>}
+          <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => testSound(systemSettings.alarm_sound_path, 660)} title="Testar alarme">Testar</button>
+          {systemSettings.alarm_sound_path && (
+            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, alarm_sound_path: "" }))}>Usar padrao</button>
+          )}
+          <input ref={alarmFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "alarm"); }} />
+        </div>
+      </div>
+
+      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes de notificacao"}</button>
+    </>
   );
 }
 

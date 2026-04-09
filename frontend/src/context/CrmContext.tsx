@@ -54,10 +54,12 @@ type CrmContextValue = {
   meusContacts: Contact[];
   nqContacts: Contact[];
   equipeContacts: Contact[];
+  botContacts: Contact[];
   novosUnread: number;
   meusUnread: number;
   nqUnread: number;
   equipeUnread: number;
+  botUnread: number;
   equipeOperatorFilter: string;
   setEquipeOperatorFilter: (v: string) => void;
   equipeFiltered: Contact[];
@@ -219,6 +221,13 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   chat_prefix_roles: ["admin", "supervisor", "operador"],
   quick_message_max: 20,
   quick_messages_global: [],
+  notification_sound_enabled: true,
+  alarm_enabled: true,
+  alarm_threshold_minutes: 5,
+  alarm_department_ids: [],
+  alarm_sound_path: "",
+  notification_sound_path: "",
+  bot_enabled: false,
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -345,8 +354,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const activeContact = contacts.find((c) => c.id === activeConversationId) || null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
 
-  // Novos: sem atribuicao (fila do bot), exclui nao qualificados
-  const novosContacts = contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado");
+  const botEnabled = systemSettings.bot_enabled;
+  // Bot: contatos sem atribuicao, no fluxo do bot (ainda nao completaram)
+  const botContacts = botEnabled ? contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado" && !c.bot_completed) : [];
+  // Novos: sem atribuicao. Com bot ativo, so mostra quem completou o bot ou nunca entrou.
+  // Sem bot, mostra todos sem atribuicao (comportamento original).
+  const novosContacts = contacts.filter((c) => {
+    if (c.assigned_to || c.qualification === "nao_qualificado") return false;
+    if (botEnabled && !c.bot_completed) return false;
+    return true;
+  });
   // Meus: atribuidos ao usuario logado (inclui coexistence auto-atribuidos)
   const meusContacts = contacts.filter((c) => c.assigned_to === sessionUser?.id);
   // Nao qualificados
@@ -359,13 +376,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return true;
   });
 
+  const botUnread = botContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const novosUnread = novosContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const meusUnread = meusContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const nqUnread = nqContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const equipeUnread = equipeContacts.reduce((s, c) => s + (c.unread || 0), 0);
   const equipeFiltered = equipeOperatorFilter ? equipeContacts.filter((c) => String(c.assigned_to) === equipeOperatorFilter) : equipeContacts;
 
-  const viewContacts = activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : activeView === "equipe" ? equipeFiltered : nqContacts;
+  const viewContacts = activeView === "bot" ? botContacts : activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : activeView === "equipe" ? equipeFiltered : nqContacts;
   const filteredContacts = viewContacts.filter((item) => {
     const matchesSearch = !searchText || [item.display_name, item.phone_formatted || "", item.department_name || "", item.assigned_name || ""].join(" ").toLowerCase().includes(searchText);
     const matchesQual = !qualificationFilter || item.qualification === qualificationFilter;
@@ -675,6 +693,129 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, bundle, selectedContactId, sessionUser]);
 
   // =========================================================================
+  // Sound notifications
+  // =========================================================================
+
+  const prevTotalUnreadRef = useRef<number | null>(null);
+  const alarmIntervalRef = useRef<number | null>(null);
+  const alarmAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Beep for all users when total unread increases
+  useEffect(() => {
+    if (!sessionUser || !systemSettings.notification_sound_enabled) {
+      prevTotalUnreadRef.current = null;
+      return;
+    }
+    const totalUnread = contacts.reduce((s, c) => s + (c.unread || 0), 0);
+    const prev = prevTotalUnreadRef.current;
+    prevTotalUnreadRef.current = totalUnread;
+    if (prev === null) return; // first load, don't beep
+    if (totalUnread > prev) {
+      // New message arrived — play notification beep
+      if (systemSettings.notification_sound_path) {
+        const audio = new Audio(systemSettings.notification_sound_path);
+        audio.volume = 0.5;
+        audio.play().catch(() => {});
+      } else {
+        // Default beep via Web Audio API
+        try {
+          const ctx = new AudioContext();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.frequency.value = 880;
+          osc.type = "sine";
+          gain.gain.value = 0.3;
+          osc.start();
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+          osc.stop(ctx.currentTime + 0.3);
+          setTimeout(() => ctx.close(), 500);
+        } catch { /* audio not available */ }
+      }
+    }
+  }, [contacts, sessionUser, systemSettings.notification_sound_enabled, systemSettings.notification_sound_path]);
+
+  // Repeating alarm for configured departments when messages unread > threshold
+  useEffect(() => {
+    if (alarmIntervalRef.current) {
+      window.clearInterval(alarmIntervalRef.current);
+      alarmIntervalRef.current = null;
+    }
+    if (alarmAudioRef.current) {
+      alarmAudioRef.current.pause();
+      alarmAudioRef.current = null;
+    }
+    if (!sessionUser || !systemSettings.alarm_enabled) return undefined;
+    // Check if user's department is in the alarm list
+    const userDeptId = sessionUser.department_id;
+    const alarmDepts = systemSettings.alarm_department_ids || [];
+    if (alarmDepts.length > 0 && (!userDeptId || !alarmDepts.includes(userDeptId))) return undefined;
+    // Only active if there are alarm departments configured (empty = disabled for dept filter)
+    if (alarmDepts.length === 0) return undefined;
+
+    const thresholdMs = (systemSettings.alarm_threshold_minutes || 5) * 60 * 1000;
+
+    const checkAlarm = () => {
+      const now = Date.now();
+      // Check contacts assigned to this user (or unassigned in "novos") that have unread messages
+      const hasOverdueUnread = contacts.some((c) => {
+        if ((c.unread || 0) <= 0) return false;
+        // Only alarm for contacts assigned to this user or unassigned (novos)
+        if (c.assigned_to && c.assigned_to !== sessionUser.id) return false;
+        // Check if last_message_at is older than threshold
+        if (!c.last_message_at) return false;
+        const msgTime = new Date(c.last_message_at).getTime();
+        return !isNaN(msgTime) && (now - msgTime) >= thresholdMs;
+      });
+
+      if (hasOverdueUnread) {
+        if (systemSettings.alarm_sound_path) {
+          if (!alarmAudioRef.current) {
+            alarmAudioRef.current = new Audio(systemSettings.alarm_sound_path);
+            alarmAudioRef.current.volume = 0.6;
+          }
+          alarmAudioRef.current.currentTime = 0;
+          alarmAudioRef.current.play().catch(() => {});
+        } else {
+          // Default alarm: two-tone beep
+          try {
+            const ctx = new AudioContext();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = 660;
+            osc.type = "square";
+            gain.gain.value = 0.25;
+            osc.start();
+            osc.frequency.setValueAtTime(880, ctx.currentTime + 0.15);
+            osc.frequency.setValueAtTime(660, ctx.currentTime + 0.3);
+            osc.frequency.setValueAtTime(880, ctx.currentTime + 0.45);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+            osc.stop(ctx.currentTime + 0.6);
+            setTimeout(() => ctx.close(), 800);
+          } catch { /* audio not available */ }
+        }
+      } else {
+        // No overdue messages — stop alarm audio if playing
+        if (alarmAudioRef.current) {
+          alarmAudioRef.current.pause();
+          alarmAudioRef.current = null;
+        }
+      }
+    };
+
+    // Check immediately and then every 30 seconds
+    checkAlarm();
+    alarmIntervalRef.current = window.setInterval(checkAlarm, 30_000);
+    return () => {
+      if (alarmIntervalRef.current) window.clearInterval(alarmIntervalRef.current);
+      if (alarmAudioRef.current) { alarmAudioRef.current.pause(); alarmAudioRef.current = null; }
+    };
+  }, [contacts, sessionUser, systemSettings.alarm_enabled, systemSettings.alarm_threshold_minutes, systemSettings.alarm_department_ids, systemSettings.alarm_sound_path]);
+
+  // =========================================================================
   // Actions
   // =========================================================================
 
@@ -970,7 +1111,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     theme, toggleTheme,
     loginWithGoogle, logout,
     contacts, selectedContactId, setSelectedContactId, selectedContact,
-    activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, novosUnread, meusUnread, nqUnread, equipeUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
+    activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
     replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,

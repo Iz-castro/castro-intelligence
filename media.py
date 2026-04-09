@@ -114,7 +114,7 @@ def ensure_media_dir():
     if _using_gcs() or _using_firestore():
         return
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    for subdir in ("images", "audio", "video", "documents", "stickers", "avatars"):
+    for subdir in ("images", "audio", "video", "documents", "stickers", "avatars", "sounds"):
         os.makedirs(os.path.join(MEDIA_DIR, subdir), exist_ok=True)
 
 

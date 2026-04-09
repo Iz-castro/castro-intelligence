@@ -58,15 +58,20 @@ service cloud.firestore {
     }
 
     match /castro_crm_wa_contacts/{contactId} {
-      // Regra temporaria de demo: para os emails explicitamente liberados,
-      // permita leitura completa das conversas no snapshot sem depender de
-      // filtros por atribuicao/departamento.
-      allow read: if emailAllowed();
+      // Privilegiados (admin/supervisor) veem todos.
+      // Operadores veem: atribuidos a si, sem atribuicao, ou do mesmo departamento.
+      allow read: if operatorActive() && (
+        isPrivileged() ||
+        resource.data.assigned_to_uid == request.auth.uid ||
+        resource.data.assigned_to_uid == '' ||
+        resource.data.assigned_to_uid == null ||
+        resource.data.department_id == myProfile().data.department_id
+      );
       allow write: if false;
     }
 
     match /castro_crm_wa_messages/{messageId} {
-      allow read: if emailAllowed();
+      allow read: if operatorActive();
       allow write: if false;
     }
 
