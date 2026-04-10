@@ -482,6 +482,50 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     });
   }
 
+  function buildContactSnapshotTargets() {
+    if (!bundle?.db || !config?.firestore.collections.wa_contacts || !sessionUser) return [];
+
+    const waContacts = collection(bundle.db, config.firestore.collections.wa_contacts);
+    const baseConstraints = [where("is_archived", "==", 0), orderBy("last_message_at", "desc"), firestoreLimit(50)] as const;
+
+    if (sessionUser.role === "admin" || sessionUser.role === "supervisor") {
+      return [{ key: "all", ref: query(waContacts, ...baseConstraints) }];
+    }
+
+    const targets: { key: string; ref: ReturnType<typeof query> }[] = [
+      { key: "unassigned:blank", ref: query(waContacts, where("assigned_to_uid", "==", ""), ...baseConstraints) },
+      { key: "unassigned:null", ref: query(waContacts, where("assigned_to_uid", "==", null), ...baseConstraints) },
+    ];
+
+    if (sessionUser.firebase_uid) {
+      targets.push({
+        key: `mine:${sessionUser.firebase_uid}`,
+        ref: query(waContacts, where("assigned_to_uid", "==", sessionUser.firebase_uid), ...baseConstraints),
+      });
+    }
+
+    if (sessionUser.department_id != null) {
+      targets.push({
+        key: `department:${sessionUser.department_id}`,
+        ref: query(waContacts, where("department_id", "==", sessionUser.department_id), ...baseConstraints),
+      });
+    }
+
+    return targets;
+  }
+
+  function mergeVisibleContacts(groups: Contact[][]) {
+    const merged = new Map<number, Contact>();
+    for (const group of groups) {
+      for (const contact of group) {
+        merged.set(contact.id, contact);
+      }
+    }
+    return Array.from(merged.values())
+      .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""))
+      .slice(0, 50);
+  }
+
   // =========================================================================
   // Effects
   // =========================================================================
@@ -602,12 +646,28 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle || !sessionUser || !config) return undefined;
     let disposed = false;
     if (!snapshotMode || !config.firestore.collections.wa_contacts) return undefined;
-    const unsubscribe = onSnapshot(
-      query(collection(bundle.db, config.firestore.collections.wa_contacts), orderBy("last_message_at", "desc"), firestoreLimit(50)),
-      (snap) => startTransition(() => setContacts(snap.docs.map((doc) => normalizeContact(doc.data(), doc.id)))),
+    const targets = buildContactSnapshotTargets();
+    const partialContacts = new Map<string, Contact[]>();
+
+    const publish = () => {
+      if (disposed) return;
+      const nextContacts = mergeVisibleContacts(Array.from(partialContacts.values()));
+      startTransition(() => setContacts(nextContacts));
+    };
+
+    const unsubscribers = targets.map(({ key, ref }) => onSnapshot(
+      ref,
+      (snap) => {
+        partialContacts.set(key, snap.docs.map((doc) => normalizeContact(doc.data() as Record<string, unknown>, doc.id)));
+        publish();
+      },
       (e) => !disposed && setError(`Snapshot de contatos falhou: ${errorText(e)}`),
-    );
-    return () => { disposed = true; unsubscribe(); };
+    ));
+
+    return () => {
+      disposed = true;
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
   }, [bundle, config, sessionUser, snapshotMode]);
 
   // Snapshot: selected conversation

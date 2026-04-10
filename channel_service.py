@@ -146,7 +146,7 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
     Se channel_id for None, usa o canal default.
     Raises ValueError se o canal nao for encontrado.
     """
-    from config import GRAPH_API_BASE
+    from config import GRAPH_API_BASE, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN
 
     channel = None
     if channel_id is not None:
@@ -155,6 +155,15 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
         channel = get_default_channel()
     if channel is None:
         raise ValueError("Nenhum canal WhatsApp configurado.")
+
+    # Para o canal standard, o segredo do Cloud Run e a fonte de verdade.
+    # Isso evita que o registry Firestore fique preso em um token antigo
+    # depois de uma rotacao do secret.
+    if channel.get("channel_type") == CHANNEL_TYPE_STANDARD:
+        env_token = str(WHATSAPP_TOKEN or "").strip()
+        env_phone_id = str(WHATSAPP_PHONE_NUMBER_ID or "").strip()
+        if env_token and env_phone_id:
+            return env_token, env_phone_id, GRAPH_API_BASE
 
     token = str(channel.get("access_token", "")).strip()
     phone_id = str(channel.get("phone_number_id", "")).strip()
@@ -211,7 +220,7 @@ def update_channel(channel_id: int, **fields: Any) -> bool:
     allowed = {
         "label", "access_token", "owner_user_id", "owner_firebase_uid",
         "default_department_id", "is_bot_enabled", "is_active",
-        "webhook_subscribed", "display_phone_number",
+        "webhook_subscribed", "display_phone_number", "phone_number_id", "waba_id",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -258,7 +267,22 @@ def bootstrap_default_channel() -> int | None:
     refresh_channels()
     existing = get_default_channel()
     if existing:
-        logger.info("Bootstrap channel: canal default ja existe (id=%s)", existing["id"])
+        updates: dict[str, Any] = {}
+        if str(existing.get("access_token", "")).strip() != str(WHATSAPP_TOKEN).strip():
+            updates["access_token"] = WHATSAPP_TOKEN
+        if str(existing.get("phone_number_id", "")).strip() != str(WHATSAPP_PHONE_NUMBER_ID).strip():
+            updates["phone_number_id"] = WHATSAPP_PHONE_NUMBER_ID
+        if str(existing.get("waba_id", "")).strip() != str(WHATSAPP_WABA_ID).strip():
+            updates["waba_id"] = WHATSAPP_WABA_ID
+        if updates:
+            update_channel(existing["id"], **updates)
+            logger.info(
+                "Bootstrap channel: canal default sincronizado com env (id=%s fields=%s)",
+                existing["id"],
+                ",".join(sorted(updates.keys())),
+            )
+        else:
+            logger.info("Bootstrap channel: canal default ja existe (id=%s)", existing["id"])
         return existing["id"]
 
     channel_id = create_channel(

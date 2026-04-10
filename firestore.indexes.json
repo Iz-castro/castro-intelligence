@@ -26,6 +26,24 @@
       ]
     },
     {
+      "collectionGroup": "castro_crm_wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "last_message_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "castro_crm_wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "department_id", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "last_message_at", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "castro_crm_wa_transfer_log",
       "queryScope": "COLLECTION",
       "fields": [
