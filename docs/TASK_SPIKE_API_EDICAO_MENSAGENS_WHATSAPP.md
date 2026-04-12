@@ -185,3 +185,55 @@ Se o resultado for negativo para edicao real, refinar a feature para:
 
 - `Corrigir mensagem`
 - ou `Sincronizar edicao inbound`
+
+---
+
+## Conclusao do Spike - 12/04/2026
+
+### Decisao final: Cenario B+C (hibrido)
+
+- **Edicao outbound real (Cenario A): NAO SUPORTADA**
+- **Sincronizacao de edicao inbound (Cenario B): PARCIALMENTE SUPORTADA**
+- **Fallback de correcao interna (Cenario C): RECOMENDADO para outbound**
+
+### Evidencias tecnicas
+
+#### Edicao outbound via Cloud API
+
+Revisao da documentacao oficial da Messages API (`POST /{phone_number_id}/messages`):
+
+- o endpoint aceita apenas `POST` para criacao de novas mensagens
+- nao existe `PUT`, `PATCH` ou qualquer variante de edicao/atualizacao
+- o unico `PUT` disponivel no endpoint de messages e para marcar mensagens como lidas (`status: "read"`), que e um read-receipt, nao edicao
+- nao existe parametro `message_id` para referenciar mensagem existente em contexto de edicao
+- wrappers third-party como CodeChat oferecem `PATCH /edit-message`, mas usam protocolo nao-oficial (WhatsApp Web), nao a Cloud API
+
+Fontes verificadas:
+- https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages/
+- https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages/
+
+#### Webhook de edicao inbound
+
+A documentacao de webhooks nao documenta explicitamente um campo `edited` no payload de mensagens. Porem, com base em relatos da comunidade e no comportamento do app (que permite editar por 15 minutos), existe a possibilidade de que versoes recentes da Graph API (v20.0+) incluam um campo `edited` no webhook.
+
+**Status: nao confirmado oficialmente na documentacao publica acessivel.**
+
+A verificacao definitiva requer teste pratico: editar uma mensagem no app e observar o webhook.
+
+### Recomendacao de implementacao
+
+1. **Para outbound:** implementar `Corrigir mensagem` (Cenario C)
+   - UX: operador seleciona mensagem > "Corrigir" > composer abre com texto original > envia nova mensagem citando a anterior
+   - a mensagem original fica marcada como "corrigida" no CRM
+   - o cliente recebe uma nova mensagem, nao uma edicao
+
+2. **Para inbound:** reservar campo `edited` no schema de mensagens para uso futuro
+   - quando a Meta confirmar o campo no webhook, implementar sincronizacao
+   - por ora, nao criar UX para algo nao confirmado
+
+3. **Nomenclatura de produto:** usar `Corrigir mensagem`, nunca `Editar mensagem`
+   - evita prometer efeito que o cliente final nao vera no WhatsApp
+
+### Proxima acao
+
+Avancar para `TASK_FEATURE_EDICAO_MENSAGENS_WHATSAPP_CRM.md` no caminho C (correcao), com reserva de schema para B (inbound edit) quando confirmado.

@@ -80,6 +80,10 @@ export type Contact = {
   id: number;
   wa_id: string;
   display_name: string;
+  declared_name?: string;
+  whatsapp_profile_name?: string;
+  created_source?: "webhook" | "manual" | string;
+  created_by_user_id?: number | null;
   phone_formatted?: string;
   qualification?: string;
   notes?: string;
@@ -100,6 +104,7 @@ export type Contact = {
   is_archived?: number;
   first_seen_at?: string;
   last_message_at?: string;
+  last_inbound_at?: string;
   contact_avatar_path?: string;
   attendance_protocol?: string;
   attendance_started_at?: string;
@@ -137,6 +142,8 @@ export type ChatMessage = {
   phone_number_id?: string;
   is_rating_message?: boolean;
   visibility?: "all" | "admin_only" | string;
+  is_corrected?: boolean;
+  corrected_by_message_id?: number | null;
 };
 
 export type TransferRequest = {

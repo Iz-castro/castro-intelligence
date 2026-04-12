@@ -223,44 +223,42 @@ No cenario de fallback, nem todos os campos acima serao necessarios. O schema fi
 
 ## Se o resultado for Cenario C - fallback interno
 
-- [ ] criar endpoint de correcao interna, por exemplo:
+- [x] criar endpoint de correcao interna, por exemplo:
   - `POST /api/wa/correct-message`
-- [ ] marcar a mensagem original como `superseded`
-- [ ] enviar uma nova mensagem citando ou substituindo semanticamente a anterior
-- [ ] manter trilha clara no banco e no audit log
+- [x] marcar a mensagem original como `superseded`
+- [x] enviar uma nova mensagem citando ou substituindo semanticamente a anterior
+- [x] manter trilha clara no banco e no audit log
 
 ## Fase 3 - Frontend
 
 ### Menu da bolha
 
-- [ ] adicionar acao contextual:
-  - `Editar` se o cenario A for confirmado
-  - `Corrigir` se o cenario C for escolhido
-- [ ] manter `Responder` e `Copiar`
+- [x] adicionar acao contextual:
+  - `Corrigir` (cenario C confirmado)
+- [x] manter `Responder` e `Copiar`
 
 ### Composer
 
-- [ ] criar modo de edicao/correcao
-- [ ] exibir estado visual claro:
+- [x] criar modo de edicao/correcao
+- [x] exibir estado visual claro:
   - "Editando mensagem"
   - "Corrigindo mensagem"
-- [ ] permitir cancelar
-- [ ] reaproveitar texto original no input
+- [x] permitir cancelar
+- [x] reaproveitar texto original no input
 
 ### Timeline do chat
 
-- [ ] exibir badge visual:
-  - `editada`
+- [x] exibir badge visual:
   - `corrigida`
 - [ ] mostrar tooltip ou texto auxiliar quando houver alteracao
 - [ ] decidir se o CRM mostra ou nao o conteudo original
 
 ### Regras de UX recomendadas
 
-- [ ] permitir apenas em mensagem de texto outbound
-- [ ] esconder a opcao para audio, imagem, video, documento, template e system
+- [x] permitir apenas em mensagem de texto outbound
+- [x] esconder a opcao para audio, imagem, video, documento, template e system
 - [ ] esconder a opcao quando a janela expirar
-- [ ] esconder para mensagens de outro operador, exceto admin/supervisor
+- [x] esconder para mensagens de outro operador, exceto admin/supervisor
 
 ## Fase 4 - Regras de negocio
 
@@ -332,8 +330,8 @@ Preferir `Corrigir mensagem` ou `Enviar correcao`, para nao prometer um efeito q
 
 ### Criterio minimo
 
-- [ ] ha uma decisao tecnica formal apos o spike
-- [ ] o CRM nao usa linguagem enganosa sobre a capacidade real
+- [x] ha uma decisao tecnica formal apos o spike
+- [x] o CRM nao usa linguagem enganosa sobre a capacidade real
 
 ### Criterio ideal
 

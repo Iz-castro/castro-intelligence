@@ -48,6 +48,8 @@ from database import (
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message, set_attendance_protocol,
     get_wa_message_by_id, update_wa_message_transcription,
+    create_manual_wa_contact, update_wa_contact_declared_name,
+    mark_message_corrected,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -725,6 +727,15 @@ from datetime import timedelta
 _24H = timedelta(hours=24)
 
 
+def _check_send_permission(contact: dict, current_user: dict):
+    """Raises 403 if operator cannot send to this contact."""
+    assigned = contact.get("assigned_to")
+    if assigned and assigned != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    if not assigned and current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
+
+
 def _check_24h_window(contact: dict):
     """Raises 403 if last inbound message is older than 24h (Meta free-form window)."""
     last_inbound = contact.get("last_inbound_at")
@@ -766,6 +777,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     token, phone_id, api_base = _resolve_channel_creds(contact)
+    _check_send_permission(contact, current_user)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
@@ -828,8 +840,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     token, phone_id, api_base = _resolve_channel_creds(contact)
-    if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_send_permission(contact, current_user)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
@@ -873,8 +884,7 @@ async def wa_send_media(
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     token, phone_id, api_base = _resolve_channel_creds(contact)
-    if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_send_permission(contact, current_user)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
     reply_context = _build_reply_context(contact_id, reply_to_message_id)
@@ -929,8 +939,7 @@ async def wa_send_audio(
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     token, phone_id, api_base = _resolve_channel_creds(contact)
-    if contact.get("assigned_to") and contact["assigned_to"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    _check_send_permission(contact, current_user)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
     reply_context = _build_reply_context(contact_id, reply_to_message_id)
@@ -1006,6 +1015,166 @@ async def wa_send_template(
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
         raise HTTPException(status_code=502, detail=result.get("error", {}).get("message", "Erro desconhecido"))
+
+
+# -- API: Correcao de mensagem (Cenario C) --
+
+
+class CorrectMessageRequest(BaseModel):
+    message_id: int
+    new_content: str
+
+    @field_validator("new_content")
+    @classmethod
+    def validate_content(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Conteudo da correcao vazio")
+        if len(v) > MAX_MESSAGE_LENGTH:
+            raise ValueError(f"Excede {MAX_MESSAGE_LENGTH} caracteres")
+        return v
+
+
+@app.post("/api/wa/correct-message")
+async def correct_message(body: CorrectMessageRequest, current_user: dict = Depends(get_current_user)):
+    """Envia uma nova mensagem corrigindo uma mensagem anterior.
+
+    Marca a mensagem original como corrigida e envia a nova mensagem
+    como reply da original, prefixada com indicador de correcao.
+    """
+    original = get_wa_message_by_id(body.message_id)
+    if not original:
+        raise HTTPException(status_code=404, detail="Mensagem original nao encontrada")
+    if original.get("direction") != "outbound":
+        raise HTTPException(status_code=400, detail="Apenas mensagens outbound podem ser corrigidas")
+    if original.get("msg_type") != "text":
+        raise HTTPException(status_code=400, detail="Apenas mensagens de texto podem ser corrigidas")
+    if original.get("is_corrected"):
+        raise HTTPException(status_code=400, detail="Mensagem ja foi corrigida")
+
+    contact_id = original["contact_id"]
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    token, phone_id, api_base = _resolve_channel_creds(contact)
+    _check_24h_window(contact)
+
+    # Enviar nova mensagem como reply da original
+    wa_id = _wa_target(contact["wa_id"])
+    url = f"{api_base}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    reply_context = {}
+    orig_wa_id = original.get("wa_message_id", "")
+    if orig_wa_id and not orig_wa_id.startswith("local_"):
+        reply_context = {"context": {"message_id": orig_wa_id}}
+    payload = {
+        "messaging_product": "whatsapp", "to": wa_id, "type": "text",
+        "text": {"body": body.new_content},
+        **reply_context,
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        result = resp.json()
+
+    if resp.status_code != 200:
+        error_msg = result.get("error", {}).get("message", "Erro desconhecido")
+        raise HTTPException(status_code=502, detail=error_msg)
+
+    wa_msg_id = result.get("messages", [{}])[0].get("id", "")
+    original_preview = (original.get("content") or "")[:80]
+
+    new_msg_id = save_wa_message(
+        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        msg_type="text", content=body.new_content, status="sent",
+        timestamp_wa=datetime.now(timezone.utc).isoformat(),
+        operator_id=current_user["id"],
+        reply_to_message_id=body.message_id,
+        reply_to_preview=original_preview,
+        reply_to_sender_name=current_user.get("display_name", "Operador"),
+    )
+
+    # Marcar original como corrigida
+    mark_message_corrected(body.message_id, new_msg_id)
+
+    log_audit(current_user["id"], "WA_MESSAGE_CORRECT", f"Msg {body.message_id} corrigida por {new_msg_id}")
+    return {"status": "sent", "wa_message_id": wa_msg_id, "new_message_id": new_msg_id, "corrected_message_id": body.message_id}
+
+
+# -- API: Contatos - Criacao manual e nome declarado --
+
+
+class ManualContactRequest(BaseModel):
+    declared_name: str
+    phone: str
+    channel_id: int | None = None
+
+    @field_validator("declared_name")
+    @classmethod
+    def validate_name(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Nome e obrigatorio")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        v = "".join(ch for ch in v.strip() if ch.isdigit())
+        if len(v) < 10:
+            raise ValueError("Telefone invalido")
+        return v
+
+
+class DeclaredNameRequest(BaseModel):
+    declared_name: str = ""
+
+    @field_validator("declared_name")
+    @classmethod
+    def validate_name(cls, v):
+        return v.strip()
+
+
+@app.post("/api/wa/contact/manual")
+async def create_contact_manual(body: ManualContactRequest, current_user: dict = Depends(get_current_user)):
+    """Cria contato manualmente para iniciar conversa outbound via template."""
+    wa_id = normalize_br_phone(body.phone)
+    if not wa_id.startswith("55"):
+        wa_id = f"55{wa_id}"
+
+    # Resolver canal
+    channel_id = body.channel_id
+    if not channel_id:
+        from channel_service import get_default_channel
+        default_ch = get_default_channel()
+        if not default_ch:
+            raise HTTPException(status_code=400, detail="Nenhum canal WhatsApp disponivel")
+        channel_id = default_ch["id"]
+
+    contact_id, error = create_manual_wa_contact(
+        declared_name=body.declared_name,
+        wa_id=wa_id,
+        channel_id=channel_id,
+        user_id=current_user["id"],
+    )
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    contact = get_wa_contact(contact_id)
+    log_audit(current_user["id"], "CONTACT_MANUAL_CREATE", f"Contato {contact_id}: {body.declared_name} ({wa_id})")
+    return {"contact": contact}
+
+
+@app.put("/api/wa/contact/{contact_id}/declared-name")
+async def update_declared_name(contact_id: int, body: DeclaredNameRequest, current_user: dict = Depends(get_current_user)):
+    """Atualiza o nome declarado pelo operador."""
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    update_wa_contact_declared_name(contact_id, body.declared_name)
+    log_audit(current_user["id"], "CONTACT_DECLARED_NAME", f"Contato {contact_id}: {body.declared_name}")
+    updated = get_wa_contact(contact_id)
+    return {"contact": updated}
 
 
 # -- API: Contatos - Qualificacao e gerenciamento --
@@ -1669,6 +1838,8 @@ async def export_data(
 @app.get("/api/admin/embedded-signup/config")
 async def embedded_signup_config(current_user: dict = Depends(get_current_user)):
     """Retorna configuracao necessaria para o frontend iniciar o Embedded Signup."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem acessar o signup")
     if not META_APP_ID:
         raise HTTPException(status_code=503, detail="META_APP_ID nao configurado no servidor")
     return {
@@ -1692,6 +1863,8 @@ async def embedded_signup_exchange(
     current_user: dict = Depends(get_current_user),
 ):
     """Troca o code do Embedded Signup por token e descobre WABA/Phone IDs."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem realizar signup")
     if not META_APP_ID or not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
 
@@ -1780,7 +1953,7 @@ async def embedded_signup_exchange(
     # Determinar tipo: coexistence se platform_type indica app onboarding
     is_coexistence = platform_type in ("CLOUD_API",) and body.channel_type == "coexistence"
     channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
-    owner_id = body.owner_user_id if is_coexistence else None
+    owner_id = (body.owner_user_id or current_user["id"]) if is_coexistence else None
 
     owner_user = get_user_by_id(owner_id) if owner_id else None
     channel_label = body.label or (

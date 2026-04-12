@@ -141,6 +141,17 @@ type CrmContextValue = {
   openLightbox: (src: string, kind: "image" | "video", alt: string, gifLike?: boolean) => void;
   closeLightbox: () => void;
 
+  // Manual contact creation
+  createManualContact: (declared_name: string, phone: string, channel_id?: number) => Promise<Contact | null>;
+  updateDeclaredName: (contact_id: number, declared_name: string) => Promise<void>;
+  busyCreateContact: boolean;
+
+  // Message correction
+  correctMessage: (messageId: number, newContent: string) => Promise<boolean>;
+  correctionTarget: ChatMessage | null;
+  startCorrection: (message: ChatMessage) => void;
+  cancelCorrection: () => void;
+
   // Detail panel
   qualification: string;
   setQualification: (v: string) => void;
@@ -316,6 +327,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [busySave, setBusySave] = useState(false);
   const [busyTransfer, setBusyTransfer] = useState(false);
   const [busyAssume, setBusyAssume] = useState(false);
+  const [busyCreateContact, setBusyCreateContact] = useState(false);
+  const [correctionTarget, setCorrectionTarget] = useState<ChatMessage | null>(null);
 
   // -- Admin users --
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
@@ -1114,6 +1127,65 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyRoleUpdate(false); }
   }
 
+  function startCorrection(message: ChatMessage) {
+    setCorrectionTarget(message);
+    setDraft(message.content || "");
+    composerInputRef.current?.focus();
+  }
+
+  function cancelCorrection() {
+    setCorrectionTarget(null);
+    setDraft("");
+  }
+
+  async function correctMessage(messageId: number, newContent: string): Promise<boolean> {
+    if (!bundle) return false;
+    try {
+      setBusySend(true); setError("");
+      const res = await sendJson(bundle.auth, "/api/wa/correct-message", { message_id: messageId, new_content: newContent }) as { corrected_message_id: number };
+      // Marcar mensagem original como corrigida no state local
+      setMessages(prev => prev.map(m => m.id === res.corrected_message_id ? { ...m, is_corrected: true } : m));
+      setCorrectionTarget(null);
+      setDraft("");
+      setNotice("Correcao enviada.");
+      if (!snapshotMode) await refreshPollingViews();
+      return true;
+    } catch (e) { setError(errorText(e)); return false; }
+    finally { setBusySend(false); }
+  }
+
+  async function createManualContact(declared_name: string, phone: string, channel_id?: number): Promise<Contact | null> {
+    if (!bundle) return null;
+    try {
+      setBusyCreateContact(true); setError("");
+      const payload: Record<string, unknown> = { declared_name, phone };
+      if (channel_id) payload.channel_id = channel_id;
+      const res = await sendJson(bundle.auth, "/api/wa/contact/manual", payload) as { contact: Record<string, unknown> };
+      const contact = normalizeContact(res.contact, String(res.contact.id));
+      setContacts(prev => {
+        const exists = prev.some(c => c.id === contact.id);
+        if (exists) return prev.map(c => c.id === contact.id ? contact : c);
+        return [contact, ...prev];
+      });
+      setSelectedContactId(contact.id);
+      setActiveView("meus");
+      setNotice("Contato criado.");
+      return contact;
+    } catch (e) { setError(errorText(e)); return null; }
+    finally { setBusyCreateContact(false); }
+  }
+
+  async function updateDeclaredName(contact_id: number, declared_name: string) {
+    if (!bundle) return;
+    try {
+      setError("");
+      const res = await putJson(bundle.auth, `/api/wa/contact/${contact_id}/declared-name`, { declared_name }) as { contact: Record<string, unknown> };
+      const updated = normalizeContact(res.contact, String(res.contact.id));
+      setContacts(prev => prev.map(c => c.id === updated.id ? updated : c));
+      setNotice("Nome atualizado.");
+    } catch (e) { setError(errorText(e)); }
+  }
+
   async function assumeContact(contactId: number) {
     if (!bundle) return;
     try { setBusyAssume(true); setError(""); setNotice(""); await sendJson(bundle.auth, `/api/wa/assume/${contactId}`, {}); setNotice("Atendimento assumido."); if (!snapshotMode) await refreshPollingViews(); }
@@ -1185,6 +1257,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef,
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
+    createManualContact, updateDeclaredName, busyCreateContact,
+    correctMessage, correctionTarget, startCorrection, cancelCorrection,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,

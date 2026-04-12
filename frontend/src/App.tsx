@@ -102,7 +102,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
-              <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>
+              {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
               {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
@@ -147,8 +147,48 @@ function NavBar() {
   );
 }
 
+function NewContactModal({ onClose }: { onClose: () => void }) {
+  const { createManualContact, busyCreateContact, channels } = useCrm();
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const availableChannels = channels.filter(ch => ch.is_active);
+  const [channelId, setChannelId] = useState<number | "">(availableChannels.length === 1 ? availableChannels[0].id : "");
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim() || !phone.trim()) return;
+    const result = await createManualContact(name.trim(), phone.trim(), channelId ? Number(channelId) : undefined);
+    if (result) onClose();
+  }
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Novo contato" onClick={onClose}>
+      <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" style={{ width: "min(420px, 92vw)" }} onClick={(e) => e.stopPropagation()}>
+        <p className="eyebrow">Novo contato</p>
+        <h2 style={{ margin: "0 0 1rem" }}>Criar contato manual</h2>
+        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required />
+          <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required />
+          {availableChannels.length > 1 && (
+            <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")}>
+              <option value="">Selecionar canal</option>
+              {availableChannels.map(ch => <option key={ch.id} value={ch.id}>{ch.label || ch.display_phone_number}</option>)}
+            </select>
+          )}
+          <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+            <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
+            <button type="submit" className="primary" disabled={busyCreateContact || !name.trim() || !phone.trim()}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function ContactList() {
   const { activeView, filteredContacts, selectedContactId, setSelectedContactId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const [showNewContact, setShowNewContact] = useState(false);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
   const visibleTeamOperators = activeView === "equipe"
     ? operators
@@ -180,7 +220,10 @@ function ContactList() {
       </div>
       <div className="toolbar">
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar contato" />
-        {activeView === "meus" && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>}
+        {activeView === "meus" && <>
+          <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Novo contato" aria-label="Novo contato"><PlusIcon /></button>
+          <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>
+        </>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
       </div>
       <div className="contact-list">
@@ -219,6 +262,7 @@ function ContactList() {
         })}
         {!filteredContacts.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
       </div>
+      {showNewContact && <NewContactModal onClose={() => setShowNewContact(false)} />}
     </aside>
   );
 }
@@ -261,13 +305,18 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   const hasDraft = Boolean(draft.trim());
+  const [editingNickname, setEditingNickname] = useState(false);
+  const [nicknameInput, setNicknameInput] = useState("");
   const [openMessageMenuId, setOpenMessageMenuId] = useState<number | null>(null);
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
   const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
   const selectedOperator = activeView === "equipe" ? findAssignedOperator(selectedContact, operators) : null;
   const selectedOperatorColor = selectedOperator ? operatorColor(selectedOperator.id) : null;
+  const noInboundWindow = selectedContact && !selectedContact.last_inbound_at;
+  const isManualContact = selectedContact?.created_source === "manual";
+  const chatIsEmpty = selectedContact && visibleMessages.length === 0;
   useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
 
   // Scroll management — must live here (not in CrmProvider) because messagesRef is attached to a DOM node inside this component
@@ -283,10 +332,13 @@ function ChatPanel() {
       }
       scrollIntentRef.current = "normal";
     } else if (scrollIntentRef.current === "normal") {
-      // Only auto-scroll to bottom when user is already near the bottom
-      // or on initial load for this contact (prevCount === 0)
+      // Auto-scroll to bottom when:
+      // - initial load (prevCount === 0)
+      // - new message arrived (count increased) and user was reasonably near bottom
+      // - user is already near the bottom
       const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-      if (prevMessageCountRef.current === 0 || distFromBottom < 150) {
+      const isNewMessage = messages.length > prevMessageCountRef.current && prevMessageCountRef.current > 0;
+      if (prevMessageCountRef.current === 0 || isNewMessage || distFromBottom < 300) {
         container.scrollTop = container.scrollHeight;
       }
     }
@@ -355,7 +407,12 @@ function ChatPanel() {
       {selectedContact ? <>
         <div className="contact-banner">
           <div>
-            <strong>{selectedContact.display_name}</strong>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "0.4rem", flexWrap: "wrap" }}>
+              <strong>{selectedContact.whatsapp_profile_name || selectedContact.phone_formatted || selectedContact.wa_id}</strong>
+              {selectedContact.declared_name ? (
+                <span className="sub" style={{ fontSize: "0.82rem" }}>- {selectedContact.declared_name}</span>
+              ) : null}
+            </div>
             {selectedOperator ? (
               <div className="contact-operator-chip">
                 <span
@@ -369,7 +426,7 @@ function ChatPanel() {
                 <span className="sub" style={{ color: selectedOperatorColor || undefined }}>{selectedOperator.display_name}</span>
               </div>
             ) : null}
-            <div className="sub">{selectedContact.phone_formatted || selectedContact.wa_id} · {selectedContact.assigned_name || "Fila aberta"}</div>
+            <div className="sub">{selectedContact.phone_formatted || selectedContact.wa_id}{selectedContact.assigned_name ? ` · ${selectedContact.assigned_name}` : ""}</div>
             {selectedContact.attendance_protocol ? <div className="sub" style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "0.72rem", marginTop: "0.2rem" }}>{selectedContact.attendance_protocol}{selectedContact.attendance_started_at ? ` · inicio ${when(selectedContact.attendance_started_at)}` : ""}</div> : null}
           </div>
           <div className="banner-actions">
@@ -387,7 +444,8 @@ function ChatPanel() {
                     <button type="button" className="attach-option" onClick={() => closeDotsMenu()}><span>📋</span><span>Templates Utility</span></button>
                     <button type="button" className="attach-option" onClick={() => closeDotsMenu()}><span>📣</span><span>Templates Marketing</span></button>
                     <div style={{ height: 1, background: "var(--border)", margin: "0.3rem 0.5rem" }} />
-                    <button type="button" className="attach-option" onClick={() => { if (selectedContact.attendance_protocol) navigator.clipboard.writeText(selectedContact.attendance_protocol).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button>
+                    <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }}><span>✏️</span><span>Editar apelido</span></button>
+                    {selectedContact.attendance_protocol ? <button type="button" className="attach-option" onClick={() => { navigator.clipboard.writeText(selectedContact.attendance_protocol!).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button> : null}
                   </div>
                 ) : null}
               </div>
@@ -395,9 +453,22 @@ function ChatPanel() {
           </div>
         </div>
 
+        {editingNickname ? (
+          <form className="toolbar" onSubmit={(e) => { e.preventDefault(); void updateDeclaredName(selectedContact.id, nicknameInput.trim()); setEditingNickname(false); }} style={{ gap: "0.4rem" }}>
+            <input value={nicknameInput} onChange={(e) => setNicknameInput(e.target.value)} placeholder="Apelido do contato (vazio para remover)" autoFocus style={{ flex: 1 }} />
+            <button type="submit" className="ghost" style={{ padding: "0.6rem 0.8rem", fontSize: "0.82rem" }}>Salvar</button>
+            <button type="button" className="ghost" style={{ padding: "0.6rem 0.8rem", fontSize: "0.82rem", opacity: 0.6 }} onClick={() => setEditingNickname(false)}>x</button>
+          </form>
+        ) : null}
         {showChatSearch ? <div className="toolbar"><input value={chatSearch} onChange={(e) => setChatSearch(e.target.value)} placeholder="Buscar na conversa..." autoFocus />{chatSearch ? <span className="sub">{(visibleMessagesFiltered ?? []).length} resultado(s)</span> : null}</div> : null}
 
         <div className="messages" ref={messagesRef}>
+          {chatIsEmpty && isManualContact ? (
+            <div className="empty" style={{ alignSelf: "center", textAlign: "center", marginTop: "2rem" }}>
+              <p style={{ marginBottom: "0.5rem" }}>Contato criado manualmente.</p>
+              <p>Envie um template para iniciar a conversa.</p>
+            </div>
+          ) : null}
           {loadingMore && <div className="sub" style={{ textAlign: "center", padding: "0.5rem" }}>Carregando mensagens anteriores...</div>}
           {(visibleMessagesFiltered ?? visibleMessages).map((message) => {
             const canInteract = message.direction !== "system";
@@ -413,6 +484,9 @@ function ChatPanel() {
                       <div className={`bubble-menu attach-menu ${openMessageMenuDirection === "up" ? "open-upward" : ""}`}>
                         <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }}><span>Responder</span></button>
                         <button type="button" className="attach-option" onClick={() => { void copyMessageText(message); setOpenMessageMenuId(null); }}><span>Copiar</span></button>
+                        {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && (message.operator_id === sessionUser?.id || sessionUser?.role === "admin" || sessionUser?.role === "supervisor") ? (
+                          <button type="button" className="attach-option" onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }}><span>Corrigir</span></button>
+                        ) : null}
                       </div>
                     ) : null}
                   </div>
@@ -421,7 +495,7 @@ function ChatPanel() {
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
                 {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
                 <MessageMedia message={message} />
-                <footer><span>{messageTypeLabel(message.msg_type)}</span>{config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}</footer>
+                <footer><span>{messageTypeLabel(message.msg_type)}{message.is_corrected ? " · corrigida" : ""}</span>{config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}</footer>
               </article>
             );
           })}
@@ -437,8 +511,21 @@ function ChatPanel() {
           ))}</div>
         )}
 
-        <form className="composer" onSubmit={submitText}>
-          {replyTarget ? (
+        {noInboundWindow ? (
+          <div className="composer" style={{ padding: "0.8rem 1rem" }}>
+            <div className="sub" style={{ textAlign: "center", width: "100%" }}>Janela de 24h indisponivel. Use o menu de templates para iniciar a conversa.</div>
+          </div>
+        ) : (
+        <form className="composer" onSubmit={correctionTarget ? (e) => { e.preventDefault(); if (draft.trim()) void correctMessage(correctionTarget.id, draft.trim()); } : submitText}>
+          {correctionTarget ? (
+            <div className="composer-reply-preview" style={{ borderLeft: "3px solid var(--warm)" }}>
+              <div style={{ flex: 1 }}>
+                <span className="sub" style={{ fontWeight: 600, color: "var(--warm)" }}>Corrigindo mensagem</span>
+                <p style={{ margin: "0.2rem 0 0", fontSize: "0.85rem" }}>{(correctionTarget.content || "").slice(0, 100)}</p>
+              </div>
+              <button type="button" className="reply-preview-close" onClick={cancelCorrection} aria-label="Cancelar correcao">x</button>
+            </div>
+          ) : replyTarget ? (
             <div className="composer-reply-preview">
               <ReplyQuote senderName={replyTarget.sender_name} preview={replyTarget.preview} compact />
               <button type="button" className="reply-preview-close" onClick={cancelReply} aria-label="Cancelar resposta">x</button>
@@ -467,6 +554,7 @@ function ChatPanel() {
             </button>
           </div>
         </form>
+        )}
       </> : <div className="empty large">Selecione um contato para abrir a conversa.</div>}
     </main>
   );
@@ -687,7 +775,7 @@ function WhatsAppSignupModal() {
           return;
         }
         setStep("exchanging");
-        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code })
+        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code, channel_type: "coexistence" })
           .then((data) => { setResult(data); setStep("done"); })
           .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
       },

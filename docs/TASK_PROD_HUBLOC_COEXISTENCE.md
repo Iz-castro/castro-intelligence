@@ -87,7 +87,7 @@ Impacto:
   - envio de midia
   - webhook inbound
   - resposta dentro da janela de 24h
-- [ ] Esconder temporariamente o fluxo de `coexistence` do usuario final:
+- [x] Esconder temporariamente o fluxo de `coexistence` do usuario final:
   - frontend
   - endpoints ou gate por role/feature flag
 
@@ -137,12 +137,12 @@ Impacto:
 
 ## Ajustes tecnicos necessarios antes da Fase 2
 
-- [ ] Remover a exposicao prematura de `WhatsApp Coexistence` para todos os usuarios
-- [ ] Fechar ou condicionar os endpoints:
+- [x] Remover a exposicao prematura de `WhatsApp Coexistence` para todos os usuarios
+- [x] Fechar ou condicionar os endpoints:
   - `GET /api/admin/embedded-signup/config`
   - `POST /api/admin/embedded-signup/exchange`
-- [ ] Corrigir o payload do frontend para nao enviar apenas `{ code }`
-- [ ] Validar se o canal criado no exchange esta recebendo `owner_user_id`
+- [x] Corrigir o payload do frontend para nao enviar apenas `{ code }`
+- [x] Validar se o canal criado no exchange esta recebendo `owner_user_id`
 
 ## Referencias no codigo
 

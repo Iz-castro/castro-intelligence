@@ -32,7 +32,7 @@ export function messageContentLabel(message: ChatMessage) {
 }
 
 export function messageSenderLabel(message: ChatMessage) {
-  if (message.direction === "outbound") return message.operator_name || "Equipe";
+  if (message.direction === "outbound") return message.operator_name || (message.operator_id ? "Equipe" : "Bot");
   if (message.direction === "inbound") return "Cliente";
   return "Sistema";
 }

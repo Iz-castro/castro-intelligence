@@ -161,7 +161,6 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             status="sent" if resp.status_code == 200 else "failed",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=None,
-            operator_name="Bot",
         )
         if resp.status_code == 200:
             logger.info("[BOT] Resposta enviada para %s | contact=%d", wa_id, contact_id)
@@ -221,7 +220,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
     channel_phone_id = str(channel.get("phone_number_id", "")) if channel else ""
     channel_type = str(channel.get("channel_type", "")) if channel else ""
     channel_owner_id = channel.get("owner_user_id") if channel else None
-    channel_token = str(channel.get("access_token", "")) if channel else ""
+    channel_token = str(channel.get("access_token", "")).strip() if channel else ""
 
     for msg in value.get("messages", []):
         wa_id = msg.get("from", "")
@@ -388,7 +387,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             if _contact_for_bot and not _contact_for_bot.get("assigned_to"):
                 bot_reply = process_bot_message(contact_id, content, contact_name)
                 if bot_reply:
-                    _bot_token = channel_token or WHATSAPP_TOKEN
+                    _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
                     _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
                     await _send_bot_reply(wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id)
 

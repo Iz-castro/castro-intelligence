@@ -492,6 +492,11 @@ def get_unread_count(user_id):
     return {int(row["sender_id"]): int(row.get("count", 0)) for row in rows if int(row.get("count", 0)) > 0}
 
 
+def _resolve_display_name(declared_name, whatsapp_profile_name, phone_formatted):
+    """Resolve o nome efetivo para exibicao: declared > whatsapp > phone."""
+    return declared_name or whatsapp_profile_name or phone_formatted or ""
+
+
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
                       auto_assign_user_id=None):
@@ -504,10 +509,17 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
     if existing:
         updates = {
-            "display_name": display_name or existing.get("display_name", ""),
             "last_message_at": now,
             "last_inbound_at": now,
         }
+        # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name
+        if display_name:
+            updates["whatsapp_profile_name"] = display_name
+            # Recalcular display_name efetivo
+            declared = existing.get("declared_name", "")
+            updates["display_name"] = _resolve_display_name(
+                declared, display_name, existing.get("phone_formatted", ""),
+            )
         # Atualizar canal se ainda nao definido ou se mudou
         if channel_id is not None and not existing.get("channel_id"):
             updates["channel_id"] = channel_id
@@ -526,12 +538,17 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         document("wa_contacts", existing["id"]).set(updates, merge=True)
         return existing["id"]
 
+    phone_formatted = format_phone_br(wa_id)
     contact_id = next_sequence("wa_contacts")
     new_contact = {
         "id": contact_id,
         "wa_id": wa_id,
-        "display_name": display_name or "",
-        "phone_formatted": format_phone_br(wa_id),
+        "display_name": _resolve_display_name("", display_name, phone_formatted),
+        "declared_name": "",
+        "whatsapp_profile_name": display_name or "",
+        "created_source": "webhook",
+        "created_by_user_id": None,
+        "phone_formatted": phone_formatted,
         "profile_picture_url": "",
         "contact_avatar_path": "",
         "qualification": "novo",
@@ -563,6 +580,89 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 new_contact["department_id"] = user["department_id"]
     document("wa_contacts", contact_id).set(new_contact)
     return contact_id
+
+
+def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id):
+    """Cria contato manualmente pelo operador.
+
+    Retorna (contact_id, error_message). Se o wa_id ja existir,
+    reatribui o contato existente ao operador e retorna o id dele.
+    """
+    existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
+    if existing:
+        user = _get_doc("users", user_id)
+        if not user:
+            return None, "Operador nao encontrado"
+        updates = {
+            "assigned_to": user_id,
+            "assigned_to_uid": user.get("firebase_uid", ""),
+            "qualification": "em_atendimento",
+            "is_archived": 0,
+        }
+        if declared_name and not existing.get("declared_name"):
+            updates["declared_name"] = declared_name
+            updates["display_name"] = _resolve_display_name(
+                declared_name,
+                existing.get("whatsapp_profile_name", ""),
+                existing.get("phone_formatted", ""),
+            )
+        if not existing.get("department_id") and user.get("department_id"):
+            updates["department_id"] = user["department_id"]
+        document("wa_contacts", existing["id"]).set(updates, merge=True)
+        return existing["id"], None
+
+    now = utcnow()
+    user = _get_doc("users", user_id)
+    if not user:
+        return None, "Operador nao encontrado"
+
+    phone_formatted = format_phone_br(wa_id)
+    contact_id = next_sequence("wa_contacts")
+    new_contact = {
+        "id": contact_id,
+        "wa_id": wa_id,
+        "display_name": _resolve_display_name(declared_name, "", phone_formatted),
+        "declared_name": declared_name or "",
+        "whatsapp_profile_name": "",
+        "created_source": "manual",
+        "created_by_user_id": user_id,
+        "phone_formatted": phone_formatted,
+        "profile_picture_url": "",
+        "contact_avatar_path": "",
+        "qualification": "em_atendimento",
+        "notes": "",
+        "assigned_to": user_id,
+        "assigned_to_uid": user.get("firebase_uid", ""),
+        "department_id": user.get("department_id"),
+        "channel_id": channel_id,
+        "phone_number_id": "",
+        "source_channel_type": "standard",
+        "original_operator_id": None,
+        "converted_by_user_id": None,
+        "rating": None,
+        "rating_requested_at": None,
+        "is_archived": 0,
+        "unread_count": 0,
+        "first_seen_at": now,
+        "last_message_at": None,
+        "last_inbound_at": None,
+    }
+    document("wa_contacts", contact_id).set(new_contact)
+    return contact_id, None
+
+
+def update_wa_contact_declared_name(contact_id, declared_name):
+    """Atualiza o nome declarado pelo operador."""
+    existing = _get_doc("wa_contacts", contact_id)
+    if not existing:
+        return False
+    phone_formatted = existing.get("phone_formatted", "")
+    whatsapp_name = existing.get("whatsapp_profile_name", "")
+    document("wa_contacts", contact_id).set({
+        "declared_name": declared_name,
+        "display_name": _resolve_display_name(declared_name, whatsapp_name, phone_formatted),
+    }, merge=True)
+    return True
 
 
 def _enrich_contact(row):
@@ -679,6 +779,7 @@ def return_contact_to_bot(contact_id, returned_by_user_id):
         "assigned_to": None,
         "assigned_to_uid": "",
         "qualification": "novo",
+        "bot_completed": False,
         "attendance_protocol": "",
         "attendance_started_at": "",
     }, merge=True)
@@ -873,6 +974,18 @@ def get_wa_message_by_wa_message_id(wa_message_id):
     for snap in collection("wa_messages").where("wa_message_id", "==", wa_message_id).limit(1).stream():
         return _raw_doc(snap)
     return None
+
+
+def mark_message_corrected(message_id: int, corrected_by_message_id: int):
+    """Marca uma mensagem como corrigida por outra mensagem."""
+    msg = get_wa_message_by_id(message_id)
+    if not msg:
+        return False
+    document("wa_messages", message_id).set({
+        "is_corrected": True,
+        "corrected_by_message_id": corrected_by_message_id,
+    }, merge=True)
+    return True
 
 
 def update_wa_message_transcription(db_id: int, transcription: str):
