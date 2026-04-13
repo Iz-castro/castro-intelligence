@@ -7,7 +7,7 @@ CRM WhatsApp multi-canal para empresa do setor imobiliario. Permite que operador
 **Stack:**
 - Backend: Python 3.10 + FastAPI + Uvicorn
 - Banco de dados: Google Cloud Firestore
-- Autenticacao: Firebase Auth (Google Sign-In)
+- Autenticacao: Firebase Auth (Google Sign-In + Email/Password opcional)
 - Frontend: React 18 + TypeScript + Vite
 - Midia: Google Cloud Storage (GCS)
 - Deploy: Google Cloud Run (Docker)
@@ -628,7 +628,7 @@ gcloud run deploy castro-crm \
 
 ## 14. Seguranca
 
-- **Autenticacao:** Firebase Auth com Google Sign-In (token ID verificado no backend)
+- **Autenticacao:** Firebase Auth com Google Sign-In (primario) + Email/Password opcional. Em ambos os casos o backend valida o mesmo ID token. Email/Password precisa ser habilitado manualmente no Firebase Console (Authentication → Sign-in method) e os emails devem respeitar `ALLOWED_FIREBASE_EMAIL_DOMAIN` ou `ALLOWED_FIREBASE_EMAILS`
 - **Webhook:** Validacao HMAC-SHA256 com `WHATSAPP_APP_SECRET`
 - **CORS:** Configuravel via `CORS_ORIGINS`
 - **Tokens:** Nunca expostos na API de listagem de canais
