@@ -39,12 +39,15 @@ export type SessionUser = {
   is_active?: number;
 };
 
+export type BotKey = "comercial" | "financeiro" | "administrativo" | "sac";
+
 export type Department = {
   id: number;
   name: string;
   description?: string;
   is_active?: number;
   sort_order?: number;
+  bot_key?: BotKey | null;
 };
 
 export type Channel = {

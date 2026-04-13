@@ -225,6 +225,7 @@ button { cursor: pointer; }
 
 .panel {
   min-height: 0;
+  height: 100%;
   overflow: hidden;
   padding: 1rem;
 }
@@ -1009,6 +1010,8 @@ textarea:focus {
   display: grid;
   gap: 0.5rem;
   padding: 0 0.75rem 0.75rem;
+  max-height: 40vh;
+  overflow-y: auto;
 }
 
 /* detail-scroll styles unified above */
@@ -1177,21 +1180,6 @@ textarea:focus {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
-}
-
-@media (max-width: 1200px) {
-  body { overflow: auto; }
-  .crm-layout { height: auto; min-height: 100vh; overflow: visible; }
-  .crm-grid {
-    flex: none;
-    height: auto;
-    grid-template-columns: 54px 280px minmax(0, 1fr);
-  }
-  .panel {
-    height: auto;
-    min-height: 420px;
-  }
-  .detail-panel { grid-column: 1 / -1; }
 }
 
 @media (max-width: 860px) {

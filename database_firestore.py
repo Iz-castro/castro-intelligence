@@ -169,7 +169,22 @@ def init_database():
     logger.info("Firestore inicializado")
 
 
-def create_department(name, description=""):
+VALID_BOT_KEYS = {"comercial", "financeiro", "administrativo", "sac"}
+_SENTINEL = object()
+
+
+def _normalize_bot_key(value):
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if not v:
+        return None
+    if v not in VALID_BOT_KEYS:
+        return None
+    return v
+
+
+def create_department(name, description="", bot_key=None):
     existing = _get_first_by_field("departments", "name", name)
     if existing:
         return existing["id"]
@@ -179,6 +194,7 @@ def create_department(name, description=""):
         "id": department_id,
         "name": name,
         "description": description or "",
+        "bot_key": _normalize_bot_key(bot_key),
         "is_active": 1,
         "created_at": utcnow(),
     })
@@ -198,7 +214,7 @@ def get_department_by_id(department_id):
     return normalize_record(_get_doc("departments", department_id))
 
 
-def update_department(department_id, name=None, description=None, is_active=None, sort_order=None):
+def update_department(department_id, name=None, description=None, is_active=None, sort_order=None, bot_key=_SENTINEL):
     fields = {}
     if name is not None:
         # Verifica duplicata de nome (excluindo o proprio)
@@ -212,6 +228,8 @@ def update_department(department_id, name=None, description=None, is_active=None
         fields["is_active"] = 1 if is_active else 0
     if sort_order is not None:
         fields["sort_order"] = sort_order
+    if bot_key is not _SENTINEL:
+        fields["bot_key"] = _normalize_bot_key(bot_key)
     if not fields:
         return False, "Nenhum campo para atualizar"
     fields["updated_at"] = utcnow()
@@ -265,11 +283,18 @@ def get_user_by_id(user_id):
     row = _get_doc("users", user_id)
     if not row or not row.get("is_active", 1):
         return None
+    department_id = row.get("department_id")
+    department_name = ""
+    if department_id:
+        department = _get_doc("departments", department_id)
+        if department:
+            department_name = department.get("name", "")
     return normalize_record({
         "id": row["id"],
         "username": row["username"],
         "display_name": row["display_name"],
-        "department_id": row.get("department_id"),
+        "department_id": department_id,
+        "department_name": department_name,
         "role": row.get("role", "operador"),
         "is_active": row.get("is_active", 1),
         "email": row.get("email", ""),

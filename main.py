@@ -1293,7 +1293,9 @@ async def create_department_endpoint(request: Request, current_user: dict = Depe
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Nome obrigatorio")
-    department_id = create_department(name, body.get("description", ""))
+    department_id = create_department(name, body.get("description", ""), bot_key=body.get("bot_key"))
+    from bot_service import invalidate_dept_cache
+    invalidate_dept_cache()
     log_audit(current_user["id"], "DEPARTMENT_CREATE", f"name={name} id={department_id}")
     return {"id": department_id, "name": name}
 
@@ -1306,15 +1308,19 @@ async def update_department_endpoint(department_id: int, request: Request, curre
     if not existing:
         raise HTTPException(status_code=404, detail="Departamento nao encontrado")
     body = await request.json()
-    ok, error = update_department(
-        department_id,
+    update_kwargs = dict(
         name=body.get("name"),
         description=body.get("description"),
         is_active=body.get("is_active"),
         sort_order=body.get("sort_order"),
     )
+    if "bot_key" in body:
+        update_kwargs["bot_key"] = body.get("bot_key")
+    ok, error = update_department(department_id, **update_kwargs)
     if not ok:
         raise HTTPException(status_code=400, detail=error)
+    from bot_service import invalidate_dept_cache
+    invalidate_dept_cache()
     log_audit(current_user["id"], "DEPARTMENT_UPDATE", f"id={department_id} fields={list(body.keys())}")
     return {"ok": True}
 
@@ -1327,6 +1333,8 @@ async def delete_department_endpoint(department_id: int, current_user: dict = De
     if not existing:
         raise HTTPException(status_code=404, detail="Departamento nao encontrado")
     deactivate_department(department_id)
+    from bot_service import invalidate_dept_cache
+    invalidate_dept_cache()
     log_audit(current_user["id"], "DEPARTMENT_DELETE", f"id={department_id} name={existing.get('name')}")
     return {"ok": True}
 

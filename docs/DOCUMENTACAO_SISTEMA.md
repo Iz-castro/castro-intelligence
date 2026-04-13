@@ -23,9 +23,9 @@ O sistema suporta dois tipos de canais WhatsApp simultaneamente:
 
 ### Canal Standard (Cloud API)
 - Numero compartilhado da empresa
-- Funciona como entrada de novos leads (fila do bot futuro)
-- Leads ficam em "Novos" ate um operador assumir
-- Flag `is_bot_enabled=true` para integracao futura com bot
+- Funciona como entrada de novos leads (fila do bot)
+- Leads ficam em "Novos" ate um operador assumir (ou o bot rotear para um departamento)
+- Flag `is_bot_enabled=true` habilita o bot para responder automaticamente no canal
 
 ### Canal Coexistence
 - Numero pessoal do operador (WhatsApp Business App continua no celular)
@@ -128,13 +128,31 @@ Departamentos representam setores da empresa (Comercial, SAC, Financeiro, Cadast
 - Admin/Supervisor pode criar, editar e remover departamentos
 - Cada operador pertence a um departamento
 - Contatos podem ser transferidos entre departamentos
-- O bot (futuro) podera rotear leads para o departamento correto
+- O bot roteia leads automaticamente para o departamento com `bot_key` correspondente
+
+### Campo `bot_key` (roteamento do bot)
+
+Cada departamento pode ter um `bot_key` opcional que liga o setor fixo do bot ao departamento real:
+
+| `bot_key` | Setor do bot |
+|---|---|
+| `comercial` | Comercial (1) |
+| `financeiro` | Financeiro (2) |
+| `administrativo` | Administrativo (3) |
+| `sac` | SAC (4) |
+| `null` | Nao recebe do bot (so transferencias manuais) |
+
+Se admin renomear o departamento, o `bot_key` continua igual e o roteamento do bot nao quebra. Qualquer mutacao em departamentos (create/update/delete) invalida o cache `_dept_cache` do bot automaticamente.
+
+Se `bot_key` nao estiver definido, o bot cai em fallback para substring match no nome (ex: "Comercial" bate com "Departamento Comercial").
 
 ### Departamentos padrao (bootstrap):
-- Geral
-- Vendas
-- Suporte
-- Financeiro
+| Nome | `bot_key` |
+|---|---|
+| Geral | `null` |
+| Vendas | `comercial` |
+| Suporte | `sac` |
+| Financeiro | `financeiro` |
 
 ### Transferencia entre departamentos:
 1. Operador seleciona contato
@@ -332,8 +350,11 @@ rating_requested_at: str | null
 rating_received_at: str | null
 unread_count: int
 is_archived: int
-attendance_protocol: str        # ATD-YYYYMMDDHHMMSS-XXXXX
+attendance_protocol: str        # ATD-YYYYMMDDHHMMSS-XXXXX (gerado ao assumir)
 attendance_started_at: str
+is_corrected: bool              # true quando msg foi corrigida
+corrected_by_message_id: int    # id da msg de correcao
+assume_pending_response: bool   # true se operador assumiu e ainda nao respondeu
 first_seen_at, last_message_at, last_inbound_at: datetime
 ```
 
@@ -367,6 +388,8 @@ reply_to_message_id: int | null
 reply_to_preview: str
 reply_to_sender_name: str
 transcription: str              # transcricao de audio (STT)
+is_corrected: bool              # true se esta msg outbound foi corrigida
+corrected_by_message_id: int    # id da msg que substituiu esta
 ```
 
 ### `wa_transfer_log`
@@ -406,10 +429,32 @@ Setores da empresa.
 id: int
 name: str
 description: str
+bot_key: "comercial" | "financeiro" | "administrativo" | "sac" | null
 is_active: int
 sort_order: int
 created_at, updated_at: datetime
 ```
+
+### `operator_assume_counters`
+Contador de "assumir sem responder" por operador. Doc ID = user_id.
+```
+user_id: int
+counter: int                    # range -2 a 0
+updated_at: datetime
+```
+Cada `assumir` sem resposta anterior decrementa o contador (minimo -2). Cada resposta apos assumir incrementa (maximo 0). Quando `counter <= -2`, o endpoint `POST /api/wa/assume/{id}` pode bloquear novas assumidas ate o operador responder os contatos pendentes (`assume_pending_response=true`).
+
+### `bot_states`
+Estado da conversa com o bot para cada contato. Doc ID = contact_id.
+```
+step: "greeting" | "ask_name" | "ask_equipment" | "ask_sector"
+      | "ask_name_after_sector" | "ask_name_after_equip" | "done"
+nome: str                       # nome coletado
+equipamento: str                # equipamento mencionado (se detectado)
+setor_sugerido: int             # 1-4 (Comercial/Financeiro/Administrativo/SAC)
+updated_at: datetime
+```
+Quando o bot finaliza, o estado e apagado e o contato recebe `attendance_protocol` + `department_id` com base no `bot_key`.
 
 ### `operator_profiles`
 Perfil do operador para snapshots Firestore (sincronizado com users).
@@ -593,13 +638,37 @@ gcloud run deploy castro-crm \
 
 ---
 
-## 15. Bot (Futuro)
+## 15. Bot de Atendimento
 
-Documentacao tecnica completa em `docs/BOT_ARCHITECTURE.md`.
+O bot esta implementado em `bot_service.py` e opera como state machine. Fluxo coleta nome, equipamento e setor do cliente antes de transferir para o departamento correto.
 
-**Resumo:**
-- O canal standard tem `is_bot_enabled=true`
-- Contatos sem operador (`assigned_to == null`) sao candidatos ao bot
-- Bot pode ser implementado como servico externo (Firestore listener) ou integrado no webhook
-- Quando operador assume, bot para de responder
-- Endpoint `POST /api/wa/contact/{id}/return-to-bot` devolve contato ao bot
+### Quando o bot responde
+- Canal com `is_bot_enabled=true` (standard tem por padrao; coexistence nao)
+- Contato sem operador assumido (`assigned_to == null`)
+- Respeito a horario de expediente (timezone -03:00, 07h-17h)
+
+### Estados da state machine
+```
+greeting -> ask_name -> ask_equipment -> ask_sector -> done
+         \-> ask_name_after_sector  (cliente pulou para setor direto)
+         \-> ask_name_after_equip   (cliente mencionou equipamento)
+```
+Estado persistido em Firestore: `bot_states/{contact_id}` (ver Section 10).
+
+### Roteamento para departamento
+Ao finalizar (`done`), o bot:
+1. Atribui o contato ao departamento via `bot_key` (ver Section 6)
+2. Se nenhum departamento tem o `bot_key` do setor escolhido: cai em fallback (substring match) ou deixa em "Novos"
+3. Insere mensagem de sistema com o protocolo e dados coletados
+
+### Quando o bot para de responder
+- Operador assume o contato (`assigned_to` deixa de ser null)
+- Admin/Supervisor usa `POST /api/wa/contact/{id}/return-to-bot` para devolver ao bot (reseta `assigned_to=null` e o state)
+
+### Assume counter (anti-spam de assumir)
+Operadores que assumem contatos mas nao respondem sao limitados pelo contador em `operator_assume_counters` (ver Section 10). Cada assumir consecutivo sem resposta decrementa ate -2. Cada resposta apos assumir incrementa de volta. Campo `assume_pending_response` em `wa_contacts` marca os que ainda esperam primeira resposta.
+
+### Protocolo de atendimento
+Ao assumir (manual ou via bot), o contato recebe `attendance_protocol` no formato `ATD-YYYYMMDDHHMMSS-XXXXX` (onde XXXXX e o contact_id zero-padded). Usado para rastreabilidade nos relatorios.
+
+Documentacao tecnica historica em `docs/BOT_ARCHITECTURE.md` (descreve o projeto original; algumas decisoes evoluiram).

@@ -63,11 +63,22 @@ function BootScreen() {
 }
 
 function LoginScreen() {
-  const { config, bundle, busyLogin, error, loginWithGoogle } = useCrm();
+  const { config, bundle, busyLogin, error, loginWithGoogle, loginWithEmail } = useCrm();
+  const [showEmailForm, setShowEmailForm] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   return (
-    <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Entrar com Google</h1>
+    <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Entrar</h1>
       <p>{config?.allowed_email_domain ? `Use sua conta ${config.allowed_email_domain}.` : "Use uma conta Google autorizada."}</p>
       <button className="primary" onClick={() => void loginWithGoogle()} disabled={!bundle || busyLogin}>{busyLogin ? "Conectando..." : "Entrar com Google"}</button>
+      <button className="ghost" style={{ marginTop: "0.6rem" }} onClick={() => setShowEmailForm((v) => !v)}>{showEmailForm ? "Ocultar email/senha" : "Entrar com email/senha"}</button>
+      {showEmailForm && (
+        <form style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginTop: "0.8rem" }} onSubmit={(e) => { e.preventDefault(); if (email.trim() && password) void loginWithEmail(email.trim(), password); }}>
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" autoComplete="email" />
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="senha" autoComplete="current-password" />
+          <button className="primary" type="submit" disabled={!bundle || busyLogin || !email.trim() || !password}>{busyLogin ? "Conectando..." : "Entrar"}</button>
+        </form>
+      )}
       {error ? <div className="alert danger">{error}</div> : null}
     </div></div>
   );
@@ -84,7 +95,7 @@ function TopBar() {
       <div className="topbar-brand"><p className="eyebrow">Hubloc CRM</p></div>
       <div className="topbar-user">
         <strong>{sessionUser.display_name}</strong>
-        <span className="sub">{sessionUser.email || sessionUser.username} · <span className="chip">{sessionUser.role}</span></span>
+        <span className="sub">{sessionUser.email || sessionUser.username} · <span className="chip">{sessionUser.role}</span>{sessionUser.department_name ? <> · <span className="chip">{sessionUser.department_name}</span></> : null}</span>
       </div>
       <div className="topbar-actions">
         <button className="composer-icon" onClick={toggleTheme} title={theme === "dark" ? "Tema claro" : "Tema escuro"} aria-label="Alternar tema">
@@ -1123,9 +1134,11 @@ function AdminSettingsModal() {
   const [depts, setDepts] = useState<Department[]>(departments);
   const [newDeptName, setNewDeptName] = useState("");
   const [newDeptDesc, setNewDeptDesc] = useState("");
+  const [newDeptBotKey, setNewDeptBotKey] = useState<string>("");
   const [editingDeptId, setEditingDeptId] = useState<number | null>(null);
   const [editDeptName, setEditDeptName] = useState("");
   const [editDeptDesc, setEditDeptDesc] = useState("");
+  const [editDeptBotKey, setEditDeptBotKey] = useState<string>("");
   const [busyDept, setBusyDept] = useState(false);
 
   // -- Channel state --
@@ -1150,25 +1163,33 @@ function AdminSettingsModal() {
     if (!bundle || !newDeptName.trim()) return;
     setBusyDept(true);
     try {
-      await sendJson(bundle.auth, "/api/admin/departments", { name: newDeptName.trim(), description: newDeptDesc.trim() });
-      setNewDeptName(""); setNewDeptDesc("");
+      await sendJson(bundle.auth, "/api/admin/departments", {
+        name: newDeptName.trim(),
+        description: newDeptDesc.trim(),
+        bot_key: newDeptBotKey || null,
+      });
+      setNewDeptName(""); setNewDeptDesc(""); setNewDeptBotKey("");
       await reloadDepts();
       setNotice("Departamento criado");
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
     setBusyDept(false);
-  }, [bundle, newDeptName, newDeptDesc, reloadDepts, setError, setNotice]);
+  }, [bundle, newDeptName, newDeptDesc, newDeptBotKey, reloadDepts, setError, setNotice]);
 
   const saveDeptEdit = useCallback(async (deptId: number) => {
     if (!bundle || !editDeptName.trim()) return;
     setBusyDept(true);
     try {
-      await putJson(bundle.auth, `/api/admin/departments/${deptId}`, { name: editDeptName.trim(), description: editDeptDesc.trim() });
+      await putJson(bundle.auth, `/api/admin/departments/${deptId}`, {
+        name: editDeptName.trim(),
+        description: editDeptDesc.trim(),
+        bot_key: editDeptBotKey || null,
+      });
       setEditingDeptId(null);
       await reloadDepts();
       setNotice("Departamento atualizado");
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
     setBusyDept(false);
-  }, [bundle, editDeptName, editDeptDesc, reloadDepts, setError, setNotice]);
+  }, [bundle, editDeptName, editDeptDesc, editDeptBotKey, reloadDepts, setError, setNotice]);
 
   const deleteDept = useCallback(async (deptId: number) => {
     if (!bundle) return;
@@ -1260,6 +1281,14 @@ function AdminSettingsModal() {
                     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", flex: 1 }}>
                       <input value={editDeptName} onChange={(e) => setEditDeptName(e.target.value)} placeholder="Nome" />
                       <input value={editDeptDesc} onChange={(e) => setEditDeptDesc(e.target.value)} placeholder="Descricao (opcional)" />
+                      <label className="sub" style={{ fontSize: "0.75rem" }}>Setor do bot (roteamento automatico):</label>
+                      <select value={editDeptBotKey} onChange={(e) => setEditDeptBotKey(e.target.value)}>
+                        <option value="">Nenhum (nao recebe do bot)</option>
+                        <option value="comercial">Comercial</option>
+                        <option value="financeiro">Financeiro</option>
+                        <option value="administrativo">Administrativo</option>
+                        <option value="sac">SAC</option>
+                      </select>
                       <div style={{ display: "flex", gap: "0.4rem" }}>
                         <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={busyDept} onClick={() => void saveDeptEdit(dept.id)}>{busyDept ? "..." : "Salvar"}</button>
                         <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setEditingDeptId(null)}>Cancelar</button>
@@ -1269,10 +1298,11 @@ function AdminSettingsModal() {
                     <>
                       <div className="admin-user-info">
                         <strong>{dept.name}</strong>
+                        {dept.bot_key ? <span className="chip" style={{ fontSize: "0.65rem", marginLeft: "0.3rem" }}>bot: {dept.bot_key}</span> : null}
                         {dept.description ? <span className="sub">{dept.description}</span> : null}
                       </div>
                       <div style={{ display: "flex", gap: "0.3rem" }}>
-                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} onClick={() => { setEditingDeptId(dept.id); setEditDeptName(dept.name); setEditDeptDesc(dept.description || ""); }}>Editar</button>
+                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} onClick={() => { setEditingDeptId(dept.id); setEditDeptName(dept.name); setEditDeptDesc(dept.description || ""); setEditDeptBotKey(dept.bot_key || ""); }}>Editar</button>
                         <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Remover departamento "${dept.name}"?`)) void deleteDept(dept.id); }}>Remover</button>
                       </div>
                     </>
@@ -1284,6 +1314,13 @@ function AdminSettingsModal() {
               <span className="sub">Novo departamento:</span>
               <input value={newDeptName} onChange={(e) => setNewDeptName(e.target.value)} placeholder="Nome do departamento" />
               <input value={newDeptDesc} onChange={(e) => setNewDeptDesc(e.target.value)} placeholder="Descricao (opcional)" />
+              <select value={newDeptBotKey} onChange={(e) => setNewDeptBotKey(e.target.value)}>
+                <option value="">Setor do bot: Nenhum</option>
+                <option value="comercial">Setor do bot: Comercial</option>
+                <option value="financeiro">Setor do bot: Financeiro</option>
+                <option value="administrativo">Setor do bot: Administrativo</option>
+                <option value="sac">Setor do bot: SAC</option>
+              </select>
               <button className="primary" style={{ padding: "0.5rem" }} disabled={!newDeptName.trim() || busyDept} onClick={() => void createDept()}>{busyDept ? "Criando..." : "Criar departamento"}</button>
             </div>
           </div>

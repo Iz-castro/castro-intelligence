@@ -180,22 +180,42 @@ def _classificar_setor(texto: str) -> Optional[int]:
 # =========================================================================
 
 _SETOR_NOMES = {1: "Comercial", 2: "Financeiro", 3: "Administrativo", 4: "SAC"}
+_BOT_KEY_BY_SETOR = {1: "comercial", 2: "financeiro", 3: "administrativo", 4: "sac"}
 
 _dept_cache = None
 
 
 def _get_dept_map() -> dict:
-    """Mapeia nome de setor do bot -> department_id do CRM."""
+    """Mapeia setor do bot -> department_id do CRM.
+
+    Preferencia: campo `bot_key` do departamento (estavel, nao quebra com rename).
+    Fallback: substring match com _SETOR_NOMES quando bot_key nao esta definido.
+    """
     global _dept_cache
     if _dept_cache is not None:
         return _dept_cache
     depts = get_all_departments()
     mapping = {}
+
+    # Pass 1: bot_key explicito (prioridade)
+    by_bot_key = {}
+    for dept in depts:
+        bk = (dept.get("bot_key") or "").strip().lower()
+        if bk:
+            by_bot_key[bk] = dept.get("id")
+    for setor_id, bot_key in _BOT_KEY_BY_SETOR.items():
+        if bot_key in by_bot_key:
+            mapping[setor_id] = by_bot_key[bot_key]
+
+    # Pass 2: substring match para setores que ainda nao tem mapeamento
     for dept in depts:
         name_norm = _norm(dept.get("name", ""))
         for setor_id, setor_nome in _SETOR_NOMES.items():
+            if setor_id in mapping:
+                continue
             if _norm(setor_nome) in name_norm or name_norm in _norm(setor_nome):
                 mapping[setor_id] = dept.get("id")
+
     _dept_cache = mapping
     return mapping
 

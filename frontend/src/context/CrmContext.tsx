@@ -1,5 +1,5 @@
 import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useRef, useState, type ReactNode } from "react";
-import { onIdTokenChanged, signInWithPopup, signOut, type User } from "firebase/auth";
+import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
 import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
 import { getJson, putJson, sendForm, sendJson } from "../api";
@@ -39,6 +39,7 @@ type CrmContextValue = {
 
   // Auth
   loginWithGoogle: () => Promise<void>;
+  loginWithEmail: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
 
   // Contacts
@@ -372,9 +373,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const botContacts = botEnabled ? contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado" && !c.bot_completed) : [];
   // Novos: sem atribuicao. Com bot ativo, so mostra quem completou o bot ou nunca entrou.
   // Sem bot, mostra todos sem atribuicao (comportamento original).
+  // Operador comum so ve contatos do seu departamento (ou sem departamento);
+  // admin/supervisor veem todos.
   const novosContacts = contacts.filter((c) => {
     if (c.assigned_to || c.qualification === "nao_qualificado") return false;
     if (botEnabled && !c.bot_completed) return false;
+    if (!isManagerRole && c.department_id != null && c.department_id !== sessionUser?.department_id) return false;
     return true;
   });
   // Meus: atribuidos ao usuario logado (inclui coexistence auto-atribuidos)
@@ -956,6 +960,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyLogin(false); }
   }
 
+  async function loginWithEmail(email: string, password: string) {
+    if (!bundle) return;
+    try { setBusyLogin(true); setError(""); await signInWithEmailAndPassword(bundle.auth, email, password); }
+    catch (e) { setError(errorText(e)); }
+    finally { setBusyLogin(false); }
+  }
+
   async function logout() { if (bundle) await signOut(bundle.auth); }
 
   async function sendTextMessage() {
@@ -1241,7 +1252,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const value: CrmContextValue = {
     config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
     theme, toggleTheme,
-    loginWithGoogle, logout,
+    loginWithGoogle, loginWithEmail, logout,
     contacts, selectedContactId, setSelectedContactId, selectedContact,
     activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
