@@ -766,8 +766,9 @@ function WhatsAppSignupModal() {
       fbLoaded.current = true;
       setStep("ready");
     };
+    const sdkVersion = encodeURIComponent(version);
     const script = document.createElement("script");
-    script.src = "https://connect.facebook.net/pt_BR/sdk.js";
+    script.src = `https://connect.facebook.net/pt_BR/sdk.js?v=${sdkVersion}`;
     script.async = true;
     script.defer = true;
     script.crossOrigin = "anonymous";

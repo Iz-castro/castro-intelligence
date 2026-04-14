@@ -189,6 +189,14 @@ def create_channel(
     owner_firebase_uid: str = "",
     default_department_id: int | None = None,
     is_bot_enabled: bool = False,
+    token_expires_at: str | None = None,
+    platform_type: str = "",
+    is_official_business_account: bool | None = None,
+    code_verification_status: str = "",
+    messaging_limit_tier: str = "",
+    verified_name: str = "",
+    quality_rating: str = "",
+    webhook_subscribed: bool = False,
 ) -> int:
     """Cria um novo canal e retorna o ID."""
     channel_id = next_sequence("channels")
@@ -201,12 +209,19 @@ def create_channel(
         "phone_number_id": str(phone_number_id).strip(),
         "display_phone_number": display_phone_number,
         "access_token": access_token,
+        "token_expires_at": token_expires_at,
         "owner_user_id": owner_user_id,
         "owner_firebase_uid": owner_firebase_uid,
         "default_department_id": default_department_id,
         "is_bot_enabled": is_bot_enabled,
         "is_active": True,
-        "webhook_subscribed": False,
+        "webhook_subscribed": webhook_subscribed,
+        "platform_type": platform_type,
+        "is_official_business_account": is_official_business_account,
+        "code_verification_status": code_verification_status,
+        "messaging_limit_tier": messaging_limit_tier,
+        "verified_name": verified_name,
+        "quality_rating": quality_rating,
         "created_at": now,
         "updated_at": now,
     })
@@ -218,9 +233,11 @@ def create_channel(
 def update_channel(channel_id: int, **fields: Any) -> bool:
     """Atualiza campos de um canal existente."""
     allowed = {
-        "label", "access_token", "owner_user_id", "owner_firebase_uid",
+        "label", "access_token", "token_expires_at", "owner_user_id", "owner_firebase_uid",
         "default_department_id", "is_bot_enabled", "is_active",
         "webhook_subscribed", "display_phone_number", "phone_number_id", "waba_id",
+        "platform_type", "is_official_business_account", "code_verification_status",
+        "messaging_limit_tier", "verified_name", "quality_rating",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -228,6 +245,71 @@ def update_channel(channel_id: int, **fields: Any) -> bool:
     updates["updated_at"] = utcnow()
     document("channels", channel_id).set(updates, merge=True)
     refresh_channels()
+    return True
+
+
+def refresh_coexistence_token(channel_id: int) -> bool:
+    """Tenta estender o token de um canal coexistence via fb_exchange_token.
+
+    Retorna True se renovou com sucesso, False caso contrario.
+    Loga warning quando falha (sinaliza necessidade de re-onboarding).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+
+    from config import GRAPH_API_BASE, META_APP_ID, META_APP_SECRET
+
+    if not META_APP_ID or not META_APP_SECRET:
+        logger.warning("refresh_coexistence_token: META_APP_ID/SECRET ausente")
+        return False
+
+    channel = get_channel(channel_id)
+    if not channel:
+        logger.warning("refresh_coexistence_token: canal %s nao encontrado", channel_id)
+        return False
+    if channel.get("channel_type") != CHANNEL_TYPE_COEXISTENCE:
+        return False
+
+    current_token = str(channel.get("access_token", "")).strip()
+    if not current_token:
+        logger.warning("refresh_coexistence_token: canal %s sem token armazenado", channel_id)
+        return False
+
+    url = f"{GRAPH_API_BASE}/oauth/access_token"
+    params = {
+        "grant_type": "fb_exchange_token",
+        "client_id": META_APP_ID,
+        "client_secret": META_APP_SECRET,
+        "fb_exchange_token": current_token,
+    }
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(url, params=params)
+        if resp.status_code >= 400:
+            logger.warning(
+                "refresh_coexistence_token: canal %s falhou status=%s body=%s",
+                channel_id, resp.status_code, resp.text[:300],
+            )
+            return False
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("refresh_coexistence_token: canal %s exception=%s", channel_id, exc)
+        return False
+
+    new_token = data.get("access_token")
+    if not new_token:
+        logger.warning("refresh_coexistence_token: canal %s resposta sem access_token: %s", channel_id, data)
+        return False
+
+    expires_in = data.get("expires_in")
+    expires_at_iso: str | None = None
+    if isinstance(expires_in, (int, float)) and expires_in > 0:
+        expires_at_iso = (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))).isoformat()
+
+    update_channel(channel_id, access_token=new_token, token_expires_at=expires_at_iso)
+    logger.info("refresh_coexistence_token: canal %s renovado (expira em %s)", channel_id, expires_at_iso)
     return True
 
 

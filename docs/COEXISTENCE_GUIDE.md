@@ -247,3 +247,80 @@ EMBEDDED_SIGNUP_CONFIG_ID=2785379481799560
 - `frontend/src/types.ts` - Adicionado `"whatsapp"` ao tipo `SettingsPage`
 - `frontend/src/context/CrmContext.tsx` - Atualizado `openSettingsPage` para suportar `"whatsapp"`
 - `.env.example` - Adicionadas variaveis de Coexistence
+
+---
+
+## Pre-requisitos para onboardar um numero via Embedded Signup
+
+Antes de clicar "Conectar WhatsApp" no CRM, valide cada item abaixo. Se algum
+falhar, o popup da Meta vai recusar o numero antes mesmo de chamar nosso
+backend.
+
+### 1. Numero esta no app correto
+
+- O numero precisa estar cadastrado no app **WhatsApp Business** (icone com
+  a letra "B"), nao no WhatsApp comum.
+- Se estava no WhatsApp comum, instale o WhatsApp Business e migre os dados
+  pelo proprio app (oferta automatica na primeira abertura).
+
+### 2. Numero NAO esta em outra WABA
+
+- Um mesmo numero so pode estar em uma WABA por vez. Se o numero ja foi
+  cadastrado em outra conta WhatsApp Business API (outro provedor, outro
+  app, etc.), a Meta bloqueia o reuso.
+- Como verificar: peca para o dono do numero abrir [business.facebook.com](https://business.facebook.com)
+  e checar se aparece em "WhatsApp Accounts". Se aparecer, remova a partir
+  do portfolio antigo antes de tentar o signup.
+
+### 3. Configuracao do App Dashboard (Meta)
+
+Em [developers.facebook.com](https://developers.facebook.com) > seu App > **WhatsApp**:
+
+- **Configuration > Webhook**: o callback URL deve apontar para
+  `https://<seu-dominio>/webhook` e o verify token bate com `WHATSAPP_VERIFY_TOKEN`.
+- **Configuration > Webhook fields**: ativar todos os toggles abaixo
+  (sem isso o webhook fica registrado mas nao recebe os eventos):
+  - `messages`
+  - `message_template_status_update`
+  - `history` (coexistence)
+  - `smb_message_echoes` (coexistence)
+  - `smb_app_state_sync` (coexistence)
+  - `account_update`
+- **Embedded Signup > Configurations**: o `EMBEDDED_SIGNUP_CONFIG_ID`
+  deve ter sido criado com a opcao **"WhatsApp Business App onboarding"**
+  (modo Coexistence). Se o config foi criado para Cloud API padrao, o
+  popup recusa numeros coexistence. Crie um novo config se necessario e
+  atualize a env var.
+
+### 4. Variaveis de ambiente do servidor
+
+Confirme via `GET /api/admin/embedded-signup/config` (logado como admin)
+que o backend retorna 200 com `app_id`, `config_id` e `graph_api_version`
+preenchidos. Se retorna 503 com mensagem indicando variaveis ausentes,
+configure-as no Cloud Run / `.env` antes de prosseguir.
+
+---
+
+## Diagnostico de falha no Embedded Signup
+
+Se o popup retorna erro ou o backend retorna 502 apos a troca do code,
+veja os logs do servidor — todas as chamadas `Graph API` agora logam
+`message`, `code`, `subcode` e `fbtrace_id` da Meta. Casos comuns:
+
+| Sintoma | Causa provavel | Acao |
+|---|---|---|
+| Popup fecha sem retornar code | Usuario cancelou OU `featureType` errado no FB.login | Verificar `frontend/src/App.tsx` `WhatsAppSignupModal` — deve passar `featureType: "whatsapp_business_app_onboarding"` |
+| Backend 502 com `code=190` | Token invalido/expirado entre popup e exchange | Tentar de novo em janela limpa |
+| Backend 502 com `code=100` em `/phone_numbers` | Token nao tem escopo para listar numeros (raro com config correto) | Validar escopos no `EMBEDDED_SIGNUP_CONFIG_ID` |
+| Backend 400 "Nenhum numero encontrado" | WABA criada mas numero ainda nao adicionado | Pedir para o dono completar o flow do WhatsApp Business no celular |
+| `webhook_subscribed=false` no response | POST `/subscribed_apps` falhou (logar detail) | Conferir se o app esta em modo "Live" e tem permissao no portfolio |
+
+---
+
+## Token expira em ~2h — agora ha refresh automatico
+
+Tokens user-bound de coexistence vencem em ~1-2h. O backend agora salva
+`token_expires_at` no documento do canal e tenta `fb_exchange_token`
+automaticamente (em `_resolve_channel_creds`) quando faltam <5 min para
+expirar. Quando o refresh falha, ha `WARNING` no log indicando que o
+canal precisa ser re-onboardado.

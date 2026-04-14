@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import (
@@ -722,8 +722,6 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
 
 # -- Helper: janela de 24h do WhatsApp --
 
-from datetime import timedelta
-
 _24H = timedelta(hours=24)
 
 
@@ -758,10 +756,31 @@ def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
     """Resolve credenciais do canal a partir do contato.
 
     Tenta channel_id do contato, senao usa canal default.
+    Para canais coexistence, tenta refresh proativo se o token vai expirar
+    em <5min — evita falhas silenciosas no envio.
     Returns (token, phone_number_id, graph_api_base).
     """
-    from channel_service import get_send_credentials
+    from channel_service import (
+        CHANNEL_TYPE_COEXISTENCE, get_channel, get_send_credentials,
+        refresh_coexistence_token,
+    )
+
     channel_id = contact.get("channel_id")
+    if channel_id is not None:
+        channel = get_channel(channel_id)
+        if channel and channel.get("channel_type") == CHANNEL_TYPE_COEXISTENCE:
+            expires_at_raw = channel.get("token_expires_at")
+            if expires_at_raw:
+                try:
+                    expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+                    if datetime.now(timezone.utc) >= expires_at - timedelta(minutes=5):
+                        refresh_coexistence_token(int(channel_id))
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Canal coexistence %s com token_expires_at invalido: %s",
+                        channel_id, expires_at_raw,
+                    )
+
     try:
         return get_send_credentials(channel_id)
     except ValueError:
@@ -1848,8 +1867,18 @@ async def embedded_signup_config(current_user: dict = Depends(get_current_user))
     """Retorna configuracao necessaria para o frontend iniciar o Embedded Signup."""
     if current_user.get("role") not in ("admin", "supervisor"):
         raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem acessar o signup")
+    missing: list[str] = []
     if not META_APP_ID:
-        raise HTTPException(status_code=503, detail="META_APP_ID nao configurado no servidor")
+        missing.append("META_APP_ID")
+    if not META_APP_SECRET:
+        missing.append("META_APP_SECRET")
+    if not EMBEDDED_SIGNUP_CONFIG_ID:
+        missing.append("EMBEDDED_SIGNUP_CONFIG_ID")
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Configuracao de Embedded Signup incompleta: {', '.join(missing)}",
+        )
     return {
         "app_id": META_APP_ID,
         "config_id": EMBEDDED_SIGNUP_CONFIG_ID,
@@ -1863,6 +1892,29 @@ class EmbeddedSignupExchange(BaseModel):
     owner_user_id: int | None = None
     label: str = ""
     default_department_id: int | None = None
+
+
+def _meta_error_detail(resp: httpx.Response) -> str:
+    """Extrai mensagem de erro estruturada de uma resposta da Graph API."""
+    try:
+        data = resp.json()
+    except Exception:
+        return resp.text[:500] or f"HTTP {resp.status_code}"
+    err = data.get("error") or {}
+    msg = err.get("message") or err.get("error_user_msg") or ""
+    code = err.get("code")
+    subcode = err.get("error_subcode")
+    trace = err.get("fbtrace_id")
+    parts = []
+    if msg:
+        parts.append(msg)
+    if code is not None:
+        parts.append(f"code={code}")
+    if subcode is not None:
+        parts.append(f"subcode={subcode}")
+    if trace:
+        parts.append(f"trace={trace}")
+    return " | ".join(parts) or resp.text[:500] or f"HTTP {resp.status_code}"
 
 
 @app.post("/api/admin/embedded-signup/exchange")
@@ -1885,49 +1937,107 @@ async def embedded_signup_exchange(
     )
     async with httpx.AsyncClient(timeout=20.0) as client:
         token_resp = await client.get(token_url)
-        token_data = token_resp.json()
 
-    if "access_token" not in token_data:
-        error_msg = token_data.get("error", {}).get("message", "Falha ao trocar code por token")
-        logger.error("Embedded Signup token exchange falhou: %s", error_msg)
-        raise HTTPException(status_code=502, detail=f"Erro na troca do code: {error_msg}")
+    if token_resp.status_code >= 400:
+        detail = _meta_error_detail(token_resp)
+        logger.error("Embedded Signup token exchange falhou: %s", detail)
+        raise HTTPException(status_code=502, detail=f"Erro na troca do code: {detail}")
 
-    access_token = token_data["access_token"]
-    logger.info("Embedded Signup: token obtido com sucesso")
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        detail = _meta_error_detail(token_resp)
+        logger.error("Embedded Signup token exchange sem access_token: %s", detail)
+        raise HTTPException(status_code=502, detail=f"Erro na troca do code: {detail}")
 
-    # 2. Buscar shared WABAs para descobrir WABA ID e Phone Number ID
+    expires_in_raw = token_data.get("expires_in")
+    token_expires_at_iso: str | None = None
+    if isinstance(expires_in_raw, (int, float)) and expires_in_raw > 0:
+        token_expires_at_iso = (
+            datetime.now(timezone.utc) + timedelta(seconds=int(expires_in_raw))
+        ).isoformat()
+    logger.info(
+        "Embedded Signup: token obtido (expires_in=%s)",
+        expires_in_raw if expires_in_raw is not None else "n/a",
+    )
+
+    # 2. debug_token: descobre WABAs autorizados e valida escopo coexistence
     debug_url = (
         f"https://graph.facebook.com/{GRAPH_API_VERSION}/debug_token"
         f"?input_token={access_token}&access_token={META_APP_ID}|{META_APP_SECRET}"
     )
     async with httpx.AsyncClient(timeout=20.0) as client:
         debug_resp = await client.get(debug_url)
-        debug_data = debug_resp.json()
 
+    if debug_resp.status_code >= 400:
+        detail = _meta_error_detail(debug_resp)
+        logger.error("Embedded Signup debug_token falhou: %s", detail)
+        raise HTTPException(status_code=502, detail=f"Erro ao validar token: {detail}")
+
+    debug_data = debug_resp.json()
     granular_scopes = debug_data.get("data", {}).get("granular_scopes", [])
-    waba_ids = []
+
+    waba_ids: list[str] = []
+    coexistence_scope_present = False
+    granted_scope_names: list[str] = []
     for scope in granular_scopes:
-        if scope.get("scope") == "whatsapp_business_management":
-            waba_ids = scope.get("target_ids", [])
-            break
+        scope_name = scope.get("scope") or ""
+        granted_scope_names.append(scope_name)
+        if scope_name == "whatsapp_business_management":
+            for tid in scope.get("target_ids") or []:
+                if tid and tid not in waba_ids:
+                    waba_ids.append(str(tid))
+        if scope_name in ("whatsapp_business_app_onboarding", "business_management"):
+            coexistence_scope_present = True
 
     if not waba_ids:
-        logger.warning("Embedded Signup: nenhum WABA encontrado nos scopes")
-        raise HTTPException(status_code=400, detail="Nenhuma conta WhatsApp Business retornada pelo signup")
+        logger.warning(
+            "Embedded Signup: nenhum WABA nos scopes (granted=%s)",
+            ",".join(granted_scope_names) or "<vazio>",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Nenhuma conta WhatsApp Business retornada pelo signup. "
+                "Confirme que o usuario concedeu acesso a uma WABA."
+            ),
+        )
+
+    if body.channel_type == "coexistence" and not coexistence_scope_present:
+        logger.warning(
+            "Embedded Signup: pediu coexistence mas escopo whatsapp_business_app_onboarding ausente (granted=%s)",
+            ",".join(granted_scope_names) or "<vazio>",
+        )
+        # Nao bloqueia (Meta as vezes nao retorna esse scope no debug),
+        # mas registra para diagnostico futuro.
 
     waba_id = waba_ids[0]
-    logger.info("Embedded Signup: WABA ID descoberto = %s", waba_id)
+    logger.info(
+        "Embedded Signup: WABA ID = %s (total descobertos: %d)",
+        waba_id, len(waba_ids),
+    )
 
-    # 3. Buscar Phone Number ID dentro do WABA
-    phones_url = f"{GRAPH_API_BASE}/{waba_id}/phone_numbers"
+    # 3. Buscar todos os Phone Numbers do WABA, com paginacao
+    phone_numbers: list[dict] = []
+    next_url: str | None = f"{GRAPH_API_BASE}/{waba_id}/phone_numbers"
+    next_params: dict | None = {"limit": 100}
     async with httpx.AsyncClient(timeout=20.0) as client:
-        phones_resp = await client.get(
-            phones_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        phones_data = phones_resp.json()
+        while next_url:
+            phones_resp = await client.get(
+                next_url,
+                params=next_params,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if phones_resp.status_code >= 400:
+                detail = _meta_error_detail(phones_resp)
+                logger.error("Embedded Signup phone_numbers falhou: %s", detail)
+                raise HTTPException(status_code=502, detail=f"Erro ao buscar numeros: {detail}")
+            phones_data = phones_resp.json()
+            phone_numbers.extend(phones_data.get("data", []) or [])
+            paging = phones_data.get("paging") or {}
+            next_url = paging.get("next")
+            next_params = None  # paging.next ja inclui cursor
 
-    phone_numbers = phones_data.get("data", [])
     if not phone_numbers:
         logger.warning("Embedded Signup: nenhum numero encontrado no WABA %s", waba_id)
         raise HTTPException(status_code=400, detail="Nenhum numero de telefone encontrado na conta")
@@ -1939,30 +2049,61 @@ async def embedded_signup_exchange(
     quality_rating = phone_info.get("quality_rating", "")
     platform_type = phone_info.get("platform_type", "")
     status = phone_info.get("status", "")
+    code_verification_status = phone_info.get("code_verification_status", "")
+    messaging_limit_tier = phone_info.get("messaging_limit_tier", "")
+    is_official = phone_info.get("is_official_business_account")
 
     logger.info(
-        "Embedded Signup concluido | waba=%s phone_id=%s display=%s status=%s platform=%s",
-        waba_id, phone_number_id, display_phone, status, platform_type,
+        "Embedded Signup concluido | waba=%s phone_id=%s display=%s status=%s platform=%s tier=%s",
+        waba_id, phone_number_id, display_phone, status, platform_type, messaging_limit_tier,
     )
 
-    # 4. Registrar o webhook do app no WABA
+    # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
+    is_coexistence = body.channel_type == "coexistence"
+    channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
+    owner_id = (body.owner_user_id or current_user["id"]) if is_coexistence else None
+
+    # 5. Registrar webhook do app no WABA com os fields apropriados
+    if is_coexistence:
+        subscribed_fields = [
+            "messages",
+            "message_template_status_update",
+            "message_template_quality_update",
+            "history",
+            "smb_message_echoes",
+            "smb_app_state_sync",
+            "account_update",
+        ]
+    else:
+        subscribed_fields = [
+            "messages",
+            "message_template_status_update",
+            "message_template_quality_update",
+            "account_update",
+        ]
+
     subscribe_url = f"{GRAPH_API_BASE}/{waba_id}/subscribed_apps"
     async with httpx.AsyncClient(timeout=15.0) as client:
         sub_resp = await client.post(
             subscribe_url,
             headers={"Authorization": f"Bearer {access_token}"},
+            json={"subscribed_fields": subscribed_fields},
         )
+
+    webhook_subscribed = False
+    if sub_resp.status_code >= 400:
+        sub_detail = _meta_error_detail(sub_resp)
+        logger.error("Embedded Signup subscribed_apps falhou: %s", sub_detail)
+        # Nao aborta: canal pode ser criado mesmo sem webhook (admin reassina depois)
+    else:
         sub_data = sub_resp.json()
+        webhook_subscribed = bool(sub_data.get("success", False))
+        logger.info(
+            "Embedded Signup: webhook subscription = %s | fields=%s",
+            webhook_subscribed, ",".join(subscribed_fields),
+        )
 
-    webhook_subscribed = sub_data.get("success", False)
-    logger.info("Embedded Signup: webhook subscription = %s", webhook_subscribed)
-
-    # 5. Criar canal no registry
-    # Determinar tipo: coexistence se platform_type indica app onboarding
-    is_coexistence = platform_type in ("CLOUD_API",) and body.channel_type == "coexistence"
-    channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
-    owner_id = (body.owner_user_id or current_user["id"]) if is_coexistence else None
-
+    # 6. Criar canal no registry
     owner_user = get_user_by_id(owner_id) if owner_id else None
     channel_label = body.label or (
         f"{(owner_user or {}).get('display_name', 'Operador')} - {display_phone}"
@@ -1977,10 +2118,18 @@ async def embedded_signup_exchange(
         phone_number_id=phone_number_id,
         display_phone_number=display_phone,
         access_token=access_token,
+        token_expires_at=token_expires_at_iso,
         owner_user_id=owner_id,
         owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
         default_department_id=body.default_department_id,
         is_bot_enabled=not is_coexistence,
+        platform_type=platform_type,
+        is_official_business_account=is_official,
+        code_verification_status=code_verification_status,
+        messaging_limit_tier=messaging_limit_tier,
+        verified_name=verified_name,
+        quality_rating=quality_rating,
+        webhook_subscribed=webhook_subscribed,
     )
 
     log_audit(
@@ -1994,14 +2143,20 @@ async def embedded_signup_exchange(
         "channel_id": new_channel_id,
         "channel_type": channel_type,
         "access_token": access_token,
+        "token_expires_at": token_expires_at_iso,
         "waba_id": waba_id,
+        "all_wabas": waba_ids,
         "phone_number_id": phone_number_id,
         "display_phone_number": display_phone,
         "verified_name": verified_name,
         "quality_rating": quality_rating,
         "platform_type": platform_type,
         "phone_status": status,
+        "code_verification_status": code_verification_status,
+        "messaging_limit_tier": messaging_limit_tier,
+        "is_official_business_account": is_official,
         "webhook_subscribed": webhook_subscribed,
+        "subscribed_fields": subscribed_fields,
         "all_phones": [
             {
                 "id": p.get("id"),

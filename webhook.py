@@ -119,6 +119,9 @@ def _resolve_webhook_channel(value):
     """Resolve o canal a partir dos metadados do webhook.
 
     Retorna dict do canal ou None se nao encontrado.
+    Loga warning quando precisa cair no fallback default — eventos de
+    coexistence com metadata malformada acabavam roteados para o bot
+    sem deixar rastro.
     """
     metadata = value.get("metadata", {})
     phone_number_id = str(metadata.get("phone_number_id", "")).strip()
@@ -127,8 +130,18 @@ def _resolve_webhook_channel(value):
         channel = get_channel_by_phone_id(phone_number_id)
         if channel:
             return channel
+        logger.warning(
+            "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado; "
+            "usando canal default. Verifique se o canal foi criado via signup.",
+            phone_number_id,
+        )
+    else:
+        logger.warning(
+            "Webhook: metadata sem phone_number_id; usando canal default. "
+            "Payload metadata=%s",
+            metadata,
+        )
 
-    # Fallback: canal default
     return get_default_channel()
 
 
