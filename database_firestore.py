@@ -620,7 +620,7 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         (assigned_to vazio), ou esta arquivado, reabre/assume e retorna
         o id existente.
     """
-    existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
+    existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
         user = _get_doc("users", user_id)
         if not user:
@@ -1207,6 +1207,39 @@ def normalize_br_phone(wa_id):
         if local and local[0] in ("6", "7", "8", "9"):
             return f"55{ddd}9{local}"
     return s
+
+
+def wa_id_variants(wa_id):
+    """Gera todas as variantes equivalentes de um wa_id brasileiro.
+
+    Celulares BR tem o '9' na frente desde 2012, mas numeros cadastrados
+    antes (ou recebidos via webhook de clientes antigos) podem chegar sem.
+    Retorna lista com o wa_id original e a variante com/sem 9 para
+    cruzamento ao buscar contato existente.
+    """
+    s = str(wa_id).strip()
+    if not s:
+        return []
+    variants = [s]
+    # Celular BR com 9 (13 digitos, ex: 5531982779779) -> adiciona variante sem 9
+    if len(s) == 13 and s.startswith("55") and len(s) > 4 and s[4] == "9":
+        variants.append(s[:4] + s[5:])
+    # Celular BR sem 9 (12 digitos, ex: 553182779779) -> adiciona variante com 9
+    elif len(s) == 12 and s.startswith("55") and len(s) > 4 and s[4] in ("6", "7", "8", "9"):
+        variants.append(s[:4] + "9" + s[4:])
+    return variants
+
+
+def _find_contact_by_wa_id_any_variant(wa_id):
+    """Busca contato por wa_id testando tambem a variante com/sem 9.
+
+    Retorna o primeiro match encontrado ou None.
+    """
+    for variant in wa_id_variants(wa_id):
+        found = _get_first_by_field("wa_contacts", "wa_id", variant)
+        if found:
+            return found
+    return None
 
 
 # ---------------------------------------------------------------------------
