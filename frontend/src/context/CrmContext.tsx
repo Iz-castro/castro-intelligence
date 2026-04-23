@@ -6,7 +6,8 @@ import { getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
   ActiveView, Channel, ChatMessage, ClientConfig, Contact, Department,
-  MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings, TransportMode, UserSettings,
+  MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings,
+  TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
@@ -153,6 +154,16 @@ type CrmContextValue = {
   startCorrection: (message: ChatMessage) => void;
   cancelCorrection: () => void;
 
+  // Templates
+  fetchTemplates: (channelId?: number | null) => Promise<WhatsAppTemplate[]>;
+  sendTemplate: (params: {
+    contactId: number;
+    templateName: string;
+    language: string;
+    components?: TemplateSendComponent[];
+  }) => Promise<boolean>;
+  busyTemplate: boolean;
+
   // Detail panel
   qualification: string;
   setQualification: (v: string) => void;
@@ -294,6 +305,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [busySend, setBusySend] = useState(false);
   const [busyUpload, setBusyUpload] = useState(false);
   const [busyAudio, setBusyAudio] = useState(false);
+  const [busyTemplate, setBusyTemplate] = useState(false);
 
   // -- Chat search --
   const [showChatSearch, setShowChatSearch] = useState(false);
@@ -1165,6 +1177,44 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusySend(false); }
   }
 
+  async function fetchTemplates(channelId?: number | null): Promise<WhatsAppTemplate[]> {
+    if (!bundle) return [];
+    const qs = channelId ? `?channel_id=${encodeURIComponent(String(channelId))}` : "";
+    try {
+      const res = await getJson<{ templates: WhatsAppTemplate[] }>(bundle.auth, `/api/wa/templates${qs}`);
+      return res.templates || [];
+    } catch (e) {
+      setError(errorText(e));
+      return [];
+    }
+  }
+
+  async function sendTemplate(params: {
+    contactId: number;
+    templateName: string;
+    language: string;
+    components?: TemplateSendComponent[];
+  }): Promise<boolean> {
+    if (!bundle) return false;
+    try {
+      setBusyTemplate(true); setError(""); setNotice("");
+      await sendJson(bundle.auth, "/api/wa/send-template", {
+        contact_id: params.contactId,
+        template_name: params.templateName,
+        language: params.language,
+        components: params.components || [],
+      });
+      setNotice("Template enviado.");
+      if (!snapshotMode) await refreshPollingViews();
+      return true;
+    } catch (e) {
+      setError(errorText(e));
+      return false;
+    } finally {
+      setBusyTemplate(false);
+    }
+  }
+
   async function createManualContact(declared_name: string, phone: string, channel_id?: number): Promise<Contact | null> {
     if (!bundle) return null;
     try {
@@ -1270,6 +1320,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
+    fetchTemplates, sendTemplate, busyTemplate,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,

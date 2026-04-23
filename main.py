@@ -1005,35 +1005,138 @@ async def wa_send_audio(
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": "audio", "media_path": local_result["path"]}
 
 
+class WaSendTemplateRequest(BaseModel):
+    contact_id: int
+    template_name: str = "hello_world"
+    language: str = "pt_BR"
+    components: list[dict] | None = None  # [{type, sub_type?, index?, parameters: [{type:"text", text:"..."}]}]
+
+
 @app.post("/api/wa/send-template")
 async def wa_send_template(
-    contact_id: int, template_name: str = "hello_world",
-    language: str = "pt_BR", current_user: dict = Depends(get_current_user),
+    body: WaSendTemplateRequest | None = None,
+    contact_id: int | None = None,
+    template_name: str = "hello_world",
+    language: str = "pt_BR",
+    current_user: dict = Depends(get_current_user),
 ):
-    contact = get_wa_contact(contact_id)
+    # Compat: aceita tanto body JSON quanto query params (legado).
+    if body is not None:
+        effective_contact_id = body.contact_id
+        effective_template_name = body.template_name or template_name
+        effective_language = body.language or language
+        components = body.components or []
+    else:
+        if contact_id is None:
+            raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+        effective_contact_id = contact_id
+        effective_template_name = template_name
+        effective_language = language
+        components = []
+
+    contact = get_wa_contact(effective_contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _check_send_permission(contact, current_user)
     token, phone_id, api_base = _resolve_channel_creds(contact)
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    template_payload: dict = {
+        "name": effective_template_name,
+        "language": {"code": effective_language},
+    }
+    if components:
+        template_payload["components"] = components
     payload = {
-        "messaging_product": "whatsapp", "to": _wa_target(contact["wa_id"]),
-        "type": "template", "template": {"name": template_name, "language": {"code": language}},
+        "messaging_product": "whatsapp",
+        "to": _wa_target(contact["wa_id"]),
+        "type": "template",
+        "template": template_payload,
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
         result = resp.json()
     if resp.status_code == 200:
         wa_msg_id = result.get("messages", [{}])[0].get("id", "")
+        # Renderiza preview do corpo para exibir no chat (substitui {{1}}..{{n}}).
+        rendered_content = f"[template: {effective_template_name}]"
+        try:
+            body_params = []
+            for comp in components:
+                if comp.get("type") == "body":
+                    body_params = [p.get("text", "") for p in comp.get("parameters", []) if p.get("type") == "text"]
+                    break
+            if body_params:
+                rendered_content = f"[template: {effective_template_name}] " + " | ".join(body_params)
+        except Exception:
+            pass
         save_wa_message(
-            wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
-            msg_type="template", content=f"[template: {template_name}]",
+            wa_message_id=wa_msg_id, contact_id=effective_contact_id, direction="outbound",
+            msg_type="template", content=rendered_content,
             status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=current_user["id"],
         )
-        return {"status": "sent", "wa_message_id": wa_msg_id}
+        log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
+        return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
     else:
         raise HTTPException(status_code=502, detail=result.get("error", {}).get("message", "Erro desconhecido"))
+
+
+@app.get("/api/wa/templates")
+async def wa_list_templates(
+    channel_id: int | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista templates aprovados da WABA do canal (ou canal default)."""
+    from channel_service import get_channel, get_default_channel, get_send_credentials
+
+    channel = get_channel(channel_id) if channel_id is not None else get_default_channel()
+    if channel is None:
+        raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
+
+    waba_id = str(channel.get("waba_id", "")).strip()
+    if not waba_id:
+        raise HTTPException(status_code=503, detail=f"Canal {channel.get('id')} sem waba_id")
+
+    try:
+        token, _phone_id, api_base = get_send_credentials(channel.get("id"))
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    url = f"{api_base}/{waba_id}/message_templates"
+    params = {
+        "fields": "name,language,category,status,components,id",
+        "limit": 100,
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+
+    templates: list[dict] = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        next_url: str | None = url
+        next_params: dict | None = params
+        while next_url:
+            resp = await client.get(next_url, params=next_params, headers=headers)
+            if resp.status_code >= 400:
+                try:
+                    err = resp.json().get("error", {}).get("message", resp.text[:300])
+                except Exception:
+                    err = resp.text[:300]
+                raise HTTPException(status_code=502, detail=f"Meta retornou erro: {err}")
+            data = resp.json()
+            templates.extend(data.get("data", []) or [])
+            paging = data.get("paging") or {}
+            next_url = paging.get("next")
+            next_params = None
+
+    approved = [t for t in templates if str(t.get("status", "")).upper() == "APPROVED"]
+    approved.sort(key=lambda t: (str(t.get("category", "")), str(t.get("name", ""))))
+    return {
+        "channel_id": channel.get("id"),
+        "waba_id": waba_id,
+        "total": len(templates),
+        "approved_count": len(approved),
+        "templates": approved,
+    }
 
 
 # -- API: Correcao de mensagem (Cenario C) --

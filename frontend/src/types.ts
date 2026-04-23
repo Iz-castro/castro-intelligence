@@ -157,6 +157,46 @@ export type TransferRequest = {
   summary: string;
 };
 
+export type TemplateButton = {
+  type: "QUICK_REPLY" | "URL" | "PHONE_NUMBER" | string;
+  text: string;
+  url?: string;
+  phone_number?: string;
+};
+
+export type TemplateComponent = {
+  type: "HEADER" | "BODY" | "FOOTER" | "BUTTONS" | string;
+  text?: string;
+  format?: "TEXT" | "IMAGE" | "VIDEO" | "DOCUMENT" | string;
+  example?: {
+    body_text?: string[][];
+    header_text?: string[];
+    header_handle?: string[];
+  };
+  buttons?: TemplateButton[];
+};
+
+export type WhatsAppTemplate = {
+  id?: string;
+  name: string;
+  language: string;
+  category: "MARKETING" | "UTILITY" | "AUTHENTICATION" | string;
+  status: "APPROVED" | "PENDING" | "REJECTED" | "PAUSED" | string;
+  components: TemplateComponent[];
+};
+
+export type TemplateParameterValue = {
+  type: "text";
+  text: string;
+};
+
+export type TemplateSendComponent = {
+  type: "header" | "body" | "button";
+  sub_type?: "quick_reply" | "url";
+  index?: string;
+  parameters: TemplateParameterValue[];
+};
+
 export type SystemSettings = {
   chat_prefix_enabled: boolean;
   chat_prefix_roles: string[];

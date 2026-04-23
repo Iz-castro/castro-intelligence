@@ -6,7 +6,7 @@ import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
-import type { Channel, ChatMessage, Contact, Department, Operator } from "./types";
+import type { Channel, ChatMessage, Contact, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
 
@@ -322,6 +322,7 @@ function ChatPanel() {
   const [nicknameInput, setNicknameInput] = useState("");
   const [openMessageMenuId, setOpenMessageMenuId] = useState<number | null>(null);
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
+  const [showTemplatePicker, setShowTemplatePicker] = useState(false);
   const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
   const selectedOperator = activeView === "equipe" ? findAssignedOperator(selectedContact, operators) : null;
   const selectedOperatorColor = selectedOperator ? operatorColor(selectedOperator.id) : null;
@@ -452,8 +453,7 @@ function ChatPanel() {
                 <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleDotsMenu} aria-label="Mais opcoes" title="Mais opcoes"><DotsIcon /></button>
                 {showDotsMenu ? (
                   <div className="attach-menu" style={{ right: 0, left: "auto", bottom: "auto", top: "calc(100% + 0.5rem)", minWidth: 220 }}>
-                    <button type="button" className="attach-option" onClick={() => closeDotsMenu()}><span>📋</span><span>Templates Utility</span></button>
-                    <button type="button" className="attach-option" onClick={() => closeDotsMenu()}><span>📣</span><span>Templates Marketing</span></button>
+                    <button type="button" className="attach-option" onClick={() => { setShowTemplatePicker(true); closeDotsMenu(); }}><span>📋</span><span>Enviar template</span></button>
                     <div style={{ height: 1, background: "var(--border)", margin: "0.3rem 0.5rem" }} />
                     <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }}><span>✏️</span><span>Editar apelido</span></button>
                     {selectedContact.attendance_protocol ? <button type="button" className="attach-option" onClick={() => { navigator.clipboard.writeText(selectedContact.attendance_protocol!).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button> : null}
@@ -567,7 +567,216 @@ function ChatPanel() {
         </form>
         )}
       </> : <div className="empty large">Selecione um contato para abrir a conversa.</div>}
+      {showTemplatePicker && selectedContact ? (
+        <TemplatePickerModal
+          contactId={selectedContact.id}
+          channelId={selectedContact.channel_id ?? null}
+          onClose={() => setShowTemplatePicker(false)}
+        />
+      ) : null}
     </main>
+  );
+}
+
+function countBodyPlaceholders(text: string): number {
+  const matches = text.match(/\{\{\d+\}\}/g);
+  return matches ? matches.length : 0;
+}
+
+function renderTemplatePreview(components: TemplateComponent[], vars: Record<string, string>): { header: string; body: string; footer: string; buttons: string[] } {
+  let header = "";
+  let body = "";
+  let footer = "";
+  const buttons: string[] = [];
+  for (const c of components || []) {
+    const type = String(c.type || "").toUpperCase();
+    if (type === "HEADER" && c.format === "TEXT" && c.text) {
+      header = c.text.replace(/\{\{(\d+)\}\}/g, (_, idx) => vars[`header_${idx}`] || `{{${idx}}}`);
+    } else if (type === "BODY" && c.text) {
+      body = c.text.replace(/\{\{(\d+)\}\}/g, (_, idx) => vars[`body_${idx}`] || `{{${idx}}}`);
+    } else if (type === "FOOTER" && c.text) {
+      footer = c.text;
+    } else if (type === "BUTTONS" && c.buttons) {
+      for (const b of c.buttons) {
+        buttons.push(b.text || "");
+      }
+    }
+  }
+  return { header, body, footer, buttons };
+}
+
+function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: number; channelId: number | null; onClose: () => void }) {
+  const { fetchTemplates, sendTemplate, busyTemplate } = useCrm();
+  const [loading, setLoading] = useState(true);
+  const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+  const [vars, setVars] = useState<Record<string, string>>({});
+  const [loadError, setLoadError] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState<"ALL" | "MARKETING" | "UTILITY" | "AUTHENTICATION">("ALL");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setLoadError("");
+      const list = await fetchTemplates(channelId);
+      if (!cancelled) {
+        setTemplates(list);
+        setLoading(false);
+        if (!list.length) setLoadError("Nenhum template aprovado encontrado na WABA.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [fetchTemplates, channelId]);
+
+  const selected = selectedIdx !== null ? templates[selectedIdx] : null;
+  const filtered = categoryFilter === "ALL" ? templates : templates.filter((t) => String(t.category).toUpperCase() === categoryFilter);
+  const preview = selected ? renderTemplatePreview(selected.components || [], vars) : null;
+
+  // Discover placeholders once template selected
+  const bodyComp = selected?.components?.find((c) => String(c.type).toUpperCase() === "BODY");
+  const headerComp = selected?.components?.find((c) => String(c.type).toUpperCase() === "HEADER" && c.format === "TEXT");
+  const bodyPlaceholders = bodyComp?.text ? countBodyPlaceholders(bodyComp.text) : 0;
+  const headerPlaceholders = headerComp?.text ? countBodyPlaceholders(headerComp.text) : 0;
+
+  function pickTemplate(idx: number) {
+    setSelectedIdx(idx);
+    setVars({});
+  }
+
+  async function submit() {
+    if (!selected) return;
+    const components: TemplateSendComponent[] = [];
+    if (headerPlaceholders > 0) {
+      const parameters = [];
+      for (let i = 1; i <= headerPlaceholders; i += 1) {
+        parameters.push({ type: "text" as const, text: vars[`header_${i}`] || "" });
+      }
+      components.push({ type: "header", parameters });
+    }
+    if (bodyPlaceholders > 0) {
+      const parameters = [];
+      for (let i = 1; i <= bodyPlaceholders; i += 1) {
+        parameters.push({ type: "text" as const, text: vars[`body_${i}`] || "" });
+      }
+      components.push({ type: "body", parameters });
+    }
+    const ok = await sendTemplate({
+      contactId,
+      templateName: selected.name,
+      language: selected.language,
+      components: components.length ? components : undefined,
+    });
+    if (ok) onClose();
+  }
+
+  const canSubmit = selected && !busyTemplate
+    && Array.from({ length: bodyPlaceholders }, (_, i) => `body_${i + 1}`).every((k) => (vars[k] || "").trim())
+    && Array.from({ length: headerPlaceholders }, (_, i) => `header_${i + 1}`).every((k) => (vars[k] || "").trim());
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Enviar template" onClick={onClose}>
+      <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 820, maxHeight: "85vh", overflow: "auto" }}>
+        <h2 style={{ margin: "0 0 1rem" }}>Enviar template WhatsApp</h2>
+
+        {loading ? <p>Carregando templates aprovados da Meta...</p> : null}
+        {loadError ? (
+          <div style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 8, padding: "0.8rem", color: "#991b1b", marginBottom: "1rem" }}>
+            {loadError} Crie e aprove um template em <a href="https://business.facebook.com/wa/manage/message-templates" target="_blank" rel="noreferrer">WhatsApp Manager</a>.
+          </div>
+        ) : null}
+
+        {!loading && templates.length > 0 ? (
+          <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: "1rem" }}>
+            <div>
+              <div style={{ display: "flex", gap: "0.3rem", marginBottom: "0.6rem", flexWrap: "wrap" }}>
+                {(["ALL", "MARKETING", "UTILITY", "AUTHENTICATION"] as const).map((c) => (
+                  <button key={c} type="button" className="chip" onClick={() => setCategoryFilter(c)} style={{ cursor: "pointer", opacity: categoryFilter === c ? 1 : 0.6 }}>{c}</button>
+                ))}
+              </div>
+              <div style={{ maxHeight: "55vh", overflowY: "auto", border: "1px solid var(--border)", borderRadius: 8 }}>
+                {filtered.map((t, idx) => {
+                  const globalIdx = templates.indexOf(t);
+                  const active = globalIdx === selectedIdx;
+                  return (
+                    <button
+                      key={`${t.name}-${t.language}`}
+                      type="button"
+                      onClick={() => pickTemplate(globalIdx)}
+                      style={{
+                        display: "block", width: "100%", textAlign: "left",
+                        padding: "0.6rem 0.8rem",
+                        border: "none",
+                        borderBottom: idx < filtered.length - 1 ? "1px solid var(--border)" : "none",
+                        background: active ? "var(--accent, #e0f2fe)" : "transparent",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ fontWeight: 600 }}>{t.name}</div>
+                      <div className="sub" style={{ fontSize: "0.72rem" }}>{t.category} · {t.language}</div>
+                    </button>
+                  );
+                })}
+                {filtered.length === 0 ? <p style={{ padding: "0.8rem", textAlign: "center" }} className="sub">Sem templates nessa categoria.</p> : null}
+              </div>
+            </div>
+
+            <div>
+              {selected ? (
+                <>
+                  <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "0.8rem", background: "var(--bg-muted, #f9fafb)", marginBottom: "1rem" }}>
+                    <div className="sub" style={{ fontSize: "0.7rem", marginBottom: "0.3rem" }}>Preview</div>
+                    {preview?.header ? <div style={{ fontWeight: 600, marginBottom: "0.3rem" }}>{preview.header}</div> : null}
+                    {preview?.body ? <div style={{ whiteSpace: "pre-wrap", fontSize: "0.9rem" }}>{preview.body}</div> : null}
+                    {preview?.footer ? <div className="sub" style={{ fontSize: "0.75rem", marginTop: "0.3rem" }}>{preview.footer}</div> : null}
+                    {preview?.buttons && preview.buttons.length > 0 ? (
+                      <div style={{ display: "flex", gap: "0.3rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
+                        {preview.buttons.map((b, i) => <span key={i} className="chip" style={{ fontSize: "0.72rem" }}>{b}</span>)}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {(headerPlaceholders > 0 || bodyPlaceholders > 0) ? (
+                    <div style={{ marginBottom: "1rem" }}>
+                      <div className="sub" style={{ marginBottom: "0.4rem", fontWeight: 600 }}>Variáveis</div>
+                      {Array.from({ length: headerPlaceholders }, (_, i) => i + 1).map((n) => (
+                        <div key={`h-${n}`} style={{ marginBottom: "0.4rem" }}>
+                          <label className="sub" style={{ fontSize: "0.75rem" }}>Cabeçalho {`{{${n}}}`}</label>
+                          <input
+                            style={{ width: "100%", padding: "0.4rem 0.6rem" }}
+                            value={vars[`header_${n}`] || ""}
+                            onChange={(e) => setVars((v) => ({ ...v, [`header_${n}`]: e.target.value }))}
+                          />
+                        </div>
+                      ))}
+                      {Array.from({ length: bodyPlaceholders }, (_, i) => i + 1).map((n) => (
+                        <div key={`b-${n}`} style={{ marginBottom: "0.4rem" }}>
+                          <label className="sub" style={{ fontSize: "0.75rem" }}>Corpo {`{{${n}}}`}</label>
+                          <input
+                            style={{ width: "100%", padding: "0.4rem 0.6rem" }}
+                            value={vars[`body_${n}`] || ""}
+                            onChange={(e) => setVars((v) => ({ ...v, [`body_${n}`]: e.target.value }))}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  ) : <p className="sub" style={{ fontSize: "0.8rem" }}>Template sem variáveis.</p>}
+
+                  <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+                    <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
+                    <button type="button" className="primary" onClick={() => void submit()} disabled={!canSubmit}>
+                      {busyTemplate ? "Enviando..." : "Enviar template"}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <p className="sub">Selecione um template na lista à esquerda.</p>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
