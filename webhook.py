@@ -395,9 +395,16 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         )
 
         # -- Bot: processar mensagem se ativo e contato sem operador --
+        # Gate: nao dispara se contato ja foi qualificado pelo bot (bot_completed=True)
+        # mesmo que ainda nao tenha operador atribuido. O contato esta na fila
+        # do departamento e redirigir pro bot reiniciaria o fluxo do zero.
         if effective_msg_type == "text" and content.strip():
             _contact_for_bot = get_wa_contact(contact_id)
-            if _contact_for_bot and not _contact_for_bot.get("assigned_to"):
+            if (
+                _contact_for_bot
+                and not _contact_for_bot.get("assigned_to")
+                and not _contact_for_bot.get("bot_completed")
+            ):
                 bot_reply = process_bot_message(contact_id, content, contact_name)
                 if bot_reply:
                     _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
