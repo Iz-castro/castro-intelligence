@@ -628,8 +628,9 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
 
         existing_assigned = existing.get("assigned_to")
         is_archived = bool(existing.get("is_archived"))
+        has_other_owner = bool(existing_assigned) and existing_assigned != user_id and not is_archived
 
-        if existing_assigned and existing_assigned != user_id and not is_archived and not allow_admin_override:
+        if has_other_owner and not allow_admin_override:
             owner = _get_doc("users", existing_assigned)
             owner_name = (owner or {}).get("display_name") if owner else ""
             owner_label = owner_name or f"operador #{existing_assigned}"
@@ -638,6 +639,23 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
                 "Solicite uma transferencia ao inves de criar um novo contato."
             )
 
+        # Admin/supervisor usando override: apenas abre o contato existente
+        # sem mexer em assigned_to/department/qualification do dono original.
+        # Apenas completa declared_name se estiver vazio (melhoria cosmetica).
+        if has_other_owner and allow_admin_override:
+            updates: dict = {}
+            if declared_name and not existing.get("declared_name"):
+                updates["declared_name"] = declared_name
+                updates["display_name"] = _resolve_display_name(
+                    declared_name,
+                    existing.get("whatsapp_profile_name", ""),
+                    existing.get("phone_formatted", ""),
+                )
+            if updates:
+                document("wa_contacts", existing["id"]).set(updates, merge=True)
+            return existing["id"], None
+
+        # Contato do proprio user, sem dono ou arquivado: reabre/assume.
         updates = {
             "assigned_to": user_id,
             "assigned_to_uid": user.get("firebase_uid", ""),
