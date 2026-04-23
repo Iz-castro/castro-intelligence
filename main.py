@@ -1273,14 +1273,16 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
             raise HTTPException(status_code=400, detail="Nenhum canal WhatsApp disponivel")
         channel_id = default_ch["id"]
 
+    allow_override = current_user.get("role") in ("admin", "supervisor")
     contact_id, error = create_manual_wa_contact(
         declared_name=body.declared_name,
         wa_id=wa_id,
         channel_id=channel_id,
         user_id=current_user["id"],
+        allow_admin_override=allow_override,
     )
     if error:
-        raise HTTPException(status_code=400, detail=error)
+        raise HTTPException(status_code=409, detail=error)
 
     contact = get_wa_contact(contact_id)
     log_audit(current_user["id"], "CONTACT_MANUAL_CREATE", f"Contato {contact_id}: {body.declared_name} ({wa_id})")

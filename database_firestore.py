@@ -607,17 +607,37 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     return contact_id
 
 
-def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id):
+def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_admin_override=False):
     """Cria contato manualmente pelo operador.
 
-    Retorna (contact_id, error_message). Se o wa_id ja existir,
-    reatribui o contato existente ao operador e retorna o id dele.
+    Retorna (contact_id, error_message).
+
+    Regras quando o wa_id ja existe:
+      - Se o contato esta atribuido a OUTRO operador (assigned_to != user_id)
+        e nao foi arquivado, retorna erro pedindo transferencia.
+        allow_admin_override=True permite ignorar essa trava (admin/supervisor).
+      - Se o contato pertence ao proprio user_id, ou esta sem dono
+        (assigned_to vazio), ou esta arquivado, reabre/assume e retorna
+        o id existente.
     """
     existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
     if existing:
         user = _get_doc("users", user_id)
         if not user:
             return None, "Operador nao encontrado"
+
+        existing_assigned = existing.get("assigned_to")
+        is_archived = bool(existing.get("is_archived"))
+
+        if existing_assigned and existing_assigned != user_id and not is_archived and not allow_admin_override:
+            owner = _get_doc("users", existing_assigned)
+            owner_name = (owner or {}).get("display_name") if owner else ""
+            owner_label = owner_name or f"operador #{existing_assigned}"
+            return None, (
+                f"Este numero ja esta em atendimento por {owner_label}. "
+                "Solicite uma transferencia ao inves de criar um novo contato."
+            )
+
         updates = {
             "assigned_to": user_id,
             "assigned_to_uid": user.get("firebase_uid", ""),
