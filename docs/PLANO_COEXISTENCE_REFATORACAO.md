@@ -57,6 +57,12 @@ Review novamente para cada cliente.
 - **Onboarding self-service de novo tenant fica pra depois** — Fase 2
   entrega o esqueleto multi-tenant, mas com 1 tenant fixo (`hubloc`).
   Quando cliente #2 fechar, faz a UI super-admin de criar tenants.
+- **Modelo financeiro passthrough** — Castro Intelligence cobra
+  mensalidade SaaS do cliente; Meta cobra direto do cliente pelo uso de
+  templates (cliente é dono da WABA, configura método de pagamento no
+  Business Manager dele). Castro Intelligence só paga GCP/Firebase. Sem
+  intermediação financeira. Implica produto avisar admin do tenant
+  quando método de pagamento Meta está pendente (Fase 2.10).
 
 ---
 
@@ -448,6 +454,101 @@ service cloud.firestore {
 Uma única regra cobre 99% das queries do operador. Backend usa Admin SDK
 e ignora rules.
 
+### 2.10 Billing & Onboarding awareness (modelo passthrough)
+
+Como Castro Intelligence cobra apenas mensalidade SaaS e a Meta cobra
+direto do cliente, o produto precisa **avisar e guiar** o admin do
+tenant a configurar o método de pagamento Meta. Sem isso, templates
+pagos falham silenciosamente.
+
+#### 2.10.1 Endpoint de health-check do canal
+
+Novo endpoint:
+
+```
+GET /api/wa/channel/{channel_id}/billing-status
+```
+
+Internamente chama `GET /{WABA_ID}?fields=primary_funding_id,
+account_review_status,health_status` na Graph API. Retorna:
+
+```json
+{
+  "channel_id": 1,
+  "waba_id": "2998122345678901",
+  "has_payment_method": true | false,
+  "account_review_status": "APPROVED" | "PENDING" | "REJECTED",
+  "health": { ... },
+  "checked_at": "2026-04-15T..."
+}
+```
+
+`has_payment_method` é derivado de `primary_funding_id`: presente →
+`true`; vazio → `false`.
+
+#### 2.10.2 Tradução de erros Meta para HTTP amigável
+
+Em `/api/wa/send-template` e demais endpoints de envio, capturar erros
+Meta relacionados a billing:
+
+- `(#131009) Account is not subscribed to this product`
+- `(#100) Subcode 2494051 / 2494052` (cobrança falha)
+- `quality_score == RED` (template pausado por baixa qualidade)
+
+Traduzir pra `HTTPException(status_code=402, detail="...")` com mensagem
+direcionando o admin pra `business.facebook.com/wa/manage/billing/`.
+
+#### 2.10.3 Cron de checagem (Cloud Scheduler + endpoint interno)
+
+Job diário que percorre `tenants/{*}/channels/*` e atualiza um campo
+`payment_method_status` no canal:
+
+- `ok` — método ativo, sem alertas
+- `pending` — sem método de pagamento configurado
+- `error` — Meta retornou erro persistente
+- `expired` — token expirado e refresh falhou
+
+Salvo em `tenants/{tenant_id}/channels/{channel_id}.payment_method_status`
+e propagado pra um doc de saúde geral em
+`tenants/{tenant_id}/health_status`:
+
+```json
+{
+  "checked_at": "...",
+  "channels_total": 2,
+  "channels_pending_payment": 1,
+  "tokens_expiring_soon": 0,
+  "templates_recent_failures": 3
+}
+```
+
+Frontend lê esse doc pra exibir o banner.
+
+#### 2.10.4 Audit trail de uso (per-tenant)
+
+Pra mostrar pro admin quanto ele usa por mês (e ele saber o que
+esperar na fatura Meta), `tenants/{id}/audit_metrics/usage_{YYYY_MM}`
+mantém:
+
+```json
+{
+  "month": "2026-04",
+  "templates_sent": {
+    "marketing": 234,
+    "utility": 1502,
+    "authentication": 0
+  },
+  "free_form_sent": 4321,
+  "inbound_received": 5876,
+  "media_uploaded_bytes": 12450000
+}
+```
+
+Atualizado por trigger Firestore (Cloud Function) ou no próprio backend
+toda vez que `save_wa_message` registra outbound. Não é fatura — é só
+visibilidade. Cliente vê no dashboard "você usou X templates marketing
+este mês" e cruza com a fatura real da Meta.
+
 ---
 
 ## Fase 3 — Frontend
@@ -526,6 +627,80 @@ Tenant_id **não aparece no frontend** — está implícito no token Firebase.
 
 - `normalizeConversation(raw): Conversation`.
 - `normalizeContact` enxuto (sem campos que migraram).
+
+### 3.5 Onboarding & Billing UI (acompanha 2.10)
+
+#### Banner persistente quando billing pendente
+
+Componente `<TenantHealthBanner />` montado no topo da app (logo abaixo
+do TopBar). Lê `tenants/{tenant_id}/health_status` via snapshot Firestore.
+Quando `channels_pending_payment > 0`, exibe:
+
+```
+⚠ Para enviar templates de marketing/utility, configure o método
+  de pagamento Meta. [Configurar agora →]
+```
+
+Link abre `https://business.facebook.com/wa/manage/billing/` em nova aba.
+
+Quando `tokens_expiring_soon > 0` (canal coexistence prestes a expirar
+sem refresh), mostra alerta similar pedindo re-onboarding.
+
+#### Página `/setup` — checklist do tenant
+
+Rota nova só admin do tenant vê. Mostra estado atual de cada item:
+
+```
+Setup da sua conta
+─────────────────────────────────────
+✓ Conta criada
+✓ WhatsApp conectado (canal "Recepção +55 11 93456-7890")
+⚠ Método de pagamento Meta — pendente
+   ↳ [Abrir Business Manager para configurar]
+○ Adicione operadores                    [+ Adicionar]
+✓ 4 setores configurados
+○ Templates aprovados — 1 (sugerimos pelo menos 3)
+   ↳ [Criar template]
+```
+
+Clicável, expansível, com tooltips explicando o porquê de cada item.
+Quando todos os itens marcados, badge "Setup completo" e remove a página
+do menu (continua acessível por URL pra revisão).
+
+#### Modal de erro de billing no envio de template
+
+Quando `/api/wa/send-template` retorna 402, frontend mostra modal:
+
+```
+Não foi possível enviar o template
+
+A Meta exige método de pagamento configurado para envio de
+templates de marketing/utility. Configure em alguns minutos:
+
+  [Abrir Business Manager →]
+
+Depois de configurar, espere ~5 minutos e tente novamente.
+```
+
+Não bloqueia outros envios livres (resposta dentro de 24h continua
+funcionando — não exige billing).
+
+#### Dashboard de uso (per-tenant)
+
+Card no dashboard do admin com gráfico de uso do mês corrente vs
+últimos 3 meses, lendo `tenants/{id}/audit_metrics/usage_{YYYY_MM}`:
+
+```
+Uso este mês
+─────────────────────────────
+Templates marketing:    234 / 500   ▓▓▓▓▓▓▓▓░░ 47%
+Templates utility:    1.502 / —     ▓▓▓▓▓▓▓▓▓▓
+Mensagens livres:     4.321 / —
+Mídia enviada:        12 MB / 5 GB
+```
+
+Limites são informativos do plano contratado (não enforced no sistema —
+serve só pra cliente ver).
 
 ---
 
@@ -608,12 +783,26 @@ de `tenants/hubloc/...`.
 
 Não faz parte deste plano, mas fica registrado como direção:
 
+- **`docs/ONBOARDING_TENANT.md`** — guia passo-a-passo pro admin do
+  tenant: configurar método de pagamento Meta (Business Manager), criar
+  templates, importar contatos iniciais, treinar operadores.
 - **Tenant onboarding UI** (super-admin do Castro Intelligence cria
-  tenant via interface).
-- **Self-service signup do cliente** (cliente cria conta sem intervenção).
-- **Billing por tenant** (uso de mensagens, storage, conversas pagas).
-- **White-label** (logo/cor/sub-domínio por tenant).
+  tenant via interface) — substitui chamada manual ao backend pra
+  provisionar tenants.
+- **Self-service signup do cliente** (cliente cria conta sem intervenção
+  do super-admin — landing page → cartão de crédito → tenant criado).
+- **Billing automation** — integração com Stripe/Asaas/Iugu pra cobrar a
+  mensalidade SaaS automaticamente. Meta continua passthrough.
+- **White-label** (logo/cor/sub-domínio próprio do tenant tipo
+  `atendimento.vidasaude.com.br`).
 - **Cross-tenant analytics** (super-admin Castro Intelligence vê uso
-  agregado de todos os clientes).
+  agregado de todos os clientes para business intelligence — `_meta/system_metrics`).
 - **Backup/export por tenant** (recursive export de
-  `tenants/{id}` → arquivo, útil para compliance e portabilidade).
+  `tenants/{id}` → arquivo, útil para compliance LGPD e portabilidade
+  caso cliente saia da plataforma).
+- **Limites enforced por plano** (Fase 2.10 já mostra uso, mas não
+  bloqueia. No futuro, plano Starter limitado a 5k mensagens/mês com
+  bloqueio quando estourar — ou cobrança extra automática).
+- **Importação de histórico do WhatsApp Business App** quando cliente
+  vem do app móvel (Coexistence webhook `history` já implementado, mas
+  vale uma UI dedicada: "Importar últimos 6 meses de conversas").
