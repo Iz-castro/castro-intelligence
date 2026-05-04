@@ -17,8 +17,14 @@ from database import (
     upsert_firebase_user,
 )
 from firebase_admin_client import set_tenant_claims, verify_firebase_id_token
+from firestore_common import set_tenant_context
 
 logger = logging.getLogger("castro_crm.auth")
+
+# Tenant default usado durante a transicao multi-tenant — todos os usuarios
+# pre-existentes do CRM Hubloc operam neste tenant ate que o custom_claim
+# correspondente seja propagado.
+_DEFAULT_TENANT = "hubloc"
 
 
 def _resolve_tenant_id(decoded_token, user):
@@ -80,6 +86,14 @@ def authenticate_firebase_token(id_token, ip_address=""):
 
     if not _firebase_email_allowed(email):
         return {"success": False, "status_code": 403, "error": "Acesso restrito ao email ou dominio autorizado"}
+
+    # Seta tenant_context EARLY para que todos os lookups abaixo
+    # (get_user_by_firebase_uid, get_user_by_email etc.) operem na
+    # subcolecao correta do tenant. Usa claim do JWT ou fallback para
+    # _DEFAULT_TENANT durante a migration. Nao reseta — o contextvar
+    # vive ate o fim da request via FastAPI dependency lifecycle.
+    claim_tenant = decoded.get("tenant_id") or _DEFAULT_TENANT
+    set_tenant_context(claim_tenant)
 
     user = get_user_by_firebase_uid(firebase_uid) or get_user_by_email(email)
     if user:

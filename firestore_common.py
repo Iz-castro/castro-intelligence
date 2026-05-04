@@ -1,11 +1,73 @@
 # -*- coding: utf-8 -*-
 
+import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from functools import lru_cache
 
 from google.cloud import firestore
 
 from config import FIRESTORE_COLLECTION_PREFIX, FIRESTORE_PROJECT_ID
+
+logger = logging.getLogger("castro_crm.firestore")
+
+# ---------------------------------------------------------------------------
+# Tenant context (Fase 2 multi-tenant)
+# ---------------------------------------------------------------------------
+#
+# Estrategia de implementacao:
+#
+#   ContextVar `_current_tenant_id` carrega o tenant ativo para a request
+#   ou tarefa atual. Toda funcao que usa `collection(name)` / `document(name)`
+#   automaticamente roteia para `tenants/{tenant_id}/<name>` quando o
+#   contextvar esta setado, ou cai em coletas flat quando ausente
+#   (compatibilidade pre-migration).
+#
+#   Coletas listadas em _GLOBAL_COLLECTIONS NUNCA sao roteadas para
+#   subcolecao do tenant — sao genuinamente globais (counters, indice
+#   phone_routing, e a propria root tenants/).
+#
+#   Uso:
+#     - FastAPI middleware ou get_current_user seta o contextvar via
+#       set_tenant_context(tid) por request.
+#     - Webhook seta antes de processar payload da Meta.
+#     - Operacoes super-admin cross-tenant podem usar
+#       `with tenant_context(None): ...` para ler/escrever no flat global.
+
+_current_tenant_id: ContextVar[str | None] = ContextVar("castro_crm_tenant", default=None)
+
+# Colecoes que permanecem globais mesmo com tenant context ativo.
+_GLOBAL_COLLECTIONS = frozenset({"_meta", "tenants", "phone_routing"})
+
+
+def set_tenant_context(tenant_id):
+    """Seta o tenant ativo para o contexto atual. Retorna token p/ reset."""
+    return _current_tenant_id.set(tenant_id if tenant_id else None)
+
+
+def reset_tenant_context(token):
+    _current_tenant_id.reset(token)
+
+
+def get_tenant_context():
+    """Retorna o tenant_id ativo no contexto atual, ou None se nao setado."""
+    return _current_tenant_id.get()
+
+
+@contextmanager
+def tenant_context(tenant_id):
+    """Context manager para escopo limitado de tenant.
+
+    Exemplo (super-admin pulando para outro tenant):
+        with tenant_context("clinica-vida"):
+            data = get_all_wa_contacts()
+    """
+    token = set_tenant_context(tenant_id)
+    try:
+        yield
+    finally:
+        reset_tenant_context(token)
 
 
 @lru_cache(maxsize=1)
@@ -20,12 +82,49 @@ def collection_name(name):
     return f"{prefix}_{name}" if prefix else name
 
 
-def collection(name):
+def _flat_collection(name):
+    """Coleção flat sem aplicar tenant context. Uso interno e GLOBAL_COLLECTIONS."""
     return get_firestore_client().collection(collection_name(name))
 
 
+def _flat_document(name, doc_id):
+    return _flat_collection(name).document(str(doc_id))
+
+
+def collection(name):
+    """Retorna referencia a colecao, aplicando tenant context se ativo.
+
+    - Se name esta em _GLOBAL_COLLECTIONS: sempre flat (counters,
+      phone_routing, tenants root).
+    - Se tenant context setado: roteia para tenants/{tid}/<name>.
+    - Se tenant context vazio: flat (compatibilidade pre-migration).
+    """
+    if name in _GLOBAL_COLLECTIONS:
+        return _flat_collection(name)
+    tid = _current_tenant_id.get()
+    if tid:
+        return _tenant_subcollection_raw(tid, name)
+    return _flat_collection(name)
+
+
 def document(name, doc_id):
-    return collection(name).document(str(doc_id))
+    """Retorna referencia a documento. Mesma logica de collection()."""
+    if name in _GLOBAL_COLLECTIONS:
+        return _flat_document(name, doc_id)
+    tid = _current_tenant_id.get()
+    if tid:
+        return _tenant_subcollection_raw(tid, name).document(str(doc_id))
+    return _flat_document(name, doc_id)
+
+
+def _tenant_subcollection_raw(tenant_id, name):
+    """Helper interno: subcolecao do tenant sem checar contextvar (evita recursao)."""
+    return (
+        get_firestore_client()
+        .collection(collection_name("tenants"))
+        .document(str(tenant_id))
+        .collection(name)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -81,17 +180,17 @@ def tenant_doc_ref(tenant_id):
 
 
 def global_collection(name):
-    """Alias semantico de collection() para colecoes FORA de tenants/.
+    """Colecao FLAT, sempre fora de tenants/ — ignora tenant context.
 
-    Usado para tornar explicito quando estamos lendo/escrevendo em
-    colecoes nao escopadas a um tenant (phone_routing, _meta, tenants
-    root listing). Aplica o prefix do ambiente.
+    Usado explicitamente para colecoes nao escopadas a um tenant
+    (phone_routing, _meta, tenants root listing). Aplica o prefix do
+    ambiente mas NUNCA a subcolecao do tenant.
     """
-    return collection(name)
+    return _flat_collection(name)
 
 
 def global_document(name, doc_id):
-    return document(name, doc_id)
+    return _flat_document(name, doc_id)
 
 
 def utcnow():
@@ -126,16 +225,19 @@ def _next_sequence_transaction(transaction, counters_ref, counter_name):
 def next_sequence(counter_name, tenant_id=None):
     """Atomico auto-increment.
 
-    - Se tenant_id e fornecido: counter fica em
-      tenants/{tenant_id}/_meta/counters (per-tenant — recomendado para
-      contact_id, channel_id, etc., garantindo isolamento total).
-    - Se tenant_id e None: counter global em _meta/counters (legado;
-      usado para contadores realmente cross-tenant ou recursos globais
-      como tenants/ root).
+    Resolucao do tenant:
+      1. Se tenant_id explicito for passado, usa ele.
+      2. Se nao, le do contextvar atual (set_tenant_context).
+      3. Se ambos vazios, cai em counters globais flat (compat pre-migration).
+
+    Counters per-tenant ficam em tenants/{tid}/_meta/counters; globais em
+    <prefix>__meta/counters.
     """
     client = get_firestore_client()
-    if tenant_id is not None:
-        counters_ref = tenant_document(tenant_id, "_meta", "counters")
+    if tenant_id is None:
+        tenant_id = _current_tenant_id.get()
+    if tenant_id:
+        counters_ref = _tenant_subcollection_raw(tenant_id, "_meta").document("counters")
     else:
-        counters_ref = document("_meta", "counters")
+        counters_ref = _flat_document("_meta", "counters")
     return _next_sequence_transaction(client.transaction(), counters_ref, counter_name)

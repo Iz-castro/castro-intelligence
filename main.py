@@ -66,7 +66,13 @@ from channel_service import (
     CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
 from auth import authenticate_firebase_token
-from firestore_common import collection_name, document as fs_document, utcnow as fs_utcnow
+from firestore_common import (
+    collection_name, document as fs_document, utcnow as fs_utcnow,
+    set_tenant_context, tenant_context, get_tenant_context,
+)
+from tenant_service import (
+    create_tenant, get_tenant, tenant_exists, lookup_phone_routing,
+)
 from webhook import process_webhook_payload, validate_signature
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
@@ -295,7 +301,21 @@ def bootstrap_admin_user():
         department_id=department_id,
     )
     if user:
-        logger.info("Bootstrap admin Firebase sincronizado | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        # Sincroniza custom_claim tenant_id no usuario Firebase para a
+        # proxima sessao. O usuario precisa renovar o ID token (logout/login
+        # ou getIdToken(true)) para o claim aparecer.
+        firebase_uid = user.get("firebase_uid", "")
+        tenant_id = get_tenant_context() or "hubloc"
+        if firebase_uid:
+            try:
+                from firebase_admin_client import set_tenant_claims
+                set_tenant_claims(firebase_uid, tenant_id, role="admin")
+            except Exception as exc:
+                logger.warning("Falha ao setar custom_claim tenant_id no admin: %s", exc)
+        logger.info(
+            "Bootstrap admin Firebase sincronizado | email=%s tenant_id=%s",
+            BOOTSTRAP_ADMIN_EMAIL, tenant_id,
+        )
     else:
         logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
 
@@ -303,6 +323,26 @@ def bootstrap_admin_user():
 def bootstrap_departments():
     dept_map = ensure_default_departments(create_department)
     logger.info("Departamentos padrao sincronizados | total=%d", len(dept_map))
+
+
+def bootstrap_default_tenant():
+    """Cria o tenant 'hubloc' (default single-tenant) se ainda nao existir.
+
+    Esse tenant e usado durante a transicao multi-tenant: todos os
+    usuarios e dados que nao tem tenant_id explicito sao roteados para
+    ele. Quando UI super-admin de criacao de tenants estiver pronta
+    (Roadmap pos-Fase 2), tenants adicionais sao criados via interface.
+    """
+    if tenant_exists("hubloc"):
+        logger.info("Tenant default 'hubloc' ja existe")
+        return
+    create_tenant(
+        tenant_id="hubloc",
+        name="Hubloc Imobiliaria",
+        plan="professional",
+        cnpj="",
+    )
+    logger.info("Tenant default 'hubloc' criado")
 
 
 def validate_runtime_config():
@@ -328,9 +368,19 @@ def validate_runtime_config():
 async def startup():
     validate_runtime_config()
     init_database()
-    bootstrap_departments()
-    bootstrap_admin_user()
+    # Cria o tenant default antes de qualquer bootstrap escopado.
+    bootstrap_default_tenant()
+    # Departamentos e admin do tenant default rodam DENTRO do contexto
+    # do tenant — assim ficam em tenants/hubloc/{departments,users,...}.
+    with tenant_context("hubloc"):
+        bootstrap_departments()
+        bootstrap_admin_user()
     ensure_media_dir()
+    # Channel ainda fica em colecao flat (compartilhado por enquanto).
+    # Migrar para tenants/{tid}/channels e parte da Fase 2 (sub-fase
+    # futura). Por enquanto, todos os tenants compartilham os canais
+    # ativos no Cloud Run — o webhook resolve o tenant via tenant_id
+    # do channel ou via phone_routing global.
     from channel_service import bootstrap_default_channel
     bootstrap_default_channel()
     if FEATURE_AUDIO_TRANSCRIPTION:

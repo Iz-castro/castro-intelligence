@@ -26,8 +26,27 @@ from database import (
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
 from bot_service import process_bot_message
+from firestore_common import set_tenant_context, reset_tenant_context
 
 logger = logging.getLogger("castro_crm.webhook")
+
+# Tenant default usado pelo webhook enquanto canais ainda nao carregam
+# tenant_id explicito. Substituir por lookup_phone_routing() quando
+# canais migrarem para tenants/{id}/channels (sub-fase futura).
+_WEBHOOK_DEFAULT_TENANT = "hubloc"
+
+
+def _resolve_webhook_tenant(channel):
+    """Resolve tenant_id a partir do canal (ou phone_routing futuro).
+
+    Hoje retorna sempre 'hubloc' (default). Quando channels carregarem
+    `tenant_id` ou phone_routing for populado, esta funcao passa a
+    consultar essas fontes. O webhook precisa setar tenant_context para
+    que toda a cadeia de save_wa_message etc. opere na subcolecao certa.
+    """
+    if channel and channel.get("tenant_id"):
+        return str(channel["tenant_id"])
+    return _WEBHOOK_DEFAULT_TENANT
 
 
 def _fallback_reply_preview(message):
@@ -187,12 +206,28 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
     """
     Processa o payload completo do webhook.
     Roteia por campo 'field' para suportar webhooks padrao e de coexistence.
-    Resolve o canal automaticamente a partir de metadata.phone_number_id.
-    ws_notify_callback: funcao async para notificar clientes via WebSocket.
+    Resolve o canal automaticamente a partir de metadata.phone_number_id e
+    o tenant a partir do canal. Seta tenant_context para que toda a
+    cadeia de save_wa_message/upsert_wa_contact opere em
+    tenants/{tenant_id}/* automaticamente.
     """
     if payload.get("object") != "whatsapp_business_account":
         return
 
+    # Resolve tenant uma unica vez no inicio do payload — todos os
+    # changes deste payload vem do mesmo phone_number_id (mesma WABA).
+    first_value = ((payload.get("entry") or [{}])[0].get("changes") or [{}])[0].get("value", {})
+    first_channel = _resolve_webhook_channel(first_value)
+    tenant_id = _resolve_webhook_tenant(first_channel)
+    ctx_token = set_tenant_context(tenant_id)
+    try:
+        await _process_webhook_payload_inner(payload, ws_notify_callback)
+    finally:
+        reset_tenant_context(ctx_token)
+
+
+async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
+    """Implementacao do processamento. Tenant_context ja setado pelo wrapper."""
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
