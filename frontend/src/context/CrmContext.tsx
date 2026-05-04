@@ -724,6 +724,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle || !sessionUser || !config) return undefined;
     if (!snapshotMode || !config.firestore.collections.wa_conversations) return undefined;
     let disposed = false;
+    // Normaliza Firestore Timestamp -> string ISO para campos de tempo
+    const tsToIso = (v: unknown): string | undefined => {
+      if (!v) return undefined;
+      if (typeof v === "string") return v;
+      if (v instanceof Date) return v.toISOString();
+      if (typeof v === "object" && v !== null && typeof (v as { toDate?: () => Date }).toDate === "function") {
+        return (v as { toDate: () => Date }).toDate().toISOString();
+      }
+      if (typeof v === "object" && v !== null && "seconds" in v) {
+        return new Date(Number((v as { seconds: number }).seconds) * 1000).toISOString();
+      }
+      return undefined;
+    };
     const ref = collection(bundle.db, config.firestore.collections.wa_conversations);
     const unsubscribe = onSnapshot(
       ref,
@@ -731,7 +744,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         if (disposed) return;
         const next = snap.docs.map((doc) => {
           const data = doc.data() as Record<string, unknown>;
-          return { ...data, id: typeof data.id === "string" || typeof data.id === "number" ? String(data.id) : doc.id } as Conversation;
+          return {
+            ...data,
+            id: typeof data.id === "string" || typeof data.id === "number" ? String(data.id) : doc.id,
+            last_message_at: tsToIso(data.last_message_at),
+            last_inbound_at: tsToIso(data.last_inbound_at),
+            last_outbound_at: tsToIso(data.last_outbound_at),
+            created_at: tsToIso(data.created_at),
+          } as Conversation;
         });
         startTransition(() => setConversations(next));
       },

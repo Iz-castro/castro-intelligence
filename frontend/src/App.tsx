@@ -214,12 +214,28 @@ function ContactList() {
     conversationsByContact.set(conv.contact_id, list);
   }
   type RenderItem = { contact: Contact; conversation: Conversation | null };
+  // Helper robusto: last_message_at pode vir como string ISO (do polling
+  // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
+  // direto). Converte ambos para epoch ms para comparacao.
+  const toMillis = (v: unknown): number => {
+    if (!v) return 0;
+    if (typeof v === "string") return new Date(v).getTime() || 0;
+    if (typeof v === "number") return v;
+    if (v instanceof Date) return v.getTime();
+    if (typeof v === "object" && v !== null && typeof (v as { toDate?: () => Date }).toDate === "function") {
+      return (v as { toDate: () => Date }).toDate().getTime();
+    }
+    if (typeof v === "object" && v !== null && "seconds" in v) {
+      return Number((v as { seconds: number }).seconds) * 1000;
+    }
+    return 0;
+  };
   const renderItems: RenderItem[] = filteredContacts.flatMap((contact): RenderItem[] => {
     const convs = conversationsByContact.get(contact.id) || [];
     if (convs.length === 0) return [{ contact, conversation: null }];
     return convs
       .slice()
-      .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""))
+      .sort((a, b) => toMillis(b.last_message_at) - toMillis(a.last_message_at))
       .map((conversation): RenderItem => ({ contact, conversation }));
   });
 
