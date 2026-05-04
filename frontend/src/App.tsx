@@ -6,7 +6,7 @@ import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
-import type { Channel, ChatMessage, Contact, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { Channel, ChatMessage, Contact, Conversation, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
 
@@ -214,13 +214,13 @@ function ContactList() {
     conversationsByContact.set(conv.contact_id, list);
   }
   type RenderItem = { contact: Contact; conversation: Conversation | null };
-  const renderItems: RenderItem[] = filteredContacts.flatMap((contact) => {
+  const renderItems: RenderItem[] = filteredContacts.flatMap((contact): RenderItem[] => {
     const convs = conversationsByContact.get(contact.id) || [];
     if (convs.length === 0) return [{ contact, conversation: null }];
     return convs
       .slice()
       .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""))
-      .map((conversation) => ({ contact, conversation }));
+      .map((conversation): RenderItem => ({ contact, conversation }));
   });
 
   const visibleTeamOperators = activeView === "equipe"
