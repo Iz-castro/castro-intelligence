@@ -116,6 +116,42 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+
+# Middleware HTTP que extrai tenant_id do JWT ANTES do endpoint e seta o
+# contextvar no asyncio task correto. Necessario porque get_current_user
+# eh sync (def) e roda em threadpool — set_tenant_context dentro dele nao
+# persiste pro endpoint async no main thread.
+@app.middleware("http")
+async def tenant_context_middleware(request: Request, call_next):
+    from firestore_common import set_tenant_context, reset_tenant_context
+    from firebase_admin_client import verify_firebase_id_token
+
+    auth_header = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
+    tid = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        try:
+            decoded = verify_firebase_id_token(token)
+            tid = decoded.get("tenant_id")
+            # Cache decoded no request.state pro get_current_user reutilizar
+            request.state.firebase_decoded = decoded
+        except Exception:
+            # Auth real acontece em get_current_user; aqui so detecta
+            # tenant pra setar context cedo.
+            pass
+    # Fallback: usuarios pre-Fase 2 sem custom_claim ainda — assume tenant default.
+    if not tid and auth_header:
+        tid = "hubloc"
+
+    if tid:
+        ctx_token = set_tenant_context(tid)
+        try:
+            return await call_next(request)
+        finally:
+            reset_tenant_context(ctx_token)
+    return await call_next(request)
+
+
 if os.path.isdir(FRONTEND_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS_DIR), name="frontend-assets")
 
@@ -1529,12 +1565,7 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
 @app.post("/api/wa/contact/{contact_id}/read")
 async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_current_user)):
-    from firestore_common import get_tenant_context
     contact = get_wa_contact(contact_id)
-    logger.info(
-        "DEBUG mark_contact_read | contact_id=%s tenant_ctx=%s user_tenant=%s found=%s",
-        contact_id, get_tenant_context(), current_user.get("tenant_id"), bool(contact),
-    )
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if int(contact.get("unread_count", 0) or 0) <= 0:
