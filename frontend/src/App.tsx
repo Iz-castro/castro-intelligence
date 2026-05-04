@@ -198,7 +198,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
 }
 
 function ContactList() {
-  const { activeView, filteredContacts, conversations, selectedContactId, setSelectedContactId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const { activeView, filteredContacts, conversations, selectedContactId, setSelectedContactId, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
 
@@ -284,8 +284,17 @@ function ContactList() {
           const unreadCount = conversation ? (conversation.unread ?? conversation.unread_count ?? 0) : (contact.unread ?? contact.unread_count ?? 0);
           const channelLabel = conversation?.channel_label || "";
           const channelType = conversation?.channel_type || conversation?.source_channel_type || contact.source_channel_type || "";
+          // V2 Fase 3: item ativo quando contact_id E thread_id batem.
+          // Se conversation e null (legado sem thread), so checa contact_id.
+          const isActive = selectedContactId === contact.id && (
+            conversation ? selectedThreadId === conversation.id : !selectedThreadId
+          );
+          const handleClick = () => {
+            setSelectedContactId(contact.id);
+            setSelectedThreadId(conversation ? conversation.id : null);
+          };
           return (
-            <button key={itemKey} className={`contact ${selectedContactId === contact.id ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={() => setSelectedContactId(contact.id)} style={operatorAccentStyle(accent)}>
+            <button key={itemKey} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
               <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
               <div className="contact-copy">
                 <div className="row">

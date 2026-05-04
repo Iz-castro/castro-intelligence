@@ -47,6 +47,8 @@ type CrmContextValue = {
   contacts: Contact[];
   conversations: Conversation[];
   selectedContactId: number | null;
+  selectedThreadId: string | null;
+  setSelectedThreadId: (id: string | null) => void;
   setSelectedContactId: (id: number | null) => void;
   selectedContact: Contact | null;
 
@@ -284,6 +286,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
+  // Fase 3 V2: thread especifica (channel_id__wa_id) selecionada.
+  // Quando setada, ChatPanel filtra mensagens por conversation_id em vez
+  // de contact_id (que mostra timeline cross-channel).
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
@@ -639,6 +646,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return () => window.clearTimeout(timeoutId);
   }, [selectedContactId]);
 
+  // Debounce equivalente para a thread selecionada (V2 Fase 3).
+  useEffect(() => {
+    if (!selectedThreadId) {
+      setActiveThreadId(null);
+      return undefined;
+    }
+    const timeoutId = window.setTimeout(() => setActiveThreadId(selectedThreadId), CONVERSATION_OPEN_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [selectedThreadId]);
+
   // Reset detail state on contact change
   useEffect(() => {
     const contact = contacts.find((c) => c.id === selectedContactId) || null;
@@ -760,14 +777,21 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return () => { disposed = true; unsubscribe(); };
   }, [bundle, config, sessionUser, snapshotMode]);
 
-  // Snapshot: selected conversation
+  // Snapshot: selected conversation/thread
+  // V2 Fase 3: se activeThreadId setado, filtra por conversation_id
+  // (mostra so mensagens daquele canal). Senao, fallback para contact_id
+  // (timeline cross-channel — comportamento legado).
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
     if (!snapshotMode) return undefined;
     if (!activeConversationId || !config.firestore.collections.wa_messages) return undefined;
     let disposed = false;
+    const baseRef = collection(bundle.db, config.firestore.collections.wa_messages);
+    const messagesQuery = activeThreadId
+      ? query(baseRef, where("conversation_id", "==", activeThreadId), orderBy("created_at", "desc"), firestoreLimit(messageLimit))
+      : query(baseRef, where("contact_id", "==", activeConversationId), orderBy("created_at", "desc"), firestoreLimit(messageLimit));
     const unsubscribe = onSnapshot(
-      query(collection(bundle.db, config.firestore.collections.wa_messages), where("contact_id", "==", activeConversationId), orderBy("created_at", "desc"), firestoreLimit(messageLimit)),
+      messagesQuery,
       (snap) => {
         const nextMessages = snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
         commitConversationMessages(activeConversationId, nextMessages);
@@ -775,7 +799,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       (e) => !disposed && setError(`Snapshot da conversa falhou: ${errorText(e)}`),
     );
     return () => { disposed = true; unsubscribe(); };
-  }, [activeConversationId, bundle, config, sessionUser, snapshotMode, messageLimit]);
+  }, [activeConversationId, activeThreadId, bundle, config, sessionUser, snapshotMode, messageLimit]);
 
   // Polling fallback
   useEffect(() => {
@@ -797,7 +821,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       }
     };
     const loadMessages = async (cid: number) => {
-      const r = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${cid}?limit=${messageLimit}`);
+      // V2 Fase 3: se ha thread selecionada, passa conversation_id como
+      // query param para filtrar mensagens daquela thread especifica.
+      const threadParam = activeThreadId ? `&conversation_id=${encodeURIComponent(activeThreadId)}` : "";
+      const r = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${cid}?limit=${messageLimit}${threadParam}`);
       if (!disposed) commitConversationMessages(cid, r.messages);
     };
     const tick = async () => {
@@ -812,7 +839,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     void tick();
     intervalId = window.setInterval(() => { void tick(); }, config.polling_interval_ms || 15000);
     return () => { disposed = true; if (intervalId) window.clearInterval(intervalId); };
-  }, [activeConversationId, bundle, config, sessionUser, snapshotMode, messageLimit]);
+  }, [activeConversationId, activeThreadId, bundle, config, sessionUser, snapshotMode, messageLimit]);
 
   // Mark selected conversation as read explicitly
   useEffect(() => {
@@ -1380,6 +1407,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout,
     contacts, conversations, selectedContactId, setSelectedContactId, selectedContact,
+    selectedThreadId, setSelectedThreadId,
     activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
