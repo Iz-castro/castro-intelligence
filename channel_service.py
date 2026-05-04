@@ -20,7 +20,19 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from firestore_common import collection, document, next_sequence, utcnow, normalize_record
+from firestore_common import (
+    _flat_collection as collection,
+    _flat_document as document,
+    next_sequence,
+    utcnow,
+    normalize_record,
+)
+
+# NOTA: channel_service usa explicitamente _flat_collection/_flat_document
+# para que canais permanecam em colecao flat (compartilhada entre tenants)
+# enquanto a migracao de canais para tenants/{id}/channels nao for feita.
+# Isso evita que o webhook, que opera dentro de tenant_context, leia
+# canais da subcolecao errada (vazia) e nao consiga rotear mensagens.
 
 logger = logging.getLogger("castro_crm.channels")
 
