@@ -522,6 +522,134 @@ def _resolve_display_name(declared_name, whatsapp_profile_name, phone_formatted)
     return declared_name or whatsapp_profile_name or phone_formatted or ""
 
 
+# ---------------------------------------------------------------------------
+# wa_conversations — sub-threads por canal (Fase 2)
+# ---------------------------------------------------------------------------
+#
+# Para suportar o cenario "mesmo wa_id em mais de um canal", as mensagens
+# pertencem a uma `conversation` (par canal+telefone) em vez de ao
+# contato direto. O contato continua sendo unico por wa_id (preserva
+# nome, notas, qualificacao do cliente), mas thread, assigned_to,
+# unread_count etc. ficam na conversation.
+#
+# conversation_id e deterministico: "{channel_id}__{wa_id}". Garante
+# que webhook nunca duplique conversation pro mesmo par.
+#
+# Esta camada e ADITIVA: as funcoes legadas (upsert_wa_contact,
+# save_wa_message, get_wa_conversation) continuam funcionando — apenas
+# passam tambem a manter a coleção wa_conversations atualizada e
+# denormalizam conversation_id em wa_messages. O frontend ainda
+# consome a API por contact_id; quando a Fase 3 do plano for entregue,
+# o frontend passa a listar conversations e mostrar badges de canal.
+
+def _make_conversation_id(channel_id, wa_id):
+    """Gera id deterministico de conversation. Aceita channel_id None
+    (legado) — usa 'default' como prefixo nesse caso."""
+    if channel_id is None or channel_id == "":
+        prefix = "default"
+    else:
+        prefix = str(channel_id)
+    return f"{prefix}__{wa_id}"
+
+
+def upsert_wa_conversation(
+    contact_id,
+    wa_id,
+    channel_id=None,
+    source_channel_type="",
+    phone_number_id="",
+    auto_assign_user_id=None,
+    direction_for_unread=None,
+):
+    """Cria ou atualiza a conversation correspondente a (channel_id, wa_id).
+
+    Retorna conversation_id (string deterministica). Se a conversation
+    ja existe, atualiza last_message_at e demais timestamps, alem de
+    auto-assign quando aplicavel.
+
+    direction_for_unread: 'inbound' incrementa unread_count, outras
+    direcoes nao mexem. None nao mexe (uso pelo upsert_wa_contact).
+    """
+    if wa_id is None or wa_id == "":
+        raise ValueError("wa_id obrigatorio para upsert_wa_conversation")
+    conversation_id = _make_conversation_id(channel_id, wa_id)
+    now = utcnow()
+    ref = document("wa_conversations", conversation_id)
+    snap = ref.get()
+    existing = snap.to_dict() if snap.exists else None
+
+    if existing:
+        updates = {
+            "last_message_at": now,
+        }
+        if direction_for_unread == "inbound":
+            updates["last_inbound_at"] = now
+            updates["unread_count"] = int(existing.get("unread_count", 0)) + 1
+        elif direction_for_unread == "outbound":
+            updates["last_outbound_at"] = now
+        # Auto-assign se nao atribuido (coexistence)
+        if auto_assign_user_id and not existing.get("assigned_to"):
+            user = _get_doc("users", auto_assign_user_id)
+            if user:
+                updates["assigned_to"] = auto_assign_user_id
+                updates["assigned_to_uid"] = user.get("firebase_uid", "")
+                if not existing.get("department_id") and user.get("department_id"):
+                    updates["department_id"] = user["department_id"]
+        ref.set(updates, merge=True)
+        return conversation_id
+
+    # Nova conversation
+    new_conv = {
+        "id": conversation_id,
+        "contact_id": contact_id,
+        "wa_id": wa_id,
+        "channel_id": channel_id,
+        "phone_number_id": phone_number_id or "",
+        "source_channel_type": source_channel_type or "",
+        "assigned_to": None,
+        "assigned_to_uid": "",
+        "department_id": None,
+        "unread_count": 1 if direction_for_unread == "inbound" else 0,
+        "status": "open",
+        "created_at": now,
+        "last_message_at": now,
+        "last_inbound_at": now if direction_for_unread == "inbound" else None,
+        "last_outbound_at": now if direction_for_unread == "outbound" else None,
+    }
+    if auto_assign_user_id:
+        user = _get_doc("users", auto_assign_user_id)
+        if user:
+            new_conv["assigned_to"] = auto_assign_user_id
+            new_conv["assigned_to_uid"] = user.get("firebase_uid", "")
+            if user.get("department_id"):
+                new_conv["department_id"] = user["department_id"]
+    ref.set(new_conv)
+    return conversation_id
+
+
+def get_wa_conversation_by_id(conversation_id):
+    """Retorna a conversation pelo id deterministico."""
+    snap = document("wa_conversations", conversation_id).get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+    if "id" not in data:
+        data["id"] = conversation_id
+    return normalize_record(data)
+
+
+def get_conversations_by_contact(contact_id):
+    """Retorna todas as conversations de um contato (todos os canais)."""
+    rows = []
+    for snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        data = snap.to_dict() or {}
+        if "id" not in data:
+            data["id"] = snap.id
+        rows.append(data)
+    rows.sort(key=lambda r: r.get("last_message_at") or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
+    return _normalize_many(rows)
+
+
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
                       auto_assign_user_id=None):
@@ -561,6 +689,10 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 if existing.get("qualification") == "novo":
                     updates["qualification"] = "em_atendimento"
         document("wa_contacts", existing["id"]).set(updates, merge=True)
+        # Garante que a conversation deste (channel, wa_id) tambem existe.
+        _maybe_upsert_conversation_for_existing_contact(
+            existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
+        )
         return existing["id"]
 
     phone_formatted = format_phone_br(wa_id)
@@ -604,7 +736,29 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             if user.get("department_id"):
                 new_contact["department_id"] = user["department_id"]
     document("wa_contacts", contact_id).set(new_contact)
+    # Upsert conversation correspondente (Fase 2 — sub-threads por canal)
+    upsert_wa_conversation(
+        contact_id=contact_id,
+        wa_id=wa_id,
+        channel_id=channel_id,
+        source_channel_type=source_channel_type,
+        phone_number_id=phone_number_id,
+        auto_assign_user_id=auto_assign_user_id,
+    )
     return contact_id
+
+
+def _maybe_upsert_conversation_for_existing_contact(existing_contact, channel_id, source_channel_type, phone_number_id, auto_assign_user_id):
+    """Helper: ao atualizar contato existente, garante que a conversation
+    correspondente (channel + wa_id) tambem exista/seja atualizada."""
+    upsert_wa_conversation(
+        contact_id=existing_contact["id"],
+        wa_id=existing_contact["wa_id"],
+        channel_id=channel_id,
+        source_channel_type=source_channel_type or existing_contact.get("source_channel_type", ""),
+        phone_number_id=phone_number_id or existing_contact.get("phone_number_id", ""),
+        auto_assign_user_id=auto_assign_user_id,
+    )
 
 
 def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_admin_override=False):
@@ -947,11 +1101,17 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     created_at = utcnow()
     effective_wa_message_id = wa_message_id or f"local_{message_id}"
     contact = _get_doc("wa_contacts", contact_id)
+    # Resolve channel/wa_id efetivos pra calcular conversation_id
+    eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
+    eff_wa_id = (contact or {}).get("wa_id", "")
+    eff_phone_number_id = phone_number_id or (contact or {}).get("phone_number_id", "")
+    conversation_id = _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
     document("wa_messages", message_id).set({
         "id": message_id,
         "wa_message_id": effective_wa_message_id,
         "contact_id": contact_id,
         "contact_doc_id": str(contact_id),
+        "conversation_id": conversation_id,
         "direction": direction,
         "msg_type": msg_type,
         "content": content or "",
@@ -966,8 +1126,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
         "department_id": (contact or {}).get("department_id"),
-        "channel_id": channel_id or (contact or {}).get("channel_id"),
-        "phone_number_id": phone_number_id or (contact or {}).get("phone_number_id", ""),
+        "channel_id": eff_channel_id,
+        "phone_number_id": eff_phone_number_id,
         "is_rating_message": is_rating_message,
         "visibility": visibility,
         "timestamp_wa": _coerce_timestamp(timestamp_wa),
@@ -982,6 +1142,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         if direction == "inbound" and status == "received":
             updates["unread_count"] = int(contact.get("unread_count", 0)) + 1
         document("wa_contacts", contact_id).set(updates, merge=True)
+
+        # Atualiza conversation correspondente (Fase 2 — sub-threads).
+        # Se ainda nao existe (mensagem de contato legado pre-Fase 2),
+        # cria automaticamente.
+        if eff_wa_id:
+            try:
+                upsert_wa_conversation(
+                    contact_id=contact_id,
+                    wa_id=eff_wa_id,
+                    channel_id=eff_channel_id,
+                    source_channel_type=(contact or {}).get("source_channel_type", ""),
+                    phone_number_id=eff_phone_number_id,
+                    direction_for_unread="inbound" if direction == "inbound" and status == "received" else ("outbound" if direction == "outbound" else None),
+                )
+            except Exception as exc:
+                logger.warning("Falha ao upsert conversation para msg %s: %s", message_id, exc)
 
     # Atualizar metricas de auditoria (fire-and-forget)
     increment_audit_metrics(
