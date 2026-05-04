@@ -1273,7 +1273,29 @@ async def wa_send_template(
         log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
         return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
     else:
-        raise HTTPException(status_code=502, detail=result.get("error", {}).get("message", "Erro desconhecido"))
+        # Fase 2.10: traduz erros Meta relacionados a billing para HTTP 402
+        # com mensagem orientando o admin a configurar metodo de pagamento.
+        err = (result or {}).get("error", {}) if isinstance(result, dict) else {}
+        err_msg = str(err.get("message") or "Erro desconhecido")
+        err_code = err.get("code")
+        err_subcode = err.get("error_subcode")
+        billing_signals = (
+            err_code == 131009
+            or err_subcode in (2494051, 2494052)
+            or "not subscribed" in err_msg.lower()
+            or "payment" in err_msg.lower()
+        )
+        if billing_signals:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "A WhatsApp Business Account ainda nao tem metodo de pagamento "
+                    "configurado na Meta. Acesse business.facebook.com/wa/manage/billing/ "
+                    "para adicionar e tente novamente em alguns minutos. "
+                    f"(Meta: {err_msg} | code={err_code})"
+                ),
+            )
+        raise HTTPException(status_code=502, detail=err_msg)
 
 
 @app.get("/api/wa/templates")
@@ -1727,6 +1749,74 @@ async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(
     deactivate_channel(channel_id)
     log_audit(current_user["id"], "CHANNEL_DELETE", f"id={channel_id} label={existing.get('label')}")
     return {"ok": True}
+
+
+@app.get("/api/wa/channel/{channel_id}/billing-status")
+async def channel_billing_status(channel_id: int, current_user: dict = Depends(get_current_user)):
+    """Health-check do canal na Meta (Fase 2.10).
+
+    Consulta GET /<WABA_ID>?fields=primary_funding_id,account_review_status
+    para descobrir se o cliente ja configurou metodo de pagamento. Sem
+    isso, templates de marketing/utility falham com erro #131009 ao
+    tentar enviar.
+
+    Resposta inclui has_payment_method (derivado de primary_funding_id),
+    account_review_status e quality_score quando disponiveis.
+    """
+    from channel_service import get_channel, get_send_credentials
+
+    channel = get_channel(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+
+    waba_id = str(channel.get("waba_id") or "").strip()
+    if not waba_id:
+        raise HTTPException(status_code=400, detail="Canal sem WABA_ID associado")
+
+    try:
+        token, _phone_id, api_base = get_send_credentials(channel_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    url = f"{api_base}/{waba_id}"
+    params = {"fields": "primary_funding_id,account_review_status,health_status,owner_business_info"}
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+        if resp.status_code >= 400:
+            detail = _meta_error_detail(resp)
+            return {
+                "channel_id": channel_id,
+                "waba_id": waba_id,
+                "ok": False,
+                "error": detail,
+                "has_payment_method": False,
+            }
+        data = resp.json()
+    except Exception as exc:
+        return {
+            "channel_id": channel_id,
+            "waba_id": waba_id,
+            "ok": False,
+            "error": str(exc),
+            "has_payment_method": False,
+        }
+
+    primary_funding_id = data.get("primary_funding_id") or ""
+    has_payment_method = bool(primary_funding_id)
+    return {
+        "channel_id": channel_id,
+        "waba_id": waba_id,
+        "ok": True,
+        "has_payment_method": has_payment_method,
+        "primary_funding_id": primary_funding_id,
+        "account_review_status": data.get("account_review_status"),
+        "health_status": data.get("health_status"),
+        "owner_business_info": data.get("owner_business_info"),
+        "checked_at": fs_utcnow().isoformat(),
+    }
 
 
 @app.get("/api/wa/contact/{contact_id}")

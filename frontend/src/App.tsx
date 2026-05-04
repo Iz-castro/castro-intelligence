@@ -1784,6 +1784,75 @@ function Lightbox() {
 // Main CRM layout
 // ---------------------------------------------------------------------------
 
+// Fase 2.10: banner persistente que avisa admin/supervisor quando o canal
+// principal nao tem metodo de pagamento configurado na Meta. Sem isso,
+// envio de templates de marketing/utility falha. Apenas roles
+// admin/supervisor veem o banner.
+function BillingHealthBanner() {
+  const { sessionUser, channels, fetchBillingStatus } = useCrm();
+  const [status, setStatus] = useState<{ ok: boolean; has_payment_method: boolean; error?: string } | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+
+  const isPrivileged = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
+  const standardChannel = channels.find((c) => c.is_active && c.channel_type === "standard");
+
+  useEffect(() => {
+    if (!isPrivileged || !standardChannel) return;
+    let cancelled = false;
+    void fetchBillingStatus(standardChannel.id).then((res) => {
+      if (!cancelled) setStatus(res);
+    });
+    return () => { cancelled = true; };
+  }, [isPrivileged, standardChannel, fetchBillingStatus]);
+
+  if (!isPrivileged || !standardChannel || !status || dismissed) return null;
+  if (status.ok && status.has_payment_method) return null;
+
+  const isError = !status.ok;
+  const message = isError
+    ? `Nao foi possivel verificar o billing da Meta para o canal ${standardChannel.label}. ${status.error || ""}`
+    : `O canal ${standardChannel.label} ainda nao tem metodo de pagamento configurado na Meta. Templates de marketing/utility nao serao entregues ate isso ser corrigido.`;
+
+  return (
+    <div style={{
+      background: isError ? "#fef3c7" : "#fee2e2",
+      borderBottom: `1px solid ${isError ? "#f59e0b" : "#dc2626"}`,
+      color: isError ? "#92400e" : "#991b1b",
+      padding: "0.6rem 1rem",
+      display: "flex",
+      gap: "0.8rem",
+      alignItems: "center",
+      justifyContent: "space-between",
+      fontSize: "0.85rem",
+    }}>
+      <div style={{ display: "flex", gap: "0.6rem", alignItems: "center" }}>
+        <span style={{ fontSize: "1.1rem" }}>⚠</span>
+        <span>{message}</span>
+      </div>
+      <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+        <a
+          href="https://business.facebook.com/wa/manage/billing/"
+          target="_blank"
+          rel="noreferrer"
+          style={{ color: "inherit", textDecoration: "underline", fontWeight: 600 }}
+        >
+          Configurar agora
+        </a>
+        <button
+          type="button"
+          onClick={() => setDismissed(true)}
+          style={{ background: "transparent", border: "none", cursor: "pointer", color: "inherit", fontSize: "1rem", padding: "0 0.3rem" }}
+          aria-label="Dispensar aviso"
+          title="Dispensar"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 function CrmApp() {
   const { booting, config, firebaseUser, sessionUser, error } = useCrm();
 
@@ -1795,6 +1864,7 @@ function CrmApp() {
     <>
       <div className="crm-layout">
         <TopBar />
+        <BillingHealthBanner />
         <div className="crm-grid">
           <NavBar />
           <ContactList />

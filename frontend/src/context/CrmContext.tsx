@@ -159,6 +159,7 @@ type CrmContextValue = {
 
   // Templates
   fetchTemplates: (channelId?: number | null) => Promise<WhatsAppTemplate[]>;
+  fetchBillingStatus: (channelId: number) => Promise<{ ok: boolean; has_payment_method: boolean; error?: string } | null>;
   sendTemplate: (params: {
     contactId: number;
     templateName: string;
@@ -1280,6 +1281,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusySend(false); }
   }
 
+  async function fetchBillingStatus(channelId: number): Promise<{ ok: boolean; has_payment_method: boolean; error?: string } | null> {
+    if (!bundle) return null;
+    try {
+      const res = await getJson<{ ok: boolean; has_payment_method: boolean; error?: string }>(
+        bundle.auth,
+        `/api/wa/channel/${channelId}/billing-status`,
+      );
+      return res;
+    } catch (e) {
+      return { ok: false, has_payment_method: false, error: errorText(e) };
+    }
+  }
+
   async function fetchTemplates(channelId?: number | null): Promise<WhatsAppTemplate[]> {
     if (!bundle) return [];
     const qs = channelId ? `?channel_id=${encodeURIComponent(String(channelId))}` : "";
@@ -1424,7 +1438,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
-    fetchTemplates, sendTemplate, busyTemplate,
+    fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
