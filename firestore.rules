@@ -119,5 +119,99 @@ service cloud.firestore {
     match /castro_crm__meta/{docId} {
       allow read, write: if false;
     }
+
+    // ====================================================================
+    // STAGING (FIRESTORE_COLLECTION_PREFIX=castro_crm_staging)
+    // Rules permissivas: qualquer email autorizado pode ler/escrever.
+    // Sera substituido por regras tenant-based na Fase 2 (subcolecao
+    // tenants/{tenant_id}/* com claim no JWT).
+    // ====================================================================
+
+    match /castro_crm_staging_operator_profiles/{uid} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_users/{userId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_departments/{deptId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_channels/{channelId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_wa_contacts/{contactId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_wa_conversations/{convId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_wa_messages/{messageId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_wa_message_status/{docId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_wa_transfer_log/{transferId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_bot_states/{convId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_system_settings/{docId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_user_settings/{userId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_audit_log/{docId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_audit_metrics/{docId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_operator_assume_counters/{userId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_media_assets/{assetId} {
+      allow read, write: if emailAllowed();
+      match /chunks/{chunkId} {
+        allow read, write: if emailAllowed();
+      }
+    }
+
+    match /castro_crm_staging_gc_conversations/{convId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_gc_messages/{msgId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_messages/{messageId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging_internal_unread/{docId} {
+      allow read, write: if emailAllowed();
+    }
+
+    match /castro_crm_staging__meta/{docId} {
+      allow read, write: if emailAllowed();
+    }
   }
 }
