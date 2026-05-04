@@ -213,5 +213,18 @@ service cloud.firestore {
     match /castro_crm_staging__meta/{docId} {
       allow read, write: if emailAllowed();
     }
+
+    // Doc do tenant em si (lista de tenants ainda flat, indice global).
+    match /castro_crm_staging_tenants/{tenantId} {
+      allow read, write: if emailAllowed();
+
+      // Subcolecoes de cada tenant — em staging libera tudo para
+      // qualquer email autorizado (modelo simplificado de teste).
+      // Sera substituido por rules tenant-based estritas com claim no
+      // JWT quando o frontend renovar tokens (sub-fase futura).
+      match /{subcol=**} {
+        allow read, write: if emailAllowed();
+      }
+    }
   }
 }
