@@ -1529,7 +1529,12 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
 @app.post("/api/wa/contact/{contact_id}/read")
 async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_current_user)):
+    from firestore_common import get_tenant_context
     contact = get_wa_contact(contact_id)
+    logger.info(
+        "DEBUG mark_contact_read | contact_id=%s tenant_ctx=%s user_tenant=%s found=%s",
+        contact_id, get_tenant_context(), current_user.get("tenant_id"), bool(contact),
+    )
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if int(contact.get("unread_count", 0) or 0) <= 0:

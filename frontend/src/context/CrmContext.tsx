@@ -719,6 +719,27 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     };
   }, [bundle, config, sessionUser, snapshotMode]);
 
+  // Snapshot: wa_conversations (Fase 3 — sub-threads por canal)
+  useEffect(() => {
+    if (!bundle || !sessionUser || !config) return undefined;
+    if (!snapshotMode || !config.firestore.collections.wa_conversations) return undefined;
+    let disposed = false;
+    const ref = collection(bundle.db, config.firestore.collections.wa_conversations);
+    const unsubscribe = onSnapshot(
+      ref,
+      (snap) => {
+        if (disposed) return;
+        const next = snap.docs.map((doc) => {
+          const data = doc.data() as Record<string, unknown>;
+          return { ...data, id: typeof data.id === "string" || typeof data.id === "number" ? String(data.id) : doc.id } as Conversation;
+        });
+        startTransition(() => setConversations(next));
+      },
+      (e) => !disposed && setError(`Snapshot de conversations falhou: ${errorText(e)}`),
+    );
+    return () => { disposed = true; unsubscribe(); };
+  }, [bundle, config, sessionUser, snapshotMode]);
+
   // Snapshot: selected conversation
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
