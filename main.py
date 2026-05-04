@@ -475,9 +475,30 @@ async def login_removed():
 
 @app.get("/api/session")
 async def session_info(current_user: dict = Depends(get_current_user)):
+    """Retorna dados da sessao do usuario autenticado.
+
+    Inclui paths das colecoes Firestore SCOPADAS ao tenant atual — o
+    frontend sobrescreve config.firestore.collections com esses paths
+    para que snapshots em modo realtime leiam diretamente da subcolecao
+    do tenant (tenants/{tenant_id}/<colecao>).
+    """
+    tenant_id = current_user.get("tenant_id") or "hubloc"
+    tenants_root = collection_name("tenants")
+    tenant_collections = {
+        "departments": f"{tenants_root}/{tenant_id}/departments",
+        "operator_profiles": f"{tenants_root}/{tenant_id}/operator_profiles",
+        "wa_contacts": f"{tenants_root}/{tenant_id}/wa_contacts",
+        "wa_messages": f"{tenants_root}/{tenant_id}/wa_messages",
+        "wa_conversations": f"{tenants_root}/{tenant_id}/wa_conversations",
+        "wa_transfer_log": f"{tenants_root}/{tenant_id}/wa_transfer_log",
+        "gc_conversations": f"{tenants_root}/{tenant_id}/gc_conversations",
+        "gc_messages": f"{tenants_root}/{tenant_id}/gc_messages",
+    }
     return {
         "user": current_user,
         "auth_mode": AUTH_MODE,
+        "tenant_id": tenant_id,
+        "firestore_collections": tenant_collections,
     }
 
 

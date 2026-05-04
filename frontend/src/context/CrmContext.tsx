@@ -586,7 +586,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setFirebaseUser(user);
       if (!user) { setSessionUser(null); setContacts([]); setMessages([]); return; }
       try {
-        const session = await getJson<{ user: SessionUser }>(bundle.auth, "/api/session");
+        const session = await getJson<{
+          user: SessionUser;
+          tenant_id?: string;
+          firestore_collections?: Record<string, string>;
+        }>(bundle.auth, "/api/session");
         const [ops, deps, chs] = await Promise.all([
           getJson<Operator[]>(bundle.auth, "/api/operators"),
           getJson<{ departments: Department[] }>(bundle.auth, "/api/departments"),
@@ -597,6 +601,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         setDepartments(deps.departments);
         setChannels(chs.channels);
         setError("");
+        // Fase 2: sobrescreve paths das colecoes Firestore com versoes
+        // scopadas ao tenant. Snapshot listeners passam a ler de
+        // tenants/{tenant_id}/* em vez de colecao flat.
+        if (session.firestore_collections) {
+          setConfig((prev) => prev ? {
+            ...prev,
+            firestore: {
+              ...prev.firestore,
+              collections: { ...prev.firestore.collections, ...session.firestore_collections! },
+            },
+          } : prev);
+        }
         Promise.all([
           getJson<SystemSettings>(bundle.auth, "/api/settings/system"),
           getJson<UserSettings>(bundle.auth, "/api/settings/user"),
