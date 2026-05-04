@@ -16,9 +16,43 @@ from database import (
     update_last_login,
     upsert_firebase_user,
 )
-from firebase_admin_client import verify_firebase_id_token
+from firebase_admin_client import set_tenant_claims, verify_firebase_id_token
 
 logger = logging.getLogger("castro_crm.auth")
+
+
+def _resolve_tenant_id(decoded_token, user):
+    """Resolve tenant_id do usuario autenticado.
+
+    Ordem de busca:
+      1. custom_claims do token (preferencia — set por set_tenant_claims)
+      2. user.tenant_id (campo do doc do CRM, futuro Fase 2)
+      3. None (sistema single-tenant ainda — backend trata como legado)
+
+    Quando claim e ausente mas user.tenant_id existe, ressincroniza
+    custom_claims em background. Cliente precisa renovar token na
+    proxima request para o claim aparecer.
+    """
+    claim_tenant = (decoded_token or {}).get("tenant_id")
+    if claim_tenant:
+        return str(claim_tenant)
+
+    db_tenant = (user or {}).get("tenant_id") if user else None
+    if db_tenant:
+        firebase_uid = (user or {}).get("firebase_uid", "")
+        if firebase_uid:
+            try:
+                set_tenant_claims(firebase_uid, str(db_tenant), role=user.get("role"))
+                logger.info(
+                    "tenant_id sincronizado em custom_claims | user_id=%s tenant_id=%s "
+                    "(usuario precisa renovar ID token para refletir)",
+                    user.get("id"), db_tenant,
+                )
+            except Exception as exc:
+                logger.warning("Falha ao sincronizar custom_claims: %s", exc)
+        return str(db_tenant)
+
+    return None
 
 
 def _firebase_email_allowed(email):
@@ -72,6 +106,15 @@ def authenticate_firebase_token(id_token, ip_address=""):
 
     update_last_login(user["id"])
     log_audit(user["id"], "LOGIN_SUCCESS_FIREBASE", email or firebase_uid, ip_address)
+
+    # Resolve e anexa tenant_id ao user retornado.
+    # No estado atual (pre Fase 2.B/C), tenant_id pode ser None — backend
+    # legado ignora. Apos Fase 2.B/C, todas as queries usam.
+    tenant_id = _resolve_tenant_id(decoded, user)
+    if tenant_id:
+        user = dict(user)
+        user["tenant_id"] = tenant_id
+
     return {
         "success": True,
         "decoded_token": decoded,
