@@ -713,8 +713,95 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
     return {"contacts": contacts}
 
 
+@app.get("/api/wa/conversations")
+async def wa_conversations(current_user: dict = Depends(get_current_user)):
+    """Retorna lista de conversations enriquecidas (Fase 3 multi-canal).
+
+    Cada conversation representa uma thread (channel_id + wa_id).
+    O mesmo wa_id em mais de um canal aparece como entradas distintas,
+    cada uma com seu proprio assigned_to/unread/last_message_at.
+    Dados do cliente (nome, telefone formatado, notas, qualificacao,
+    rating) sao mesclados via join in-memory com wa_contacts.
+    """
+    from firestore_common import collection as fs_coll
+    from channel_service import get_channel
+    convs_raw = []
+    for snap in fs_coll("wa_conversations").stream():
+        data = snap.to_dict() or {}
+        if "id" not in data:
+            data["id"] = snap.id
+        convs_raw.append(data)
+
+    # Cache de contatos por id (evita N queries)
+    contacts_by_id = {}
+    for c in get_all_wa_contacts():
+        contacts_by_id[c["id"]] = c
+
+    enriched = []
+    for conv in convs_raw:
+        contact = contacts_by_id.get(conv.get("contact_id"))
+        if not contact:
+            continue
+        channel = get_channel(conv.get("channel_id")) if conv.get("channel_id") else None
+        item = {
+            **conv,
+            "wa_id": contact.get("wa_id"),
+            "display_name": contact.get("display_name"),
+            "declared_name": contact.get("declared_name"),
+            "phone_formatted": contact.get("phone_formatted"),
+            "qualification": contact.get("qualification"),
+            "notes": contact.get("notes"),
+            "rating": contact.get("rating"),
+            "is_archived": contact.get("is_archived", 0),
+            "contact_avatar_path": contact.get("contact_avatar_path"),
+            "attendance_protocol": contact.get("attendance_protocol"),
+            "attendance_started_at": contact.get("attendance_started_at"),
+            "channel_label": channel.get("label", "") if channel else "",
+            "channel_type": channel.get("channel_type", "") if channel else "",
+            "channel_phone_number": channel.get("display_phone_number", "") if channel else "",
+            "unread": int(conv.get("unread_count", 0)),
+        }
+        enriched.append(item)
+
+    # Ordena por last_message_at desc (similar a get_all_wa_contacts)
+    def _ts(c):
+        v = c.get("last_message_at")
+        if not v:
+            return ""
+        return v if isinstance(v, str) else v.isoformat()
+    enriched.sort(key=_ts, reverse=True)
+
+    return {"conversations": enriched}
+
+
 @app.get("/api/wa/messages/{contact_id}")
-async def wa_messages(contact_id: int, limit: int = Query(default=10, ge=1, le=200), current_user: dict = Depends(get_current_user)):
+async def wa_messages(
+    contact_id: int,
+    limit: int = Query(default=10, ge=1, le=200),
+    conversation_id: str | None = Query(default=None, description="Filtra por thread especifica (canal+wa_id)"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna mensagens de um contato.
+
+    Comportamento Fase 2:
+    - Se conversation_id e fornecido: filtra por aquela thread (canal+wa_id).
+    - Se nao: retorna timeline cross-channel do contato (legado).
+    """
+    if conversation_id:
+        from firestore_common import collection as fs_coll
+        q = (
+            fs_coll("wa_messages")
+            .where("conversation_id", "==", conversation_id)
+            .order_by("created_at", direction="DESCENDING")
+            .limit(limit)
+        )
+        rows = []
+        for snap in q.stream():
+            data = snap.to_dict() or {}
+            if "id" not in data:
+                data["id"] = snap.id
+            rows.append(data)
+        return {"messages": rows}
     messages = get_wa_conversation(contact_id, limit=limit)
     return {"messages": messages}
 
