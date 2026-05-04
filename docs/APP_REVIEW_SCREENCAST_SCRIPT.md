@@ -238,17 +238,17 @@ Permissions requested:
 Summary of demonstration
 
 ✓ whatsapp_business_messaging
-  Two-way messaging shown at 0:40–2:10
+  Two-way messaging shown at 0:40–2:04
 
 ✓ whatsapp_business_management
-  Template list and send shown at 2:10–4:00
+  Template list and send shown at 2:04-3:08
 
 ✓ business_management
-  Embedded Signup flow shown at 4:00–5:00
+  Embedded Signup flow shown at 3:08–4:04
 
 Backend architecture
 
-- Frontend Meta Login appears only during Embedded Signup (4:00–5:00)
+- Frontend Meta Login appears only during Embedded Signup
 - All Graph API calls after the OAuth code exchange are server-to-server
 - Access tokens are stored in Firestore and auto-refreshed before expiry
 
@@ -274,7 +274,7 @@ Ao reenviar cada permissão na página de App Review, use estes trechos:
 ### 3.1. `whatsapp_business_messaging`
 
 ```
-Demonstrated at 0:40–2:10 in the attached screencast.
+Demonstrated at 0:40–2:04 in the attached screencast.
 
 Inbound: a customer sends a message to the business WhatsApp number.
 Webhook delivers the event to the CRM, which routes it to the assigned
@@ -292,17 +292,17 @@ as requested in the previous review note.
 ### 3.2. `whatsapp_business_management`
 
 ```
-Demonstrated at 2:10–4:00 in the attached screencast.
+Demonstrated at 2:04-3:08 in the attached screencast.
 
-Template management: shown at 2:10–2:40 in Meta's WhatsApp Manager,
+Template management: shown at 2:10–2:22 in Meta's WhatsApp Manager,
 where templates are created, submitted, and approved outside our app.
 
-Template usage inside CRM: at 2:40–3:10, the operator opens the
+Template usage inside CRM: at 2:22–2:42, the operator opens the
 template picker modal. The CRM calls GET /{WABA_ID}/message_templates
 using the whatsapp_business_management permission to fetch currently
 approved templates.
 
-Template send: at 3:10–3:50, the operator selects a template, fills
+Template send: at 2:42–3:08, the operator selects a template, fills
 any variables, and sends it to the test number. The message is rendered
 by WhatsApp on the recipient's device.
 ```
@@ -310,7 +310,7 @@ by WhatsApp on the recipient's device.
 ### 3.3. `business_management`
 
 ```
-Demonstrated at 4:00–5:00 in the attached screencast.
+Demonstrated at 3:08–4:04 in the attached screencast.
 
 Our app uses business_management to read the customer's Business
 Portfolio during Embedded Signup (featureType:

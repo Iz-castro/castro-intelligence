@@ -41,7 +41,7 @@ Objetivo: identificar o que realmente está pronto, o que tem gaps entre doc e c
 
 ### Implementado mas não documentado ⚠️
 - **Assume counter** ([database_firestore.py:1389-1428](castro-intelligence/database_firestore.py#L1389-L1428), usado em [main.py:1469-1480](castro-intelligence/main.py#L1469-L1480)) — limite de "assumir" sem responder
-- **Coleção `bot_states`** em [bot_service.py:215-228](castro-intelligence/bot_service.py#L215-L228) (mencionado só em `docs/internal/090426.md`)
+- **Coleção `bot_states`** em [bot_service.py:215-228](castro-intelligence/bot_service.py#L215-L228) (mencionado só em `docs/internal/2026-04-09.md`)
 - **Protocolo ATD-YYYYMMDDHHMMSS-XXXXX** ([main.py:1486](castro-intelligence/main.py#L1486))
 - **Bot completo e VIVO** — docs em `DOCUMENTACAO_SISTEMA.md:26` e `BOT_ARCHITECTURE.md` ainda chamam de "futuro", mas [bot_service.py](castro-intelligence/bot_service.py) tem 429 linhas em produção atrás da flag `bot_enabled`. **Docs precisam reescrever como presente**
 
