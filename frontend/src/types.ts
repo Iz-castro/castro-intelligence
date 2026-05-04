@@ -115,6 +115,42 @@ export type Contact = {
   bot_setor_nome?: string;
 };
 
+// Conversation = thread unica (channel_id + wa_id). Mesmo wa_id em
+// dois canais aparece como duas Conversations distintas.
+// id deterministico: "{channel_id}__{wa_id}"
+export type Conversation = {
+  id: string;
+  contact_id: number;
+  wa_id: string;
+  channel_id: number | null;
+  channel_label?: string;
+  channel_type?: "standard" | "coexistence" | string;
+  channel_phone_number?: string;
+  source_channel_type?: "standard" | "coexistence" | string;
+  phone_number_id?: string;
+  assigned_to?: number | null;
+  assigned_to_uid?: string;
+  department_id?: number | null;
+  unread_count?: number;
+  unread?: number;
+  status?: "open" | "archived" | string;
+  last_message_at?: string;
+  last_inbound_at?: string;
+  last_outbound_at?: string;
+  created_at?: string;
+  // Dados do contato denormalizados (join in-memory feito pelo backend)
+  display_name?: string;
+  declared_name?: string;
+  phone_formatted?: string;
+  qualification?: string;
+  notes?: string;
+  rating?: number | null;
+  is_archived?: number;
+  contact_avatar_path?: string;
+  attendance_protocol?: string;
+  attendance_started_at?: string;
+};
+
 export type MessageReplyReference = {
   message_id: number;
   preview: string;

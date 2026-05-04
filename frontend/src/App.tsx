@@ -198,9 +198,31 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
 }
 
 function ContactList() {
-  const { activeView, filteredContacts, selectedContactId, setSelectedContactId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const { activeView, filteredContacts, conversations, selectedContactId, setSelectedContactId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
+
+  // Fase 3: agrupa conversations por contact_id para descobrir quando um
+  // mesmo contato aparece em mais de um canal. Pra cada contato exibido:
+  //   - se nao tem conversations registradas (legado), mostra 1 linha;
+  //   - se tem 1 conversation, mostra 1 linha com badge do canal;
+  //   - se tem N conversations, mostra N linhas (uma por canal) com badges.
+  const conversationsByContact = new Map<number, Conversation[]>();
+  for (const conv of conversations) {
+    const list = conversationsByContact.get(conv.contact_id) || [];
+    list.push(conv);
+    conversationsByContact.set(conv.contact_id, list);
+  }
+  type RenderItem = { contact: Contact; conversation: Conversation | null };
+  const renderItems: RenderItem[] = filteredContacts.flatMap((contact) => {
+    const convs = conversationsByContact.get(contact.id) || [];
+    if (convs.length === 0) return [{ contact, conversation: null }];
+    return convs
+      .slice()
+      .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""))
+      .map((conversation) => ({ contact, conversation }));
+  });
+
   const visibleTeamOperators = activeView === "equipe"
     ? operators
       .filter((operator) => operator.id !== sessionUser?.id && filteredContacts.some((contact) => contact.assigned_to === operator.id))
@@ -209,7 +231,7 @@ function ContactList() {
   return (
     <aside className="panel sidebar">
       <div className={`panel-head ${activeView === "equipe" ? "panel-head--stacked" : ""}`}>
-        <div><p className="eyebrow">{viewTitle}</p><h2>{filteredContacts.length} conversa{filteredContacts.length !== 1 ? "s" : ""}</h2></div>
+        <div><p className="eyebrow">{viewTitle}</p><h2>{renderItems.length} conversa{renderItems.length !== 1 ? "s" : ""}</h2></div>
         {activeView === "equipe" && visibleTeamOperators.length ? (
           <div className="operator-presence-strip" aria-label="Operadores com conversas visiveis">
             {visibleTeamOperators.map((operator) => {
@@ -238,11 +260,16 @@ function ContactList() {
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
       </div>
       <div className="contact-list">
-        {filteredContacts.map((contact) => {
+        {renderItems.map(({ contact, conversation }) => {
           const assignedOperator = activeView === "equipe" ? findAssignedOperator(contact, operators) : null;
           const accent = assignedOperator ? operatorColor(assignedOperator.id) : null;
+          const itemKey = conversation ? `${contact.id}__${conversation.id}` : `${contact.id}`;
+          const lastMessageAt = conversation?.last_message_at || contact.last_message_at;
+          const unreadCount = conversation ? (conversation.unread ?? conversation.unread_count ?? 0) : (contact.unread ?? contact.unread_count ?? 0);
+          const channelLabel = conversation?.channel_label || "";
+          const channelType = conversation?.channel_type || conversation?.source_channel_type || contact.source_channel_type || "";
           return (
-            <button key={contact.id} className={`contact ${selectedContactId === contact.id ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={() => setSelectedContactId(contact.id)} style={operatorAccentStyle(accent)}>
+            <button key={itemKey} className={`contact ${selectedContactId === contact.id ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={() => setSelectedContactId(contact.id)} style={operatorAccentStyle(accent)}>
               <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
               <div className="contact-copy">
                 <div className="row">
@@ -258,20 +285,26 @@ function ContactList() {
                         {operatorInitial(assignedOperator)}
                       </span>
                     ) : null}
-                    <span>{when(contact.last_message_at)}</span>
+                    <span>{when(lastMessageAt)}</span>
                   </div>
                 </div>
                 <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div>
                 <div className="row">
                   <span className="chip">{contact.qualification || "novo"}</span>
-                  {contact.source_channel_type === "coexistence" ? <span className="chip" style={{ fontSize: "0.65rem", opacity: 0.7 }}>coex</span> : null}
-                  {contact.unread ? <b className="badge">{contact.unread}</b> : null}
+                  {channelLabel ? (
+                    <span className="chip" style={{ fontSize: "0.65rem", background: channelType === "coexistence" ? "#dbeafe" : "#dcfce7", color: channelType === "coexistence" ? "#1e40af" : "#166534" }} title={channelType === "coexistence" ? "Canal Coexistence (numero pessoal)" : "Canal Standard (Cloud API)"}>
+                      {channelLabel}
+                    </span>
+                  ) : channelType === "coexistence" ? (
+                    <span className="chip" style={{ fontSize: "0.65rem", opacity: 0.7 }}>coex</span>
+                  ) : null}
+                  {unreadCount ? <b className="badge">{unreadCount}</b> : null}
                 </div>
               </div>
             </button>
           );
         })}
-        {!filteredContacts.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
+        {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
       </div>
       {showNewContact && <NewContactModal onClose={() => setShowNewContact(false)} />}
     </aside>

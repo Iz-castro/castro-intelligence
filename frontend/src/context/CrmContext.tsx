@@ -5,7 +5,7 @@ import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where 
 import { getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
-  ActiveView, Channel, ChatMessage, ClientConfig, Contact, Department,
+  ActiveView, Channel, ChatMessage, ClientConfig, Contact, Conversation, Department,
   MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings,
   TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
@@ -45,6 +45,7 @@ type CrmContextValue = {
 
   // Contacts
   contacts: Contact[];
+  conversations: Conversation[];
   selectedContactId: number | null;
   setSelectedContactId: (id: number | null) => void;
   selectedContact: Contact | null;
@@ -277,6 +278,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
+  // Fase 3: lista de conversations (sub-threads por canal). Mesmo wa_id em
+  // dois canais aparece como duas entradas distintas.
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
@@ -726,13 +730,22 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       const r = await getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts");
       if (!disposed) startTransition(() => setContacts(r.contacts));
     };
+    const loadConversations = async () => {
+      try {
+        const r = await getJson<{ conversations: Conversation[] }>(bundle.auth, "/api/wa/conversations");
+        if (!disposed) startTransition(() => setConversations(r.conversations || []));
+      } catch (e) {
+        // Endpoint pode nao existir em ambientes legados; fallback silencioso.
+        if (!disposed) setConversations([]);
+      }
+    };
     const loadMessages = async (cid: number) => {
       const r = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${cid}?limit=${messageLimit}`);
       if (!disposed) commitConversationMessages(cid, r.messages);
     };
     const tick = async () => {
       try {
-        await loadContacts();
+        await Promise.all([loadContacts(), loadConversations()]);
         if (activeConversationId) await loadMessages(activeConversationId);
       } catch (e) {
         if (!disposed) setError(errorText(e));
@@ -957,8 +970,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function refreshPollingViews() {
     if (!bundle) return;
-    const cr = await getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts");
-    startTransition(() => setContacts(cr.contacts));
+    const [cr, vr] = await Promise.all([
+      getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts"),
+      getJson<{ conversations: Conversation[] }>(bundle.auth, "/api/wa/conversations").catch(() => ({ conversations: [] })),
+    ]);
+    startTransition(() => {
+      setContacts(cr.contacts);
+      setConversations(vr.conversations || []);
+    });
     if (selectedContactId) {
       const mr = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${selectedContactId}?limit=${messageLimit}`);
       commitConversationMessages(selectedContactId, mr.messages);
@@ -1303,7 +1322,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout,
-    contacts, selectedContactId, setSelectedContactId, selectedContact,
+    contacts, conversations, selectedContactId, setSelectedContactId, selectedContact,
     activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
