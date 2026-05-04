@@ -852,7 +852,7 @@ function CollapsibleCard({ title, defaultOpen = true, children }: { title: strin
 }
 
 function DetailPanel() {
-  const { bundle, selectedContact, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, setError, setNotice, refreshPollingViews } = useCrm();
+  const { bundle, selectedContact, selectedThreadId, conversations, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
   const [bulkFromUser, setBulkFromUser] = useState<number | "">("");
   const [bulkAction, setBulkAction] = useState<"return_to_bot" | "transfer">("return_to_bot");
@@ -897,7 +897,12 @@ function DetailPanel() {
     setBusyBulk(false);
   }, [bundle, bulkFromUser, bulkAction, bulkToUser, setError, setNotice, refreshPollingViews]);
 
-  const contactChannel = selectedContact?.channel_id ? channels.find((ch) => ch.id === selectedContact.channel_id) : null;
+  // V2 Fase 3: prioriza o canal da thread selecionada (selectedThreadId)
+  // sobre o canal "primario" do contato. Se o usuario abriu a linha do
+  // canal coexistence, o painel direito reflete esse canal.
+  const selectedThread = selectedThreadId ? conversations.find((c) => c.id === selectedThreadId) : null;
+  const threadChannelId = selectedThread?.channel_id ?? selectedContact?.channel_id ?? null;
+  const contactChannel = threadChannelId ? channels.find((ch) => ch.id === threadChannelId) : null;
 
   return (
     <aside className="panel detail-panel">
