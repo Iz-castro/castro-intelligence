@@ -1630,8 +1630,10 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
         raise HTTPException(status_code=409, detail=error)
 
     contact = get_wa_contact(contact_id)
+    # Conversation determinística criada por upsert_wa_conversation (Fase 3).
+    conversation_id = f"{channel_id}__{wa_id}"
     log_audit(current_user["id"], "CONTACT_MANUAL_CREATE", f"Contato {contact_id}: {body.declared_name} ({wa_id})")
-    return {"contact": contact}
+    return {"contact": contact, "conversation_id": conversation_id}
 
 
 @app.put("/api/wa/contact/{contact_id}/declared-name")

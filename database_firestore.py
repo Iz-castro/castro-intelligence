@@ -940,6 +940,20 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         "last_inbound_at": None,
     }
     document("wa_contacts", contact_id).set(new_contact)
+    # Fase 3: cria conversation associada para o contato manual aparecer
+    # imediatamente na sidebar (que agora itera por threads, nao contatos).
+    try:
+        upsert_wa_conversation(
+            contact_id=contact_id,
+            wa_id=wa_id,
+            channel_id=channel_id,
+            source_channel_type=new_contact.get("source_channel_type", "standard"),
+            phone_number_id="",
+            auto_assign_user_id=user_id,
+            direction_for_unread=None,
+        )
+    except Exception as exc:
+        logger.warning("Falha ao criar conversation para contato manual %s: %s", contact_id, exc)
     return contact_id, None
 
 

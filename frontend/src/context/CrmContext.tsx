@@ -508,7 +508,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     startTransition(() => setMessages(cachedMessages));
   }
 
-  function applyConversationReadLocally(contactId: number) {
+  function applyConversationReadLocally(contactId: number, conversationId?: string | null) {
     const cachedMessages = messageCacheRef.current.get(contactId);
     if (cachedMessages) {
       rememberConversationMessages(contactId, cachedMessages.map((message) => (
@@ -518,9 +518,17 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       )));
     }
     startTransition(() => {
-      setContacts((prev) => prev.map((contact) => (
-        contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
-      )));
+      // Fase 3: zera unread da conversation alvo (se houver), nao do contato
+      // inteiro — outras threads do mesmo contato podem ter unread proprio.
+      if (conversationId) {
+        setConversations((prev) => prev.map((conv) => (
+          conv.id === conversationId ? { ...conv, unread: 0, unread_count: 0 } : conv
+        )));
+      } else {
+        setContacts((prev) => prev.map((contact) => (
+          contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
+        )));
+      }
       if (selectedContactIdRef.current === contactId) {
         setMessages((prev) => {
           const nextMessages = prev.map((message) => (
@@ -865,7 +873,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         .then(() => {
           if (cancelled) return;
           markingReadContactIdRef.current = null;
-          applyConversationReadLocally(activeConversationId);
+          applyConversationReadLocally(activeConversationId, threadIdAtMark);
         })
         .catch((e) => {
           if (cancelled) return;
@@ -1360,18 +1368,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setBusyCreateContact(true); setError("");
       const payload: Record<string, unknown> = { declared_name, phone };
       if (channel_id) payload.channel_id = channel_id;
-      const res = await sendJson(bundle.auth, "/api/wa/contact/manual", payload) as { contact: Record<string, unknown> };
+      const res = await sendJson(bundle.auth, "/api/wa/contact/manual", payload) as { contact: Record<string, unknown>; conversation_id?: string };
       const contact = normalizeContact(res.contact, String(res.contact.id));
       setContacts(prev => {
         const exists = prev.some(c => c.id === contact.id);
         if (exists) return prev.map(c => c.id === contact.id ? contact : c);
         return [contact, ...prev];
       });
-      // Seleciona a primeira conversation desse contato (criada pelo backend
-      // junto com o contact). Se ainda nao chegou pelo snapshot, deixa a
-      // auto-select effect cuidar quando ela aparecer.
-      const conv = conversations.find((c) => c.contact_id === contact.id);
-      if (conv) setSelectedThreadId(conv.id);
+      // Backend retorna conversation_id deterministico do contato manual
+      // (Fase 3). Setamos a thread direto — o snapshot listener vai trazer
+      // a Conversation logo em seguida.
+      if (res.conversation_id) {
+        setSelectedThreadId(res.conversation_id);
+      }
       setActiveView("meus");
       setNotice("Contato criado.");
       return contact;
