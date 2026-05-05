@@ -16,7 +16,16 @@ Executa, em sequencia:
        - 2 contatos (X e Y)
        - 3 conversations: 100__X, 200__X, 200__Y
        - 4 mensagens, cada uma com conversation_id correto
-  6. Imprime relatorio.
+  6. (Cutover Fase 2C) Loga como BOOTSTRAP_ADMIN_EMAIL e exercita
+     POST /api/wa/conversation/{id}/read sobre a thread 100__X.
+     Valida que unread_count zera so dela; threads 200__X e 200__Y
+     mantem unread; mensagens inbound da thread 100 ficam status=read,
+     enquanto inbound da 200 permanece received.
+  7. (Cutover Fase 2C) POST /api/wa/send com conversation_id inexistente
+     espera HTTP 404 — prova que _resolve_send_target rejeita antes da
+     chamada Meta (caminho feliz nao testado: tokens dos canais sao fake
+     e a Graph API recusaria).
+  8. Imprime relatorio.
 
 Uso (local com gcloud auth ja configurado):
     python -m scripts.e2e_test_staging
@@ -26,6 +35,8 @@ Variaveis de ambiente necessarias:
     FIRESTORE_COLLECTION_PREFIX  (default: castro_crm_staging)
     STAGING_URL                  (default: castro-crm-staging URL)
     WHATSAPP_APP_SECRET          (lido do GCP Secret Manager se ausente)
+    FIREBASE_WEB_API_KEY         (lido do Cloud Run env se ausente)
+    BOOTSTRAP_ADMIN_EMAIL        (lido do Cloud Run env se ausente)
 """
 
 from __future__ import annotations
@@ -86,6 +97,156 @@ def get_app_secret() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cloud Run env reader (para FIREBASE_WEB_API_KEY, BOOTSTRAP_ADMIN_EMAIL etc)
+# ---------------------------------------------------------------------------
+
+_cloud_run_env_cache: dict[str, str] | None = None
+
+
+def _read_cloud_run_env() -> dict[str, str]:
+    """Le todas as env vars do servico castro-crm-staging via gcloud."""
+    global _cloud_run_env_cache
+    if _cloud_run_env_cache is not None:
+        return _cloud_run_env_cache
+    cmd = [
+        "gcloud", "run", "services", "describe", "castro-crm-staging",
+        "--region", "southamerica-east1",
+        "--project", os.environ["FIRESTORE_PROJECT_ID"],
+        "--format", "json",
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+    if out.returncode != 0:
+        _cloud_run_env_cache = {}
+        return _cloud_run_env_cache
+    try:
+        data = json.loads(out.stdout)
+        containers = (data.get("spec", {}).get("template", {}).get("spec", {})
+                          .get("containers", []) or [])
+        env_list = (containers[0].get("env", []) if containers else []) or []
+        _cloud_run_env_cache = {e["name"]: e.get("value", "")
+                                for e in env_list if "name" in e}
+    except Exception:
+        _cloud_run_env_cache = {}
+    return _cloud_run_env_cache
+
+
+def get_env_or_cloud_run(name: str) -> str:
+    cached = os.environ.get(name, "").strip()
+    if cached:
+        return cached
+    return (_read_cloud_run_env().get(name) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Auth helper — admin idToken via Firebase custom token + REST exchange
+# ---------------------------------------------------------------------------
+
+_E2E_SIGNER_SA = (
+    "castro-crm-run@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com"
+)
+
+
+def mint_admin_id_token() -> tuple[str, str] | None:
+    """Retorna (id_token, admin_email) ou None se auth nao pode ser
+    estabelecida (skip com warning amarelo nos passos 6-7).
+
+    Cria custom token assinado pela SA do Cloud Run staging (precisa
+    iam.serviceAccountTokenCreator no usuario corrente) e troca por
+    idToken via REST. Evita BOOTSTRAP_ADMIN_PASSWORD (que nao existe —
+    admin loga via Google SSO)."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import firebase_admin
+    from firebase_admin import auth as fb_auth, credentials as fb_credentials
+
+    api_key = get_env_or_cloud_run("FIREBASE_WEB_API_KEY")
+    if not api_key:
+        print(_yellow("  [skip] FIREBASE_WEB_API_KEY indisponivel"))
+        return None
+    admin_email = get_env_or_cloud_run("BOOTSTRAP_ADMIN_EMAIL")
+    if not admin_email:
+        print(_yellow("  [skip] BOOTSTRAP_ADMIN_EMAIL indisponivel"))
+        return None
+
+    try:
+        e2e_app = firebase_admin.get_app("e2e_signer")
+    except ValueError:
+        e2e_app = firebase_admin.initialize_app(
+            credential=fb_credentials.ApplicationDefault(),
+            options={
+                "projectId": os.environ["FIRESTORE_PROJECT_ID"],
+                "serviceAccountId": _E2E_SIGNER_SA,
+            },
+            name="e2e_signer",
+        )
+
+    try:
+        user = fb_auth.get_user_by_email(admin_email, app=e2e_app)
+    except Exception as exc:
+        print(_yellow(f"  [skip] get_user_by_email falhou: {exc}"))
+        return None
+    try:
+        custom_token = fb_auth.create_custom_token(
+            user.uid,
+            developer_claims={"tenant_id": "hubloc"},
+            app=e2e_app,
+        )
+    except Exception as exc:
+        print(_yellow(
+            f"  [skip] create_custom_token falhou: {exc}\n"
+            "         (usuario corrente precisa de roles/iam.serviceAccountTokenCreator "
+            f"em {_E2E_SIGNER_SA})"
+        ))
+        return None
+    if isinstance(custom_token, bytes):
+        custom_token = custom_token.decode("utf-8")
+
+    url = (
+        "https://identitytoolkit.googleapis.com/v1/accounts:"
+        f"signInWithCustomToken?key={api_key}"
+    )
+    body = json.dumps({"token": custom_token, "returnSecureToken": True}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(_yellow(
+            f"  [skip] signInWithCustomToken falhou: {e.code} "
+            f"{e.read().decode('utf-8', 'ignore')}"
+        ))
+        return None
+    return payload["idToken"], admin_email
+
+
+def http_post_authed(path: str, id_token: str, body: dict | None = None) -> tuple[int, dict | str]:
+    url = STAGING_URL + path
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {id_token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
+# ---------------------------------------------------------------------------
 # Firestore helpers (lazy import — depende do path)
 # ---------------------------------------------------------------------------
 
@@ -112,7 +273,7 @@ def get_clients():
 # ---------------------------------------------------------------------------
 
 def step_wipe(c) -> None:
-    print(_bold("\n[1/5] Wipe do tenant hubloc + canais fake"))
+    print(_bold("\n[1/7] Wipe do tenant hubloc + canais fake"))
     client = c["client"]
     coll_name = c["coll_name"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -137,7 +298,7 @@ def step_wipe(c) -> None:
 
 
 def step_create_channels(c) -> None:
-    print(_bold("\n[2/5] Criando 2 canais ficticios para teste"))
+    print(_bold("\n[2/7] Criando 2 canais ficticios para teste"))
     utcnow = c["utcnow"]
     flat_doc = c["flat_doc"]
 
@@ -184,7 +345,7 @@ def step_create_channels(c) -> None:
 
 
 def step_wait_cache():
-    print(_bold("\n[3/5] Aguardando 70s para cache de canais reciclar no Cloud Run"))
+    print(_bold("\n[3/7] Aguardando 70s para cache de canais reciclar no Cloud Run"))
     print(f"  cache TTL = 60s; aguardamos um pouco a mais...")
     for remaining in range(70, 0, -10):
         print(f"  {remaining}s...", end="\r")
@@ -242,7 +403,7 @@ def make_payload(phone_number_id: str, wa_id: str, profile_name: str, msg_id: st
 
 
 def step_send_webhooks(secret: str) -> None:
-    print(_bold("\n[4/5] Disparando 4 webhooks Meta-shape"))
+    print(_bold("\n[4/7] Disparando 4 webhooks Meta-shape"))
     wa_x = "5531777771111"
     wa_y = "5531777772222"
 
@@ -265,7 +426,7 @@ def step_send_webhooks(secret: str) -> None:
 
 
 def step_verify(c) -> int:
-    print(_bold("\n[5/5] Verificando estado final no Firestore"))
+    print(_bold("\n[5/7] Verificando estado final dos webhooks no Firestore"))
     coll_name = c["coll_name"]
     client = c["client"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -325,6 +486,101 @@ def step_verify(c) -> int:
     return 0
 
 
+def _conv_doc(c, conv_id: str):
+    coll_name = c["coll_name"]
+    client = c["client"]
+    return (client.collection(coll_name("tenants")).document("hubloc")
+                  .collection("wa_conversations").document(conv_id).get())
+
+
+def step_post_mark_read(c, id_token: str) -> int:
+    """Cutover Fase 2C: POST /api/wa/conversation/{id}/read marca leitura
+    de uma thread especifica e nao das outras do mesmo contato."""
+    print(_bold("\n[6/7] POST /api/wa/conversation/{id}/read (cutover Fase 2C)"))
+    coll_name = c["coll_name"]
+    client = c["client"]
+    hubloc = client.collection(coll_name("tenants")).document("hubloc")
+
+    target_conv = "100__5531777771111"
+
+    before_target = (_conv_doc(c, target_conv).to_dict() or {}).get("unread_count")
+    before_other_x = (_conv_doc(c, "200__5531777771111").to_dict() or {}).get("unread_count")
+    before_y = (_conv_doc(c, "200__5531777772222").to_dict() or {}).get("unread_count")
+    print(f"  antes: {target_conv}.unread={before_target}, "
+          f"200__X.unread={before_other_x}, 200__Y.unread={before_y}")
+
+    status, payload = http_post_authed(f"/api/wa/conversation/{target_conv}/read", id_token)
+    if status != 200:
+        print(_red(f"  ✗ POST retornou {status}: {payload}"))
+        return 1
+    print(f"  ✓ POST status=200 payload={payload}")
+
+    after_target = (_conv_doc(c, target_conv).to_dict() or {}).get("unread_count")
+    after_other_x = (_conv_doc(c, "200__5531777771111").to_dict() or {}).get("unread_count")
+    after_y = (_conv_doc(c, "200__5531777772222").to_dict() or {}).get("unread_count")
+    print(f"  depois: {target_conv}.unread={after_target}, "
+          f"200__X.unread={after_other_x}, 200__Y.unread={after_y}")
+
+    failures = []
+    if after_target != 0:
+        failures.append(f"{target_conv}.unread esperado=0 obtido={after_target}")
+    if after_other_x != before_other_x:
+        failures.append(f"200__X.unread mudou (esperado {before_other_x} estavel, obtido {after_other_x})")
+    if after_y != before_y:
+        failures.append(f"200__Y.unread mudou (esperado {before_y} estavel, obtido {after_y})")
+
+    # mensagens inbound da thread alvo devem estar status=read; das outras
+    # threads do MESMO contato (200__X) devem manter received.
+    msgs = list(hubloc.collection("wa_messages").stream())
+    for s in msgs:
+        d = s.to_dict() or {}
+        if d.get("direction") != "inbound":
+            continue
+        conv = d.get("conversation_id")
+        st = d.get("status")
+        if conv == target_conv and st != "read":
+            failures.append(f"msg {d.get('id')} ({conv}) esperado read, obtido {st}")
+        if conv == "200__5531777771111" and st == "read":
+            failures.append(f"msg {d.get('id')} ({conv}) virou read sem solicitacao (cross-channel leak!)")
+
+    if failures:
+        print(_red("  ✗ FALHAS:"))
+        for f in failures:
+            print(_red(f"    - {f}"))
+        return 1
+    print(_green("  ✓ mark-read isolado por thread"))
+    return 0
+
+
+def step_post_send_validation(c, id_token: str) -> int:
+    """Cutover Fase 2C: POST /api/wa/send com conversation_id inexistente
+    deve retornar 404, provando que _resolve_send_target rejeita antes de
+    chamar Meta. Caminho feliz nao testado (canais fake, tokens fake)."""
+    print(_bold("\n[7/7] POST /api/wa/send com conversation_id invalido (cutover Fase 2C)"))
+
+    bad_conv = "9999__inexistente"
+    status, payload = http_post_authed(
+        "/api/wa/send", id_token,
+        {"conversation_id": bad_conv, "content": "ignored"},
+    )
+    print(f"  POST conversation_id={bad_conv} -> status={status}")
+    if status != 404:
+        print(_red(f"  ✗ esperado 404, obtido {status}: {payload}"))
+        return 1
+
+    # Tambem valida que sem nem conversation_id nem contact_id retorna 4xx
+    status2, payload2 = http_post_authed(
+        "/api/wa/send", id_token, {"content": "no target"},
+    )
+    print(f"  POST sem target -> status={status2}")
+    if status2 not in (400, 422):
+        print(_red(f"  ✗ esperado 400/422, obtido {status2}: {payload2}"))
+        return 1
+
+    print(_green("  ✓ _resolve_send_target rejeita antes de chegar em Meta"))
+    return 0
+
+
 def main() -> int:
     print(_bold(f"E2E test against {STAGING_URL}"))
     secret = get_app_secret()
@@ -338,12 +594,30 @@ def main() -> int:
     step_wait_cache()
     step_send_webhooks(secret)
     rc = step_verify(c)
+    if rc != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passos 1-5)")))
+        return rc
 
-    if rc == 0:
-        print(_green(_bold("\n✓ E2E PASSED")))
-    else:
-        print(_red(_bold("\n✗ E2E FAILED")))
-    return rc
+    auth = mint_admin_id_token()
+    if auth is None:
+        print(_yellow(_bold("\n⚠ Passos 6-7 pulados (auth indisponivel) — passos 1-5 OK")))
+        print(_green(_bold("\n✓ E2E PASSED (parcial)")))
+        return 0
+    id_token, admin_email = auth
+    print(_bold(f"\nAuth: idToken obtido para {admin_email}"))
+
+    rc6 = step_post_mark_read(c, id_token)
+    if rc6 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 6 mark-read)")))
+        return rc6
+
+    rc7 = step_post_send_validation(c, id_token)
+    if rc7 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 7 send validation)")))
+        return rc7
+
+    print(_green(_bold("\n✓ E2E PASSED")))
+    return 0
 
 
 if __name__ == "__main__":
