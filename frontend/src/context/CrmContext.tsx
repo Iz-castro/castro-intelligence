@@ -429,11 +429,23 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return true;
   });
 
-  const botUnread = botContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const novosUnread = novosContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const meusUnread = meusContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const nqUnread = nqContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const equipeUnread = equipeContacts.reduce((s, c) => s + (c.unread || 0), 0);
+  // Fase 3: unread real do contato é a soma das suas conversations.
+  // Mark-read zera so a Conversation alvo, entao c.unread no contato fica
+  // stale. Derivamos do estado das conversations (single source of truth).
+  const unreadByContact = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const conv of conversations) {
+      const cur = map.get(conv.contact_id) || 0;
+      map.set(conv.contact_id, cur + (conv.unread_count ?? conv.unread ?? 0));
+    }
+    return map;
+  }, [conversations]);
+  const contactUnread = (c: Contact) => unreadByContact.get(c.id) ?? c.unread ?? c.unread_count ?? 0;
+  const botUnread = botContacts.reduce((s, c) => s + contactUnread(c), 0);
+  const novosUnread = novosContacts.reduce((s, c) => s + contactUnread(c), 0);
+  const meusUnread = meusContacts.reduce((s, c) => s + contactUnread(c), 0);
+  const nqUnread = nqContacts.reduce((s, c) => s + contactUnread(c), 0);
+  const equipeUnread = equipeContacts.reduce((s, c) => s + contactUnread(c), 0);
   const equipeFiltered = equipeOperatorFilter ? equipeContacts.filter((c) => String(c.assigned_to) === equipeOperatorFilter) : equipeContacts;
 
   const viewContacts = activeView === "bot" ? botContacts : activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : activeView === "equipe" ? equipeFiltered : nqContacts;
