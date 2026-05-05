@@ -650,6 +650,81 @@ def get_conversations_by_contact(contact_id):
     return _normalize_many(rows)
 
 
+def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transferred_by, reason="", summary=""):
+    """Transfere uma conversation (thread). Atualiza apenas a conversation
+    e contact (assigned_to compartilhado por enquanto). Loga transferencia
+    com referencia a conversation_id E contact_id.
+
+    Retorna {from_user_id, to_user_id, contact_id} ou None se nao achar.
+    """
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        return None
+    contact_id = conv.get("contact_id")
+    from_user = conv.get("assigned_to")
+    from_dept = conv.get("department_id")
+    to_user = _get_doc("users", to_user_id) if to_user_id else None
+
+    document("wa_conversations", conversation_id).set({
+        "assigned_to": to_user_id,
+        "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
+        "department_id": to_department_id,
+    }, merge=True)
+    # Espelho no contato pra views legadas que ainda leem dali
+    if contact_id is not None:
+        document("wa_contacts", contact_id).set({
+            "assigned_to": to_user_id,
+            "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
+            "department_id": to_department_id,
+        }, merge=True)
+
+    transfer_id = next_sequence("wa_transfer_log")
+    document("wa_transfer_log", transfer_id).set({
+        "id": transfer_id,
+        "conversation_id": conversation_id,
+        "contact_id": contact_id,
+        "contact_doc_id": str(contact_id) if contact_id is not None else "",
+        "from_user_id": from_user,
+        "to_user_id": to_user_id,
+        "to_user_uid": (to_user or {}).get("firebase_uid", ""),
+        "from_department_id": from_dept,
+        "to_department_id": to_department_id,
+        "department_id": to_department_id,
+        "reason": reason or "",
+        "summary": summary or "",
+        "transferred_by": transferred_by,
+        "created_at": utcnow(),
+    })
+    return {"from_user_id": from_user, "to_user_id": to_user_id, "contact_id": contact_id}
+
+
+def mark_wa_conversation_read_by_id(conversation_id):
+    """Marca como lidas as mensagens inbound de uma conversation especifica.
+    Usa filtro por conversation_id (Fase 2C) — nao colide entre threads do
+    mesmo contato em canais diferentes."""
+    q = (
+        collection("wa_messages")
+        .where("conversation_id", "==", conversation_id)
+        .where("direction", "==", "inbound")
+        .where("status", "==", "received")
+    )
+    batch = get_firestore_client().batch()
+    count = 0
+    total_updated = 0
+    for snapshot in q.stream():
+        batch.set(snapshot.reference, {"status": "read"}, merge=True)
+        count += 1
+        total_updated += 1
+        if count >= 400:
+            batch.commit()
+            batch = get_firestore_client().batch()
+            count = 0
+    if count > 0:
+        batch.commit()
+    document("wa_conversations", conversation_id).set({"unread_count": 0}, merge=True)
+    return total_updated
+
+
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
                       auto_assign_user_id=None):
@@ -1030,7 +1105,8 @@ def get_contacts_by_assigned_user(user_id):
     return _normalize_many(rows)
 
 
-def insert_transfer_system_message(contact_id, content, operator_id=None):
+def insert_transfer_system_message(contact_id, content, operator_id=None,
+                                   conversation_id=None, channel_id=None):
     return save_wa_message(
         wa_message_id=f"sys_{utcnow().isoformat()}_{contact_id}",
         contact_id=contact_id,
@@ -1040,6 +1116,9 @@ def insert_transfer_system_message(contact_id, content, operator_id=None):
         status="delivered",
         timestamp_wa=utcnow().isoformat(),
         operator_id=operator_id,
+        sender_user_id=operator_id,
+        conversation_id=conversation_id,
+        channel_id=channel_id,
     )
 
 
@@ -1075,7 +1154,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     status="received", timestamp_wa="", operator_id=None,
                     reply_to_message_id=None, reply_to_preview="", reply_to_sender_name="",
                     channel_id=None, phone_number_id="",
-                    is_rating_message=False, visibility="all"):
+                    is_rating_message=False, visibility="all",
+                    conversation_id=None,
+                    channel_owner_user_id=None, sender_user_id=None):
+    """Persiste mensagem WhatsApp.
+
+    Auditoria coexistence (Fase 2C):
+      - `channel_owner_user_id`: dono fisico do numero (ex.: operador X que
+        conectou o WhatsApp pessoal dele via coexistence). Vem de
+        `channel.owner_user_id` no momento do envio/recebimento.
+      - `sender_user_id`: operador que efetivamente digitou/enviou (em
+        outbound). None em inbound. Permite distinguir, em transferencias
+        coexistence, quem digitou vs quem e o dono do numero.
+
+    `conversation_id` pode ser passado explicitamente (caller ja resolveu
+    a thread). Caso contrario, e derivado de (channel_id, contact.wa_id).
+    """
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
         if existing:
@@ -1105,13 +1199,15 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
     eff_wa_id = (contact or {}).get("wa_id", "")
     eff_phone_number_id = phone_number_id or (contact or {}).get("phone_number_id", "")
-    conversation_id = _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
+    eff_conversation_id = conversation_id or (
+        _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
+    )
     document("wa_messages", message_id).set({
         "id": message_id,
         "wa_message_id": effective_wa_message_id,
         "contact_id": contact_id,
         "contact_doc_id": str(contact_id),
-        "conversation_id": conversation_id,
+        "conversation_id": eff_conversation_id,
         "direction": direction,
         "msg_type": msg_type,
         "content": content or "",
@@ -1123,6 +1219,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "filename": filename or "",
         "status": status or "received",
         "operator_id": operator_id,
+        "sender_user_id": sender_user_id,
+        "channel_owner_user_id": channel_owner_user_id,
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
         "department_id": (contact or {}).get("department_id"),
