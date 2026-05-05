@@ -1916,32 +1916,43 @@ async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(
     return {"ok": True}
 
 
-@app.get("/api/wa/channel/{channel_id}/billing-status")
-async def channel_billing_status(channel_id: int, current_user: dict = Depends(get_current_user)):
-    """Health-check do canal na Meta (Fase 2.10).
+async def _fetch_channel_billing_status(channel_id: int) -> dict:
+    """Helper reusavel: consulta Meta Graph API e retorna estado de billing
+    de um canal. Usado pelo endpoint admin (channel_billing_status) e pelo
+    cron de health-check (Fase 2.10.3).
 
-    Consulta GET /<WABA_ID>?fields=primary_funding_id,account_review_status
-    para descobrir se o cliente ja configurou metodo de pagamento. Sem
-    isso, templates de marketing/utility falham com erro #131009 ao
-    tentar enviar.
-
-    Resposta inclui has_payment_method (derivado de primary_funding_id),
-    account_review_status e quality_score quando disponiveis.
+    Em vez de raise, retorna dict com `ok=False` e `error` na falha.
     """
     from channel_service import get_channel, get_send_credentials
 
     channel = get_channel(channel_id)
     if not channel:
-        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+        return {
+            "channel_id": channel_id,
+            "ok": False,
+            "error": "channel_not_found",
+            "has_payment_method": False,
+        }
 
     waba_id = str(channel.get("waba_id") or "").strip()
     if not waba_id:
-        raise HTTPException(status_code=400, detail="Canal sem WABA_ID associado")
+        return {
+            "channel_id": channel_id,
+            "ok": False,
+            "error": "missing_waba_id",
+            "has_payment_method": False,
+        }
 
     try:
         token, _phone_id, api_base = get_send_credentials(channel_id)
     except ValueError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        return {
+            "channel_id": channel_id,
+            "waba_id": waba_id,
+            "ok": False,
+            "error": str(exc),
+            "has_payment_method": False,
+        }
 
     url = f"{api_base}/{waba_id}"
     params = {"fields": "primary_funding_id,account_review_status,health_status,owner_business_info"}
@@ -1951,12 +1962,11 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, params=params, headers=headers)
         if resp.status_code >= 400:
-            detail = _meta_error_detail(resp)
             return {
                 "channel_id": channel_id,
                 "waba_id": waba_id,
                 "ok": False,
-                "error": detail,
+                "error": _meta_error_detail(resp),
                 "has_payment_method": False,
             }
         data = resp.json()
@@ -1970,17 +1980,210 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
         }
 
     primary_funding_id = data.get("primary_funding_id") or ""
-    has_payment_method = bool(primary_funding_id)
     return {
         "channel_id": channel_id,
         "waba_id": waba_id,
         "ok": True,
-        "has_payment_method": has_payment_method,
+        "has_payment_method": bool(primary_funding_id),
         "primary_funding_id": primary_funding_id,
         "account_review_status": data.get("account_review_status"),
         "health_status": data.get("health_status"),
         "owner_business_info": data.get("owner_business_info"),
         "checked_at": fs_utcnow().isoformat(),
+    }
+
+
+@app.get("/api/wa/channel/{channel_id}/billing-status")
+async def channel_billing_status(channel_id: int, current_user: dict = Depends(get_current_user)):
+    """Health-check do canal na Meta (Fase 2.10).
+
+    Consulta GET /<WABA_ID>?fields=primary_funding_id,account_review_status
+    para descobrir se o cliente ja configurou metodo de pagamento. Sem
+    isso, templates de marketing/utility falham com erro #131009 ao
+    tentar enviar.
+    """
+    from channel_service import get_channel
+
+    channel = get_channel(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+    waba_id = str(channel.get("waba_id") or "").strip()
+    if not waba_id:
+        raise HTTPException(status_code=400, detail="Canal sem WABA_ID associado")
+
+    res = await _fetch_channel_billing_status(channel_id)
+    if not res.get("ok") and res.get("error") in ("channel_not_found", "missing_waba_id"):
+        # Caminho rejeitado antes do helper — manter HTTPException pro endpoint admin
+        raise HTTPException(
+            status_code=404 if res["error"] == "channel_not_found" else 400,
+            detail=res["error"],
+        )
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Cron health-check (Fase 2.10.3) — Cloud Scheduler chama diariamente.
+# Computa estado consolidado por tenant em tenants/{tid}/health_status/current
+# e atualiza payment_method_status no doc flat de cada canal.
+# ---------------------------------------------------------------------------
+
+def _classify_payment_status(billing: dict, channel: dict) -> tuple[str, bool, bool]:
+    """Decide payment_method_status (ok|pending|error|expired) e flags
+    de token_expired/token_expiring_soon (so coexistence)."""
+    if not billing.get("ok"):
+        status = "error"
+    elif billing.get("has_payment_method"):
+        status = "ok"
+    else:
+        status = "pending"
+
+    token_expired = False
+    token_expiring = False
+    if channel.get("channel_type") == "coexistence":
+        expires_at_raw = channel.get("token_expires_at")
+        if expires_at_raw:
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(expires_at_raw).replace("Z", "+00:00")
+                )
+                now = datetime.now(timezone.utc)
+                if expires_at <= now:
+                    token_expired = True
+                    status = "expired"
+                elif expires_at - now <= timedelta(days=7):
+                    token_expiring = True
+            except (ValueError, TypeError):
+                pass
+    return status, token_expired, token_expiring
+
+
+async def _compute_tenant_health() -> dict:
+    """Executa dentro de tenant_context. Para cada canal ativo: chama
+    _fetch_channel_billing_status, classifica, persiste payment_method_status
+    no doc flat do canal. Retorna dict pronto pra gravar em
+    tenants/{tid}/health_status/current.
+    """
+    import asyncio
+    from channel_service import get_all_active_channels
+    from firestore_common import global_document
+
+    channels = get_all_active_channels()
+    if not channels:
+        return {
+            "checked_at": fs_utcnow().isoformat(),
+            "channels_total": 0,
+            "channels_pending_payment": 0,
+            "tokens_expiring_soon": 0,
+            "templates_recent_failures": 0,
+            "per_channel": [],
+        }
+
+    billing_results = await asyncio.gather(
+        *[_fetch_channel_billing_status(ch["id"]) for ch in channels],
+        return_exceptions=True,
+    )
+
+    channels_pending_payment = 0
+    tokens_expiring_soon = 0
+    per_channel: list[dict] = []
+    for ch, billing in zip(channels, billing_results):
+        if isinstance(billing, Exception):
+            billing = {
+                "channel_id": ch["id"],
+                "ok": False,
+                "error": str(billing),
+                "has_payment_method": False,
+            }
+        status, token_expired, token_expiring = _classify_payment_status(billing, ch)
+        if status == "pending":
+            channels_pending_payment += 1
+        if token_expiring:
+            tokens_expiring_soon += 1
+
+        try:
+            global_document("channels", ch["id"]).set({
+                "payment_method_status": status,
+                "payment_method_checked_at": fs_utcnow(),
+            }, merge=True)
+        except Exception as exc:
+            logger.warning(
+                "cron health: falha ao atualizar payment_method_status canal %s: %s",
+                ch["id"], exc,
+            )
+
+        per_channel.append({
+            "channel_id": ch["id"],
+            "label": ch.get("label", ""),
+            "channel_type": ch.get("channel_type"),
+            "payment_method_status": status,
+            "has_payment_method": billing.get("has_payment_method", False),
+            "account_review_status": billing.get("account_review_status"),
+            "token_expiring_soon": token_expiring,
+            "token_expired": token_expired,
+            "error": billing.get("error") if not billing.get("ok") else None,
+        })
+
+    return {
+        "checked_at": fs_utcnow().isoformat(),
+        "channels_total": len(channels),
+        "channels_pending_payment": channels_pending_payment,
+        "tokens_expiring_soon": tokens_expiring_soon,
+        "templates_recent_failures": 0,  # placeholder pra futura agregacao
+        "per_channel": per_channel,
+    }
+
+
+def _verify_cron_secret(request: Request) -> None:
+    import hmac as _hmac
+    expected = os.environ.get("INTERNAL_CRON_SECRET", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="INTERNAL_CRON_SECRET nao configurado",
+        )
+    secret_header = request.headers.get("X-Cron-Secret", "")
+    if not _hmac.compare_digest(secret_header.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="X-Cron-Secret invalido")
+
+
+@app.post("/api/internal/cron/health-check")
+async def cron_health_check(request: Request):
+    """Cloud Scheduler chama diariamente. Itera tenants ativos, computa
+    estado consolidado e grava em tenants/{tid}/health_status/current.
+
+    Auth: header X-Cron-Secret == INTERNAL_CRON_SECRET (env). Sem
+    autenticacao Firebase — Cloud Scheduler nao tem identidade humana.
+    """
+    _verify_cron_secret(request)
+
+    from tenant_service import list_tenants
+    from firestore_common import set_tenant_context, reset_tenant_context, document as fs_doc
+
+    summary: list[dict] = []
+    for tenant in list_tenants(active_only=True):
+        tid = str(tenant.get("id") or "")
+        if not tid:
+            continue
+        token = set_tenant_context(tid)
+        try:
+            health = await _compute_tenant_health()
+            fs_doc("health_status", "current").set(health, merge=False)
+            summary.append({
+                "tenant_id": tid,
+                "channels_total": health["channels_total"],
+                "channels_pending_payment": health["channels_pending_payment"],
+                "tokens_expiring_soon": health["tokens_expiring_soon"],
+            })
+        except Exception as exc:
+            logger.warning("cron_health_check: tenant %s falhou: %s", tid, exc)
+            summary.append({"tenant_id": tid, "error": str(exc)})
+        finally:
+            reset_tenant_context(token)
+
+    return {
+        "checked_at": fs_utcnow().isoformat(),
+        "tenants_processed": len(summary),
+        "summary": summary,
     }
 
 

@@ -29,7 +29,11 @@ Executa, em sequencia:
      em tenants/hubloc/audit_metrics/usage_{YYYY-MM} e tambem o endpoint
      GET /api/wa/usage/current-month. Confirma inbound_received >= 4
      (4 webhooks disparados no passo 4) e estrutura de retorno.
-  9. Imprime relatorio.
+  9. (Fase 2.10.3) POST /api/internal/cron/health-check com header
+     X-Cron-Secret. Itera tenants ativos, grava
+     tenants/{tid}/health_status/current. Valida que doc do hubloc tem
+     channels_total >= 2 (canais e2e 100/200) e per_channel populado.
+  10. Imprime relatorio.
 
 Uso (local com gcloud auth ja configurado):
     python -m scripts.e2e_test_staging
@@ -271,6 +275,32 @@ def http_get_authed(path: str, id_token: str) -> tuple[int, dict | str]:
             return e.code, raw
 
 
+def http_post_cron(path: str, cron_secret: str, body: dict | None = None) -> tuple[int, dict | str]:
+    """POST sem Firebase auth, com header X-Cron-Secret (Fase 2.10.3)."""
+    url = STAGING_URL + path
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Cron-Secret": cron_secret,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
 # ---------------------------------------------------------------------------
 # Firestore helpers (lazy import — depende do path)
 # ---------------------------------------------------------------------------
@@ -298,7 +328,7 @@ def get_clients():
 # ---------------------------------------------------------------------------
 
 def step_wipe(c) -> None:
-    print(_bold("\n[1/8] Wipe do tenant hubloc + canais fake"))
+    print(_bold("\n[1/9] Wipe do tenant hubloc + canais fake"))
     client = c["client"]
     coll_name = c["coll_name"]
     utcnow = c["utcnow"]
@@ -339,7 +369,7 @@ def step_wipe(c) -> None:
 
 
 def step_create_channels(c) -> None:
-    print(_bold("\n[2/8] Criando 2 canais ficticios para teste"))
+    print(_bold("\n[2/9] Criando 2 canais ficticios para teste"))
     utcnow = c["utcnow"]
     flat_doc = c["flat_doc"]
 
@@ -386,7 +416,7 @@ def step_create_channels(c) -> None:
 
 
 def step_wait_cache():
-    print(_bold("\n[3/8] Aguardando 70s para cache de canais reciclar no Cloud Run"))
+    print(_bold("\n[3/9] Aguardando 70s para cache de canais reciclar no Cloud Run"))
     print(f"  cache TTL = 60s; aguardamos um pouco a mais...")
     for remaining in range(70, 0, -10):
         print(f"  {remaining}s...", end="\r")
@@ -444,7 +474,7 @@ def make_payload(phone_number_id: str, wa_id: str, profile_name: str, msg_id: st
 
 
 def step_send_webhooks(secret: str) -> None:
-    print(_bold("\n[4/8] Disparando 4 webhooks Meta-shape"))
+    print(_bold("\n[4/9] Disparando 4 webhooks Meta-shape"))
     wa_x = "5531777771111"
     wa_y = "5531777772222"
 
@@ -467,7 +497,7 @@ def step_send_webhooks(secret: str) -> None:
 
 
 def step_verify(c) -> int:
-    print(_bold("\n[5/8] Verificando estado final dos webhooks no Firestore"))
+    print(_bold("\n[5/9] Verificando estado final dos webhooks no Firestore"))
     coll_name = c["coll_name"]
     client = c["client"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -537,7 +567,7 @@ def _conv_doc(c, conv_id: str):
 def step_post_mark_read(c, id_token: str) -> int:
     """Cutover Fase 2C: POST /api/wa/conversation/{id}/read marca leitura
     de uma thread especifica e nao das outras do mesmo contato."""
-    print(_bold("\n[6/8] POST /api/wa/conversation/{id}/read (cutover Fase 2C)"))
+    print(_bold("\n[6/9] POST /api/wa/conversation/{id}/read (cutover Fase 2C)"))
     coll_name = c["coll_name"]
     client = c["client"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -597,7 +627,7 @@ def step_post_send_validation(c, id_token: str) -> int:
     """Cutover Fase 2C: POST /api/wa/send com conversation_id inexistente
     deve retornar 404, provando que _resolve_send_target rejeita antes de
     chamar Meta. Caminho feliz nao testado (canais fake, tokens fake)."""
-    print(_bold("\n[7/8] POST /api/wa/send com conversation_id invalido (cutover Fase 2C)"))
+    print(_bold("\n[7/9] POST /api/wa/send com conversation_id invalido (cutover Fase 2C)"))
 
     bad_conv = "9999__inexistente"
     status, payload = http_post_authed(
@@ -629,7 +659,7 @@ def step_validate_usage(c, id_token: str) -> int:
       tenants/hubloc/audit_metrics/usage_{YYYY-MM}.inbound_received >= 4
     Tambem exercita GET /api/wa/usage/current-month e compara.
     """
-    print(_bold("\n[8/8] Validando usage_{YYYY_MM} per-tenant (Fase 2.10.4)"))
+    print(_bold("\n[8/9] Validando usage_{YYYY_MM} per-tenant (Fase 2.10.4)"))
     coll_name = c["coll_name"]
     client = c["client"]
     utcnow = c["utcnow"]
@@ -684,6 +714,67 @@ def step_validate_usage(c, id_token: str) -> int:
     return 0
 
 
+def step_cron_health_check(c) -> int:
+    """Fase 2.10.3: cron health-check.
+
+    POST /api/internal/cron/health-check com header X-Cron-Secret. Itera
+    tenants ativos, grava tenants/{tid}/health_status/current. Valida
+    estrutura do doc do hubloc apos a chamada.
+    """
+    print(_bold("\n[9/9] POST /api/internal/cron/health-check (Fase 2.10.3)"))
+    cron_secret = get_env_or_cloud_run("INTERNAL_CRON_SECRET")
+    if not cron_secret:
+        print(_yellow(
+            "  [skip] INTERNAL_CRON_SECRET indisponivel no Cloud Run env nem local. "
+            "Defina via gcloud run services update castro-crm-staging "
+            "--update-env-vars INTERNAL_CRON_SECRET=..."
+        ))
+        return 0  # skip nao falha
+
+    status, payload = http_post_cron("/api/internal/cron/health-check", cron_secret)
+    if status != 200:
+        print(_red(f"  ✗ POST status={status} payload={payload}"))
+        return 1
+    print(f"  ✓ POST status=200 tenants_processed={payload.get('tenants_processed')}")
+    print(f"  summary: {payload.get('summary')}")
+
+    coll_name = c["coll_name"]
+    client = c["client"]
+    hubloc = client.collection(coll_name("tenants")).document("hubloc")
+    snap = hubloc.collection("health_status").document("current").get()
+    if not snap.exists:
+        print(_red("  ✗ tenants/hubloc/health_status/current nao existe pos-cron"))
+        return 1
+    data = snap.to_dict() or {}
+    channels_total = int(data.get("channels_total") or 0)
+    per_channel = data.get("per_channel") or []
+    print(f"  doc tenants/hubloc/health_status/current:")
+    print(f"    channels_total={channels_total}, "
+          f"channels_pending_payment={data.get('channels_pending_payment')}, "
+          f"tokens_expiring_soon={data.get('tokens_expiring_soon')}")
+    for ch in per_channel:
+        print(f"    channel_id={ch.get('channel_id')} type={ch.get('channel_type')} "
+              f"status={ch.get('payment_method_status')} error={ch.get('error') or '-'}")
+
+    failures = []
+    if channels_total < 2:
+        failures.append(
+            f"channels_total esperado>=2 (canais e2e 100/200) obtido={channels_total}"
+        )
+    if not per_channel:
+        failures.append("per_channel vazio")
+    if not data.get("checked_at"):
+        failures.append("checked_at ausente")
+
+    if failures:
+        print(_red("  ✗ FALHAS:"))
+        for f in failures:
+            print(_red(f"    - {f}"))
+        return 1
+    print(_green("  ✓ health_status gravado com per_channel coerente"))
+    return 0
+
+
 def main() -> int:
     print(_bold(f"E2E test against {STAGING_URL}"))
     secret = get_app_secret()
@@ -723,6 +814,11 @@ def main() -> int:
     if rc8 != 0:
         print(_red(_bold("\n✗ E2E FAILED (passo 8 usage_{YYYY_MM})")))
         return rc8
+
+    rc9 = step_cron_health_check(c)
+    if rc9 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 9 cron health-check)")))
+        return rc9
 
     print(_green(_bold("\n✓ E2E PASSED")))
     return 0

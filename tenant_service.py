@@ -61,11 +61,17 @@ _SLUG_RE = re.compile(r"^[a-z][a-z0-9\-]{2,63}$")
 
 _lock = threading.Lock()
 _tenants_by_id: dict[str, dict] = {}
-_last_refresh: float = 0
+# None = cache nunca foi populado (forca refresh na primeira call). Usar
+# valor numerico inicial 0 era bug: time.monotonic() retorna seconds desde
+# o container boot — pequeno na primeira call — entao 0 - 0.5 < 60 e o
+# refresh nao era disparado, deixando o cache vazio ate o TTL expirar.
+_last_refresh: float | None = None
 _CACHE_TTL_SECONDS = 60
 
 
 def _needs_refresh() -> bool:
+    if _last_refresh is None:
+        return True
     return time.monotonic() - _last_refresh > _CACHE_TTL_SECONDS
 
 
