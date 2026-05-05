@@ -113,8 +113,9 @@ Commit `a8566b0` no branch `develop` (push feito). Deploy ativo.
 
 ### 1.6 Documentação
 
-- `docs/COEXISTENCE_GUIDE.md` ampliado com pré-requisitos manuais e tabela
-  de troubleshooting.
+- Guia técnico de Coexistence (pré-requisitos manuais e troubleshooting)
+  arquivado junto com a reorganização de `docs/`. Ponto de partida para
+  contribuidores hoje: este plano + `docs/APP_REVIEW_SCREENCAST_SCRIPT.md`.
 
 ---
 

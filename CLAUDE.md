@@ -154,7 +154,5 @@ implementar e proponha um caminho alternativo conforme.
 
 - [docs/PLANO_COEXISTENCE_REFATORACAO.md](docs/PLANO_COEXISTENCE_REFATORACAO.md) — plano
   arquitetural ativo (Fases 1–4).
-- [docs/COEXISTENCE_GUIDE.md](docs/COEXISTENCE_GUIDE.md) — guia técnico Coexistence + troubleshooting.
 - [docs/APP_REVIEW_SCREENCAST_SCRIPT.md](docs/APP_REVIEW_SCREENCAST_SCRIPT.md) — roteiro do screencast Meta App Review.
-- [docs/GUIA_USUARIOS_TESTE.md](docs/GUIA_USUARIOS_TESTE.md) — provisionamento de usuários de teste.
-- [docs/SISTEMA_COMPLETO.md](SISTEMA_COMPLETO.md) — overview funcional.
+- [SISTEMA_COMPLETO.md](SISTEMA_COMPLETO.md) — overview funcional gerado por `scripts/build_sistema_completo.py`.
