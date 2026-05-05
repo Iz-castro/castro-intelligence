@@ -209,16 +209,27 @@ def create_channel(
     verified_name: str = "",
     quality_rating: str = "",
     webhook_subscribed: bool = False,
+    tenant_id: str | None = None,
 ) -> int:
-    """Cria um novo canal e retorna o ID."""
+    """Cria um novo canal e retorna o ID.
+
+    Tambem popula o indice global `phone_routing/{phone_number_id}` quando
+    `phone_number_id` esta disponivel — permite ao webhook resolver
+    tenant em O(1) sem varrer canais por tenant.
+    """
     channel_id = next_sequence("channels")
     now = utcnow()
+    phone_id_norm = str(phone_number_id).strip()
+    # Resolve tenant: prioridade explicito > contexto atual > 'hubloc'.
+    if not tenant_id:
+        from firestore_common import get_tenant_context
+        tenant_id = get_tenant_context() or "hubloc"
     document("channels", channel_id).set({
         "id": channel_id,
         "channel_type": channel_type,
         "label": label,
         "waba_id": str(waba_id).strip(),
-        "phone_number_id": str(phone_number_id).strip(),
+        "phone_number_id": phone_id_norm,
         "display_phone_number": display_phone_number,
         "access_token": access_token,
         "token_expires_at": token_expires_at,
@@ -234,11 +245,22 @@ def create_channel(
         "messaging_limit_tier": messaging_limit_tier,
         "verified_name": verified_name,
         "quality_rating": quality_rating,
+        "tenant_id": str(tenant_id),
         "created_at": now,
         "updated_at": now,
     })
+    if phone_id_norm:
+        try:
+            from tenant_service import upsert_phone_routing
+            upsert_phone_routing(phone_id_norm, str(tenant_id), channel_id)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao popular phone_routing | channel=%s phone=%s tenant=%s err=%s",
+                channel_id, phone_id_norm, tenant_id, exc,
+            )
     refresh_channels()
-    logger.info("Channel created: id=%d type=%s label=%s phone=%s", channel_id, channel_type, label, phone_number_id)
+    logger.info("Channel created: id=%d type=%s label=%s phone=%s tenant=%s",
+                channel_id, channel_type, label, phone_id_norm, tenant_id)
     return channel_id
 
 
@@ -326,8 +348,20 @@ def refresh_coexistence_token(channel_id: int) -> bool:
 
 
 def deactivate_channel(channel_id: int) -> bool:
-    """Desativa um canal."""
-    return update_channel(channel_id, is_active=False)
+    """Desativa um canal e remove o indice phone_routing correspondente."""
+    channel = get_channel(channel_id)
+    phone_id = str((channel or {}).get("phone_number_id", "")).strip()
+    ok = update_channel(channel_id, is_active=False)
+    if phone_id:
+        try:
+            from tenant_service import remove_phone_routing
+            remove_phone_routing(phone_id)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao remover phone_routing | channel=%s phone=%s err=%s",
+                channel_id, phone_id, exc,
+            )
+    return ok
 
 
 def get_channel_by_id_from_db(channel_id: int) -> dict | None:
@@ -377,6 +411,17 @@ def bootstrap_default_channel() -> int | None:
             )
         else:
             logger.info("Bootstrap channel: canal default ja existe (id=%s)", existing["id"])
+        # Garante que phone_routing aponta para o canal default ate quando
+        # ele foi criado antes da Fase 2C (sem indice).
+        eff_phone_id = str(updates.get("phone_number_id") or existing.get("phone_number_id") or "").strip()
+        if eff_phone_id:
+            try:
+                from firestore_common import get_tenant_context
+                from tenant_service import upsert_phone_routing
+                tenant_id = existing.get("tenant_id") or get_tenant_context() or "hubloc"
+                upsert_phone_routing(eff_phone_id, str(tenant_id), existing["id"])
+            except Exception as exc:
+                logger.warning("Bootstrap channel: falha ao backfill phone_routing: %s", exc)
         return existing["id"]
 
     channel_id = create_channel(

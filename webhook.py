@@ -27,23 +27,34 @@ from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
 from bot_service import process_bot_message
 from firestore_common import set_tenant_context, reset_tenant_context
+from tenant_service import lookup_phone_routing
 
 logger = logging.getLogger("castro_crm.webhook")
 
-# Tenant default usado pelo webhook enquanto canais ainda nao carregam
-# tenant_id explicito. Substituir por lookup_phone_routing() quando
-# canais migrarem para tenants/{id}/channels (sub-fase futura).
+# Tenant default usado quando o webhook recebe payload sem phone_number_id
+# valido OU quando phone_routing ainda nao tem entrada pra esse numero.
+# Sub-fase: enquanto canais sao flat, canal default pertence a 'hubloc'.
 _WEBHOOK_DEFAULT_TENANT = "hubloc"
 
 
-def _resolve_webhook_tenant(channel):
-    """Resolve tenant_id a partir do canal (ou phone_routing futuro).
+def _resolve_webhook_tenant(channel, phone_number_id: str | None = None):
+    """Resolve tenant_id pra um payload de webhook.
 
-    Hoje retorna sempre 'hubloc' (default). Quando channels carregarem
-    `tenant_id` ou phone_routing for populado, esta funcao passa a
-    consultar essas fontes. O webhook precisa setar tenant_context para
-    que toda a cadeia de save_wa_message etc. opere na subcolecao certa.
+    Ordem de preferencia (Fase 2C):
+      1. `phone_routing[phone_number_id]` se phone_number_id for fornecido
+         e existir indice (caminho oficial pra multi-tenant).
+      2. `channel.tenant_id` denormalizado no doc do canal (fallback
+         enquanto canais nao migram pra subcolecao).
+      3. `_WEBHOOK_DEFAULT_TENANT` (single-tenant Hubloc).
     """
+    if phone_number_id:
+        try:
+            routing = lookup_phone_routing(str(phone_number_id))
+        except Exception as exc:
+            logger.warning("phone_routing lookup falhou para %s: %s", phone_number_id, exc)
+            routing = None
+        if routing and routing.get("tenant_id"):
+            return str(routing["tenant_id"])
     if channel and channel.get("tenant_id"):
         return str(channel["tenant_id"])
     return _WEBHOOK_DEFAULT_TENANT
@@ -164,8 +175,13 @@ def _resolve_webhook_channel(value):
     return get_default_channel()
 
 
-async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str):
-    """Envia resposta do bot via WhatsApp Cloud API e salva no banco."""
+async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str,
+                          channel_id=None, channel_owner_user_id=None):
+    """Envia resposta do bot via WhatsApp Cloud API e salva no banco.
+
+    sender_user_id=None marca a mensagem como originada pelo bot
+    automatico (nao por operador humano).
+    """
     import httpx
     from config import GRAPH_API_BASE
     from database import save_wa_message
@@ -193,6 +209,9 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             status="sent" if resp.status_code == 200 else "failed",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=None,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+            sender_user_id=None,
         )
         if resp.status_code == 200:
             logger.info("[BOT] Resposta enviada para %s | contact=%d", wa_id, contact_id)
@@ -217,8 +236,9 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
     # Resolve tenant uma unica vez no inicio do payload — todos os
     # changes deste payload vem do mesmo phone_number_id (mesma WABA).
     first_value = ((payload.get("entry") or [{}])[0].get("changes") or [{}])[0].get("value", {})
+    first_phone_id = str((first_value.get("metadata") or {}).get("phone_number_id") or "").strip()
     first_channel = _resolve_webhook_channel(first_value)
-    tenant_id = _resolve_webhook_tenant(first_channel)
+    tenant_id = _resolve_webhook_tenant(first_channel, phone_number_id=first_phone_id)
     ctx_token = set_tenant_context(tenant_id)
     try:
         await _process_webhook_payload_inner(payload, ws_notify_callback)
@@ -404,7 +424,8 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             content = f"[{msg_type}]"
             logger.info("Tipo de mensagem nao tratado: %s", msg_type)
 
-        # Persistir
+        # Persistir. sender_user_id=None em inbound (cliente final).
+        # channel_owner_user_id captura o dono do numero (relevante p/ coexistence).
         db_id = save_wa_message(
             wa_message_id=msg_id,
             contact_id=contact_id,
@@ -421,6 +442,8 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             timestamp_wa=ts_iso,
             channel_id=channel_id,
             phone_number_id=channel_phone_id,
+            channel_owner_user_id=channel_owner_id,
+            sender_user_id=None,
             **reply_fields,
         )
 
@@ -444,7 +467,11 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 if bot_reply:
                     _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
                     _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
-                    await _send_bot_reply(wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id)
+                    await _send_bot_reply(
+                        wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
+                        channel_id=channel_id,
+                        channel_owner_user_id=channel_owner_id,
+                    )
 
         # -- Lead convertido: capturar rating ou rerouting --
         _contact_fresh = get_wa_contact(contact_id)
@@ -579,6 +606,14 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
     metadata = value.get("metadata", {})
     echoes = value.get("message_echoes", [])
 
+    # Em smb_message_echoes, "quem enviou" foi o proprio dono do numero
+    # operando o WhatsApp do celular — channel_owner_user_id e sender_user_id
+    # apontam pra mesma pessoa.
+    channel_id_outer = channel.get("id") if channel else None
+    channel_owner_outer = channel.get("owner_user_id") if channel else None
+    channel_phone_id_outer = str(channel.get("phone_number_id", "")) if channel else ""
+    channel_type_outer = str(channel.get("channel_type", "")) if channel else ""
+
     for echo in echoes:
         business_phone = echo.get("from", "")
         customer_phone = echo.get("to", "")
@@ -593,7 +628,13 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
 
         # Normalizar telefone do cliente e criar/atualizar contato
         normalized_phone = normalize_br_phone(customer_phone)
-        contact_id = upsert_wa_contact(normalized_phone, "")
+        contact_id = upsert_wa_contact(
+            normalized_phone, "",
+            channel_id=channel_id_outer,
+            phone_number_id=channel_phone_id_outer,
+            source_channel_type=channel_type_outer,
+            auto_assign_user_id=channel_owner_outer if channel_type_outer == CHANNEL_TYPE_COEXISTENCE else None,
+        )
 
         # Extrair conteudo conforme tipo de mensagem
         content = ""
@@ -697,6 +738,10 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             filename=filename,
             status="sent",
             timestamp_wa=ts_iso,
+            channel_id=channel_id_outer,
+            phone_number_id=channel_phone_id_outer,
+            channel_owner_user_id=channel_owner_outer,
+            sender_user_id=channel_owner_outer,
         )
 
         logger.info(
@@ -797,6 +842,12 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
     if not history_entries:
         return
 
+    # Channel context para enriquecer contatos/mensagens importadas.
+    hist_channel_id = channel.get("id") if channel else None
+    hist_channel_owner = channel.get("owner_user_id") if channel else None
+    hist_channel_phone = str(channel.get("phone_number_id", "")) if channel else ""
+    hist_channel_type = str(channel.get("channel_type", "")) if channel else ""
+
     for hist in history_entries:
         # Verificar se e um erro (empresa recusou compartilhar historico)
         errors = hist.get("errors", [])
@@ -824,7 +875,13 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 continue
 
             normalized_thread_phone = normalize_br_phone(thread_phone)
-            contact_id = upsert_wa_contact(normalized_thread_phone, "")
+            contact_id = upsert_wa_contact(
+                normalized_thread_phone, "",
+                channel_id=hist_channel_id,
+                phone_number_id=hist_channel_phone,
+                source_channel_type=hist_channel_type,
+                auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+            )
             messages = thread.get("messages", [])
 
             for msg in messages:
@@ -851,6 +908,10 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                         content="[Midia do historico - aguardando]",
                         status=msg_status or "delivered",
                         timestamp_wa=ts_iso,
+                        channel_id=hist_channel_id,
+                        phone_number_id=hist_channel_phone,
+                        channel_owner_user_id=hist_channel_owner,
+                        sender_user_id=hist_channel_owner if direction == "outbound" else None,
                     )
                     continue
 
@@ -955,6 +1016,10 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     filename=filename,
                     status=msg_status or ("received" if direction == "inbound" else "sent"),
                     timestamp_wa=ts_iso,
+                    channel_id=hist_channel_id,
+                    phone_number_id=hist_channel_phone,
+                    channel_owner_user_id=hist_channel_owner,
+                    sender_user_id=hist_channel_owner if direction == "outbound" else None,
                 )
 
             logger.info(
