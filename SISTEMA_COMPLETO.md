@@ -2280,16 +2280,27 @@ def create_channel(
     verified_name: str = "",
     quality_rating: str = "",
     webhook_subscribed: bool = False,
+    tenant_id: str | None = None,
 ) -> int:
-    """Cria um novo canal e retorna o ID."""
+    """Cria um novo canal e retorna o ID.
+
+    Tambem popula o indice global `phone_routing/{phone_number_id}` quando
+    `phone_number_id` esta disponivel — permite ao webhook resolver
+    tenant em O(1) sem varrer canais por tenant.
+    """
     channel_id = next_sequence("channels")
     now = utcnow()
+    phone_id_norm = str(phone_number_id).strip()
+    # Resolve tenant: prioridade explicito > contexto atual > 'hubloc'.
+    if not tenant_id:
+        from firestore_common import get_tenant_context
+        tenant_id = get_tenant_context() or "hubloc"
     document("channels", channel_id).set({
         "id": channel_id,
         "channel_type": channel_type,
         "label": label,
         "waba_id": str(waba_id).strip(),
-        "phone_number_id": str(phone_number_id).strip(),
+        "phone_number_id": phone_id_norm,
         "display_phone_number": display_phone_number,
         "access_token": access_token,
         "token_expires_at": token_expires_at,
@@ -2305,11 +2316,22 @@ def create_channel(
         "messaging_limit_tier": messaging_limit_tier,
         "verified_name": verified_name,
         "quality_rating": quality_rating,
+        "tenant_id": str(tenant_id),
         "created_at": now,
         "updated_at": now,
     })
+    if phone_id_norm:
+        try:
+            from tenant_service import upsert_phone_routing
+            upsert_phone_routing(phone_id_norm, str(tenant_id), channel_id)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao popular phone_routing | channel=%s phone=%s tenant=%s err=%s",
+                channel_id, phone_id_norm, tenant_id, exc,
+            )
     refresh_channels()
-    logger.info("Channel created: id=%d type=%s label=%s phone=%s", channel_id, channel_type, label, phone_number_id)
+    logger.info("Channel created: id=%d type=%s label=%s phone=%s tenant=%s",
+                channel_id, channel_type, label, phone_id_norm, tenant_id)
     return channel_id
 
 
@@ -2397,8 +2419,20 @@ def refresh_coexistence_token(channel_id: int) -> bool:
 
 
 def deactivate_channel(channel_id: int) -> bool:
-    """Desativa um canal."""
-    return update_channel(channel_id, is_active=False)
+    """Desativa um canal e remove o indice phone_routing correspondente."""
+    channel = get_channel(channel_id)
+    phone_id = str((channel or {}).get("phone_number_id", "")).strip()
+    ok = update_channel(channel_id, is_active=False)
+    if phone_id:
+        try:
+            from tenant_service import remove_phone_routing
+            remove_phone_routing(phone_id)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao remover phone_routing | channel=%s phone=%s err=%s",
+                channel_id, phone_id, exc,
+            )
+    return ok
 
 
 def get_channel_by_id_from_db(channel_id: int) -> dict | None:
@@ -2448,6 +2482,17 @@ def bootstrap_default_channel() -> int | None:
             )
         else:
             logger.info("Bootstrap channel: canal default ja existe (id=%s)", existing["id"])
+        # Garante que phone_routing aponta para o canal default ate quando
+        # ele foi criado antes da Fase 2C (sem indice).
+        eff_phone_id = str(updates.get("phone_number_id") or existing.get("phone_number_id") or "").strip()
+        if eff_phone_id:
+            try:
+                from firestore_common import get_tenant_context
+                from tenant_service import upsert_phone_routing
+                tenant_id = existing.get("tenant_id") or get_tenant_context() or "hubloc"
+                upsert_phone_routing(eff_phone_id, str(tenant_id), existing["id"])
+            except Exception as exc:
+                logger.warning("Bootstrap channel: falha ao backfill phone_routing: %s", exc)
         return existing["id"]
 
     channel_id = create_channel(
@@ -3809,6 +3854,81 @@ def get_conversations_by_contact(contact_id):
     return _normalize_many(rows)
 
 
+def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transferred_by, reason="", summary=""):
+    """Transfere uma conversation (thread). Atualiza apenas a conversation
+    e contact (assigned_to compartilhado por enquanto). Loga transferencia
+    com referencia a conversation_id E contact_id.
+
+    Retorna {from_user_id, to_user_id, contact_id} ou None se nao achar.
+    """
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        return None
+    contact_id = conv.get("contact_id")
+    from_user = conv.get("assigned_to")
+    from_dept = conv.get("department_id")
+    to_user = _get_doc("users", to_user_id) if to_user_id else None
+
+    document("wa_conversations", conversation_id).set({
+        "assigned_to": to_user_id,
+        "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
+        "department_id": to_department_id,
+    }, merge=True)
+    # Espelho no contato pra views legadas que ainda leem dali
+    if contact_id is not None:
+        document("wa_contacts", contact_id).set({
+            "assigned_to": to_user_id,
+            "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
+            "department_id": to_department_id,
+        }, merge=True)
+
+    transfer_id = next_sequence("wa_transfer_log")
+    document("wa_transfer_log", transfer_id).set({
+        "id": transfer_id,
+        "conversation_id": conversation_id,
+        "contact_id": contact_id,
+        "contact_doc_id": str(contact_id) if contact_id is not None else "",
+        "from_user_id": from_user,
+        "to_user_id": to_user_id,
+        "to_user_uid": (to_user or {}).get("firebase_uid", ""),
+        "from_department_id": from_dept,
+        "to_department_id": to_department_id,
+        "department_id": to_department_id,
+        "reason": reason or "",
+        "summary": summary or "",
+        "transferred_by": transferred_by,
+        "created_at": utcnow(),
+    })
+    return {"from_user_id": from_user, "to_user_id": to_user_id, "contact_id": contact_id}
+
+
+def mark_wa_conversation_read_by_id(conversation_id):
+    """Marca como lidas as mensagens inbound de uma conversation especifica.
+    Usa filtro por conversation_id (Fase 2C) — nao colide entre threads do
+    mesmo contato em canais diferentes."""
+    q = (
+        collection("wa_messages")
+        .where("conversation_id", "==", conversation_id)
+        .where("direction", "==", "inbound")
+        .where("status", "==", "received")
+    )
+    batch = get_firestore_client().batch()
+    count = 0
+    total_updated = 0
+    for snapshot in q.stream():
+        batch.set(snapshot.reference, {"status": "read"}, merge=True)
+        count += 1
+        total_updated += 1
+        if count >= 400:
+            batch.commit()
+            batch = get_firestore_client().batch()
+            count = 0
+    if count > 0:
+        batch.commit()
+    document("wa_conversations", conversation_id).set({"unread_count": 0}, merge=True)
+    return total_updated
+
+
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
                       auto_assign_user_id=None):
@@ -4189,7 +4309,8 @@ def get_contacts_by_assigned_user(user_id):
     return _normalize_many(rows)
 
 
-def insert_transfer_system_message(contact_id, content, operator_id=None):
+def insert_transfer_system_message(contact_id, content, operator_id=None,
+                                   conversation_id=None, channel_id=None):
     return save_wa_message(
         wa_message_id=f"sys_{utcnow().isoformat()}_{contact_id}",
         contact_id=contact_id,
@@ -4199,6 +4320,9 @@ def insert_transfer_system_message(contact_id, content, operator_id=None):
         status="delivered",
         timestamp_wa=utcnow().isoformat(),
         operator_id=operator_id,
+        sender_user_id=operator_id,
+        conversation_id=conversation_id,
+        channel_id=channel_id,
     )
 
 
@@ -4234,7 +4358,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     status="received", timestamp_wa="", operator_id=None,
                     reply_to_message_id=None, reply_to_preview="", reply_to_sender_name="",
                     channel_id=None, phone_number_id="",
-                    is_rating_message=False, visibility="all"):
+                    is_rating_message=False, visibility="all",
+                    conversation_id=None,
+                    channel_owner_user_id=None, sender_user_id=None):
+    """Persiste mensagem WhatsApp.
+
+    Auditoria coexistence (Fase 2C):
+      - `channel_owner_user_id`: dono fisico do numero (ex.: operador X que
+        conectou o WhatsApp pessoal dele via coexistence). Vem de
+        `channel.owner_user_id` no momento do envio/recebimento.
+      - `sender_user_id`: operador que efetivamente digitou/enviou (em
+        outbound). None em inbound. Permite distinguir, em transferencias
+        coexistence, quem digitou vs quem e o dono do numero.
+
+    `conversation_id` pode ser passado explicitamente (caller ja resolveu
+    a thread). Caso contrario, e derivado de (channel_id, contact.wa_id).
+    """
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
         if existing:
@@ -4264,13 +4403,15 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
     eff_wa_id = (contact or {}).get("wa_id", "")
     eff_phone_number_id = phone_number_id or (contact or {}).get("phone_number_id", "")
-    conversation_id = _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
+    eff_conversation_id = conversation_id or (
+        _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
+    )
     document("wa_messages", message_id).set({
         "id": message_id,
         "wa_message_id": effective_wa_message_id,
         "contact_id": contact_id,
         "contact_doc_id": str(contact_id),
-        "conversation_id": conversation_id,
+        "conversation_id": eff_conversation_id,
         "direction": direction,
         "msg_type": msg_type,
         "content": content or "",
@@ -4282,6 +4423,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "filename": filename or "",
         "status": status or "received",
         "operator_id": operator_id,
+        "sender_user_id": sender_user_id,
+        "channel_owner_user_id": channel_owner_user_id,
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
         "department_id": (contact or {}).get("department_id"),
@@ -5461,11 +5604,12 @@ from config import (
 from database import (
     init_database, get_user_by_id, get_all_users,
     get_all_wa_contacts, get_wa_conversation,
-    mark_wa_conversation_read, save_wa_message, get_wa_contact,
+    mark_wa_conversation_read, mark_wa_conversation_read_by_id,
+    save_wa_message, get_wa_contact,
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
     get_department_by_id, update_department, deactivate_department,
-    assign_wa_contact, get_transfer_history,
+    assign_wa_contact, assign_wa_conversation, get_transfer_history,
     return_contact_to_bot, get_contacts_by_assigned_user,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user,
@@ -5475,6 +5619,7 @@ from database import (
     get_wa_message_by_id, update_wa_message_transcription,
     create_manual_wa_contact, update_wa_contact_declared_name,
     mark_message_corrected,
+    get_wa_conversation_by_id, upsert_wa_conversation,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -5581,7 +5726,11 @@ if os.path.isdir(FRONTEND_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS_DIR), name="frontend-assets")
 
 class WaSendRequest(BaseModel):
-    contact_id: int
+    # Fase 2C: conversation_id e o canonico (identifica thread channel+wa_id).
+    # contact_id continua aceito enquanto o frontend nao migrou todas as views
+    # — backend resolve para (conversation, contact) via _resolve_send_target.
+    conversation_id: str | None = None
+    contact_id: int | None = None
     content: str
     reply_to_message_id: int | None = None
     reply_to_preview: str = ""
@@ -5604,7 +5753,8 @@ class WaSendRequest(BaseModel):
 
 
 class WaSendLocationRequest(BaseModel):
-    contact_id: int
+    conversation_id: str | None = None
+    contact_id: int | None = None
     latitude: float
     longitude: float
     name: str = ""
@@ -6345,7 +6495,9 @@ _24H = timedelta(hours=24)
 
 
 def _check_send_permission(contact: dict, current_user: dict):
-    """Raises 403 if operator cannot send to this contact."""
+    """LEGADO. Substituido por _check_conv_send_permission (atua na conversation).
+    Mantido apenas como fallback caso algum codigo legado interno chame.
+    """
     assigned = contact.get("assigned_to")
     if assigned and assigned != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
@@ -6371,34 +6523,35 @@ def _check_24h_window(contact: dict):
         )
 
 
-def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
-    """Resolve credenciais do canal a partir do contato.
+def _maybe_refresh_coex_token(channel: dict | None) -> None:
+    """Renova proativamente token coexistence se faltar <5min."""
+    if not channel:
+        return
+    from channel_service import CHANNEL_TYPE_COEXISTENCE, refresh_coexistence_token
 
-    Tenta channel_id do contato, senao usa canal default.
-    Para canais coexistence, tenta refresh proativo se o token vai expirar
-    em <5min — evita falhas silenciosas no envio.
-    Returns (token, phone_number_id, graph_api_base).
-    """
-    from channel_service import (
-        CHANNEL_TYPE_COEXISTENCE, get_channel, get_send_credentials,
-        refresh_coexistence_token,
-    )
+    if channel.get("channel_type") != CHANNEL_TYPE_COEXISTENCE:
+        return
+    expires_at_raw = channel.get("token_expires_at")
+    if not expires_at_raw:
+        return
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= expires_at - timedelta(minutes=5):
+            refresh_coexistence_token(int(channel["id"]))
+    except (ValueError, TypeError):
+        logger.warning(
+            "Canal coexistence %s com token_expires_at invalido: %s",
+            channel.get("id"), expires_at_raw,
+        )
 
-    channel_id = contact.get("channel_id")
+
+def _resolve_channel_creds_by_id(channel_id: int | None) -> tuple[str, str, str]:
+    """Resolve credenciais (token, phone_id, base) a partir de um channel_id.
+    Refresh proativo do token coexistence quando aplicavel."""
+    from channel_service import get_channel, get_send_credentials
+
     if channel_id is not None:
-        channel = get_channel(channel_id)
-        if channel and channel.get("channel_type") == CHANNEL_TYPE_COEXISTENCE:
-            expires_at_raw = channel.get("token_expires_at")
-            if expires_at_raw:
-                try:
-                    expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
-                    if datetime.now(timezone.utc) >= expires_at - timedelta(minutes=5):
-                        refresh_coexistence_token(int(channel_id))
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Canal coexistence %s com token_expires_at invalido: %s",
-                        channel_id, expires_at_raw,
-                    )
+        _maybe_refresh_coex_token(get_channel(channel_id))
 
     try:
         return get_send_credentials(channel_id)
@@ -6409,16 +6562,98 @@ def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
         raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
 
 
+def _resolve_send_target(
+    conversation_id: str | None,
+    contact_id: int | None,
+) -> tuple[dict, dict, dict | None]:
+    """Resolve (conversation, contact, channel) para um endpoint de envio.
+
+    Estrategia Fase 2C:
+      - Se conversation_id: thread e canonica. Carrega conversation, contato
+        derivado dela, canal pelo conversation.channel_id.
+      - Se so contact_id (legado): carrega contato, deriva
+        conversation_id deterministico via (contact.channel_id, contact.wa_id),
+        upserta conversation se nao existir.
+
+    Levanta HTTPException 400/404 quando algo estiver inconsistente.
+    Channel pode ser None quando canal foi removido (envio cai em fallback).
+    """
+    from channel_service import get_channel
+    from database import (
+        get_wa_conversation_by_id, get_wa_contact, upsert_wa_conversation,
+    )
+
+    if conversation_id:
+        conv = get_wa_conversation_by_id(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+        ctc = get_wa_contact(conv.get("contact_id"))
+        if not ctc:
+            raise HTTPException(status_code=404, detail="Contato da conversation nao encontrado")
+        ch = get_channel(conv.get("channel_id")) if conv.get("channel_id") is not None else None
+        return conv, ctc, ch
+
+    if contact_id is None:
+        raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
+
+    ctc = get_wa_contact(contact_id)
+    if not ctc:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    ch_id = ctc.get("channel_id")
+    ch = get_channel(ch_id) if ch_id is not None else None
+    # Garante conversation: necessario pra audit + thread frontend
+    derived_conv_id = upsert_wa_conversation(
+        contact_id=ctc["id"],
+        wa_id=ctc.get("wa_id", ""),
+        channel_id=ch_id,
+        source_channel_type=str(ctc.get("source_channel_type") or ""),
+        phone_number_id=str(ctc.get("phone_number_id") or ""),
+    )
+    conv = get_wa_conversation_by_id(derived_conv_id) or {
+        "id": derived_conv_id,
+        "contact_id": ctc["id"],
+        "wa_id": ctc.get("wa_id", ""),
+        "channel_id": ch_id,
+        "assigned_to": ctc.get("assigned_to"),
+        "department_id": ctc.get("department_id"),
+    }
+    return conv, ctc, ch
+
+
+def _check_conv_send_permission(conversation: dict, current_user: dict):
+    """Permission check baseado na conversation (Fase 2C).
+
+    Bloqueia envio se a thread esta atribuida a outro operador. Sem
+    atribuicao, exige role admin/supervisor (mesma regra anterior, mas
+    por thread em vez de por contato — admite que o mesmo cliente em
+    canais diferentes seja atendido por gente diferente).
+    """
+    assigned = conversation.get("assigned_to")
+    if assigned and assigned != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    if not assigned and current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
+
+
+def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
+    """LEGADO. Resolve credenciais a partir do contato. Mantido para os
+    poucos call-sites que ainda nao migraram para conversation_id (qualify
+    rating template e similares onde a thread vem do contato direto).
+    Novos endpoints devem usar _resolve_send_target + _resolve_channel_creds_by_id.
+    """
+    return _resolve_channel_creds_by_id(contact.get("channel_id"))
+
+
 @app.post("/api/wa/send-location")
 async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Depends(get_current_user)):
-    contact = get_wa_contact(body.contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(body.conversation_id, body.contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
-    reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
     wa_id = contact["wa_id"]
     url = f"{api_base}/{phone_id}/messages"
@@ -6447,7 +6682,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
         content = f"{body.name} {body.address}".strip()
         save_wa_message(
             wa_message_id=wa_msg_id,
-            contact_id=body.contact_id,
+            contact_id=contact["id"],
             direction="outbound",
             msg_type="location",
             content=content,
@@ -6456,6 +6691,10 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
             status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=current_user["id"],
+            channel_id=channel["id"] if channel else conv.get("channel_id"),
+            conversation_id=conv["id"],
+            sender_user_id=current_user["id"],
+            channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
         )
         log_audit(current_user["id"], "WA_SEND_LOCATION", f"Para {wa_id}: {body.latitude},{body.longitude}")
@@ -6474,14 +6713,14 @@ def _maybe_credit_assume_counter(contact: dict, operator_id: int):
 
 @app.post("/api/wa/send")
 async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_user)):
-    contact = get_wa_contact(body.contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(body.conversation_id, body.contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
-    reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
     wa_id = _wa_target(contact["wa_id"])
     url = f"{api_base}/{phone_id}/messages"
@@ -6495,9 +6734,13 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     if resp.status_code == 200:
         wa_msg_id = result.get("messages", [{}])[0].get("id", "")
         save_wa_message(
-            wa_message_id=wa_msg_id, contact_id=body.contact_id, direction="outbound",
+            wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
             msg_type="text", content=body.content, status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
+            channel_id=channel["id"] if channel else conv.get("channel_id"),
+            conversation_id=conv["id"],
+            sender_user_id=current_user["id"],
+            channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
         )
         _maybe_credit_assume_counter(contact, current_user["id"])
@@ -6511,21 +6754,23 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
 
 @app.post("/api/wa/send-media")
 async def wa_send_media(
-    request: Request, contact_id: int = Form(...),
+    request: Request,
+    conversation_id: str | None = Form(None),
+    contact_id: int | None = Form(None),
     caption: str = Form(""), file: UploadFile = File(...),
     reply_to_message_id: int | None = Form(None),
     reply_to_preview: str = Form(""),
     reply_to_sender_name: str = Form(""),
 ):
     current_user = get_current_user(request)
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
-    reply_context = _build_reply_context(contact_id, reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], reply_to_message_id)
 
     file_content = await file.read()
     if len(file_content) > 16 * 1024 * 1024:
@@ -6550,11 +6795,15 @@ async def wa_send_media(
 
     wa_msg_id = send_result.get("wa_message_id", "")
     save_wa_message(
-        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
         msg_type=msg_type, content=caption, media_path=local_result["path"],
         media_mime=mime_type, media_id=media_id, filename=filename,
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+        conversation_id=conv["id"],
+        sender_user_id=current_user["id"],
+        channel_owner_user_id=(channel or {}).get("owner_user_id"),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -6564,7 +6813,10 @@ async def wa_send_media(
 
 @app.post("/api/wa/send-audio")
 async def wa_send_audio(
-    request: Request, contact_id: int = Form(...), file: UploadFile = File(...),
+    request: Request,
+    conversation_id: str | None = Form(None),
+    contact_id: int | None = Form(None),
+    file: UploadFile = File(...),
     reply_to_message_id: int | None = Form(None),
     reply_to_preview: str = Form(""),
     reply_to_sender_name: str = Form(""),
@@ -6573,14 +6825,14 @@ async def wa_send_audio(
     Converte WebM/Opus do navegador para OGG/Opus via FFmpeg."""
     current_user = get_current_user(request)
 
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
-    reply_context = _build_reply_context(contact_id, reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], reply_to_message_id)
 
     raw_content = await file.read()
     if len(raw_content) > 16 * 1024 * 1024:
@@ -6612,11 +6864,15 @@ async def wa_send_audio(
 
     wa_msg_id = send_result.get("wa_message_id", "")
     save_wa_message(
-        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
         msg_type="audio", content="", media_path=local_result["path"],
         media_mime="audio/ogg", media_id=media_id, filename="gravacao.ogg",
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+        conversation_id=conv["id"],
+        sender_user_id=current_user["id"],
+        channel_owner_user_id=(channel or {}).get("owner_user_id"),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -6625,7 +6881,8 @@ async def wa_send_audio(
 
 
 class WaSendTemplateRequest(BaseModel):
-    contact_id: int
+    conversation_id: str | None = None
+    contact_id: int | None = None
     template_name: str = "hello_world"
     language: str = "pt_BR"
     components: list[dict] | None = None  # [{type, sub_type?, index?, parameters: [{type:"text", text:"..."}]}]
@@ -6641,23 +6898,25 @@ async def wa_send_template(
 ):
     # Compat: aceita tanto body JSON quanto query params (legado).
     if body is not None:
+        effective_conversation_id = body.conversation_id
         effective_contact_id = body.contact_id
         effective_template_name = body.template_name or template_name
         effective_language = body.language or language
         components = body.components or []
     else:
         if contact_id is None:
-            raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+            raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
+        effective_conversation_id = None
         effective_contact_id = contact_id
         effective_template_name = template_name
         effective_language = language
         components = []
 
-    contact = get_wa_contact(effective_contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    _check_send_permission(contact, current_user)
-    token, phone_id, api_base = _resolve_channel_creds(contact)
+    conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
+    _check_conv_send_permission(conv, current_user)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     template_payload: dict = {
@@ -6690,10 +6949,14 @@ async def wa_send_template(
         except Exception:
             pass
         save_wa_message(
-            wa_message_id=wa_msg_id, contact_id=effective_contact_id, direction="outbound",
+            wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
             msg_type="template", content=rendered_content,
             status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=current_user["id"],
+            channel_id=channel["id"] if channel else conv.get("channel_id"),
+            conversation_id=conv["id"],
+            sender_user_id=current_user["id"],
+            channel_owner_user_id=(channel or {}).get("owner_user_id"),
         )
         log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
         return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
@@ -6815,11 +7078,16 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
     if original.get("is_corrected"):
         raise HTTPException(status_code=400, detail="Mensagem ja foi corrigida")
 
-    contact_id = original["contact_id"]
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
+    # Resolve thread original — preferimos conversation_id da mensagem
+    # (denormalizado no save_wa_message) para nao confundir threads do
+    # mesmo contato em canais distintos.
+    conv, contact, channel = _resolve_send_target(
+        original.get("conversation_id"),
+        original.get("contact_id"),
+    )
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
     _check_24h_window(contact)
 
     # Enviar nova mensagem como reply da original
@@ -6848,10 +7116,14 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
     original_preview = (original.get("content") or "")[:80]
 
     new_msg_id = save_wa_message(
-        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
         msg_type="text", content=body.new_content, status="sent",
         timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+        conversation_id=conv["id"],
+        sender_user_id=current_user["id"],
+        channel_owner_user_id=(channel or {}).get("owner_user_id"),
         reply_to_message_id=body.message_id,
         reply_to_preview=original_preview,
         reply_to_sender_name=current_user.get("display_name", "Operador"),
@@ -6988,11 +7260,16 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
             if resp.status_code == 200:
                 wa_msg_id = resp_data.get("messages", [{}])[0].get("id", "")
+                from channel_service import get_channel as _get_ch
+                _rating_channel = _get_ch(contact.get("channel_id")) if contact.get("channel_id") is not None else None
                 save_wa_message(
                     wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
                     msg_type="template", content="[avaliacao: responda de 1 a 10]",
                     status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
                     operator_id=current_user["id"],
+                    sender_user_id=current_user["id"],
+                    channel_id=contact.get("channel_id"),
+                    channel_owner_user_id=(_rating_channel or {}).get("owner_user_id"),
                     is_rating_message=True, visibility="admin_only",
                 )
                 result["rating_sent"] = True
@@ -7012,12 +7289,31 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
 @app.post("/api/wa/contact/{contact_id}/read")
 async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_current_user)):
+    """LEGADO: marca todas as mensagens inbound do contato como lidas
+    (cross-channel). Frontend novo deve usar
+    POST /api/wa/conversation/{conversation_id}/read pra zerar unread
+    apenas da thread aberta."""
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if int(contact.get("unread_count", 0) or 0) <= 0:
         return {"status": "ok", "updated_count": 0}
     updated_count = mark_wa_conversation_read(contact_id)
+    return {"status": "ok", "updated_count": updated_count}
+
+
+@app.post("/api/wa/conversation/{conversation_id}/read")
+async def mark_conversation_read(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Zera unread_count da conversation e marca mensagens inbound da
+    thread como lidas. Diferente do endpoint legado por contato, nao
+    afeta unread de outras threads do mesmo cliente em canais distintos.
+    """
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+    if int(conv.get("unread_count", 0) or 0) <= 0:
+        return {"status": "ok", "updated_count": 0}
+    updated_count = mark_wa_conversation_read_by_id(conversation_id)
     return {"status": "ok", "updated_count": updated_count}
 
 
@@ -7255,24 +7551,31 @@ async def wa_contact_detail(contact_id: int, current_user: dict = Depends(get_cu
 @app.post("/api/wa/transfer")
 async def wa_transfer(request: Request, current_user: dict = Depends(get_current_user)):
     body = await request.json()
+    conversation_id = body.get("conversation_id")
     contact_id = body.get("contact_id")
     to_user_id = body.get("to_user_id")
     to_department_id = body.get("to_department_id")
     reason = body.get("reason", "")
     summary = body.get("summary", "")
-    if not contact_id:
-        raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+    if not conversation_id and not contact_id:
+        raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
     if not to_user_id:
         raise HTTPException(status_code=400, detail="Selecione o operador destino")
     if not summary:
         raise HTTPException(status_code=400, detail="Resumo do atendimento e obrigatorio")
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
 
-    result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
+    conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+
+    # Fase 2C: transferencia atua na conversation. Quando vier so contact_id
+    # (legado), assign_wa_contact espelha em todas as conversations do contato
+    # — mas no fluxo novo so transferimos a thread aberta, deixando outras
+    # threads coexistence intactas.
+    if conversation_id:
+        result = assign_wa_conversation(conv["id"], to_user_id, to_department_id, current_user["id"], reason, summary)
+    else:
+        result = assign_wa_contact(contact["id"], to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+        raise HTTPException(status_code=404, detail="Conversation nao encontrada")
 
     to_user = get_user_by_id(to_user_id) if to_user_id else None
     to_name = to_user["display_name"] if to_user else "Nenhum"
@@ -7282,12 +7585,21 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
         + (f" | Motivo: {reason}" if reason else "")
         + (f" | Resumo: {summary}" if summary else "")
     )
-    insert_transfer_system_message(contact_id, sys_content, current_user["id"])
-    log_audit(current_user["id"], "WA_TRANSFER", f"Contato {contact_id} -> {to_name} (dept={to_department_id}): {reason}")
+    insert_transfer_system_message(
+        contact["id"], sys_content, current_user["id"],
+        conversation_id=conv["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+    )
+    log_audit(current_user["id"], "WA_TRANSFER", f"Conv {conv['id']} -> {to_name} (dept={to_department_id}): {reason}")
 
     await broadcast_to_operators({
         "event": "wa_contact_reassigned",
-        "data": {"contact_id": contact_id, "assigned_to": to_user_id, "assigned_name": to_name},
+        "data": {
+            "conversation_id": conv["id"],
+            "contact_id": contact["id"],
+            "assigned_to": to_user_id,
+            "assigned_name": to_name,
+        },
     })
     return {"status": "transferred", "to_user": to_name}
 
@@ -7376,6 +7688,11 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
     """Reatribuicao em lote de contatos de um operador.
 
     Body: { from_user_id, action: "return_to_bot" | "transfer", to_user_id? }
+
+    Exclui automaticamente contatos cujo canal e coexistence proprio do
+    operador X (i.e. `channel.owner_user_id == from_user_id`). Esses
+    contatos pertencem ao WhatsApp pessoal dele e nao podem ser
+    transferidos sem perder acesso ao numero — o operador continua dono.
     """
     if current_user.get("role") not in ("admin", "supervisor"):
         raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
@@ -7391,9 +7708,24 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
     if not contacts:
         return {"status": "ok", "count": 0}
 
+    from channel_service import CHANNEL_TYPE_COEXISTENCE, get_channel
+
     count = 0
+    skipped_coex = 0
     for contact in contacts:
         cid = contact["id"]
+        # Filtro coexistence: se canal e coexistence cujo dono e exatamente
+        # o operador que estamos esvaziando, manter o vinculo.
+        ch_id = contact.get("channel_id")
+        if ch_id is not None:
+            ch = get_channel(ch_id)
+            if (
+                ch
+                and ch.get("channel_type") == CHANNEL_TYPE_COEXISTENCE
+                and int(ch.get("owner_user_id") or 0) == int(from_user_id)
+            ):
+                skipped_coex += 1
+                continue
         if action == "return_to_bot":
             return_contact_to_bot(cid, current_user["id"])
             insert_transfer_system_message(cid, f"Devolvido ao bot (reatribuicao em lote) por {current_user['display_name']}", current_user["id"])
@@ -7403,8 +7735,8 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
             insert_transfer_system_message(cid, f"Reatribuido para {(to_user or {}).get('display_name', '?')} por {current_user['display_name']} (lote)", current_user["id"])
         count += 1
 
-    log_audit(current_user["id"], "BULK_REASSIGN", f"from={from_user_id} action={action} to={to_user_id} count={count}")
-    return {"status": "ok", "count": count}
+    log_audit(current_user["id"], "BULK_REASSIGN", f"from={from_user_id} action={action} to={to_user_id} count={count} skipped_coex={skipped_coex}")
+    return {"status": "ok", "count": count, "skipped_coex": skipped_coex}
 
 
 @app.get("/api/operators")
@@ -9600,23 +9932,34 @@ from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
 from bot_service import process_bot_message
 from firestore_common import set_tenant_context, reset_tenant_context
+from tenant_service import lookup_phone_routing
 
 logger = logging.getLogger("castro_crm.webhook")
 
-# Tenant default usado pelo webhook enquanto canais ainda nao carregam
-# tenant_id explicito. Substituir por lookup_phone_routing() quando
-# canais migrarem para tenants/{id}/channels (sub-fase futura).
+# Tenant default usado quando o webhook recebe payload sem phone_number_id
+# valido OU quando phone_routing ainda nao tem entrada pra esse numero.
+# Sub-fase: enquanto canais sao flat, canal default pertence a 'hubloc'.
 _WEBHOOK_DEFAULT_TENANT = "hubloc"
 
 
-def _resolve_webhook_tenant(channel):
-    """Resolve tenant_id a partir do canal (ou phone_routing futuro).
+def _resolve_webhook_tenant(channel, phone_number_id: str | None = None):
+    """Resolve tenant_id pra um payload de webhook.
 
-    Hoje retorna sempre 'hubloc' (default). Quando channels carregarem
-    `tenant_id` ou phone_routing for populado, esta funcao passa a
-    consultar essas fontes. O webhook precisa setar tenant_context para
-    que toda a cadeia de save_wa_message etc. opere na subcolecao certa.
+    Ordem de preferencia (Fase 2C):
+      1. `phone_routing[phone_number_id]` se phone_number_id for fornecido
+         e existir indice (caminho oficial pra multi-tenant).
+      2. `channel.tenant_id` denormalizado no doc do canal (fallback
+         enquanto canais nao migram pra subcolecao).
+      3. `_WEBHOOK_DEFAULT_TENANT` (single-tenant Hubloc).
     """
+    if phone_number_id:
+        try:
+            routing = lookup_phone_routing(str(phone_number_id))
+        except Exception as exc:
+            logger.warning("phone_routing lookup falhou para %s: %s", phone_number_id, exc)
+            routing = None
+        if routing and routing.get("tenant_id"):
+            return str(routing["tenant_id"])
     if channel and channel.get("tenant_id"):
         return str(channel["tenant_id"])
     return _WEBHOOK_DEFAULT_TENANT
@@ -9737,8 +10080,13 @@ def _resolve_webhook_channel(value):
     return get_default_channel()
 
 
-async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str):
-    """Envia resposta do bot via WhatsApp Cloud API e salva no banco."""
+async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str,
+                          channel_id=None, channel_owner_user_id=None):
+    """Envia resposta do bot via WhatsApp Cloud API e salva no banco.
+
+    sender_user_id=None marca a mensagem como originada pelo bot
+    automatico (nao por operador humano).
+    """
     import httpx
     from config import GRAPH_API_BASE
     from database import save_wa_message
@@ -9766,6 +10114,9 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             status="sent" if resp.status_code == 200 else "failed",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=None,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+            sender_user_id=None,
         )
         if resp.status_code == 200:
             logger.info("[BOT] Resposta enviada para %s | contact=%d", wa_id, contact_id)
@@ -9790,8 +10141,9 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
     # Resolve tenant uma unica vez no inicio do payload — todos os
     # changes deste payload vem do mesmo phone_number_id (mesma WABA).
     first_value = ((payload.get("entry") or [{}])[0].get("changes") or [{}])[0].get("value", {})
+    first_phone_id = str((first_value.get("metadata") or {}).get("phone_number_id") or "").strip()
     first_channel = _resolve_webhook_channel(first_value)
-    tenant_id = _resolve_webhook_tenant(first_channel)
+    tenant_id = _resolve_webhook_tenant(first_channel, phone_number_id=first_phone_id)
     ctx_token = set_tenant_context(tenant_id)
     try:
         await _process_webhook_payload_inner(payload, ws_notify_callback)
@@ -9977,7 +10329,8 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             content = f"[{msg_type}]"
             logger.info("Tipo de mensagem nao tratado: %s", msg_type)
 
-        # Persistir
+        # Persistir. sender_user_id=None em inbound (cliente final).
+        # channel_owner_user_id captura o dono do numero (relevante p/ coexistence).
         db_id = save_wa_message(
             wa_message_id=msg_id,
             contact_id=contact_id,
@@ -9994,6 +10347,8 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             timestamp_wa=ts_iso,
             channel_id=channel_id,
             phone_number_id=channel_phone_id,
+            channel_owner_user_id=channel_owner_id,
+            sender_user_id=None,
             **reply_fields,
         )
 
@@ -10017,7 +10372,11 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 if bot_reply:
                     _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
                     _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
-                    await _send_bot_reply(wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id)
+                    await _send_bot_reply(
+                        wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
+                        channel_id=channel_id,
+                        channel_owner_user_id=channel_owner_id,
+                    )
 
         # -- Lead convertido: capturar rating ou rerouting --
         _contact_fresh = get_wa_contact(contact_id)
@@ -10152,6 +10511,14 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
     metadata = value.get("metadata", {})
     echoes = value.get("message_echoes", [])
 
+    # Em smb_message_echoes, "quem enviou" foi o proprio dono do numero
+    # operando o WhatsApp do celular — channel_owner_user_id e sender_user_id
+    # apontam pra mesma pessoa.
+    channel_id_outer = channel.get("id") if channel else None
+    channel_owner_outer = channel.get("owner_user_id") if channel else None
+    channel_phone_id_outer = str(channel.get("phone_number_id", "")) if channel else ""
+    channel_type_outer = str(channel.get("channel_type", "")) if channel else ""
+
     for echo in echoes:
         business_phone = echo.get("from", "")
         customer_phone = echo.get("to", "")
@@ -10166,7 +10533,13 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
 
         # Normalizar telefone do cliente e criar/atualizar contato
         normalized_phone = normalize_br_phone(customer_phone)
-        contact_id = upsert_wa_contact(normalized_phone, "")
+        contact_id = upsert_wa_contact(
+            normalized_phone, "",
+            channel_id=channel_id_outer,
+            phone_number_id=channel_phone_id_outer,
+            source_channel_type=channel_type_outer,
+            auto_assign_user_id=channel_owner_outer if channel_type_outer == CHANNEL_TYPE_COEXISTENCE else None,
+        )
 
         # Extrair conteudo conforme tipo de mensagem
         content = ""
@@ -10270,6 +10643,10 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             filename=filename,
             status="sent",
             timestamp_wa=ts_iso,
+            channel_id=channel_id_outer,
+            phone_number_id=channel_phone_id_outer,
+            channel_owner_user_id=channel_owner_outer,
+            sender_user_id=channel_owner_outer,
         )
 
         logger.info(
@@ -10370,6 +10747,12 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
     if not history_entries:
         return
 
+    # Channel context para enriquecer contatos/mensagens importadas.
+    hist_channel_id = channel.get("id") if channel else None
+    hist_channel_owner = channel.get("owner_user_id") if channel else None
+    hist_channel_phone = str(channel.get("phone_number_id", "")) if channel else ""
+    hist_channel_type = str(channel.get("channel_type", "")) if channel else ""
+
     for hist in history_entries:
         # Verificar se e um erro (empresa recusou compartilhar historico)
         errors = hist.get("errors", [])
@@ -10397,7 +10780,13 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 continue
 
             normalized_thread_phone = normalize_br_phone(thread_phone)
-            contact_id = upsert_wa_contact(normalized_thread_phone, "")
+            contact_id = upsert_wa_contact(
+                normalized_thread_phone, "",
+                channel_id=hist_channel_id,
+                phone_number_id=hist_channel_phone,
+                source_channel_type=hist_channel_type,
+                auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+            )
             messages = thread.get("messages", [])
 
             for msg in messages:
@@ -10424,6 +10813,10 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                         content="[Midia do historico - aguardando]",
                         status=msg_status or "delivered",
                         timestamp_wa=ts_iso,
+                        channel_id=hist_channel_id,
+                        phone_number_id=hist_channel_phone,
+                        channel_owner_user_id=hist_channel_owner,
+                        sender_user_id=hist_channel_owner if direction == "outbound" else None,
                     )
                     continue
 
@@ -10528,6 +10921,10 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     filename=filename,
                     status=msg_status or ("received" if direction == "inbound" else "sent"),
                     timestamp_wa=ts_iso,
+                    channel_id=hist_channel_id,
+                    phone_number_id=hist_channel_phone,
+                    channel_owner_user_id=hist_channel_owner,
+                    sender_user_id=hist_channel_owner if direction == "outbound" else None,
                 )
 
             logger.info(
@@ -12926,6 +13323,7 @@ export type ChatMessage = {
   id: number;
   wa_message_id?: string;
   contact_id: number;
+  conversation_id?: string | null;
   direction: "inbound" | "outbound" | "system" | string;
   msg_type: "text" | "image" | "audio" | "video" | "gif" | "sticker" | "document" | "system" | string;
   content?: string;
@@ -12933,7 +13331,13 @@ export type ChatMessage = {
   media_mime?: string;
   filename?: string;
   status?: string;
+  // operator_id e o legado; sender_user_id e o novo (Fase 2C). Sao iguais
+  // quando o operador atribuido envia. Diferem em coexistence quando a
+  // thread foi transferida — channel_owner_user_id mostra o dono fisico
+  // do numero, sender_user_id mostra quem digitou de fato.
   operator_id?: number | null;
+  sender_user_id?: number | null;
+  channel_owner_user_id?: number | null;
   operator_name?: string;
   assigned_to_uid?: string;
   created_at?: string;
@@ -12951,7 +13355,8 @@ export type ChatMessage = {
 };
 
 export type TransferRequest = {
-  contact_id: number;
+  conversation_id?: string;
+  contact_id?: number;
   to_user_id: number;
   to_department_id?: number | null;
   reason: string;
@@ -16126,11 +16531,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
     if (markingReadContactIdRef.current === activeConversationId) return undefined;
 
+    // Fase 2C: marca thread aberta como lida (se houver). Sem thread,
+    // cai no endpoint legado por contact_id (timeline cross-channel).
+    const threadIdAtMark = activeThreadId;
+    const readPath = threadIdAtMark
+      ? `/api/wa/conversation/${encodeURIComponent(threadIdAtMark)}/read`
+      : `/api/wa/contact/${activeConversationId}/read`;
+
     let cancelled = false;
     const timeoutId = window.setTimeout(() => {
       if (cancelled) return;
       markingReadContactIdRef.current = activeConversationId;
-      void sendJson<{ status: string; updated_count: number }>(bundle.auth, `/api/wa/contact/${activeConversationId}/read`, {})
+      void sendJson<{ status: string; updated_count: number }>(bundle.auth, readPath, {})
         .then(() => {
           if (cancelled) return;
           markingReadContactIdRef.current = null;
@@ -16147,7 +16559,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, bundle, selectedContactId, sessionUser]);
+  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, bundle, selectedContactId, sessionUser]);
 
   // =========================================================================
   // Sound notifications
@@ -16355,6 +16767,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function logout() { if (bundle) await signOut(bundle.auth); }
 
+  // Resolve a chave de envio: preferimos conversation_id (thread atual)
+  // — backend resolve canal pela thread, garantindo que mesmo wa_id em
+  // 2 canais saia pelo canal correto. Se nao houver thread selecionada,
+  // mandamos contact_id e o backend deriva a thread default.
+  function buildSendTarget(): { conversation_id?: string; contact_id?: number } {
+    if (selectedThreadId) return { conversation_id: selectedThreadId };
+    if (selectedContact) return { contact_id: selectedContact.id };
+    return {};
+  }
+
   async function sendTextMessage() {
     if (!bundle || !selectedContact || !draft.trim()) return;
     try {
@@ -16363,7 +16785,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (userSettings.chat_prefix_enabled && userSettings.chat_prefix_name.trim() && systemSettings.chat_prefix_roles.includes(sessionUser?.role || "")) {
         content = `${userSettings.chat_prefix_name.trim()}: ${content}`;
       }
-      await sendJson(bundle.auth, "/api/wa/send", { contact_id: selectedContact.id, content, ...buildReplyPayload() });
+      await sendJson(bundle.auth, "/api/wa/send", { ...buildSendTarget(), content, ...buildReplyPayload() });
       setDraft(""); setReplyTarget(null); setNotice("Mensagem enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
@@ -16377,7 +16799,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusyUpload(true); setError(""); setNotice("");
       const form = new FormData();
-      form.append("contact_id", String(selectedContact.id));
+      const target = buildSendTarget();
+      if (target.conversation_id) form.append("conversation_id", target.conversation_id);
+      else if (target.contact_id) form.append("contact_id", String(target.contact_id));
       form.append("caption", ""); form.append("file", file);
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-media", form);
@@ -16417,7 +16841,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       audioChunksRef.current = []; setRecording(false); setRecordingSeconds(0);
       if (!audioBlob.size) throw new Error("Nao foi possivel capturar o audio gravado.");
       const form = new FormData();
-      form.append("contact_id", String(selectedContact.id));
+      const target = buildSendTarget();
+      if (target.conversation_id) form.append("conversation_id", target.conversation_id);
+      else if (target.contact_id) form.append("contact_id", String(target.contact_id));
       form.append("file", audioBlob, "gravacao.webm");
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-audio", form);
@@ -16457,7 +16883,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusyUpload(true); setError(""); setNotice("");
       const form = new FormData();
-      form.append("contact_id", String(selectedContact.id)); form.append("caption", ""); form.append("file", file);
+      const target = buildSendTarget();
+      if (target.conversation_id) form.append("conversation_id", target.conversation_id);
+      else if (target.contact_id) form.append("contact_id", String(target.contact_id));
+      form.append("caption", ""); form.append("file", file);
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-media", form);
       setReplyTarget(null); setNotice(`${label} enviado.`);
@@ -16473,7 +16902,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setError(""); setNotice("");
       const pos = await new Promise<GeolocationPosition>((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 10000 }));
-      await sendJson(bundle.auth, "/api/wa/send-location", { contact_id: selectedContact.id, latitude: pos.coords.latitude, longitude: pos.coords.longitude, ...buildReplyPayload() });
+      await sendJson(bundle.auth, "/api/wa/send-location", { ...buildSendTarget(), latitude: pos.coords.latitude, longitude: pos.coords.longitude, ...buildReplyPayload() });
       setNotice("Localização enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { const geo = e as { code?: number }; setError(geo.code ? "Permissão de localização negada ou tempo esgotado." : errorText(e)); }
@@ -16578,6 +17007,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function sendTemplate(params: {
     contactId: number;
+    conversationId?: string | null;
     templateName: string;
     language: string;
     components?: TemplateSendComponent[];
@@ -16585,8 +17015,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle) return false;
     try {
       setBusyTemplate(true); setError(""); setNotice("");
+      // Prefere conversation_id explicito, depois selectedThreadId, e por
+      // ultimo cai em contact_id (legado pra views que ainda nao tem thread).
+      const targetConv = params.conversationId || selectedThreadId || null;
       await sendJson(bundle.auth, "/api/wa/send-template", {
-        contact_id: params.contactId,
+        ...(targetConv ? { conversation_id: targetConv } : { contact_id: params.contactId }),
         template_name: params.templateName,
         language: params.language,
         components: params.components || [],
@@ -16645,7 +17078,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle || !selectedContact || !toUserId || !transferSummary.trim()) return;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
-      await sendJson(bundle.auth, "/api/wa/transfer", { contact_id: selectedContact.id, to_user_id: Number(toUserId), to_department_id: toDepartmentId ? Number(toDepartmentId) : null, reason: transferReason, summary: transferSummary });
+      await sendJson(bundle.auth, "/api/wa/transfer", { ...buildSendTarget(), to_user_id: Number(toUserId), to_department_id: toDepartmentId ? Number(toDepartmentId) : null, reason: transferReason, summary: transferSummary });
       setTransferReason(""); setTransferSummary(""); setNotice("Atendimento transferido.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
