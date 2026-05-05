@@ -1,4 +1,4 @@
-import type { ChatMessage, Contact } from "../types";
+import type { ChatMessage, Contact, Conversation } from "../types";
 
 export function iso(value: unknown) {
   if (!value) return "";
@@ -59,6 +59,7 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
   return {
     id: num(record.id ?? docId),
     contact_id: num(record.contact_id),
+    conversation_id: record.conversation_id == null ? null : String(record.conversation_id),
     direction: String(record.direction || "system"),
     msg_type: String(record.msg_type || "text"),
     content: String(record.content || ""),
@@ -67,6 +68,8 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     filename: String(record.filename || ""),
     status: String(record.status || ""),
     operator_id: record.operator_id == null ? null : num(record.operator_id),
+    sender_user_id: record.sender_user_id == null ? null : num(record.sender_user_id),
+    channel_owner_user_id: record.channel_owner_user_id == null ? null : num(record.channel_owner_user_id),
     operator_name: String(record.operator_name || ""),
     created_at: iso(record.created_at),
     timestamp_wa: iso(record.timestamp_wa),
@@ -78,5 +81,39 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     phone_number_id: String(record.phone_number_id || ""),
     is_corrected: Boolean(record.is_corrected),
     corrected_by_message_id: record.corrected_by_message_id == null ? null : num(record.corrected_by_message_id),
+  };
+}
+
+export function normalizeConversation(record: Record<string, unknown>, docId: string): Conversation {
+  return {
+    id: String(record.id || docId),
+    contact_id: num(record.contact_id),
+    wa_id: String(record.wa_id || ""),
+    channel_id: record.channel_id == null ? null : num(record.channel_id),
+    channel_label: String(record.channel_label || ""),
+    channel_type: String(record.channel_type || ""),
+    channel_phone_number: String(record.channel_phone_number || ""),
+    source_channel_type: String(record.source_channel_type || ""),
+    phone_number_id: String(record.phone_number_id || ""),
+    assigned_to: record.assigned_to == null ? null : num(record.assigned_to),
+    assigned_to_uid: String(record.assigned_to_uid || ""),
+    department_id: record.department_id == null ? null : num(record.department_id),
+    unread_count: num(record.unread_count ?? record.unread ?? 0),
+    unread: num(record.unread ?? record.unread_count ?? 0),
+    status: String(record.status || "open"),
+    last_message_at: iso(record.last_message_at),
+    last_inbound_at: iso(record.last_inbound_at),
+    last_outbound_at: iso(record.last_outbound_at),
+    created_at: iso(record.created_at),
+    display_name: String(record.display_name || ""),
+    declared_name: String(record.declared_name || ""),
+    phone_formatted: String(record.phone_formatted || ""),
+    qualification: String(record.qualification || ""),
+    notes: String(record.notes || ""),
+    rating: record.rating == null ? null : num(record.rating),
+    is_archived: num(record.is_archived ?? 0),
+    contact_avatar_path: String(record.contact_avatar_path || ""),
+    attendance_protocol: String(record.attendance_protocol || ""),
+    attendance_started_at: iso(record.attendance_started_at),
   };
 }

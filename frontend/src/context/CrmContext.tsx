@@ -1,4 +1,4 @@
-import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useRef, useState, type ReactNode } from "react";
+import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
 import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
@@ -12,7 +12,7 @@ import type {
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
 import { buildMessageReplyReference, formatRecordingTime, messageCopyText, messageMoment } from "../utils/formatting";
-import { normalizeContact, normalizeMessage } from "../utils/normalization";
+import { normalizeContact, normalizeConversation, normalizeMessage } from "../utils/normalization";
 import { applyTheme, themePref, transportPref } from "../utils/storage";
 import type { LightboxMedia } from "../utils/media";
 
@@ -45,12 +45,15 @@ type CrmContextValue = {
 
   // Contacts
   contacts: Contact[];
+  contactsById: Map<number, Contact>;
   conversations: Conversation[];
+  // selectedContactId é derivado de selectedThreadId -> conversation.contact_id.
+  // Para selecionar uma conversa, chame setSelectedThreadId(conversationId).
   selectedContactId: number | null;
   selectedThreadId: string | null;
   setSelectedThreadId: (id: string | null) => void;
-  setSelectedContactId: (id: number | null) => void;
   selectedContact: Contact | null;
+  selectedConversation: Conversation | null;
 
   // Views
   activeView: ActiveView;
@@ -284,14 +287,23 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Fase 3: lista de conversations (sub-threads por canal). Mesmo wa_id em
   // dois canais aparece como duas entradas distintas.
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const contactsById = useMemo(
+    () => new Map<number, Contact>(contacts.map((c) => [c.id, c])),
+    [contacts],
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
-  // Fase 3 V2: thread especifica (channel_id__wa_id) selecionada.
-  // Quando setada, ChatPanel filtra mensagens por conversation_id em vez
-  // de contact_id (que mostra timeline cross-channel).
+  // Fase 3 V2: selectedThreadId e a fonte unica de selecao na sidebar.
+  // selectedContactId vira derivado de selectedThreadId -> conversation.contact_id.
+  // Quando setado, ChatPanel filtra mensagens por conversation_id (nao
+  // cross-channel como o legado).
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const selectedConversation = useMemo(
+    () => (selectedThreadId ? conversations.find((c) => c.id === selectedThreadId) || null : null),
+    [conversations, selectedThreadId],
+  );
+  const selectedContactId = selectedConversation?.contact_id ?? null;
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
@@ -388,8 +400,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // -- Derived --
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
-  const selectedContact = contacts.find((c) => c.id === selectedContactId) || null;
-  const activeContact = contacts.find((c) => c.id === activeConversationId) || null;
+  const selectedContact = selectedContactId != null ? (contactsById.get(selectedContactId) || null) : null;
+  const activeContact = activeConversationId != null ? (contactsById.get(activeConversationId) || null) : null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
 
   const botEnabled = systemSettings.bot_enabled;
@@ -629,11 +641,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     });
   }, [bundle]);
 
-  // Auto-select contact
+  // Auto-select primeira conversation se nada selecionado (ou seleção orfã).
   useEffect(() => {
-    if (!contacts.length) { setSelectedContactId(null); return; }
-    if (!selectedContactId || !contacts.some((c) => c.id === selectedContactId)) setSelectedContactId(contacts[0].id);
-  }, [contacts, selectedContactId]);
+    if (!conversations.length) {
+      if (selectedThreadId) setSelectedThreadId(null);
+      return;
+    }
+    if (!selectedThreadId || !conversations.some((c) => c.id === selectedThreadId)) {
+      setSelectedThreadId(conversations[0].id);
+    }
+  }, [conversations, selectedThreadId]);
 
   // Track the selected conversation and restore its recent in-memory cache immediately.
   useEffect(() => {
@@ -742,35 +759,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle || !sessionUser || !config) return undefined;
     if (!snapshotMode || !config.firestore.collections.wa_conversations) return undefined;
     let disposed = false;
-    // Normaliza Firestore Timestamp -> string ISO para campos de tempo
-    const tsToIso = (v: unknown): string | undefined => {
-      if (!v) return undefined;
-      if (typeof v === "string") return v;
-      if (v instanceof Date) return v.toISOString();
-      if (typeof v === "object" && v !== null && typeof (v as { toDate?: () => Date }).toDate === "function") {
-        return (v as { toDate: () => Date }).toDate().toISOString();
-      }
-      if (typeof v === "object" && v !== null && "seconds" in v) {
-        return new Date(Number((v as { seconds: number }).seconds) * 1000).toISOString();
-      }
-      return undefined;
-    };
     const ref = collection(bundle.db, config.firestore.collections.wa_conversations);
     const unsubscribe = onSnapshot(
       ref,
       (snap) => {
         if (disposed) return;
-        const next = snap.docs.map((doc) => {
-          const data = doc.data() as Record<string, unknown>;
-          return {
-            ...data,
-            id: typeof data.id === "string" || typeof data.id === "number" ? String(data.id) : doc.id,
-            last_message_at: tsToIso(data.last_message_at),
-            last_inbound_at: tsToIso(data.last_inbound_at),
-            last_outbound_at: tsToIso(data.last_outbound_at),
-            created_at: tsToIso(data.created_at),
-          } as Conversation;
-        });
+        const next = snap.docs.map((doc) => normalizeConversation(doc.data() as Record<string, unknown>, doc.id));
         startTransition(() => setConversations(next));
       },
       (e) => !disposed && setError(`Snapshot de conversations falhou: ${errorText(e)}`),
@@ -1373,7 +1367,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         if (exists) return prev.map(c => c.id === contact.id ? contact : c);
         return [contact, ...prev];
       });
-      setSelectedContactId(contact.id);
+      // Seleciona a primeira conversation desse contato (criada pelo backend
+      // junto com o contact). Se ainda nao chegou pelo snapshot, deixa a
+      // auto-select effect cuidar quando ela aparecer.
+      const conv = conversations.find((c) => c.contact_id === contact.id);
+      if (conv) setSelectedThreadId(conv.id);
       setActiveView("meus");
       setNotice("Contato criado.");
       return contact;
@@ -1448,7 +1446,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout,
-    contacts, conversations, selectedContactId, setSelectedContactId, selectedContact,
+    contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
     activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
