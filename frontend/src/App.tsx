@@ -198,25 +198,13 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
 }
 
 function ContactList() {
-  const { activeView, filteredContacts, conversations, selectedContactId, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
 
-  // Fase 3: agrupa conversations por contact_id para descobrir quando um
-  // mesmo contato aparece em mais de um canal. Pra cada contato exibido:
-  //   - se nao tem conversations registradas (legado), mostra 1 linha;
-  //   - se tem 1 conversation, mostra 1 linha com badge do canal;
-  //   - se tem N conversations, mostra N linhas (uma por canal) com badges.
-  const conversationsByContact = new Map<number, Conversation[]>();
-  for (const conv of conversations) {
-    const list = conversationsByContact.get(conv.contact_id) || [];
-    list.push(conv);
-    conversationsByContact.set(conv.contact_id, list);
-  }
-  type RenderItem = { contact: Contact; conversation: Conversation | null };
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
-  // direto). Converte ambos para epoch ms para comparacao.
+  // direto). Converte ambos para epoch ms para ordenacao.
   const toMillis = (v: unknown): number => {
     if (!v) return 0;
     if (typeof v === "string") return new Date(v).getTime() || 0;
@@ -230,18 +218,21 @@ function ContactList() {
     }
     return 0;
   };
-  const renderItems: RenderItem[] = filteredContacts.flatMap((contact): RenderItem[] => {
-    const convs = conversationsByContact.get(contact.id) || [];
-    if (convs.length === 0) return [{ contact, conversation: null }];
-    return convs
-      .slice()
-      .sort((a, b) => toMillis(b.last_message_at) - toMillis(a.last_message_at))
-      .map((conversation): RenderItem => ({ contact, conversation }));
-  });
+  type RenderItem = { contact: Contact; conversation: Conversation };
+  // Fase 3.D: cada item da sidebar e uma Conversation. O Contact e
+  // resolvido via contactsById (join in-memory). Mesmo wa_id em 2 canais
+  // = 2 entradas distintas, com badge proprio do canal.
+  const renderItems: RenderItem[] = filteredConversations
+    .slice()
+    .sort((a, b) => toMillis(b.last_message_at) - toMillis(a.last_message_at))
+    .flatMap((conversation): RenderItem[] => {
+      const contact = contactsById.get(conversation.contact_id);
+      return contact ? [{ contact, conversation }] : [];
+    });
 
   const visibleTeamOperators = activeView === "equipe"
     ? operators
-      .filter((operator) => operator.id !== sessionUser?.id && filteredContacts.some((contact) => contact.assigned_to === operator.id))
+      .filter((operator) => operator.id !== sessionUser?.id && filteredConversations.some((conv) => conv.assigned_to === operator.id))
       .sort((left, right) => left.display_name.localeCompare(right.display_name))
     : [];
   return (
@@ -277,25 +268,20 @@ function ContactList() {
       </div>
       <div className="contact-list">
         {renderItems.map(({ contact, conversation }) => {
-          const assignedOperator = activeView === "equipe" ? findAssignedOperator(contact, operators) : null;
+          // Fase 3.D: assigned/department vem da Conversation (cutover Fase 2C);
+          // qualification/notes/avatar continuam no Contact.
+          const assignedOperator = activeView === "equipe"
+            ? (operators.find((o) => o.id === conversation.assigned_to) || null)
+            : null;
           const accent = assignedOperator ? operatorColor(assignedOperator.id) : null;
-          const itemKey = conversation ? `${contact.id}__${conversation.id}` : `${contact.id}`;
-          const lastMessageAt = conversation?.last_message_at || contact.last_message_at;
-          const unreadCount = conversation ? (conversation.unread ?? conversation.unread_count ?? 0) : (contact.unread ?? contact.unread_count ?? 0);
-          const channelLabel = conversation?.channel_label || "";
-          const channelType = conversation?.channel_type || conversation?.source_channel_type || contact.source_channel_type || "";
-          // Fase 3: selectedThreadId e fonte unica. Para contatos legados
-          // sem conversation (pre-Fase 2C), comparamos contact_id e ausencia
-          // de thread; setSelectedThreadId(null) deixa auto-select effect
-          // resolver quando uma conversation aparecer.
-          const isActive = conversation
-            ? selectedThreadId === conversation.id
-            : selectedContactId === contact.id && !selectedThreadId;
-          const handleClick = () => {
-            setSelectedThreadId(conversation ? conversation.id : null);
-          };
+          const lastMessageAt = conversation.last_message_at || contact.last_message_at;
+          const unreadCount = conversation.unread_count ?? conversation.unread ?? 0;
+          const channelLabel = conversation.channel_label || "";
+          const channelType = conversation.channel_type || conversation.source_channel_type || contact.source_channel_type || "";
+          const isActive = selectedThreadId === conversation.id;
+          const handleClick = () => setSelectedThreadId(conversation.id);
           return (
-            <button key={itemKey} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
+            <button key={conversation.id} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
               <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
               <div className="contact-copy">
                 <div className="row">
@@ -314,7 +300,7 @@ function ContactList() {
                     <span>{when(lastMessageAt)}</span>
                   </div>
                 </div>
-                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div>
+                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
                 <div className="row">
                   <span className="chip">{contact.qualification || "novo"}</span>
                   {channelLabel ? (

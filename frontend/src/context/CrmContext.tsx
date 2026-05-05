@@ -58,11 +58,11 @@ type CrmContextValue = {
   // Views
   activeView: ActiveView;
   setActiveView: (v: ActiveView) => void;
-  novosContacts: Contact[];
-  meusContacts: Contact[];
-  nqContacts: Contact[];
-  equipeContacts: Contact[];
-  botContacts: Contact[];
+  novosConversations: Conversation[];
+  meusConversations: Conversation[];
+  nqConversations: Conversation[];
+  equipeConversations: Conversation[];
+  botConversations: Conversation[];
   novosUnread: number;
   meusUnread: number;
   nqUnread: number;
@@ -70,7 +70,7 @@ type CrmContextValue = {
   botUnread: number;
   equipeOperatorFilter: string;
   setEquipeOperatorFilter: (v: string) => void;
-  equipeFiltered: Contact[];
+  equipeFiltered: Conversation[];
 
   // Messages
   messages: ChatMessage[];
@@ -222,8 +222,8 @@ type CrmContextValue = {
   searchText: string;
   qualificationFilter: string;
   setQualificationFilter: (v: string) => void;
-  filteredContacts: Contact[];
-  viewContacts: Contact[];
+  filteredConversations: Conversation[];
+  viewConversations: Conversation[];
 
   // Notifications
   error: string;
@@ -405,53 +405,84 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
 
   const botEnabled = systemSettings.bot_enabled;
-  // Bot: contatos sem atribuicao, no fluxo do bot (ainda nao completaram)
-  const botContacts = botEnabled ? contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado" && !c.bot_completed) : [];
-  // Novos: sem atribuicao. Com bot ativo, so mostra quem completou o bot ou nunca entrou.
-  // Sem bot, mostra todos sem atribuicao (comportamento original).
-  // Operador comum so ve contatos do seu departamento (ou sem departamento);
-  // admin/supervisor veem todos.
-  const novosContacts = contacts.filter((c) => {
-    if (c.assigned_to || c.qualification === "nao_qualificado") return false;
-    if (botEnabled && !c.bot_completed) return false;
-    if (!isManagerRole && c.department_id != null && c.department_id !== sessionUser?.department_id) return false;
-    return true;
-  });
-  // Meus: atribuidos ao usuario logado (inclui coexistence auto-atribuidos)
-  const meusContacts = contacts.filter((c) => c.assigned_to === sessionUser?.id);
-  // Nao qualificados
-  const nqContacts = contacts.filter((c) => c.qualification === "nao_qualificado");
-  // Equipe: atribuidos a outros operadores
-  // Operadores comuns NAO veem coexistence de outros; admin/supervisor veem tudo
-  const equipeContacts = contacts.filter((c) => {
-    if (!c.assigned_to || c.assigned_to === sessionUser?.id) return false;
-    if (!isManagerRole && c.source_channel_type === "coexistence") return false;
-    return true;
-  });
+  // Fase 3.D: filtros operam sobre conversations (sub-threads por canal).
+  // Mesmo wa_id em 2 canais = 2 entradas distintas em cada filtro. Campos
+  // que pertencem ao contato (qualification, bot_completed, notes) sao
+  // resolvidos via contactsById; o resto vem da propria conversation
+  // (assigned_to, department_id, source_channel_type, unread_count).
+  // Bot: sem atribuicao, no fluxo do bot (ainda nao completaram)
+  const botConversations = useMemo(() => {
+    if (!botEnabled) return [] as Conversation[];
+    return conversations.filter((conv) => {
+      if (conv.assigned_to) return false;
+      const c = contactsById.get(conv.contact_id);
+      if (!c) return false;
+      return c.qualification !== "nao_qualificado" && !c.bot_completed;
+    });
+  }, [botEnabled, conversations, contactsById]);
+  // Novos: sem atribuicao. Com bot ativo, so threads que ja completaram bot.
+  // Operador comum so ve threads do seu departamento (ou sem); admin/supervisor veem todas.
+  const novosConversations = useMemo(() => {
+    return conversations.filter((conv) => {
+      if (conv.assigned_to) return false;
+      const c = contactsById.get(conv.contact_id);
+      if (!c) return false;
+      if (c.qualification === "nao_qualificado") return false;
+      if (botEnabled && !c.bot_completed) return false;
+      if (!isManagerRole && conv.department_id != null && conv.department_id !== sessionUser?.department_id) return false;
+      return true;
+    });
+  }, [conversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
+  // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas)
+  const meusConversations = useMemo(
+    () => conversations.filter((conv) => conv.assigned_to === sessionUser?.id),
+    [conversations, sessionUser?.id],
+  );
+  // Nao qualificadas: qualification do contato e "nao_qualificado"
+  const nqConversations = useMemo(() => {
+    return conversations.filter((conv) => {
+      const c = contactsById.get(conv.contact_id);
+      return c?.qualification === "nao_qualificado";
+    });
+  }, [conversations, contactsById]);
+  // Equipe: atribuidas a outros operadores. Operadores comuns nao veem
+  // coexistence de outros; admin/supervisor veem tudo.
+  const equipeConversations = useMemo(() => {
+    return conversations.filter((conv) => {
+      if (!conv.assigned_to || conv.assigned_to === sessionUser?.id) return false;
+      if (!isManagerRole && conv.source_channel_type === "coexistence") return false;
+      return true;
+    });
+  }, [conversations, isManagerRole, sessionUser?.id]);
 
-  // Fase 3: unread real do contato é a soma das suas conversations.
-  // Mark-read zera so a Conversation alvo, entao c.unread no contato fica
-  // stale. Derivamos do estado das conversations (single source of truth).
-  const unreadByContact = useMemo(() => {
-    const map = new Map<number, number>();
-    for (const conv of conversations) {
-      const cur = map.get(conv.contact_id) || 0;
-      map.set(conv.contact_id, cur + (conv.unread_count ?? conv.unread ?? 0));
-    }
-    return map;
-  }, [conversations]);
-  const contactUnread = (c: Contact) => unreadByContact.get(c.id) ?? c.unread ?? c.unread_count ?? 0;
-  const botUnread = botContacts.reduce((s, c) => s + contactUnread(c), 0);
-  const novosUnread = novosContacts.reduce((s, c) => s + contactUnread(c), 0);
-  const meusUnread = meusContacts.reduce((s, c) => s + contactUnread(c), 0);
-  const nqUnread = nqContacts.reduce((s, c) => s + contactUnread(c), 0);
-  const equipeUnread = equipeContacts.reduce((s, c) => s + contactUnread(c), 0);
-  const equipeFiltered = equipeOperatorFilter ? equipeContacts.filter((c) => String(c.assigned_to) === equipeOperatorFilter) : equipeContacts;
+  // Fase 3.D: unread agregado e a soma das conversations daquela view.
+  // Single source of truth — coerente com mark-read otimista por thread.
+  const sumUnread = (list: Conversation[]) =>
+    list.reduce((s, conv) => s + (conv.unread_count ?? conv.unread ?? 0), 0);
+  const botUnread = sumUnread(botConversations);
+  const novosUnread = sumUnread(novosConversations);
+  const meusUnread = sumUnread(meusConversations);
+  const nqUnread = sumUnread(nqConversations);
+  const equipeUnread = sumUnread(equipeConversations);
+  const equipeFiltered = equipeOperatorFilter
+    ? equipeConversations.filter((conv) => String(conv.assigned_to) === equipeOperatorFilter)
+    : equipeConversations;
 
-  const viewContacts = activeView === "bot" ? botContacts : activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : activeView === "equipe" ? equipeFiltered : nqContacts;
-  const filteredContacts = viewContacts.filter((item) => {
-    const matchesSearch = !searchText || [item.display_name, item.phone_formatted || "", item.department_name || "", item.assigned_name || ""].join(" ").toLowerCase().includes(searchText);
-    const matchesQual = !qualificationFilter || item.qualification === qualificationFilter;
+  const viewConversations = activeView === "bot" ? botConversations
+    : activeView === "novos" ? novosConversations
+    : activeView === "meus" ? meusConversations
+    : activeView === "equipe" ? equipeFiltered
+    : nqConversations;
+  // Search e qualification filter operam no contato (denormalizado pra UX).
+  const filteredConversations = viewConversations.filter((conv) => {
+    const c = contactsById.get(conv.contact_id);
+    const matchesSearch = !searchText || [
+      c?.display_name || "",
+      c?.phone_formatted || "",
+      c?.department_name || "",
+      c?.assigned_name || "",
+    ].join(" ").toLowerCase().includes(searchText);
+    const matchesQual = !qualificationFilter || c?.qualification === qualificationFilter;
     return matchesSearch && matchesQual;
   });
 
@@ -1469,7 +1500,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loginWithGoogle, loginWithEmail, logout,
     contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
-    activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
+    activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
     replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,
@@ -1489,7 +1520,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
-    search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredContacts, viewContacts,
+    search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     refreshPollingViews,
   };
