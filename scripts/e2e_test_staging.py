@@ -25,7 +25,11 @@ Executa, em sequencia:
      espera HTTP 404 — prova que _resolve_send_target rejeita antes da
      chamada Meta (caminho feliz nao testado: tokens dos canais sao fake
      e a Graph API recusaria).
-  8. Imprime relatorio.
+  8. (Fase 2.10.4) Valida usage_{YYYY_MM} per-tenant: le o doc Firestore
+     em tenants/hubloc/audit_metrics/usage_{YYYY-MM} e tambem o endpoint
+     GET /api/wa/usage/current-month. Confirma inbound_received >= 4
+     (4 webhooks disparados no passo 4) e estrutura de retorno.
+  9. Imprime relatorio.
 
 Uso (local com gcloud auth ja configurado):
     python -m scripts.e2e_test_staging
@@ -246,6 +250,27 @@ def http_post_authed(path: str, id_token: str, body: dict | None = None) -> tupl
             return e.code, raw
 
 
+def http_get_authed(path: str, id_token: str) -> tuple[int, dict | str]:
+    url = STAGING_URL + path
+    req = urllib.request.Request(
+        url, method="GET",
+        headers={"Authorization": f"Bearer {id_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
 # ---------------------------------------------------------------------------
 # Firestore helpers (lazy import — depende do path)
 # ---------------------------------------------------------------------------
@@ -273,12 +298,16 @@ def get_clients():
 # ---------------------------------------------------------------------------
 
 def step_wipe(c) -> None:
-    print(_bold("\n[1/7] Wipe do tenant hubloc + canais fake"))
+    print(_bold("\n[1/8] Wipe do tenant hubloc + canais fake"))
     client = c["client"]
     coll_name = c["coll_name"]
+    utcnow = c["utcnow"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
 
-    counts = {"contacts": 0, "conversations": 0, "messages": 0, "transfer_log": 0, "channels_fake": 0}
+    counts = {
+        "contacts": 0, "conversations": 0, "messages": 0,
+        "transfer_log": 0, "channels_fake": 0, "usage_current_month": 0,
+    }
 
     for sub in ("wa_contacts", "wa_conversations", "wa_messages", "wa_transfer_log"):
         for snap in hubloc.collection(sub).stream():
@@ -292,13 +321,25 @@ def step_wipe(c) -> None:
             snap.reference.delete()
             counts["channels_fake"] += 1
 
+    # Limpa apenas usage_{YYYY_MM} do mes corrente (Fase 2.10.4) pra
+    # garantir contagem deterministica do passo 8. Daily docs (usados
+    # pelo dashboard de auditoria existente) sao preservados.
+    year_month = utcnow().strftime("%Y-%m")
+    try:
+        usage_ref = hubloc.collection("audit_metrics").document(f"usage_{year_month}")
+        if usage_ref.get().exists:
+            usage_ref.delete()
+            counts["usage_current_month"] = 1
+    except Exception as exc:
+        print(f"  aviso: falha ao limpar usage_{year_month}: {exc}")
+
     for k, v in counts.items():
         print(f"  removidos {k}: {v}")
     print(_green("  ✓ wipe completo"))
 
 
 def step_create_channels(c) -> None:
-    print(_bold("\n[2/7] Criando 2 canais ficticios para teste"))
+    print(_bold("\n[2/8] Criando 2 canais ficticios para teste"))
     utcnow = c["utcnow"]
     flat_doc = c["flat_doc"]
 
@@ -345,7 +386,7 @@ def step_create_channels(c) -> None:
 
 
 def step_wait_cache():
-    print(_bold("\n[3/7] Aguardando 70s para cache de canais reciclar no Cloud Run"))
+    print(_bold("\n[3/8] Aguardando 70s para cache de canais reciclar no Cloud Run"))
     print(f"  cache TTL = 60s; aguardamos um pouco a mais...")
     for remaining in range(70, 0, -10):
         print(f"  {remaining}s...", end="\r")
@@ -403,7 +444,7 @@ def make_payload(phone_number_id: str, wa_id: str, profile_name: str, msg_id: st
 
 
 def step_send_webhooks(secret: str) -> None:
-    print(_bold("\n[4/7] Disparando 4 webhooks Meta-shape"))
+    print(_bold("\n[4/8] Disparando 4 webhooks Meta-shape"))
     wa_x = "5531777771111"
     wa_y = "5531777772222"
 
@@ -426,7 +467,7 @@ def step_send_webhooks(secret: str) -> None:
 
 
 def step_verify(c) -> int:
-    print(_bold("\n[5/7] Verificando estado final dos webhooks no Firestore"))
+    print(_bold("\n[5/8] Verificando estado final dos webhooks no Firestore"))
     coll_name = c["coll_name"]
     client = c["client"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -496,7 +537,7 @@ def _conv_doc(c, conv_id: str):
 def step_post_mark_read(c, id_token: str) -> int:
     """Cutover Fase 2C: POST /api/wa/conversation/{id}/read marca leitura
     de uma thread especifica e nao das outras do mesmo contato."""
-    print(_bold("\n[6/7] POST /api/wa/conversation/{id}/read (cutover Fase 2C)"))
+    print(_bold("\n[6/8] POST /api/wa/conversation/{id}/read (cutover Fase 2C)"))
     coll_name = c["coll_name"]
     client = c["client"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -556,7 +597,7 @@ def step_post_send_validation(c, id_token: str) -> int:
     """Cutover Fase 2C: POST /api/wa/send com conversation_id inexistente
     deve retornar 404, provando que _resolve_send_target rejeita antes de
     chamar Meta. Caminho feliz nao testado (canais fake, tokens fake)."""
-    print(_bold("\n[7/7] POST /api/wa/send com conversation_id invalido (cutover Fase 2C)"))
+    print(_bold("\n[7/8] POST /api/wa/send com conversation_id invalido (cutover Fase 2C)"))
 
     bad_conv = "9999__inexistente"
     status, payload = http_post_authed(
@@ -578,6 +619,68 @@ def step_post_send_validation(c, id_token: str) -> int:
         return 1
 
     print(_green("  ✓ _resolve_send_target rejeita antes de chegar em Meta"))
+    return 0
+
+
+def step_validate_usage(c, id_token: str) -> int:
+    """Fase 2.10.4: usage_{YYYY_MM} per-tenant.
+
+    Apos os 4 webhooks inbound (passo 4), espera:
+      tenants/hubloc/audit_metrics/usage_{YYYY-MM}.inbound_received >= 4
+    Tambem exercita GET /api/wa/usage/current-month e compara.
+    """
+    print(_bold("\n[8/8] Validando usage_{YYYY_MM} per-tenant (Fase 2.10.4)"))
+    coll_name = c["coll_name"]
+    client = c["client"]
+    utcnow = c["utcnow"]
+    year_month = utcnow().strftime("%Y-%m")
+    doc_id = f"usage_{year_month}"
+    hubloc = client.collection(coll_name("tenants")).document("hubloc")
+
+    snap = hubloc.collection("audit_metrics").document(doc_id).get()
+    if not snap.exists:
+        print(_red(f"  ✗ doc {doc_id} nao existe em tenants/hubloc/audit_metrics"))
+        return 1
+    data = snap.to_dict() or {}
+    inbound = int(data.get("inbound_received") or 0)
+    free_form = int(data.get("free_form_sent") or 0)
+    templates = data.get("templates_sent") or {}
+    media_bytes = int(data.get("media_uploaded_bytes") or 0)
+    print(f"  doc:           tenants/hubloc/audit_metrics/{doc_id}")
+    print(f"  month:         {data.get('month')}")
+    print(f"  inbound_received={inbound}, free_form_sent={free_form}, "
+          f"media_uploaded_bytes={media_bytes}")
+    print(f"  templates_sent: {templates}")
+
+    failures = []
+    if inbound < 4:
+        failures.append(f"inbound_received esperado>=4 obtido={inbound}")
+    elif inbound > 4:
+        print(_yellow(
+            f"  [warn] inbound_received={inbound} (esperado=4) — provavel "
+            "trafego paralelo no staging entre wipe e e2e"
+        ))
+    if data.get("month") != year_month:
+        failures.append(f"month esperado={year_month} obtido={data.get('month')}")
+
+    # Tambem exercita o endpoint REST
+    status, payload = http_get_authed("/api/wa/usage/current-month", id_token)
+    if status != 200:
+        failures.append(f"GET /api/wa/usage/current-month status={status} payload={payload}")
+    else:
+        api_inbound = int((payload or {}).get("inbound_received") or 0)
+        if api_inbound != inbound:
+            failures.append(
+                f"GET retornou inbound_received={api_inbound}, Firestore={inbound}"
+            )
+        print(f"  GET /api/wa/usage/current-month -> 200 inbound={api_inbound}")
+
+    if failures:
+        print(_red("  ✗ FALHAS:"))
+        for f in failures:
+            print(_red(f"    - {f}"))
+        return 1
+    print(_green("  ✓ usage_{YYYY_MM} consistente com webhooks disparados"))
     return 0
 
 
@@ -615,6 +718,11 @@ def main() -> int:
     if rc7 != 0:
         print(_red(_bold("\n✗ E2E FAILED (passo 7 send validation)")))
         return rc7
+
+    rc8 = step_validate_usage(c, id_token)
+    if rc8 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 8 usage_{YYYY_MM})")))
+        return rc8
 
     print(_green(_bold("\n✓ E2E PASSED")))
     return 0

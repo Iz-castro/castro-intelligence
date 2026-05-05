@@ -57,6 +57,7 @@ from database import (
     get_all_gc_conversations, get_gc_messages, save_gc_message,
     mark_gc_conversation_read, upsert_gc_conversation,
     get_audit_metrics, get_all_ratings,
+    get_monthly_usage, get_usage_history,
     get_assume_counter, decrement_assume_counter, increment_assume_counter,
     mark_contact_pending_response, clear_contact_pending_response,
     reset_assume_counter,
@@ -1236,6 +1237,7 @@ async def wa_send_media(
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
+        media_size_bytes=len(file_content),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -1305,6 +1307,7 @@ async def wa_send_audio(
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
+        media_size_bytes=len(converted),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -1318,6 +1321,10 @@ class WaSendTemplateRequest(BaseModel):
     template_name: str = "hello_world"
     language: str = "pt_BR"
     components: list[dict] | None = None  # [{type, sub_type?, index?, parameters: [{type:"text", text:"..."}]}]
+    # Categoria Meta (marketing/utility/authentication). Best-effort
+    # informada pelo frontend que ja conhece via /api/wa/templates.
+    # Quando ausente, contabilizada em templates_sent.unknown.
+    template_category: str | None = None
 
 
 @app.post("/api/wa/send-template")
@@ -1335,6 +1342,7 @@ async def wa_send_template(
         effective_template_name = body.template_name or template_name
         effective_language = body.language or language
         components = body.components or []
+        effective_template_category = body.template_category
     else:
         if contact_id is None:
             raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
@@ -1343,6 +1351,7 @@ async def wa_send_template(
         effective_template_name = template_name
         effective_language = language
         components = []
+        effective_template_category = None
 
     conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
     _check_conv_send_permission(conv, current_user)
@@ -1389,6 +1398,7 @@ async def wa_send_template(
             conversation_id=conv["id"],
             sender_user_id=current_user["id"],
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
+            template_category=effective_template_category,
         )
         log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
         return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
@@ -2393,6 +2403,52 @@ async def dashboard_ratings(
         raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
     ratings = get_all_ratings(date_from or None, date_to or None)
     return {"ratings": ratings}
+
+
+# -- API: Usage mensal per-tenant (Fase 2.10.4) --
+
+
+@app.get("/api/wa/usage/current-month")
+async def wa_usage_current_month(current_user: dict = Depends(get_current_user)):
+    """Retorna usage do mes corrente pro tenant atual (informativo).
+
+    Estrutura: { month, templates_sent: {marketing,utility,authentication,unknown},
+    free_form_sent, inbound_received, media_uploaded_bytes }.
+    Acessivel a admin/supervisor — visibilidade pra cruzar com fatura Meta.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    return get_monthly_usage()
+
+
+@app.get("/api/wa/usage/history")
+async def wa_usage_history(
+    months: int = Query(3, ge=1, le=24),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna ultimos N meses de usage do tenant atual (mes corrente primeiro)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    return {"months": get_usage_history(months)}
+
+
+@app.get("/api/wa/usage/{year_month}")
+async def wa_usage_specific_month(
+    year_month: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna usage de um mes especifico (formato YYYY-MM)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    if len(year_month) != 7 or year_month[4] != "-":
+        raise HTTPException(status_code=400, detail="Formato esperado: YYYY-MM")
+    try:
+        y, m = year_month.split("-")
+        if not (1 <= int(m) <= 12) or not (2020 <= int(y) <= 2099):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato esperado: YYYY-MM")
+    return get_monthly_usage(year_month)
 
 
 # -- API: Export --

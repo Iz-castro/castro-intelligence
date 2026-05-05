@@ -1170,7 +1170,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     channel_id=None, phone_number_id="",
                     is_rating_message=False, visibility="all",
                     conversation_id=None,
-                    channel_owner_user_id=None, sender_user_id=None):
+                    channel_owner_user_id=None, sender_user_id=None,
+                    template_category=None, media_size_bytes=0):
     """Persiste mensagem WhatsApp.
 
     Auditoria coexistence (Fase 2C):
@@ -1183,6 +1184,12 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
 
     `conversation_id` pode ser passado explicitamente (caller ja resolveu
     a thread). Caso contrario, e derivado de (channel_id, contact.wa_id).
+
+    Visibilidade de uso (Fase 2.10.4):
+      - `template_category`: 'marketing'/'utility'/'authentication' quando
+        msg_type='template'; demais values mapeados pra 'unknown'.
+      - `media_size_bytes`: tamanho em bytes do payload de midia outbound.
+        Usado pra agregacao mensal em audit_metrics/usage_{YYYY_MM}.
     """
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
@@ -1275,6 +1282,13 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     increment_audit_metrics(
         direction=direction,
         operator_id=operator_id or (contact or {}).get("assigned_to"),
+    )
+    # Visibilidade de uso mensal (Fase 2.10.4 — usage_{YYYY_MM} per-tenant)
+    increment_usage_metrics(
+        direction=direction,
+        msg_type=msg_type,
+        template_category=template_category,
+        media_size_bytes=media_size_bytes,
     )
     return message_id
 
@@ -1456,14 +1470,121 @@ def increment_audit_metrics(direction, operator_id=None, is_new_lead=False, is_a
 
 
 def get_audit_metrics(date_from, date_to):
-    """Retorna metricas agregadas para o periodo."""
+    """Retorna metricas agregadas (daily/per-operator) para o periodo.
+
+    Pula docs com prefix `usage_` (agregacao mensal — get_monthly_usage).
+    """
     rows = []
     for snap in collection("audit_metrics").stream():
+        if snap.id.startswith("usage_"):
+            continue
         data = snap.to_dict() or {}
         date_str = data.get("date", "")
         if date_from <= date_str <= date_to:
             data["doc_id"] = snap.id
             rows.append(normalize_record(data))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Usage metrics mensal per-tenant (Fase 2.10.4)
+# ---------------------------------------------------------------------------
+#
+# Doc id: `usage_{YYYY-MM}` em tenants/{tid}/audit_metrics/.
+# Tenant scoping vem do ContextVar (collection() roteia automaticamente).
+# Increment atomico via firestore.Increment evita perda em concorrencia.
+
+def _usage_metrics_doc_id(year_month=None):
+    if not year_month:
+        year_month = utcnow().strftime("%Y-%m")
+    return f"usage_{year_month}"
+
+
+_VALID_TEMPLATE_CATEGORIES = ("marketing", "utility", "authentication")
+
+
+def increment_usage_metrics(direction, msg_type="", template_category=None, media_size_bytes=0):
+    """Incrementa usage_{YYYY_MM} do tenant atual com Increment atomico.
+
+    Campos atualizados conforme direction/msg_type:
+      - inbound  -> inbound_received++
+      - outbound + msg_type='template' -> templates_sent.{cat}++ (cat
+        normalizada pra marketing/utility/authentication ou 'unknown')
+      - outbound + outros msg_type -> free_form_sent++
+      - media_size_bytes>0 -> media_uploaded_bytes += bytes
+    """
+    now = utcnow()
+    year_month = now.strftime("%Y-%m")
+    doc_id = _usage_metrics_doc_id(year_month)
+
+    updates = {
+        "month": year_month,
+        "updated_at": now,
+    }
+
+    if direction == "inbound":
+        updates["inbound_received"] = firestore.Increment(1)
+    elif direction == "outbound":
+        if msg_type == "template":
+            cat = (template_category or "").strip().lower() or "unknown"
+            if cat not in _VALID_TEMPLATE_CATEGORIES:
+                cat = "unknown"
+            updates["templates_sent"] = {cat: firestore.Increment(1)}
+        else:
+            updates["free_form_sent"] = firestore.Increment(1)
+
+    if media_size_bytes and int(media_size_bytes) > 0:
+        updates["media_uploaded_bytes"] = firestore.Increment(int(media_size_bytes))
+
+    try:
+        document("audit_metrics", doc_id).set(updates, merge=True)
+    except Exception as exc:
+        logger.warning("Falha ao atualizar usage_metrics: %s", exc)
+
+
+def get_monthly_usage(year_month=None):
+    """Retorna usage_{YYYY_MM} do tenant atual.
+
+    year_month default = mes corrente (UTC). Retorna esqueleto zerado se
+    o doc ainda nao existe (mes sem trafego).
+    """
+    if not year_month:
+        year_month = utcnow().strftime("%Y-%m")
+    doc_id = _usage_metrics_doc_id(year_month)
+    snap = document("audit_metrics", doc_id).get()
+    if not snap.exists:
+        return {
+            "month": year_month,
+            "templates_sent": {},
+            "free_form_sent": 0,
+            "inbound_received": 0,
+            "media_uploaded_bytes": 0,
+        }
+    data = snap.to_dict() or {}
+    data.setdefault("month", year_month)
+    data.setdefault("templates_sent", {})
+    data.setdefault("free_form_sent", 0)
+    data.setdefault("inbound_received", 0)
+    data.setdefault("media_uploaded_bytes", 0)
+    return normalize_record(data)
+
+
+def get_usage_history(months=3):
+    """Retorna ultimos N meses de usage do tenant atual (mes corrente primeiro).
+
+    months e clampeado em [1, 24].
+    """
+    months = max(1, min(int(months or 3), 24))
+    now = utcnow()
+    rows = []
+    for offset in range(months):
+        year = now.year
+        month = now.month - offset
+        while month <= 0:
+            month += 12
+            year -= 1
+        ym = f"{year:04d}-{month:02d}"
+        rows.append(get_monthly_usage(ym))
     return rows
 
 
