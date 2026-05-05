@@ -36,11 +36,12 @@ from config import (
 from database import (
     init_database, get_user_by_id, get_all_users,
     get_all_wa_contacts, get_wa_conversation,
-    mark_wa_conversation_read, save_wa_message, get_wa_contact,
+    mark_wa_conversation_read, mark_wa_conversation_read_by_id,
+    save_wa_message, get_wa_contact,
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
     get_department_by_id, update_department, deactivate_department,
-    assign_wa_contact, get_transfer_history,
+    assign_wa_contact, assign_wa_conversation, get_transfer_history,
     return_contact_to_bot, get_contacts_by_assigned_user,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user,
@@ -50,6 +51,7 @@ from database import (
     get_wa_message_by_id, update_wa_message_transcription,
     create_manual_wa_contact, update_wa_contact_declared_name,
     mark_message_corrected,
+    get_wa_conversation_by_id, upsert_wa_conversation,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -156,7 +158,11 @@ if os.path.isdir(FRONTEND_ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS_DIR), name="frontend-assets")
 
 class WaSendRequest(BaseModel):
-    contact_id: int
+    # Fase 2C: conversation_id e o canonico (identifica thread channel+wa_id).
+    # contact_id continua aceito enquanto o frontend nao migrou todas as views
+    # — backend resolve para (conversation, contact) via _resolve_send_target.
+    conversation_id: str | None = None
+    contact_id: int | None = None
     content: str
     reply_to_message_id: int | None = None
     reply_to_preview: str = ""
@@ -179,7 +185,8 @@ class WaSendRequest(BaseModel):
 
 
 class WaSendLocationRequest(BaseModel):
-    contact_id: int
+    conversation_id: str | None = None
+    contact_id: int | None = None
     latitude: float
     longitude: float
     name: str = ""
@@ -920,7 +927,9 @@ _24H = timedelta(hours=24)
 
 
 def _check_send_permission(contact: dict, current_user: dict):
-    """Raises 403 if operator cannot send to this contact."""
+    """LEGADO. Substituido por _check_conv_send_permission (atua na conversation).
+    Mantido apenas como fallback caso algum codigo legado interno chame.
+    """
     assigned = contact.get("assigned_to")
     if assigned and assigned != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
@@ -946,34 +955,35 @@ def _check_24h_window(contact: dict):
         )
 
 
-def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
-    """Resolve credenciais do canal a partir do contato.
+def _maybe_refresh_coex_token(channel: dict | None) -> None:
+    """Renova proativamente token coexistence se faltar <5min."""
+    if not channel:
+        return
+    from channel_service import CHANNEL_TYPE_COEXISTENCE, refresh_coexistence_token
 
-    Tenta channel_id do contato, senao usa canal default.
-    Para canais coexistence, tenta refresh proativo se o token vai expirar
-    em <5min — evita falhas silenciosas no envio.
-    Returns (token, phone_number_id, graph_api_base).
-    """
-    from channel_service import (
-        CHANNEL_TYPE_COEXISTENCE, get_channel, get_send_credentials,
-        refresh_coexistence_token,
-    )
+    if channel.get("channel_type") != CHANNEL_TYPE_COEXISTENCE:
+        return
+    expires_at_raw = channel.get("token_expires_at")
+    if not expires_at_raw:
+        return
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= expires_at - timedelta(minutes=5):
+            refresh_coexistence_token(int(channel["id"]))
+    except (ValueError, TypeError):
+        logger.warning(
+            "Canal coexistence %s com token_expires_at invalido: %s",
+            channel.get("id"), expires_at_raw,
+        )
 
-    channel_id = contact.get("channel_id")
+
+def _resolve_channel_creds_by_id(channel_id: int | None) -> tuple[str, str, str]:
+    """Resolve credenciais (token, phone_id, base) a partir de um channel_id.
+    Refresh proativo do token coexistence quando aplicavel."""
+    from channel_service import get_channel, get_send_credentials
+
     if channel_id is not None:
-        channel = get_channel(channel_id)
-        if channel and channel.get("channel_type") == CHANNEL_TYPE_COEXISTENCE:
-            expires_at_raw = channel.get("token_expires_at")
-            if expires_at_raw:
-                try:
-                    expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
-                    if datetime.now(timezone.utc) >= expires_at - timedelta(minutes=5):
-                        refresh_coexistence_token(int(channel_id))
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Canal coexistence %s com token_expires_at invalido: %s",
-                        channel_id, expires_at_raw,
-                    )
+        _maybe_refresh_coex_token(get_channel(channel_id))
 
     try:
         return get_send_credentials(channel_id)
@@ -984,16 +994,98 @@ def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
         raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
 
 
+def _resolve_send_target(
+    conversation_id: str | None,
+    contact_id: int | None,
+) -> tuple[dict, dict, dict | None]:
+    """Resolve (conversation, contact, channel) para um endpoint de envio.
+
+    Estrategia Fase 2C:
+      - Se conversation_id: thread e canonica. Carrega conversation, contato
+        derivado dela, canal pelo conversation.channel_id.
+      - Se so contact_id (legado): carrega contato, deriva
+        conversation_id deterministico via (contact.channel_id, contact.wa_id),
+        upserta conversation se nao existir.
+
+    Levanta HTTPException 400/404 quando algo estiver inconsistente.
+    Channel pode ser None quando canal foi removido (envio cai em fallback).
+    """
+    from channel_service import get_channel
+    from database import (
+        get_wa_conversation_by_id, get_wa_contact, upsert_wa_conversation,
+    )
+
+    if conversation_id:
+        conv = get_wa_conversation_by_id(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+        ctc = get_wa_contact(conv.get("contact_id"))
+        if not ctc:
+            raise HTTPException(status_code=404, detail="Contato da conversation nao encontrado")
+        ch = get_channel(conv.get("channel_id")) if conv.get("channel_id") is not None else None
+        return conv, ctc, ch
+
+    if contact_id is None:
+        raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
+
+    ctc = get_wa_contact(contact_id)
+    if not ctc:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    ch_id = ctc.get("channel_id")
+    ch = get_channel(ch_id) if ch_id is not None else None
+    # Garante conversation: necessario pra audit + thread frontend
+    derived_conv_id = upsert_wa_conversation(
+        contact_id=ctc["id"],
+        wa_id=ctc.get("wa_id", ""),
+        channel_id=ch_id,
+        source_channel_type=str(ctc.get("source_channel_type") or ""),
+        phone_number_id=str(ctc.get("phone_number_id") or ""),
+    )
+    conv = get_wa_conversation_by_id(derived_conv_id) or {
+        "id": derived_conv_id,
+        "contact_id": ctc["id"],
+        "wa_id": ctc.get("wa_id", ""),
+        "channel_id": ch_id,
+        "assigned_to": ctc.get("assigned_to"),
+        "department_id": ctc.get("department_id"),
+    }
+    return conv, ctc, ch
+
+
+def _check_conv_send_permission(conversation: dict, current_user: dict):
+    """Permission check baseado na conversation (Fase 2C).
+
+    Bloqueia envio se a thread esta atribuida a outro operador. Sem
+    atribuicao, exige role admin/supervisor (mesma regra anterior, mas
+    por thread em vez de por contato — admite que o mesmo cliente em
+    canais diferentes seja atendido por gente diferente).
+    """
+    assigned = conversation.get("assigned_to")
+    if assigned and assigned != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
+    if not assigned and current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
+
+
+def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
+    """LEGADO. Resolve credenciais a partir do contato. Mantido para os
+    poucos call-sites que ainda nao migraram para conversation_id (qualify
+    rating template e similares onde a thread vem do contato direto).
+    Novos endpoints devem usar _resolve_send_target + _resolve_channel_creds_by_id.
+    """
+    return _resolve_channel_creds_by_id(contact.get("channel_id"))
+
+
 @app.post("/api/wa/send-location")
 async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Depends(get_current_user)):
-    contact = get_wa_contact(body.contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(body.conversation_id, body.contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
-    reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
     wa_id = contact["wa_id"]
     url = f"{api_base}/{phone_id}/messages"
@@ -1022,7 +1114,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
         content = f"{body.name} {body.address}".strip()
         save_wa_message(
             wa_message_id=wa_msg_id,
-            contact_id=body.contact_id,
+            contact_id=contact["id"],
             direction="outbound",
             msg_type="location",
             content=content,
@@ -1031,6 +1123,10 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
             status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=current_user["id"],
+            channel_id=channel["id"] if channel else conv.get("channel_id"),
+            conversation_id=conv["id"],
+            sender_user_id=current_user["id"],
+            channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
         )
         log_audit(current_user["id"], "WA_SEND_LOCATION", f"Para {wa_id}: {body.latitude},{body.longitude}")
@@ -1049,14 +1145,14 @@ def _maybe_credit_assume_counter(contact: dict, operator_id: int):
 
 @app.post("/api/wa/send")
 async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_user)):
-    contact = get_wa_contact(body.contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(body.conversation_id, body.contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(body.contact_id, body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
-    reply_context = _build_reply_context(body.contact_id, body.reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
     wa_id = _wa_target(contact["wa_id"])
     url = f"{api_base}/{phone_id}/messages"
@@ -1070,9 +1166,13 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     if resp.status_code == 200:
         wa_msg_id = result.get("messages", [{}])[0].get("id", "")
         save_wa_message(
-            wa_message_id=wa_msg_id, contact_id=body.contact_id, direction="outbound",
+            wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
             msg_type="text", content=body.content, status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
+            channel_id=channel["id"] if channel else conv.get("channel_id"),
+            conversation_id=conv["id"],
+            sender_user_id=current_user["id"],
+            channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
         )
         _maybe_credit_assume_counter(contact, current_user["id"])
@@ -1086,21 +1186,23 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
 
 @app.post("/api/wa/send-media")
 async def wa_send_media(
-    request: Request, contact_id: int = Form(...),
+    request: Request,
+    conversation_id: str | None = Form(None),
+    contact_id: int | None = Form(None),
     caption: str = Form(""), file: UploadFile = File(...),
     reply_to_message_id: int | None = Form(None),
     reply_to_preview: str = Form(""),
     reply_to_sender_name: str = Form(""),
 ):
     current_user = get_current_user(request)
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
-    reply_context = _build_reply_context(contact_id, reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], reply_to_message_id)
 
     file_content = await file.read()
     if len(file_content) > 16 * 1024 * 1024:
@@ -1125,11 +1227,15 @@ async def wa_send_media(
 
     wa_msg_id = send_result.get("wa_message_id", "")
     save_wa_message(
-        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
         msg_type=msg_type, content=caption, media_path=local_result["path"],
         media_mime=mime_type, media_id=media_id, filename=filename,
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+        conversation_id=conv["id"],
+        sender_user_id=current_user["id"],
+        channel_owner_user_id=(channel or {}).get("owner_user_id"),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -1139,7 +1245,10 @@ async def wa_send_media(
 
 @app.post("/api/wa/send-audio")
 async def wa_send_audio(
-    request: Request, contact_id: int = Form(...), file: UploadFile = File(...),
+    request: Request,
+    conversation_id: str | None = Form(None),
+    contact_id: int | None = Form(None),
+    file: UploadFile = File(...),
     reply_to_message_id: int | None = Form(None),
     reply_to_preview: str = Form(""),
     reply_to_sender_name: str = Form(""),
@@ -1148,14 +1257,14 @@ async def wa_send_audio(
     Converte WebM/Opus do navegador para OGG/Opus via FFmpeg."""
     current_user = get_current_user(request)
 
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
-    _check_send_permission(contact, current_user)
+    conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
+    _check_conv_send_permission(conv, current_user)
     _check_24h_window(contact)
-    reply_fields = _build_reply_fields(contact_id, reply_to_message_id, reply_to_preview, reply_to_sender_name)
-    reply_context = _build_reply_context(contact_id, reply_to_message_id)
+    reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
+    reply_context = _build_reply_context(contact["id"], reply_to_message_id)
 
     raw_content = await file.read()
     if len(raw_content) > 16 * 1024 * 1024:
@@ -1187,11 +1296,15 @@ async def wa_send_audio(
 
     wa_msg_id = send_result.get("wa_message_id", "")
     save_wa_message(
-        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
         msg_type="audio", content="", media_path=local_result["path"],
         media_mime="audio/ogg", media_id=media_id, filename="gravacao.ogg",
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+        conversation_id=conv["id"],
+        sender_user_id=current_user["id"],
+        channel_owner_user_id=(channel or {}).get("owner_user_id"),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -1200,7 +1313,8 @@ async def wa_send_audio(
 
 
 class WaSendTemplateRequest(BaseModel):
-    contact_id: int
+    conversation_id: str | None = None
+    contact_id: int | None = None
     template_name: str = "hello_world"
     language: str = "pt_BR"
     components: list[dict] | None = None  # [{type, sub_type?, index?, parameters: [{type:"text", text:"..."}]}]
@@ -1216,23 +1330,25 @@ async def wa_send_template(
 ):
     # Compat: aceita tanto body JSON quanto query params (legado).
     if body is not None:
+        effective_conversation_id = body.conversation_id
         effective_contact_id = body.contact_id
         effective_template_name = body.template_name or template_name
         effective_language = body.language or language
         components = body.components or []
     else:
         if contact_id is None:
-            raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+            raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
+        effective_conversation_id = None
         effective_contact_id = contact_id
         effective_template_name = template_name
         effective_language = language
         components = []
 
-    contact = get_wa_contact(effective_contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    _check_send_permission(contact, current_user)
-    token, phone_id, api_base = _resolve_channel_creds(contact)
+    conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
+    _check_conv_send_permission(conv, current_user)
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     template_payload: dict = {
@@ -1265,10 +1381,14 @@ async def wa_send_template(
         except Exception:
             pass
         save_wa_message(
-            wa_message_id=wa_msg_id, contact_id=effective_contact_id, direction="outbound",
+            wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
             msg_type="template", content=rendered_content,
             status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=current_user["id"],
+            channel_id=channel["id"] if channel else conv.get("channel_id"),
+            conversation_id=conv["id"],
+            sender_user_id=current_user["id"],
+            channel_owner_user_id=(channel or {}).get("owner_user_id"),
         )
         log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
         return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
@@ -1390,11 +1510,16 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
     if original.get("is_corrected"):
         raise HTTPException(status_code=400, detail="Mensagem ja foi corrigida")
 
-    contact_id = original["contact_id"]
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    token, phone_id, api_base = _resolve_channel_creds(contact)
+    # Resolve thread original — preferimos conversation_id da mensagem
+    # (denormalizado no save_wa_message) para nao confundir threads do
+    # mesmo contato em canais distintos.
+    conv, contact, channel = _resolve_send_target(
+        original.get("conversation_id"),
+        original.get("contact_id"),
+    )
+    token, phone_id, api_base = _resolve_channel_creds_by_id(
+        channel["id"] if channel else conv.get("channel_id")
+    )
     _check_24h_window(contact)
 
     # Enviar nova mensagem como reply da original
@@ -1423,10 +1548,14 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
     original_preview = (original.get("content") or "")[:80]
 
     new_msg_id = save_wa_message(
-        wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
+        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
         msg_type="text", content=body.new_content, status="sent",
         timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+        conversation_id=conv["id"],
+        sender_user_id=current_user["id"],
+        channel_owner_user_id=(channel or {}).get("owner_user_id"),
         reply_to_message_id=body.message_id,
         reply_to_preview=original_preview,
         reply_to_sender_name=current_user.get("display_name", "Operador"),
@@ -1563,11 +1692,16 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
             if resp.status_code == 200:
                 wa_msg_id = resp_data.get("messages", [{}])[0].get("id", "")
+                from channel_service import get_channel as _get_ch
+                _rating_channel = _get_ch(contact.get("channel_id")) if contact.get("channel_id") is not None else None
                 save_wa_message(
                     wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
                     msg_type="template", content="[avaliacao: responda de 1 a 10]",
                     status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
                     operator_id=current_user["id"],
+                    sender_user_id=current_user["id"],
+                    channel_id=contact.get("channel_id"),
+                    channel_owner_user_id=(_rating_channel or {}).get("owner_user_id"),
                     is_rating_message=True, visibility="admin_only",
                 )
                 result["rating_sent"] = True
@@ -1587,12 +1721,31 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
 
 @app.post("/api/wa/contact/{contact_id}/read")
 async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_current_user)):
+    """LEGADO: marca todas as mensagens inbound do contato como lidas
+    (cross-channel). Frontend novo deve usar
+    POST /api/wa/conversation/{conversation_id}/read pra zerar unread
+    apenas da thread aberta."""
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     if int(contact.get("unread_count", 0) or 0) <= 0:
         return {"status": "ok", "updated_count": 0}
     updated_count = mark_wa_conversation_read(contact_id)
+    return {"status": "ok", "updated_count": updated_count}
+
+
+@app.post("/api/wa/conversation/{conversation_id}/read")
+async def mark_conversation_read(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Zera unread_count da conversation e marca mensagens inbound da
+    thread como lidas. Diferente do endpoint legado por contato, nao
+    afeta unread de outras threads do mesmo cliente em canais distintos.
+    """
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+    if int(conv.get("unread_count", 0) or 0) <= 0:
+        return {"status": "ok", "updated_count": 0}
+    updated_count = mark_wa_conversation_read_by_id(conversation_id)
     return {"status": "ok", "updated_count": updated_count}
 
 
@@ -1830,24 +1983,31 @@ async def wa_contact_detail(contact_id: int, current_user: dict = Depends(get_cu
 @app.post("/api/wa/transfer")
 async def wa_transfer(request: Request, current_user: dict = Depends(get_current_user)):
     body = await request.json()
+    conversation_id = body.get("conversation_id")
     contact_id = body.get("contact_id")
     to_user_id = body.get("to_user_id")
     to_department_id = body.get("to_department_id")
     reason = body.get("reason", "")
     summary = body.get("summary", "")
-    if not contact_id:
-        raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+    if not conversation_id and not contact_id:
+        raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
     if not to_user_id:
         raise HTTPException(status_code=400, detail="Selecione o operador destino")
     if not summary:
         raise HTTPException(status_code=400, detail="Resumo do atendimento e obrigatorio")
-    contact = get_wa_contact(contact_id)
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
 
-    result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
+    conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+
+    # Fase 2C: transferencia atua na conversation. Quando vier so contact_id
+    # (legado), assign_wa_contact espelha em todas as conversations do contato
+    # — mas no fluxo novo so transferimos a thread aberta, deixando outras
+    # threads coexistence intactas.
+    if conversation_id:
+        result = assign_wa_conversation(conv["id"], to_user_id, to_department_id, current_user["id"], reason, summary)
+    else:
+        result = assign_wa_contact(contact["id"], to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
-        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+        raise HTTPException(status_code=404, detail="Conversation nao encontrada")
 
     to_user = get_user_by_id(to_user_id) if to_user_id else None
     to_name = to_user["display_name"] if to_user else "Nenhum"
@@ -1857,12 +2017,21 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
         + (f" | Motivo: {reason}" if reason else "")
         + (f" | Resumo: {summary}" if summary else "")
     )
-    insert_transfer_system_message(contact_id, sys_content, current_user["id"])
-    log_audit(current_user["id"], "WA_TRANSFER", f"Contato {contact_id} -> {to_name} (dept={to_department_id}): {reason}")
+    insert_transfer_system_message(
+        contact["id"], sys_content, current_user["id"],
+        conversation_id=conv["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+    )
+    log_audit(current_user["id"], "WA_TRANSFER", f"Conv {conv['id']} -> {to_name} (dept={to_department_id}): {reason}")
 
     await broadcast_to_operators({
         "event": "wa_contact_reassigned",
-        "data": {"contact_id": contact_id, "assigned_to": to_user_id, "assigned_name": to_name},
+        "data": {
+            "conversation_id": conv["id"],
+            "contact_id": contact["id"],
+            "assigned_to": to_user_id,
+            "assigned_name": to_name,
+        },
     })
     return {"status": "transferred", "to_user": to_name}
 
@@ -1951,6 +2120,11 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
     """Reatribuicao em lote de contatos de um operador.
 
     Body: { from_user_id, action: "return_to_bot" | "transfer", to_user_id? }
+
+    Exclui automaticamente contatos cujo canal e coexistence proprio do
+    operador X (i.e. `channel.owner_user_id == from_user_id`). Esses
+    contatos pertencem ao WhatsApp pessoal dele e nao podem ser
+    transferidos sem perder acesso ao numero — o operador continua dono.
     """
     if current_user.get("role") not in ("admin", "supervisor"):
         raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
@@ -1966,9 +2140,24 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
     if not contacts:
         return {"status": "ok", "count": 0}
 
+    from channel_service import CHANNEL_TYPE_COEXISTENCE, get_channel
+
     count = 0
+    skipped_coex = 0
     for contact in contacts:
         cid = contact["id"]
+        # Filtro coexistence: se canal e coexistence cujo dono e exatamente
+        # o operador que estamos esvaziando, manter o vinculo.
+        ch_id = contact.get("channel_id")
+        if ch_id is not None:
+            ch = get_channel(ch_id)
+            if (
+                ch
+                and ch.get("channel_type") == CHANNEL_TYPE_COEXISTENCE
+                and int(ch.get("owner_user_id") or 0) == int(from_user_id)
+            ):
+                skipped_coex += 1
+                continue
         if action == "return_to_bot":
             return_contact_to_bot(cid, current_user["id"])
             insert_transfer_system_message(cid, f"Devolvido ao bot (reatribuicao em lote) por {current_user['display_name']}", current_user["id"])
@@ -1978,8 +2167,8 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
             insert_transfer_system_message(cid, f"Reatribuido para {(to_user or {}).get('display_name', '?')} por {current_user['display_name']} (lote)", current_user["id"])
         count += 1
 
-    log_audit(current_user["id"], "BULK_REASSIGN", f"from={from_user_id} action={action} to={to_user_id} count={count}")
-    return {"status": "ok", "count": count}
+    log_audit(current_user["id"], "BULK_REASSIGN", f"from={from_user_id} action={action} to={to_user_id} count={count} skipped_coex={skipped_coex}")
+    return {"status": "ok", "count": count, "skipped_coex": skipped_coex}
 
 
 @app.get("/api/operators")

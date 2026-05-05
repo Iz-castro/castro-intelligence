@@ -856,11 +856,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
     if (markingReadContactIdRef.current === activeConversationId) return undefined;
 
+    // Fase 2C: marca thread aberta como lida (se houver). Sem thread,
+    // cai no endpoint legado por contact_id (timeline cross-channel).
+    const threadIdAtMark = activeThreadId;
+    const readPath = threadIdAtMark
+      ? `/api/wa/conversation/${encodeURIComponent(threadIdAtMark)}/read`
+      : `/api/wa/contact/${activeConversationId}/read`;
+
     let cancelled = false;
     const timeoutId = window.setTimeout(() => {
       if (cancelled) return;
       markingReadContactIdRef.current = activeConversationId;
-      void sendJson<{ status: string; updated_count: number }>(bundle.auth, `/api/wa/contact/${activeConversationId}/read`, {})
+      void sendJson<{ status: string; updated_count: number }>(bundle.auth, readPath, {})
         .then(() => {
           if (cancelled) return;
           markingReadContactIdRef.current = null;
@@ -877,7 +884,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, bundle, selectedContactId, sessionUser]);
+  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, bundle, selectedContactId, sessionUser]);
 
   // =========================================================================
   // Sound notifications
@@ -1085,6 +1092,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function logout() { if (bundle) await signOut(bundle.auth); }
 
+  // Resolve a chave de envio: preferimos conversation_id (thread atual)
+  // — backend resolve canal pela thread, garantindo que mesmo wa_id em
+  // 2 canais saia pelo canal correto. Se nao houver thread selecionada,
+  // mandamos contact_id e o backend deriva a thread default.
+  function buildSendTarget(): { conversation_id?: string; contact_id?: number } {
+    if (selectedThreadId) return { conversation_id: selectedThreadId };
+    if (selectedContact) return { contact_id: selectedContact.id };
+    return {};
+  }
+
   async function sendTextMessage() {
     if (!bundle || !selectedContact || !draft.trim()) return;
     try {
@@ -1093,7 +1110,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (userSettings.chat_prefix_enabled && userSettings.chat_prefix_name.trim() && systemSettings.chat_prefix_roles.includes(sessionUser?.role || "")) {
         content = `${userSettings.chat_prefix_name.trim()}: ${content}`;
       }
-      await sendJson(bundle.auth, "/api/wa/send", { contact_id: selectedContact.id, content, ...buildReplyPayload() });
+      await sendJson(bundle.auth, "/api/wa/send", { ...buildSendTarget(), content, ...buildReplyPayload() });
       setDraft(""); setReplyTarget(null); setNotice("Mensagem enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
@@ -1107,7 +1124,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusyUpload(true); setError(""); setNotice("");
       const form = new FormData();
-      form.append("contact_id", String(selectedContact.id));
+      const target = buildSendTarget();
+      if (target.conversation_id) form.append("conversation_id", target.conversation_id);
+      else if (target.contact_id) form.append("contact_id", String(target.contact_id));
       form.append("caption", ""); form.append("file", file);
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-media", form);
@@ -1147,7 +1166,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       audioChunksRef.current = []; setRecording(false); setRecordingSeconds(0);
       if (!audioBlob.size) throw new Error("Nao foi possivel capturar o audio gravado.");
       const form = new FormData();
-      form.append("contact_id", String(selectedContact.id));
+      const target = buildSendTarget();
+      if (target.conversation_id) form.append("conversation_id", target.conversation_id);
+      else if (target.contact_id) form.append("contact_id", String(target.contact_id));
       form.append("file", audioBlob, "gravacao.webm");
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-audio", form);
@@ -1187,7 +1208,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusyUpload(true); setError(""); setNotice("");
       const form = new FormData();
-      form.append("contact_id", String(selectedContact.id)); form.append("caption", ""); form.append("file", file);
+      const target = buildSendTarget();
+      if (target.conversation_id) form.append("conversation_id", target.conversation_id);
+      else if (target.contact_id) form.append("contact_id", String(target.contact_id));
+      form.append("caption", ""); form.append("file", file);
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-media", form);
       setReplyTarget(null); setNotice(`${label} enviado.`);
@@ -1203,7 +1227,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setError(""); setNotice("");
       const pos = await new Promise<GeolocationPosition>((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 10000 }));
-      await sendJson(bundle.auth, "/api/wa/send-location", { contact_id: selectedContact.id, latitude: pos.coords.latitude, longitude: pos.coords.longitude, ...buildReplyPayload() });
+      await sendJson(bundle.auth, "/api/wa/send-location", { ...buildSendTarget(), latitude: pos.coords.latitude, longitude: pos.coords.longitude, ...buildReplyPayload() });
       setNotice("Localização enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { const geo = e as { code?: number }; setError(geo.code ? "Permissão de localização negada ou tempo esgotado." : errorText(e)); }
@@ -1308,6 +1332,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function sendTemplate(params: {
     contactId: number;
+    conversationId?: string | null;
     templateName: string;
     language: string;
     components?: TemplateSendComponent[];
@@ -1315,8 +1340,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle) return false;
     try {
       setBusyTemplate(true); setError(""); setNotice("");
+      // Prefere conversation_id explicito, depois selectedThreadId, e por
+      // ultimo cai em contact_id (legado pra views que ainda nao tem thread).
+      const targetConv = params.conversationId || selectedThreadId || null;
       await sendJson(bundle.auth, "/api/wa/send-template", {
-        contact_id: params.contactId,
+        ...(targetConv ? { conversation_id: targetConv } : { contact_id: params.contactId }),
         template_name: params.templateName,
         language: params.language,
         components: params.components || [],
@@ -1375,7 +1403,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle || !selectedContact || !toUserId || !transferSummary.trim()) return;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
-      await sendJson(bundle.auth, "/api/wa/transfer", { contact_id: selectedContact.id, to_user_id: Number(toUserId), to_department_id: toDepartmentId ? Number(toDepartmentId) : null, reason: transferReason, summary: transferSummary });
+      await sendJson(bundle.auth, "/api/wa/transfer", { ...buildSendTarget(), to_user_id: Number(toUserId), to_department_id: toDepartmentId ? Number(toDepartmentId) : null, reason: transferReason, summary: transferSummary });
       setTransferReason(""); setTransferSummary(""); setNotice("Atendimento transferido.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }

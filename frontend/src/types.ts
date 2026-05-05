@@ -161,6 +161,7 @@ export type ChatMessage = {
   id: number;
   wa_message_id?: string;
   contact_id: number;
+  conversation_id?: string | null;
   direction: "inbound" | "outbound" | "system" | string;
   msg_type: "text" | "image" | "audio" | "video" | "gif" | "sticker" | "document" | "system" | string;
   content?: string;
@@ -168,7 +169,13 @@ export type ChatMessage = {
   media_mime?: string;
   filename?: string;
   status?: string;
+  // operator_id e o legado; sender_user_id e o novo (Fase 2C). Sao iguais
+  // quando o operador atribuido envia. Diferem em coexistence quando a
+  // thread foi transferida — channel_owner_user_id mostra o dono fisico
+  // do numero, sender_user_id mostra quem digitou de fato.
   operator_id?: number | null;
+  sender_user_id?: number | null;
+  channel_owner_user_id?: number | null;
   operator_name?: string;
   assigned_to_uid?: string;
   created_at?: string;
@@ -186,7 +193,8 @@ export type ChatMessage = {
 };
 
 export type TransferRequest = {
-  contact_id: number;
+  conversation_id?: string;
+  contact_id?: number;
   to_user_id: number;
   to_department_id?: number | null;
   reason: string;
