@@ -16,6 +16,8 @@ from datetime import datetime
 
 import httpx
 
+from pii_redaction import redact_phone
+
 from config import (
     WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID,
@@ -428,7 +430,17 @@ async def get_media_url(media_id, token=None):
         try:
             resp = await client.get(endpoint, headers=headers)
             if resp.status_code != 200:
-                logger.error("Falha ao obter URL da midia %s: %s", media_id, resp.text)
+                # NAO logar resp.text cru — pode ter URL assinada com token.
+                # Loga apenas a mensagem de erro estruturada.
+                err_msg = ""
+                try:
+                    err_msg = ((resp.json() or {}).get("error") or {}).get("message", "")
+                except Exception:
+                    err_msg = "<unparseable>"
+                logger.error(
+                    "Falha ao obter URL da midia %s | status=%s erro=%s",
+                    media_id, resp.status_code, err_msg,
+                )
                 return None
             data = resp.json()
             return {
@@ -589,11 +601,11 @@ async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_mes
             result = resp.json()
             if resp.status_code == 200:
                 wa_msg_id = result.get("messages", [{}])[0].get("id", "")
-                logger.info("[WA MEDIA OUT] %s -> %s (type=%s)", wa_id, wa_msg_id, msg_type)
+                logger.info("[WA MEDIA OUT] %s -> %s (type=%s)", redact_phone(wa_id), wa_msg_id, msg_type)
                 return {"wa_message_id": wa_msg_id, "status": "sent"}
             error = result.get("error", {}).get("message", "Erro desconhecido")
-            logger.error("[WA MEDIA FAIL] %s: %s", wa_id, error)
+            logger.error("[WA MEDIA FAIL] %s: %s", redact_phone(wa_id), error)
             return {"error": error}
         except Exception as exc:
-            logger.error("Erro ao enviar midia para %s: %s", wa_id, exc)
+            logger.error("Erro ao enviar midia para %s: %s", redact_phone(wa_id), exc)
             return {"error": str(exc)}

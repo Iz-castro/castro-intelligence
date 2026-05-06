@@ -322,9 +322,17 @@ def refresh_coexistence_token(channel_id: int) -> bool:
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(url, params=params)
         if resp.status_code >= 400:
+            # NAO logar resp.text cru — pode conter token em sucesso parcial
+            # ou outros campos sensiveis. Extrai apenas a mensagem de erro
+            # estruturada do JSON da Graph API.
+            err_msg = ""
+            try:
+                err_msg = ((resp.json() or {}).get("error") or {}).get("message", "")
+            except Exception:
+                err_msg = "<unparseable>"
             logger.warning(
-                "refresh_coexistence_token: canal %s falhou status=%s body=%s",
-                channel_id, resp.status_code, resp.text[:300],
+                "refresh_coexistence_token: canal %s falhou status=%s erro=%s",
+                channel_id, resp.status_code, err_msg,
             )
             return False
         data = resp.json()
@@ -334,7 +342,12 @@ def refresh_coexistence_token(channel_id: int) -> bool:
 
     new_token = data.get("access_token")
     if not new_token:
-        logger.warning("refresh_coexistence_token: canal %s resposta sem access_token: %s", channel_id, data)
+        # Loga apenas as chaves do response (sem valores) — o que importa
+        # pra debug e qual campo veio (ex.: 'error' vs 'access_token').
+        logger.warning(
+            "refresh_coexistence_token: canal %s resposta sem access_token (campos=%s)",
+            channel_id, sorted((data or {}).keys()),
+        )
         return False
 
     expires_in = data.get("expires_in")

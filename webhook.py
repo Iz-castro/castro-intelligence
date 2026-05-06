@@ -28,6 +28,7 @@ from channel_service import get_channel_by_phone_id, get_default_channel, CHANNE
 from bot_service import process_bot_message
 from firestore_common import set_tenant_context, reset_tenant_context
 from tenant_service import lookup_phone_routing
+from pii_redaction import redact_phone, redact_name
 
 logger = logging.getLogger("castro_crm.webhook")
 
@@ -214,7 +215,7 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             sender_user_id=None,
         )
         if resp.status_code == 200:
-            logger.info("[BOT] Resposta enviada para %s | contact=%d", wa_id, contact_id)
+            logger.info("[BOT] Resposta enviada para %s | contact=%d", redact_phone(wa_id), contact_id)
         else:
             logger.warning("[BOT] Falha ao enviar resposta | status=%s | erro=%s", resp.status_code, result)
     except Exception as e:
@@ -416,7 +417,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             logger.info(
                 "Mensagem unsupported sem midia tratavel | keys=%s | wa_id=%s | id=%s",
                 sorted(msg.keys()),
-                wa_id,
+                redact_phone(wa_id),
                 msg_id[:20],
             )
 
@@ -449,7 +450,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
 
         logger.info(
             "[WA IN] %s (%s) | tipo=%s | id=%s",
-            contact_name, wa_id, effective_msg_type, msg_id[:20]
+            redact_name(contact_name), redact_phone(wa_id), effective_msg_type, msg_id[:20]
         )
 
         # -- Bot: processar mensagem se ativo e contato sem operador --
@@ -805,7 +806,7 @@ def _process_smb_app_state_sync(value):
             contact_id = upsert_wa_contact(normalized_phone, display_name)
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
-                normalized_phone, display_name, contact_id,
+                redact_phone(normalized_phone), redact_name(display_name), contact_id,
             )
 
         elif action == "remove":
@@ -1148,10 +1149,12 @@ def _process_account_update(value):
     event = str(value.get("event", "")).upper()
     phone_number = value.get("phone_number", "")
 
+    redacted_phone = redact_phone(phone_number)
+
     if event == "PARTNER_REMOVED":
         logger.warning(
             "[ACCOUNT] Cliente desconectou da API de Nuvem | phone=%s",
-            phone_number,
+            redacted_phone,
         )
         log_audit(
             user_id=None,
@@ -1160,7 +1163,7 @@ def _process_account_update(value):
         )
 
     elif event == "ACCOUNT_OFFBOARDED":
-        logger.warning("[ACCOUNT] Conta removida (offboarded) | phone=%s", phone_number)
+        logger.warning("[ACCOUNT] Conta removida (offboarded) | phone=%s", redacted_phone)
         log_audit(
             user_id=None,
             action="coexistence_offboarded",
@@ -1168,7 +1171,7 @@ def _process_account_update(value):
         )
 
     elif event == "ACCOUNT_RECONNECTED":
-        logger.info("[ACCOUNT] Conta reconectada | phone=%s", phone_number)
+        logger.info("[ACCOUNT] Conta reconectada | phone=%s", redacted_phone)
         log_audit(
             user_id=None,
             action="coexistence_reconnected",
@@ -1176,4 +1179,4 @@ def _process_account_update(value):
         )
 
     else:
-        logger.info("[ACCOUNT] Evento nao tratado: %s | phone=%s", event, phone_number)
+        logger.info("[ACCOUNT] Evento nao tratado: %s | phone=%s", event, redacted_phone)

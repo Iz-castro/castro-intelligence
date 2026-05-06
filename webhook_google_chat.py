@@ -16,6 +16,7 @@ from database import (
 )
 from google_chat import download_attachment
 from media import save_upload_media
+from pii_redaction import redact_name
 
 logger = logging.getLogger("castro_crm.webhook_gchat")
 
@@ -216,7 +217,7 @@ async def _process_gchat_message(message, space_id, space_name, sender_email, se
 
     logger.info(
         "[GC IN] %s (%s) | tipo=%s | space=%s",
-        sender_name, sender_email, msg_type, space_id,
+        redact_name(sender_name), redact_name(sender_email), msg_type, space_id,
     )
 
     return {}

@@ -73,6 +73,7 @@ from firestore_common import (
     collection_name, document as fs_document, utcnow as fs_utcnow,
     set_tenant_context, tenant_context, get_tenant_context,
 )
+from pii_redaction import redact_phone, redact_name
 from tenant_service import (
     create_tenant, get_tenant, tenant_exists, lookup_phone_routing,
 )
@@ -358,10 +359,13 @@ def bootstrap_admin_user():
                 logger.warning("Falha ao setar custom_claim tenant_id no admin: %s", exc)
         logger.info(
             "Bootstrap admin Firebase sincronizado | email=%s tenant_id=%s",
-            BOOTSTRAP_ADMIN_EMAIL, tenant_id,
+            redact_name(BOOTSTRAP_ADMIN_EMAIL), tenant_id,
         )
     else:
-        logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        logger.warning(
+            "Falha ao sincronizar bootstrap admin Firebase | email=%s",
+            redact_name(BOOTSTRAP_ADMIN_EMAIL),
+        )
 
 
 def bootstrap_departments():
@@ -491,7 +495,12 @@ async def webhook_verify(
     if hub_mode == "subscribe" and hub_verify_token == WHATSAPP_VERIFY_TOKEN:
         logger.info("Webhook verificado com sucesso")
         return PlainTextResponse(hub_challenge)
-    logger.warning("Falha na verificacao do webhook (token=%s)", hub_verify_token)
+    # NAO logar o token recebido (LGPD/secret leakage). Indica apenas o
+    # comprimento pra diferenciar "token vazio" de "token errado".
+    logger.warning(
+        "Falha na verificacao do webhook | mode=%s token_len=%s",
+        hub_mode, len(hub_verify_token or ""),
+    )
     return PlainTextResponse("Forbidden", status_code=403)
 
 
@@ -1181,7 +1190,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
         error_msg = result.get("error", {}).get("message", "Erro desconhecido")
-        logger.warning("Falha ao enviar texto para %s | status=%s | erro=%s", wa_id, resp.status_code, error_msg)
+        logger.warning("Falha ao enviar texto para %s | status=%s | erro=%s", redact_phone(wa_id), resp.status_code, error_msg)
         raise HTTPException(status_code=502, detail=error_msg)
 
 
@@ -2894,7 +2903,7 @@ async def embedded_signup_exchange(
 
     logger.info(
         "Embedded Signup concluido | waba=%s phone_id=%s display=%s status=%s platform=%s tier=%s",
-        waba_id, phone_number_id, display_phone, status, platform_type, messaging_limit_tier,
+        waba_id, phone_number_id, redact_phone(display_phone), status, platform_type, messaging_limit_tier,
     )
 
     # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
