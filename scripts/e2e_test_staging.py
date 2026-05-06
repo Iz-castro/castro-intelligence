@@ -112,7 +112,11 @@ _cloud_run_env_cache: dict[str, str] | None = None
 
 
 def _read_cloud_run_env() -> dict[str, str]:
-    """Le todas as env vars do servico castro-crm-staging via gcloud."""
+    """Le todas as env vars do servico castro-crm-staging via gcloud.
+
+    Resolve `valueFrom.secretKeyRef` chamando `gcloud secrets versions
+    access` (caso o env tenha sido configurado via --update-secrets).
+    Requer `roles/secretmanager.secretAccessor` no usuario corrente."""
     global _cloud_run_env_cache
     if _cloud_run_env_cache is not None:
         return _cloud_run_env_cache
@@ -131,8 +135,32 @@ def _read_cloud_run_env() -> dict[str, str]:
         containers = (data.get("spec", {}).get("template", {}).get("spec", {})
                           .get("containers", []) or [])
         env_list = (containers[0].get("env", []) if containers else []) or []
-        _cloud_run_env_cache = {e["name"]: e.get("value", "")
-                                for e in env_list if "name" in e}
+        resolved: dict[str, str] = {}
+        for e in env_list:
+            name = e.get("name")
+            if not name:
+                continue
+            v = e.get("value", "")
+            if v:
+                resolved[name] = v
+                continue
+            ref = (e.get("valueFrom") or {}).get("secretKeyRef") or {}
+            secret_name = ref.get("name", "")
+            secret_key = ref.get("key", "latest") or "latest"
+            if not secret_name:
+                continue
+            try:
+                cmd2 = [
+                    "gcloud", "secrets", "versions", "access", secret_key,
+                    f"--secret={secret_name}",
+                    "--project", os.environ["FIRESTORE_PROJECT_ID"],
+                ]
+                out2 = subprocess.run(cmd2, capture_output=True, text=True, shell=True)
+                if out2.returncode == 0:
+                    resolved[name] = out2.stdout.rstrip("\n")
+            except Exception:
+                pass
+        _cloud_run_env_cache = resolved
     except Exception:
         _cloud_run_env_cache = {}
     return _cloud_run_env_cache

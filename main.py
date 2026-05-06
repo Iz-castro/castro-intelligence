@@ -2142,17 +2142,85 @@ async def _compute_tenant_health() -> dict:
     }
 
 
-def _verify_cron_secret(request: Request) -> None:
-    import hmac as _hmac
-    expected = os.environ.get("INTERNAL_CRON_SECRET", "").strip()
-    if not expected:
+def _verify_oidc_token(token: str) -> None:
+    """Valida OIDC token Bearer (Cloud Scheduler nativo).
+
+    Cloud Scheduler com `--oidc-service-account-email=<sa>` e
+    `--oidc-token-audience=<url>` envia Authorization: Bearer <jwt>
+    onde o JWT eh assinado pelo Google e tem:
+      - iss = https://accounts.google.com
+      - aud = audience configurado no job
+      - email = SA do scheduler
+
+    Env vars (configuradas no Cloud Run):
+      CRON_OIDC_AUDIENCE          (obrigatorio, ex: a propria URL do endpoint)
+      CRON_OIDC_SERVICE_ACCOUNT   (opcional, email do SA esperado — strict)
+    """
+    audience = os.environ.get("CRON_OIDC_AUDIENCE", "").strip()
+    if not audience:
         raise HTTPException(
             status_code=503,
-            detail="INTERNAL_CRON_SECRET nao configurado",
+            detail="CRON_OIDC_AUDIENCE nao configurado",
         )
+    expected_sa = os.environ.get("CRON_OIDC_SERVICE_ACCOUNT", "").strip()
+
+    from google.oauth2 import id_token as _id_token
+    from google.auth.transport import requests as _ga_requests
+
+    try:
+        payload = _id_token.verify_oauth2_token(
+            token, _ga_requests.Request(), audience=audience
+        )
+    except ValueError as exc:
+        # Token invalido / mal-assinado / aud errada / iss errada / expirado
+        raise HTTPException(
+            status_code=401,
+            detail=f"OIDC token invalido: {exc}",
+        )
+
+    if expected_sa and payload.get("email") != expected_sa:
+        # Strict mode: rejeita se SA nao bate com o esperado
+        raise HTTPException(
+            status_code=401,
+            detail="OIDC SA mismatch",
+        )
+
+
+def _verify_cron_auth(request: Request) -> None:
+    """Aceita OIDC Bearer (Cloud Scheduler) OU header X-Cron-Secret.
+
+    Tenta primeiro o que estiver presente:
+      1. Authorization: Bearer ...  -> OIDC verify
+      2. X-Cron-Secret: ...         -> shared secret hmac compare
+      3. Nenhum                     -> 401
+
+    Cada metodo eh independente — falha de um nao cai no outro.
+    Em prod, mover pra OIDC e remover INTERNAL_CRON_SECRET (CRON_OIDC_*
+    sao suficientes); em staging/dev/CI, X-Cron-Secret continua util.
+    """
+    import hmac as _hmac
+
+    auth_header = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        _verify_oidc_token(auth_header[7:].strip())
+        return
+
     secret_header = request.headers.get("X-Cron-Secret", "")
-    if not _hmac.compare_digest(secret_header.encode("utf-8"), expected.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="X-Cron-Secret invalido")
+    if secret_header:
+        expected = os.environ.get("INTERNAL_CRON_SECRET", "").strip()
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail="INTERNAL_CRON_SECRET nao configurado",
+            )
+        if not _hmac.compare_digest(secret_header.encode("utf-8"), expected.encode("utf-8")):
+            raise HTTPException(status_code=401, detail="X-Cron-Secret invalido")
+        return
+
+    raise HTTPException(
+        status_code=401,
+        detail="auth ausente: envie Authorization: Bearer <oidc> ou X-Cron-Secret",
+    )
 
 
 @app.post("/api/internal/cron/health-check")
@@ -2160,10 +2228,13 @@ async def cron_health_check(request: Request):
     """Cloud Scheduler chama diariamente. Itera tenants ativos, computa
     estado consolidado e grava em tenants/{tid}/health_status/current.
 
-    Auth: header X-Cron-Secret == INTERNAL_CRON_SECRET (env). Sem
-    autenticacao Firebase — Cloud Scheduler nao tem identidade humana.
+    Auth (qualquer um valida):
+      - Authorization: Bearer <OIDC token>  (Cloud Scheduler com
+        --oidc-service-account-email + --oidc-token-audience)
+      - X-Cron-Secret: <secret>             (header customizado, fallback
+        pra dev/staging onde OIDC nao tem SA configurado)
     """
-    _verify_cron_secret(request)
+    _verify_cron_auth(request)
 
     from tenant_service import list_tenants
     from firestore_common import set_tenant_context, reset_tenant_context, document as fs_doc

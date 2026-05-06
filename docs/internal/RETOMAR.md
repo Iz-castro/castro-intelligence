@@ -32,15 +32,20 @@ dcd27ba feat(fase2c):   wa_messages ganham channel_owner_user_id + sender_user_i
 **Staging:** revision `castro-crm-staging-00023-pbf` em 100% do tráfego.
 Service URL: https://castro-crm-staging-286866630844.southamerica-east1.run.app
 
-**Cloud Scheduler:** **criado e validado em staging** durante esta
-sessão. Job `castro-crm-staging-health-check` em `southamerica-east1`,
-schedule `0 9 * * *` (09:00 BRT diário). Manual run validado —
-`tenants/hubloc/health_status/current.checked_at` bate com
-`lastAttemptTime` do job. Próxima execução automática: 2026-05-06 09:00
-BRT.
+**Cloud Scheduler em staging:** criado e validado, **migrado pra OIDC
++ Secret Manager**. Job `castro-crm-staging-health-check` em
+`southamerica-east1`, schedule `0 9 * * *` (09:00 BRT diário). Auth
+via OIDC token assinado pela SA dedicada
+`castro-crm-scheduler@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com`
+(`roles/run.invoker` no Cloud Run). `INTERNAL_CRON_SECRET` agora vem do
+Secret Manager (`castro-crm-internal-cron-secret:latest`) — fallback
+pra e2e/CI que continuam usando header `X-Cron-Secret`. Backend aceita
+ambos via `_verify_cron_auth` (precedence: OIDC primeiro).
 
 **Produção:** intocada (`castro-crm`, `00077-qls`). Aguardando aprovação
-Meta App Review pra cutover prod (Fase 4).
+Meta App Review pra cutover prod (Fase 4). Cloud Scheduler prod
+**ainda não criado** — comandos OIDC + Secret Manager documentados em
+`docs/deploy/RUNBOOK_CUTOVER_PROD.md` §6.
 
 ## Validação — todos os 9 passos do e2e PASSED
 
@@ -301,7 +306,7 @@ Após `jobs run`, validar com:
 
 ## URL e revisões úteis
 
-- **Staging:** https://castro-crm-staging-286866630844.southamerica-east1.run.app — `castro-crm-staging-00023-pbf`
+- **Staging:** https://castro-crm-staging-286866630844.southamerica-east1.run.app — `castro-crm-staging-00027-zct`
 - **Produção:** `castro-crm`, `00077-qls` (Fase 1 apenas, intocada)
 - **Repo:** https://github.com/Iz-castro/castro-intelligence — branch `develop`
 - **Último commit:** `11e299b`

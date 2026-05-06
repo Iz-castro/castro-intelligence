@@ -124,41 +124,88 @@ fluxo Embedded Signup coexistence retorna #131009 ou similar.
 3. Token coexistence salvo com `token_expires_at` (~60 dias).
 4. Smoke test: aguardar mensagem inbound e verificar `channel_owner_user_id` populado em `wa_messages`.
 
-## 6. Replicar Cloud Scheduler em prod
+## 6. Replicar Cloud Scheduler em prod (com OIDC + Secret Manager)
+
+Em staging foi validado o pattern OIDC nativo (Cloud Scheduler) +
+shared secret no Secret Manager (fallback pra dev/CI). Mesmo pattern
+em prod.
+
+### 6.1 SA dedicado pro Cloud Scheduler
 
 ```powershell
-# Setar secret no Cloud Run prod (gerar valor novo, nao reusar staging)
-$NEW_SECRET = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_})
+gcloud iam service-accounts create castro-crm-prod-scheduler `
+  --display-name='Castro CRM prod scheduler invoker' `
+  --project=project-26fb9c99-8ee9-4179-aef
 
+gcloud run services add-iam-policy-binding castro-crm `
+  --member='serviceAccount:castro-crm-prod-scheduler@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com' `
+  --role='roles/run.invoker' `
+  --region=southamerica-east1 `
+  --project=project-26fb9c99-8ee9-4179-aef
+```
+
+### 6.2 Secret Manager (shared secret, fallback)
+
+```powershell
+# Gera valor seguro (32 chars urlsafe)
+$NEW_SECRET = python -c 'import secrets; print(secrets.token_urlsafe(32))'
+
+gcloud secrets create castro-crm-prod-internal-cron-secret `
+  --replication-policy='automatic' `
+  --project=project-26fb9c99-8ee9-4179-aef
+
+# Adiciona valor como version 1 (sem expor no shell history)
+$NEW_SECRET | gcloud secrets versions add castro-crm-prod-internal-cron-secret `
+  --data-file=- --project=project-26fb9c99-8ee9-4179-aef
+
+# Cloud Run SA precisa de leitura
+gcloud secrets add-iam-policy-binding castro-crm-prod-internal-cron-secret `
+  --member='serviceAccount:castro-crm-run@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com' `
+  --role='roles/secretmanager.secretAccessor' `
+  --project=project-26fb9c99-8ee9-4179-aef
+```
+
+### 6.3 Configurar env vars do Cloud Run prod
+
+```powershell
 gcloud run services update castro-crm `
-  --region southamerica-east1 `
-  --project project-26fb9c99-8ee9-4179-aef `
-  --update-env-vars "INTERNAL_CRON_SECRET=$NEW_SECRET"
+  --region=southamerica-east1 `
+  --project=project-26fb9c99-8ee9-4179-aef `
+  --update-env-vars="CRON_OIDC_AUDIENCE=https://<URL_PROD>/api/internal/cron/health-check,CRON_OIDC_SERVICE_ACCOUNT=castro-crm-prod-scheduler@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com" `
+  --update-secrets='INTERNAL_CRON_SECRET=castro-crm-prod-internal-cron-secret:latest'
+```
 
-# Idealmente, mover pra Secret Manager:
-#   gcloud secrets create castro-crm-internal-cron-secret --data-file=- <<<$NEW_SECRET
-#   gcloud run services update castro-crm --update-secrets INTERNAL_CRON_SECRET=castro-crm-internal-cron-secret:latest
+### 6.4 Criar job Cloud Scheduler com OIDC
 
-# Criar job Cloud Scheduler em prod
+```powershell
 gcloud scheduler jobs create http castro-crm-prod-health-check `
   --location=southamerica-east1 `
   --schedule='0 9 * * *' `
   --time-zone='America/Sao_Paulo' `
   --uri='https://<URL_PROD>/api/internal/cron/health-check' `
   --http-method=POST `
-  --headers="X-Cron-Secret=$NEW_SECRET,Content-Type=application/json" `
+  --update-headers='Content-Type=application/json' `
+  --oidc-service-account-email='castro-crm-prod-scheduler@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com' `
+  --oidc-token-audience='https://<URL_PROD>/api/internal/cron/health-check' `
   --message-body='{}' `
-  --project=project-26fb9c99-8ee9-4179-aef
-
-# Trigger manual pra validar
-gcloud scheduler jobs run castro-crm-prod-health-check `
-  --location=southamerica-east1 `
   --project=project-26fb9c99-8ee9-4179-aef
 ```
 
-**TODO antes de prod real:** migrar pra OIDC token (Cloud Scheduler
-suporta nativamente — endpoint validaria issuer+SA, eliminando o
-header customizado).
+Note: o backend aceita OIDC Bearer **OU** X-Cron-Secret (precedence:
+OIDC primeiro). Configurando `--oidc-*`, o Cloud Scheduler envia
+Authorization: Bearer e o backend valida via `google.oauth2.id_token`
+(issuer + audience + email do SA).
+
+### 6.5 Trigger manual pra validar
+
+```powershell
+gcloud scheduler jobs run castro-crm-prod-health-check `
+  --location=southamerica-east1 `
+  --project=project-26fb9c99-8ee9-4179-aef
+
+# Aguardar ~5s e validar Firestore
+./.venv/Scripts/python.exe -c "import os; os.environ['FIRESTORE_PROJECT_ID']='project-26fb9c99-8ee9-4179-aef'; os.environ['FIRESTORE_COLLECTION_PREFIX']='castro_crm'; from firestore_common import get_firestore_client, collection_name; c=get_firestore_client(); d=c.collection(collection_name('tenants')).document('hubloc').collection('health_status').document('current').get().to_dict(); print('checked_at=', d.get('checked_at'))"
+```
 
 ## 7. Smoke test final
 
