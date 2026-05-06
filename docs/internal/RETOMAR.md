@@ -1,35 +1,45 @@
-# Contexto pra retomar — Fase 2.10.3+2.10.4 concluídas, prox: Fase 2.10 UI
+# Contexto pra retomar — Backend ~95% fechado, prox: Firestore rules WIP + Fase 2.10 UI
 
-> Snapshot atualizado em 2026-05-05 (manhã/início tarde) após sessão de
-> retomada. Quando voltar, leia este arquivo primeiro, depois o
-> [2026-05-05.md](2026-05-05.md) pra detalhe das mudanças desta sessão,
-> ou [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md)
-> pra detalhe arquitetural geral.
+> Snapshot atualizado em 2026-05-06 (final da tarde) após maratona de
+> 2 dias fechando o backend. Quando voltar, leia este arquivo primeiro,
+> depois [2026-05-05.md](2026-05-05.md) e [2026-05-06.md](2026-05-06.md)
+> pra detalhe cronológico, ou
+> [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md)
+> pra detalhe arquitetural.
 
 ## Onde paramos
 
-**Fase 2C cutover + Fase 3 frontend + Fase 2.10.3 (cron health) +
-Fase 2.10.4 (usage per-tenant) totalmente concluídas, validadas em
-staging.** 12 commits acima do snapshot anterior (`022a6b0` → último
-commit no fim desta sessão). Os 2 docs (RETOMAR.md, 2026-05-05.md)
-ficam untracked até decisão de push.
+**Backend essencialmente fechado.** Fase 2C cutover + Fase 3 frontend
++ Fase 2.10.3 (cron health com OIDC + Secret Manager) + Fase 2.10.4
+(usage per-tenant) + Auditoria LGPD logs + Fase 4 prep (wipe script
++ runbook prod) — todos validados em staging. **Pendência única:
+Firestore rules estritas em staging (frente WIP — 4ª da fila do
+"fechar backend").** WIP preservado em
+[`firestore-rules-staging-strict.wip`](firestore-rules-staging-strict.wip).
+Rules permissivas restauradas no Firebase pra não bloquear staging.
+
+15 commits acima do snapshot anterior (`022a6b0` → `78234f7`).
 
 ```
+78234f7 feat(fase2.10.3): cron auth via OIDC + Secret Manager (staging migrado)
+578f8c4 feat(fase4):      wipe_all_collections.py + runbook cutover prod
+52c0ae5 feat(lgpd):       redact PII em logs (telefone, nome, secret)
+c7c4716 docs(internal):   RETOMAR + diario 2026-05-05 cobrindo fase 2.10.3 + scheduler
 11e299b feat(fase2.10.3): cron health-check + endpoint + e2e passo 9
-08c0753 feat(fase2.10): usage_{YYYY_MM} per-tenant + endpoints + e2e passo 8
-d0367fd feat(fase3.D):  filtros novos/meus/NQ/equipe operam sobre conversations
-235fe03 fix(fase3):     badges *Unread agregam por conversation, nao por contato
-d045ee1 fix(fase3):     mark-read zera unread da thread + contato manual ganha conversation
-9d1b66c feat(fase3):    selectedThreadId vira fonte unica de selecao
-fb8eef6 test(fase2c):   e2e cobre POST /conversation/{id}/read e /send com conv invalida
-e50a9fc docs:           corrige diario 2026-05-04 e regera SISTEMA_COMPLETO
-2f93040 chore(docs):    remove references a docs arquivados
-c67444b feat(fase2c):   phone_routing ativo no webhook
-6cd4891 feat(fase2c):   endpoints de envio aceitam conversation_id
-dcd27ba feat(fase2c):   wa_messages ganham channel_owner_user_id + sender_user_id
+08c0753 feat(fase2.10):   usage_{YYYY_MM} per-tenant + endpoints + e2e passo 8
+d0367fd feat(fase3.D):    filtros novos/meus/NQ/equipe operam sobre conversations
+235fe03 fix(fase3):       badges *Unread agregam por conversation, nao por contato
+d045ee1 fix(fase3):       mark-read zera unread da thread + contato manual ganha conversation
+9d1b66c feat(fase3):      selectedThreadId vira fonte unica de selecao
+fb8eef6 test(fase2c):     e2e cobre POST /conversation/{id}/read e /send com conv invalida
+e50a9fc docs:             corrige diario 2026-05-04 e regera SISTEMA_COMPLETO
+2f93040 chore(docs):      remove references a docs arquivados
+c67444b feat(fase2c):     phone_routing ativo no webhook
+6cd4891 feat(fase2c):     endpoints de envio aceitam conversation_id
+dcd27ba feat(fase2c):     wa_messages ganham channel_owner_user_id + sender_user_id
 ```
 
-**Staging:** revision `castro-crm-staging-00023-pbf` em 100% do tráfego.
+**Staging:** revision `castro-crm-staging-00028-qbn` em 100% do tráfego.
 Service URL: https://castro-crm-staging-286866630844.southamerica-east1.run.app
 
 **Cloud Scheduler em staging:** criado e validado, **migrado pra OIDC
@@ -190,6 +200,51 @@ Já estava no working tree do RETOMAR anterior — agora consolidado:
 
 ## Próximos passos (em ordem)
 
+### 0. Firestore rules estritas em staging — INVESTIGAÇÃO PENDENTE
+
+Ver [`2026-05-06.md` §3.4](2026-05-06.md) pro contexto detalhado do
+bug. Resumo:
+
+- Tentativa: substituir `match /castro_crm_staging_tenants/{tid}/{subcol=**}`
+  permissivo por rules tenant-scoped via custom claim `tenant_id` no JWT.
+- WIP completo (220 linhas) preservado em
+  [`firestore-rules-staging-strict.wip`](firestore-rules-staging-strict.wip).
+- Fix em `auth.py` (`_resolve_tenant_id` agora usa `get_tenant_context()`
+  como fallback) já está no Cloud Run staging revision `00028-qbn`,
+  e `set_custom_user_claims` foi rodado manualmente no UID
+  `znkzvZTl2kZ4gmg95pHjBLElEjS2` (rafa) — claims persistem
+  (`{tenant_id: hubloc, role: admin}` confirmado via Admin SDK).
+- **Mas:** `wa_conversations` snapshot funciona com cache local, e
+  `wa_messages` snapshot (que faz query `where conversation_id == ...
+  orderBy created_at desc limit N`) é negado mesmo em janela anônima.
+- Hipóteses não validadas: (a) JWT do client não está atualizando
+  apesar de logout/login; (b) interação rules + query com filter +
+  orderBy em wa_messages que rules engine recusa; (c) bundle JS
+  cached lendo path errado.
+
+**Como retomar:**
+
+```js
+// 1. Browser console (F12) na sessão logada:
+firebase.auth().currentUser.getIdTokenResult(true).then(r =>
+  console.log('claims:', JSON.stringify(r.claims)))
+
+// 2. Se claims OK no JWT, simular query no Firebase Console >
+//    Firestore > Rules Playground:
+//    Operation: list
+//    Path: castro_crm_staging_tenants/hubloc/wa_messages/anyId
+//    Authenticated: { tenant_id: 'hubloc', role: 'admin' }
+//    Query: where conversation_id == "100__5531777771111" orderBy created_at desc
+
+// 3. Restaurar rules WIP (quando preparado pra testar de novo):
+//    cp docs/internal/firestore-rules-staging-strict.wip firestore.rules
+//    firebase deploy --only firestore:rules \
+//      --project=project-26fb9c99-8ee9-4179-aef
+```
+
+**Não é blocker do App Review** — Meta valida BUSINESS app, não as
+rules Firestore.
+
 ### 1. Fase 2.10 UI (entrega visível pro cliente — recomendada)
 Backend 100% pronto: billing health-check
 (`GET /api/wa/channel/{id}/billing-status`), tradução erro 402 (desde
@@ -306,10 +361,10 @@ Após `jobs run`, validar com:
 
 ## URL e revisões úteis
 
-- **Staging:** https://castro-crm-staging-286866630844.southamerica-east1.run.app — `castro-crm-staging-00027-zct`
+- **Staging:** https://castro-crm-staging-286866630844.southamerica-east1.run.app — `castro-crm-staging-00028-qbn`
 - **Produção:** `castro-crm`, `00077-qls` (Fase 1 apenas, intocada)
 - **Repo:** https://github.com/Iz-castro/castro-intelligence — branch `develop`
-- **Último commit:** `11e299b`
+- **Último commit:** `78234f7`
 - **Cloud Scheduler staging:** `castro-crm-staging-health-check` em
   `southamerica-east1` — schedule `0 9 * * *` (09:00 BRT diário), state
   ENABLED.

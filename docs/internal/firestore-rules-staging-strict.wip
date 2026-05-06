@@ -1,0 +1,399 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Estas rules precisam usar o mesmo prefixo definido em FIRESTORE_COLLECTION_PREFIX.
+    // No ambiente atual, as collections reais sao "castro_crm_*".
+    // Regra temporaria de teste:
+    // libera somente o email abaixo. Depois troque para o dominio oficial da empresa.
+    function signedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+
+    function emailAllowed() {
+      return signedIn() && (
+        request.auth.token.email == 'rafaluisc@outlook.com' ||
+        request.auth.token.email == 'izaeldecastro@gmail.com' ||
+        request.auth.token.email.matches('.*@centralloc\\.com\\.br')
+      );
+    }
+
+    function myProfileExists() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/castro_crm_operator_profiles/$(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/castro_crm_operator_profiles/$(request.auth.uid));
+    }
+
+    function operatorActive() {
+      return emailAllowed() &&
+        myProfileExists() &&
+        myProfile().data.is_active == 1;
+    }
+
+    function isPrivileged() {
+      return operatorActive() &&
+        (myProfile().data.role == 'admin' || myProfile().data.role == 'supervisor');
+    }
+
+    function canSeeConversation(assignedUid, departmentId) {
+      return operatorActive() && (
+        isPrivileged() ||
+        assignedUid == request.auth.uid ||
+        assignedUid == '' ||
+        departmentId == null ||
+        departmentId == myProfile().data.department_id
+      );
+    }
+
+    match /castro_crm_operator_profiles/{uid} {
+      allow read: if emailAllowed() && (uid == request.auth.uid || operatorActive());
+      allow write: if false;
+    }
+
+    match /castro_crm_departments/{departmentId} {
+      allow read: if operatorActive();
+      allow write: if false;
+    }
+
+    match /castro_crm_wa_contacts/{contactId} {
+      // Privilegiados (admin/supervisor) veem todos.
+      // Operadores veem: atribuidos a si, sem atribuicao, ou do mesmo departamento.
+      allow read: if operatorActive() && (
+        isPrivileged() ||
+        resource.data.assigned_to_uid == request.auth.uid ||
+        resource.data.assigned_to_uid == '' ||
+        resource.data.assigned_to_uid == null ||
+        resource.data.department_id == myProfile().data.department_id
+      );
+      allow write: if false;
+    }
+
+    match /castro_crm_wa_messages/{messageId} {
+      allow read: if operatorActive();
+      allow write: if false;
+    }
+
+    match /castro_crm_wa_transfer_log/{transferId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_gc_conversations/{convId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_gc_messages/{msgId} {
+      allow read: if emailAllowed();
+      allow write: if false;
+    }
+
+    match /castro_crm_messages/{messageId} {
+      allow read: if operatorActive() && (
+        resource.data.sender_id == myProfile().data.user_id ||
+        resource.data.receiver_id == myProfile().data.user_id
+      );
+      allow write: if false;
+    }
+
+    match /castro_crm_internal_unread/{docId} {
+      allow read: if operatorActive() &&
+        resource.data.receiver_id == myProfile().data.user_id;
+      allow write: if false;
+    }
+
+    match /castro_crm_users/{userId} {
+      allow read, write: if false;
+    }
+
+    match /castro_crm_audit_log/{docId} {
+      allow read, write: if false;
+    }
+
+    match /castro_crm_wa_message_status/{docId} {
+      allow read, write: if false;
+    }
+
+    match /castro_crm__meta/{docId} {
+      allow read, write: if false;
+    }
+
+    // ====================================================================
+    // STAGING (FIRESTORE_COLLECTION_PREFIX=castro_crm_staging)
+    // Rules tenant-based estritas (PLANO_COEXISTENCE §2.9): isolamento
+    // entre tenants validado por custom claim `tenant_id` no JWT do
+    // Firebase Auth. Operador so le/escreve dentro do tenant dele.
+    //
+    // Pre-requisito client-side: frontend renova ID token apos bootstrap
+    // (set_tenant_claims) — `firebaseUser.getIdToken(true)` ou re-login.
+    // Backend Admin SDK ignora rules.
+    //
+    // Colecoes flat legadas pre-Fase 2 (`castro_crm_staging_<colecao>`
+    // sem prefix tenants/) ficam BLOCKEADAS pra forcar uso de paths
+    // tenant-scoped. Frontend ja consome tenant_collections via
+    // /api/session.
+    // ====================================================================
+
+    function tokenTenantId() {
+      return signedIn() && request.auth.token.tenant_id != null
+        ? string(request.auth.token.tenant_id)
+        : '';
+    }
+
+    function tokenRole() {
+      return signedIn() && request.auth.token.role != null
+        ? string(request.auth.token.role)
+        : '';
+    }
+
+    function ownsTenant(tid) {
+      return emailAllowed() && tokenTenantId() == tid;
+    }
+
+    function isPrivilegedInTenant(tid) {
+      return ownsTenant(tid) && (tokenRole() == 'admin' || tokenRole() == 'supervisor');
+    }
+
+    function tenantOperatorProfile(tid) {
+      return get(/databases/$(database)/documents/castro_crm_staging_tenants/$(tid)/operator_profiles/$(request.auth.uid));
+    }
+
+    function tenantOperatorActive(tid) {
+      return ownsTenant(tid) &&
+        exists(/databases/$(database)/documents/castro_crm_staging_tenants/$(tid)/operator_profiles/$(request.auth.uid)) &&
+        (tenantOperatorProfile(tid).data.is_active == 1 ||
+         tenantOperatorProfile(tid).data.is_active == true);
+    }
+
+    function canSeeContactScoped(tid) {
+      // Privilegiado le todos do tenant; operador so os atribuidos a si,
+      // sem atribuicao ou do mesmo departamento.
+      // Short-circuit em isPrivilegedInTenant evita get() de
+      // operator_profile no caminho admin/supervisor (caso comum).
+      return ownsTenant(tid) && (
+        isPrivilegedInTenant(tid) ||
+        resource.data.assigned_to_uid == request.auth.uid ||
+        resource.data.assigned_to_uid == '' ||
+        resource.data.assigned_to_uid == null ||
+        resource.data.department_id == tenantOperatorProfile(tid).data.department_id
+      );
+    }
+
+    // -- Colecoes flat legadas: bloqueadas em staging (sem read/write client) --
+    // Backend Admin SDK continua escrevendo nelas; frontend usa tenant-scoped.
+
+    match /castro_crm_staging_operator_profiles/{uid} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_users/{userId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_departments/{deptId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_channels/{channelId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_wa_contacts/{contactId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_wa_conversations/{convId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_wa_messages/{messageId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_wa_message_status/{docId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_wa_transfer_log/{transferId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_bot_states/{convId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_system_settings/{docId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_user_settings/{userId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_audit_log/{docId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_audit_metrics/{docId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_operator_assume_counters/{userId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_media_assets/{assetId} {
+      allow read, write: if false;
+      match /chunks/{chunkId} {
+        allow read, write: if false;
+      }
+    }
+    match /castro_crm_staging_gc_conversations/{convId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_gc_messages/{msgId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_messages/{messageId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_internal_unread/{docId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging__meta/{docId} {
+      allow read, write: if false;
+    }
+    match /castro_crm_staging_phone_routing/{phoneId} {
+      // Indice global tenant_id->channel_id, Admin SDK only.
+      allow read, write: if false;
+    }
+
+    // -- Tenant root + subcolecoes (rules tenant-scoped via claim) --
+
+    match /castro_crm_staging_tenants/{tenantId} {
+      // Operadores ativos do tenant podem ler o doc do proprio tenant
+      // (nome/branding/plan exibido na UI). Lista de tenants nao eh
+      // navegavel no client.
+      allow read: if tenantOperatorActive(tenantId);
+      allow write: if false;
+
+      match /operator_profiles/{uid} {
+        // Operador le seu proprio profile; admin/supervisor le todos
+        // do tenant. Writes via Admin SDK only.
+        allow read: if ownsTenant(tenantId) && (
+          uid == request.auth.uid || isPrivilegedInTenant(tenantId)
+        );
+        allow write: if false;
+      }
+
+      match /users/{userId} {
+        // Cadastro completo de usuarios — Admin SDK only (frontend usa
+        // operator_profiles enxutos).
+        allow read, write: if false;
+      }
+
+      match /departments/{deptId} {
+        // Lista de departamentos visivel a qualquer membro do tenant.
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /wa_contacts/{contactId} {
+        allow read: if canSeeContactScoped(tenantId);
+        allow write: if false;
+      }
+
+      match /wa_conversations/{convId} {
+        allow read: if canSeeContactScoped(tenantId);
+        allow write: if false;
+      }
+
+      match /wa_messages/{messageId} {
+        // Mensagens herdam visibilidade da conversation/contact —
+        // checagem granular fica caro (get extra) e pode estourar
+        // quota do rules engine em queries. Qualquer membro do tenant
+        // le; backend filtra via query where conversation_id == ...
+        // pra so retornar threads do operador autorizado.
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /wa_message_status/{docId} {
+        allow read, write: if false;
+      }
+
+      match /wa_transfer_log/{transferId} {
+        // Auditoria de transferencias — admin/supervisor only.
+        allow read: if isPrivilegedInTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /bot_states/{convId} {
+        // Estado interno do bot — Admin SDK only.
+        allow read, write: if false;
+      }
+
+      match /system_settings/{docId} {
+        // Toggle de bot, brand_color, etc. Operador le, admin escreve
+        // via REST endpoint do backend (writes nao vem do client).
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /user_settings/{userId} {
+        // Preferencias do operador — Admin SDK only (frontend usa
+        // endpoints REST pra ler/atualizar).
+        allow read, write: if false;
+      }
+
+      match /audit_log/{docId} {
+        // Trilha LGPD — admin/supervisor only.
+        allow read: if isPrivilegedInTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /audit_metrics/{docId} {
+        // Dashboard auditoria + usage_{YYYY-MM} — admin/supervisor only.
+        allow read: if isPrivilegedInTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /health_status/{docId} {
+        // Banner de saude do tenant — qualquer membro le. Cron escreve
+        // via Admin SDK.
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /gc_conversations/{convId} {
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /gc_messages/{messageId} {
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /messages/{messageId} {
+        // Internal chat cross-operador. Filter granular (sender/receiver
+        // == user_id) ficaria caro per-doc; o backend ja faz controle
+        // via query e endpoint REST. Aqui basta isolamento por tenant.
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
+      match /internal_unread/{docId} {
+        // Contador de nao-lidos do internal chat. Admin SDK only —
+        // frontend consome via REST.
+        allow read, write: if false;
+      }
+
+      match /operator_assume_counters/{userId} {
+        // Contadores de "assumir" — Admin SDK only.
+        allow read, write: if false;
+      }
+
+      match /_meta/{docId} {
+        // Counters per-tenant — Admin SDK only.
+        allow read, write: if false;
+      }
+
+      match /media_assets/{assetId} {
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+        match /chunks/{chunkId} {
+          allow read: if ownsTenant(tenantId);
+          allow write: if false;
+        }
+      }
+    }
+  }
+}

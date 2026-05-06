@@ -32,27 +32,37 @@ def _resolve_tenant_id(decoded_token, user):
 
     Ordem de busca:
       1. custom_claims do token (preferencia — set por set_tenant_claims)
-      2. user.tenant_id (campo do doc do CRM, futuro Fase 2)
-      3. None (sistema single-tenant ainda — backend trata como legado)
+      2. user.tenant_id (campo do doc do CRM — raro, redundante com path)
+      3. tenant_context atual (foi setado em authenticate_firebase_token
+         como claim_tenant or _DEFAULT_TENANT). Caso comum hoje — usuario
+         que logou via SSO sem claim nunca teve seu JWT sincronizado.
+      4. None (sistema single-tenant ainda — backend trata como legado).
 
-    Quando claim e ausente mas user.tenant_id existe, ressincroniza
+    Quando claim e ausente mas algum fallback retorna tenant, ressincroniza
     custom_claims em background. Cliente precisa renovar token na
-    proxima request para o claim aparecer.
+    proxima request (getIdToken(true) ou logout/login) para o claim
+    aparecer no JWT — Firestore rules tenant-scoped dependem disso.
     """
     claim_tenant = (decoded_token or {}).get("tenant_id")
     if claim_tenant:
         return str(claim_tenant)
 
     db_tenant = (user or {}).get("tenant_id") if user else None
+    if not db_tenant:
+        # Fallback: tenant context atual (setado upstream em
+        # authenticate_firebase_token a partir do claim ou _DEFAULT_TENANT).
+        from firestore_common import get_tenant_context as _get_ctx
+        db_tenant = _get_ctx()
+
     if db_tenant:
-        firebase_uid = (user or {}).get("firebase_uid", "")
+        firebase_uid = (user or {}).get("firebase_uid", "") or (decoded_token or {}).get("uid", "")
         if firebase_uid:
             try:
-                set_tenant_claims(firebase_uid, str(db_tenant), role=user.get("role"))
+                set_tenant_claims(firebase_uid, str(db_tenant), role=(user or {}).get("role") or "operador")
                 logger.info(
                     "tenant_id sincronizado em custom_claims | user_id=%s tenant_id=%s "
                     "(usuario precisa renovar ID token para refletir)",
-                    user.get("id"), db_tenant,
+                    (user or {}).get("id"), db_tenant,
                 )
             except Exception as exc:
                 logger.warning("Falha ao sincronizar custom_claims: %s", exc)
