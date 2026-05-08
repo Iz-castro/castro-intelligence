@@ -1,9 +1,13 @@
-# Contexto pra retomar — App Review parcial, refazer screencast
+# Contexto pra retomar — Coexistence validado em prod, screencast pendente
 
-> Snapshot atualizado em 2026-05-08 (manhã) após resultado da revisão
-> Meta. Quando voltar, leia este arquivo primeiro, depois
-> [2026-05-05.md](2026-05-05.md), [2026-05-06.md](2026-05-06.md) e
-> [2026-05-08.md](2026-05-08.md) pra detalhe cronológico, ou
+> Snapshot atualizado em 2026-05-08 (fim do dia) após sessão longa
+> que validou coexistence end-to-end em prod, fixou 4 bugs reais
+> (nono dígito BR, httpx timeout no subscribe_apps, channel resolution
+> stale, firestore.rules prod faltando) e fez Fase 4 cutover parcial.
+> Quando voltar, leia este arquivo primeiro, depois
+> [2026-05-08.md](2026-05-08.md) §5 (sessão da tarde),
+> [2026-05-06.md](2026-05-06.md) e
+> [2026-05-05.md](2026-05-05.md) pra detalhe cronológico, ou
 > [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md)
 > pra detalhe arquitetural.
 
@@ -20,9 +24,34 @@
 - `manage_app_solution` — não se aplica (somos Tech Provider direto
   pra clientes finais, não intermediamos Solution Partners)
 - `whatsapp_business_manage_events` — Conversions API for WhatsApp
-  não está implementada; pedir sem feature levaria a reprovação. A
-  função `test_whatsapp_business_manage_events` em
-  `test_meta_app_review.py` ficou comentada como referência histórica.
+  não está implementada; pedir sem feature levaria a reprovação.
+
+**App Live em prod**: Rafa publicou (`Live mode`) em 2026-05-08.
+Embedded Signup, send/receive, templates — tudo destravado pra
+clientes externos.
+
+**Coexistence end-to-end validado em prod** (2026-05-08 tarde):
+mensagem mandada do app celular aparece no CRM via
+`smb_message_echoes`; resposta do CRM chega no celular do cliente;
+inbound do cliente chega no CRM via `messages`. Sem duplicação.
+Token funcional. Canal #1 coex (WABA `680503338460083`, phone
+`1055982807598158`, Castro Operações) ativo.
+
+**4 bugs reais foram fixados em prod nesta sessão** (ver
+[2026-05-08.md §5](2026-05-08.md)):
+1. `firestore.rules` prod sem rule pra `castro_crm_tenants` (snapshot
+   conversations falhando)
+2. `_process_messages` no webhook não normalizava `wa_id` BR (bug
+   nono dígito — mesmo cliente virava 2 contatos/conversations)
+3. `httpx.ReadTimeout` em `subscribe_apps` da Meta abortava o signup
+   inteiro (frontend pegou como "Internal Server Error" / "Unexpected
+   token 'I'...")
+4. `get_send_credentials` caía em fallback `get_default_channel`
+   quando cache stale entre instâncias Cloud Run, enviando pelo canal
+   errado com creds expiradas (401 Authentication Error)
+
+Commits: `8c34311`, `b127015`, `c632580`, `1fe7379`. Prod em
+`castro-crm-00082-tm6`.
 
 Meta também reprovou o screencast por "não demonstrar a experiência
 completa do caso de uso" — faltou tela de consent + caso de uso
@@ -230,7 +259,7 @@ Já estava no working tree do RETOMAR anterior — agora consolidado:
 
 ## Próximos passos (em ordem)
 
-### 0. App Review — refazer screencast e ressubmeter (FRENTE CRÍTICA)
+### 0. App Review — gravar e submeter screencast (FRENTE CRÍTICA)
 
 Resultado de 2026-05-08: 2 perms aprovadas Advanced
 (`whatsapp_business_messaging` + `whatsapp_business_management`),
@@ -238,49 +267,39 @@ Resultado de 2026-05-08: 2 perms aprovadas Advanced
 pra Embedded Signup do WhatsApp). Screencast anterior reprovado por
 não demonstrar experiência completa do caso de uso.
 
-**Sequência:**
+**Pré-requisitos JÁ ATENDIDOS** (sessão 2026-05-08 tarde):
+- ✅ App em Live mode
+- ✅ Configurador Meta verificado (Embedded Signup completou sem #2655111)
+- ✅ Canal coexistence ativo em prod com token válido
+- ✅ Coexistence end-to-end testado e funcional
+- ✅ Bug do nono dígito BR fixado (sem duplicação de threads)
+- ✅ Bug de channel resolution stale fixado (sem 401 ao enviar)
 
-1. **Revisar Configurador Embedded Signup no Painel Meta**
-   (business.facebook.com → app `1434723791183375` → Account Tools →
-   API setup). Localizar Configurador correspondente a
-   `EMBEDDED_SIGNUP_CONFIG_ID`. Remover `business_management` dos
-   scopes solicitados se estiver lá. Garantir que pede só
-   `whatsapp_business_management` + `whatsapp_business_messaging`.
-   Ver §5 do
+**Sequência (curta — só falta gravar e submeter):**
+
+1. **Gravar screencast** seguindo
    [APP_REVIEW_SCREENCAST_SCRIPT.md](../APP_REVIEW_SCREENCAST_SCRIPT.md).
-
-2. **Deploy prod com a limpeza** (`main.py` simplificou a tupla de
-   detection do scope coexistence — irrelevante operacionalmente, mas
-   pra evitar drift fica em prod junto):
-   ```powershell
-   gcloud run deploy castro-crm `
-     --source . --region southamerica-east1 `
-     --project project-26fb9c99-8ee9-4179-aef --quiet
-   ```
-
-3. **Smoke test em staging**: abrir `Conectar WhatsApp` no CRM staging,
-   iniciar Embedded Signup. Popup deve completar sem erro #2655111
-   agora que as 2 perms estão Advanced. Se ainda der erro, capturar
-   o erro REAL (provavelmente é o Configurador ainda pedindo
-   `business_management`).
-
-4. **Gravar screencast** seguindo
-   [APP_REVIEW_SCREENCAST_SCRIPT.md](../APP_REVIEW_SCREENCAST_SCRIPT.md).
-   Pontos críticos:
+   Pontos críticos do feedback Meta de 2026-05-08:
    - Narração em inglês + legendas em inglês visíveis
-   - Tooltips em inglês explicando elementos da UI portuguesa
+   - Tooltips em inglês explicando elementos da UI em português
    - Consent screen do Meta visível e pausada ~3s
    - Embedded Signup conclui com sucesso (popup fecha, CRM mostra
      "Conexão realizada com sucesso!")
    - Disclaimer server-to-server explícito no slide intro + closing
    - Handle do destinatário visível em todos envios
 
-5. **Resubmeter cada permission** com as notas técnicas atualizadas
+2. **Resubmeter cada permission** com as notas técnicas atualizadas
    (§3 do roteiro). Reforçar disclaimer server-to-server em cada nota.
 
 **Não submeter `business_management`, `manage_app_solution` nem
 `whatsapp_business_manage_events`.** Todas três fora do escopo do
 produto — ver bloco "Onde paramos" acima.
+
+**Cenário ideal pra gravar:** abrir nova aba anônima, login admin,
+preparar conta de teste, abrir o app WhatsApp Business no celular
+(coex confirmado), preparar 2-3 mensagens com cliente teste pra
+demonstrar bidirecional + echo. Estimar 30-45min de gravação +
+edição.
 
 ### 0.B Firestore rules estritas em staging — INVESTIGAÇÃO PENDENTE
 
