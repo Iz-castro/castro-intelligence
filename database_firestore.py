@@ -569,9 +569,14 @@ def upsert_wa_conversation(
 
     direction_for_unread: 'inbound' incrementa unread_count, outras
     direcoes nao mexem. None nao mexe (uso pelo upsert_wa_contact).
+
+    Normaliza o nono digito BR antes de calcular o conversation_id —
+    determinismo de id depende de wa_id canonico para nao criar
+    threads duplicadas pra mesmo cliente.
     """
     if wa_id is None or wa_id == "":
         raise ValueError("wa_id obrigatorio para upsert_wa_conversation")
+    wa_id = normalize_br_phone(wa_id)
     conversation_id = _make_conversation_id(channel_id, wa_id)
     now = utcnow()
     ref = document("wa_conversations", conversation_id)
@@ -732,9 +737,14 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
     ao operador dono do numero.
+
+    Normaliza o nono digito BR e busca tambem variantes (com/sem '9')
+    como defesa em profundidade contra callers que esquecam de
+    normalizar.
     """
+    wa_id = normalize_br_phone(wa_id)
     now = utcnow()
-    existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
+    existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
         updates = {
             "last_message_at": now,

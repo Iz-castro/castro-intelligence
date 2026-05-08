@@ -292,7 +292,10 @@ async def _process_messages(value, ws_notify_callback, channel=None):
     channel_token = str(channel.get("access_token", "")).strip() if channel else ""
 
     for msg in value.get("messages", []):
-        wa_id = msg.get("from", "")
+        # Normaliza nono digito BR — Meta entrega numero ora com '9' ora sem
+        # (numeros antigos/legados). Sem normalizacao, o mesmo cliente cria
+        # contatos e conversations duplicadas.
+        wa_id = normalize_br_phone(msg.get("from", ""))
         msg_id = msg.get("id", "")
         msg_type = msg.get("type", "unknown")
         timestamp = msg.get("timestamp", "")

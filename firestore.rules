@@ -121,6 +121,25 @@ service cloud.firestore {
     }
 
     // ====================================================================
+    // PROD — subcolecoes tenant-scoped (Fase 2C cutover).
+    // Backend retorna em /api/session paths como
+    // castro_crm_tenants/{tid}/wa_contacts, wa_conversations,
+    // wa_messages, etc. Frontend faz onSnapshot direto nesses paths.
+    // Rules permissivas espelhando staging (qualquer email autorizado
+    // pode ler/escrever). Sera substituido por rules tenant-based
+    // estritas com claim no JWT em sessao futura — ver
+    // docs/internal/firestore-rules-staging-strict.wip.
+    // ====================================================================
+
+    match /castro_crm_tenants/{tenantId} {
+      allow read, write: if emailAllowed();
+
+      match /{subcol=**} {
+        allow read, write: if emailAllowed();
+      }
+    }
+
+    // ====================================================================
     // STAGING (FIRESTORE_COLLECTION_PREFIX=castro_crm_staging)
     // Rules permissivas: qualquer email autorizado pode ler/escrever.
     // Sera substituido por regras tenant-based na Fase 2 (subcolecao
