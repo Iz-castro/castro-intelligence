@@ -3002,15 +3002,29 @@ async def embedded_signup_exchange(
         ]
 
     subscribe_url = f"{GRAPH_API_BASE}/{waba_id}/subscribed_apps"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        sub_resp = await client.post(
-            subscribe_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            json={"subscribed_fields": subscribed_fields},
+    sub_resp = None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            sub_resp = await client.post(
+                subscribe_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"subscribed_fields": subscribed_fields},
+            )
+    except httpx.RequestError as exc:
+        # ReadTimeout / ConnectError / etc na Meta sao transitorios e nao
+        # devem aborter o signup — o canal eh criado e o admin reinscreve
+        # o webhook depois (botao na UI ou rerun do signup).
+        logger.warning(
+            "Embedded Signup subscribed_apps falhou por erro de rede (%s: %s) "
+            "— canal segue criado, admin reassina webhook depois",
+            type(exc).__name__, exc,
         )
 
     webhook_subscribed = False
-    if sub_resp.status_code >= 400:
+    if sub_resp is None:
+        # Falha de rede — log ja emitido acima, continua com webhook=False
+        pass
+    elif sub_resp.status_code >= 400:
         sub_detail = _meta_error_detail(sub_resp)
         logger.error("Embedded Signup subscribed_apps falhou: %s", sub_detail)
         # Nao aborta: canal pode ser criado mesmo sem webhook (admin reassina depois)
