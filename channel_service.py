@@ -156,6 +156,11 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
     """Retorna (access_token, phone_number_id, graph_api_base) para envio.
 
     Se channel_id for None, usa o canal default.
+    Quando channel_id e explicito mas nao encontrado no cache, faz UM
+    refresh sincrono e tenta de novo — protege contra cache stale entre
+    instancias do Cloud Run apos create_channel recente. Se ainda assim
+    nao for encontrado, falha em vez de cair em outro canal (caso
+    contrario o envio iria pelo canal default com creds erradas).
     Raises ValueError se o canal nao for encontrado.
     """
     from config import GRAPH_API_BASE, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN
@@ -163,6 +168,16 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
     channel = None
     if channel_id is not None:
         channel = get_channel(channel_id)
+        if channel is None:
+            # Cache stale entre instancias — recarrega do Firestore e
+            # tenta de novo antes de aceitar o miss.
+            refresh_channels()
+            channel = get_channel(channel_id)
+        if channel is None:
+            raise ValueError(
+                f"Canal {channel_id} solicitado nao existe (mesmo apos refresh). "
+                "Recusa-se a cair em canal default para evitar enviar pelo canal errado."
+            )
     if channel is None:
         channel = get_default_channel()
     if channel is None:
