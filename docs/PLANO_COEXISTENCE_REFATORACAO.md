@@ -11,10 +11,25 @@
 Três objetivos casados nesta refatoração:
 
 **1. Onboarding de coexistence funcional** — código já blindado em produção
-(commit `a8566b0`, revisão `castro-crm-00073-xxk` ou superior). Aguardando
-Advanced Access da Meta nas permissões `whatsapp_business_messaging`,
-`whatsapp_business_management` e `business_management` pra finalizar testes
-end-to-end com `featureType: whatsapp_business_app_onboarding`.
+(commit `a8566b0`, revisão `castro-crm-00073-xxk` ou superior). **App Review
+de 2026-05-08:** `whatsapp_business_messaging` e `whatsapp_business_management`
+APROVADAS (Advanced Access); `public_profile` renovada. Próxima ação:
+re-screencast cobrindo as 2 permissões aprovadas com fluxo end-to-end.
+`featureType: whatsapp_business_app_onboarding` permanece sem alteração —
+é featureType do JS SDK, não permission.
+
+**Permissions FORA do escopo do produto** (decididas em 2026-05-08):
+- `business_management` — REPROVADA pela Meta. É permission de Ads
+  Manager (impressions/conversions/ad spend), não de Embedded Signup do
+  WhatsApp. Descartada.
+- `manage_app_solution` — não se aplica. Castro Intelligence é Tech
+  Provider direto pra clientes finais (Hubloc, futuras clínicas), não
+  intermedia Solution Partners.
+- `whatsapp_business_manage_events` — caso de uso é Conversions API for
+  WhatsApp (eventos de conversão pra Meta Events Manager). Feature não
+  implementada no produto. Pedir sem implementação levaria à mesma
+  reprovação que `business_management`. Reavaliar quando/se houver
+  roadmap de tracking de ROI pra anúncios click-to-WhatsApp.
 
 **2. Mesmo número em dois canais sem colidir** — hoje `wa_contacts` é
 chaveado só por telefone e `_resolve_channel_creds` lê `contact.channel_id`

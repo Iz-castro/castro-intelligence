@@ -2906,7 +2906,7 @@ async def embedded_signup_exchange(
             for tid in scope.get("target_ids") or []:
                 if tid and tid not in waba_ids:
                     waba_ids.append(str(tid))
-        if scope_name in ("whatsapp_business_app_onboarding", "business_management"):
+        if scope_name == "whatsapp_business_app_onboarding":
             coexistence_scope_present = True
 
     if not waba_ids:

@@ -6,13 +6,27 @@ os testes de caso de uso na revisao do app Meta.
 Uso:
   python test_meta_app_review.py
   python test_meta_app_review.py --token SEU_TOKEN
-  python test_meta_app_review.py --section business_management
+  python test_meta_app_review.py --section whatsapp_business_management
   python test_meta_app_review.py --dry-run
 
 Secoes disponiveis:
-  business_management, whatsapp_business_management,
-  whatsapp_business_messaging, whatsapp_business_manage_events,
+  whatsapp_business_management, whatsapp_business_messaging,
   public_profile
+
+Permissions FORA do escopo do produto (revisao 2026-05-08):
+  - business_management: reprovada pela Meta — e permission de Ads
+    Manager (manage ad accounts, impressions, conversions), nao de
+    Embedded Signup do WhatsApp.
+  - manage_app_solution: nao se aplica — Castro Intelligence atende
+    clientes finais como Tech Provider direto, nao intermedia
+    Solution Partners.
+  - whatsapp_business_manage_events: caso de uso e Conversions API
+    for WhatsApp (eventos de conversao para Meta Events Manager) —
+    feature nao implementada no produto. Pedir sem implementacao
+    levaria a mesma reprovacao que business_management.
+
+As funcoes correspondentes permanecem comentadas como referencia
+historica — caso o roadmap mude e essas perms voltem ao escopo.
 """
 
 from __future__ import annotations
@@ -136,19 +150,21 @@ def run_test(label: str, method: str, path: str, token: str,
 
 
 # ---------------------------------------------------------------------------
-# Secao 1: business_management (0/1 obrigatoria)
+# Secao 1: business_management — DESCONTINUADA (App Review 2026-05-08)
 # ---------------------------------------------------------------------------
-
-def test_business_management(token: str, dry_run: bool = False) -> None:
-    print("\n=== business_management (0/1 obrigatoria) ===\n")
-
-    # Listar businesses do usuario — endpoint principal desta permissao
-    run_test("GET /me/businesses", "GET", "me/businesses",
-             token, params={"fields": "id,name,created_time"}, dry_run=dry_run)
-
-    # Consultar o app
-    run_test("GET /app", "GET", APP_ID,
-             token, params={"fields": "id,name,category"}, dry_run=dry_run)
+# A Meta reprovou em 2026-05-08 explicando que essa permission e para
+# gerenciar Ad Accounts (impressions, conversions, ad spend) — nao tem
+# relacao com Embedded Signup do WhatsApp. O fluxo de coexistence usa
+# whatsapp_business_management + whatsapp_business_messaging (ambas
+# aprovadas Advanced) + featureType=whatsapp_business_app_onboarding
+# no popup do FB.login. Codigo abaixo preservado como referencia.
+#
+# def test_business_management(token: str, dry_run: bool = False) -> None:
+#     print("\n=== business_management (0/1 obrigatoria) ===\n")
+#     run_test("GET /me/businesses", "GET", "me/businesses",
+#              token, params={"fields": "id,name,created_time"}, dry_run=dry_run)
+#     run_test("GET /app", "GET", APP_ID,
+#              token, params={"fields": "id,name,category"}, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -263,34 +279,33 @@ def test_whatsapp_business_messaging(token: str, dry_run: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Secao 4: whatsapp_business_manage_events
+# Secao 4: whatsapp_business_manage_events — DESCONTINUADA (2026-05-08)
 # ---------------------------------------------------------------------------
-
-def test_whatsapp_business_manage_events(token: str, dry_run: bool = False) -> None:
-    print("\n=== whatsapp_business_manage_events ===\n")
-
-    # manage_events precisa de App Access Token (APP_ID|APP_SECRET)
-    app_token = f"{APP_ID}|{APP_SECRET}" if APP_ID and APP_SECRET else ""
-    if not app_token:
-        print("  [SKIP] META_APP_ID ou META_APP_SECRET nao configurado")
-        return
-
-    # Listar subscriptions do app (requer app token)
-    run_test("GET app subscriptions", "GET", f"{APP_ID}/subscriptions",
-             app_token, dry_run=dry_run)
-
-    # Inscrever o app no campo messages (idempotente, requer app token)
-    run_test("POST subscribe webhook field", "POST", f"{APP_ID}/subscriptions",
-             app_token, body={
-                 "object": "whatsapp_business_account",
-                 "fields": "messages",
-                 "callback_url": "https://castro-crm-286866630844.southamerica-east1.run.app/webhook",
-                 "verify_token": "castro-webhook-2026",
-             }, dry_run=dry_run)
-
-    # Verificar WABA subscribed_apps (usa user token)
-    run_test("GET WABA subscribed_apps", "GET", f"{WABA_ID}/subscribed_apps",
-             token, dry_run=dry_run)
+# Caso de uso real dessa permission e Conversions API for WhatsApp —
+# enviar eventos (Purchase, Lead, AddToCart) para Meta Events Manager
+# e mensurar ROI de anuncios click-to-WhatsApp. Feature nao
+# implementada no produto. Pedir sem implementacao levaria a mesma
+# reprovacao que business_management ("nao demonstra caso de uso").
+# A implementacao original abaixo testava webhook subscriptions
+# (GET/POST /APP_ID/subscriptions), o que nao requer essa permission.
+#
+# def test_whatsapp_business_manage_events(token: str, dry_run: bool = False) -> None:
+#     print("\n=== whatsapp_business_manage_events ===\n")
+#     app_token = f"{APP_ID}|{APP_SECRET}" if APP_ID and APP_SECRET else ""
+#     if not app_token:
+#         print("  [SKIP] META_APP_ID ou META_APP_SECRET nao configurado")
+#         return
+#     run_test("GET app subscriptions", "GET", f"{APP_ID}/subscriptions",
+#              app_token, dry_run=dry_run)
+#     run_test("POST subscribe webhook field", "POST", f"{APP_ID}/subscriptions",
+#              app_token, body={
+#                  "object": "whatsapp_business_account",
+#                  "fields": "messages",
+#                  "callback_url": "https://castro-crm-286866630844.southamerica-east1.run.app/webhook",
+#                  "verify_token": "castro-webhook-2026",
+#              }, dry_run=dry_run)
+#     run_test("GET WABA subscribed_apps", "GET", f"{WABA_ID}/subscribed_apps",
+#              token, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -322,10 +337,11 @@ def test_public_profile(token: str, dry_run: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 ALL_SECTIONS = {
-    "business_management": test_business_management,
+    # Permissions fora do escopo (revisao 2026-05-08) — ver header:
+    #   business_management, manage_app_solution,
+    #   whatsapp_business_manage_events.
     "whatsapp_business_management": test_whatsapp_business_management,
     "whatsapp_business_messaging": test_whatsapp_business_messaging,
-    "whatsapp_business_manage_events": test_whatsapp_business_manage_events,
     "public_profile": test_public_profile,
 }
 

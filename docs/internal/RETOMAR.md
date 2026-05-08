@@ -1,18 +1,48 @@
-# Contexto pra retomar — Backend ~95% fechado, prox: Firestore rules WIP + Fase 2.10 UI
+# Contexto pra retomar — App Review parcial, refazer screencast
 
-> Snapshot atualizado em 2026-05-06 (final da tarde) após maratona de
-> 2 dias fechando o backend. Quando voltar, leia este arquivo primeiro,
-> depois [2026-05-05.md](2026-05-05.md) e [2026-05-06.md](2026-05-06.md)
-> pra detalhe cronológico, ou
+> Snapshot atualizado em 2026-05-08 (manhã) após resultado da revisão
+> Meta. Quando voltar, leia este arquivo primeiro, depois
+> [2026-05-05.md](2026-05-05.md), [2026-05-06.md](2026-05-06.md) e
+> [2026-05-08.md](2026-05-08.md) pra detalhe cronológico, ou
 > [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md)
 > pra detalhe arquitetural.
 
 ## Onde paramos
 
+**App Review parcialmente aprovado em 2026-05-08:**
+- ✅ `whatsapp_business_messaging` — Advanced Access
+- ✅ `whatsapp_business_management` — Advanced Access
+- ✅ `public_profile` — renovada
+- ❌ `business_management` — reprovada (é permission de Ads Manager,
+  não de Embedded Signup do WhatsApp; descartada do escopo)
+
+**Outras 2 permissions decididas como fora do escopo (mesma sessão):**
+- `manage_app_solution` — não se aplica (somos Tech Provider direto
+  pra clientes finais, não intermediamos Solution Partners)
+- `whatsapp_business_manage_events` — Conversions API for WhatsApp
+  não está implementada; pedir sem feature levaria a reprovação. A
+  função `test_whatsapp_business_manage_events` em
+  `test_meta_app_review.py` ficou comentada como referência histórica.
+
+Meta também reprovou o screencast por "não demonstrar a experiência
+completa do caso de uso" — faltou tela de consent + caso de uso
+end-to-end. **Refazer screencast cobrindo as 2 perms aprovadas é a
+frente crítica agora.** Roteiro novo pronto em
+[`docs/APP_REVIEW_SCREENCAST_SCRIPT.md`](../APP_REVIEW_SCREENCAST_SCRIPT.md)
+endereçando todos os pontos do feedback (login Meta completo, consent
+screen, server-to-server note, narração+legendas inglês com tooltips).
+
+Código já limpo: `business_management` removida da tupla de detection
+em `main.py` (era fallback redundante) e neutralizada em
+`test_meta_app_review.py`. Configurador da Meta (referenciado por
+`EMBEDDED_SIGNUP_CONFIG_ID`) **precisa** ser revisado no painel
+business.facebook.com pra remover `business_management` se estiver
+solicitando — ver §5 do roteiro do screencast.
+
 **Backend essencialmente fechado.** Fase 2C cutover + Fase 3 frontend
 + Fase 2.10.3 (cron health com OIDC + Secret Manager) + Fase 2.10.4
 (usage per-tenant) + Auditoria LGPD logs + Fase 4 prep (wipe script
-+ runbook prod) — todos validados em staging. **Pendência única:
++ runbook prod) — todos validados em staging. **Pendência menor:
 Firestore rules estritas em staging (frente WIP — 4ª da fila do
 "fechar backend").** WIP preservado em
 [`firestore-rules-staging-strict.wip`](firestore-rules-staging-strict.wip).
@@ -200,7 +230,59 @@ Já estava no working tree do RETOMAR anterior — agora consolidado:
 
 ## Próximos passos (em ordem)
 
-### 0. Firestore rules estritas em staging — INVESTIGAÇÃO PENDENTE
+### 0. App Review — refazer screencast e ressubmeter (FRENTE CRÍTICA)
+
+Resultado de 2026-05-08: 2 perms aprovadas Advanced
+(`whatsapp_business_messaging` + `whatsapp_business_management`),
+`business_management` reprovada (descartada do escopo — não é necessária
+pra Embedded Signup do WhatsApp). Screencast anterior reprovado por
+não demonstrar experiência completa do caso de uso.
+
+**Sequência:**
+
+1. **Revisar Configurador Embedded Signup no Painel Meta**
+   (business.facebook.com → app `1434723791183375` → Account Tools →
+   API setup). Localizar Configurador correspondente a
+   `EMBEDDED_SIGNUP_CONFIG_ID`. Remover `business_management` dos
+   scopes solicitados se estiver lá. Garantir que pede só
+   `whatsapp_business_management` + `whatsapp_business_messaging`.
+   Ver §5 do
+   [APP_REVIEW_SCREENCAST_SCRIPT.md](../APP_REVIEW_SCREENCAST_SCRIPT.md).
+
+2. **Deploy prod com a limpeza** (`main.py` simplificou a tupla de
+   detection do scope coexistence — irrelevante operacionalmente, mas
+   pra evitar drift fica em prod junto):
+   ```powershell
+   gcloud run deploy castro-crm `
+     --source . --region southamerica-east1 `
+     --project project-26fb9c99-8ee9-4179-aef --quiet
+   ```
+
+3. **Smoke test em staging**: abrir `Conectar WhatsApp` no CRM staging,
+   iniciar Embedded Signup. Popup deve completar sem erro #2655111
+   agora que as 2 perms estão Advanced. Se ainda der erro, capturar
+   o erro REAL (provavelmente é o Configurador ainda pedindo
+   `business_management`).
+
+4. **Gravar screencast** seguindo
+   [APP_REVIEW_SCREENCAST_SCRIPT.md](../APP_REVIEW_SCREENCAST_SCRIPT.md).
+   Pontos críticos:
+   - Narração em inglês + legendas em inglês visíveis
+   - Tooltips em inglês explicando elementos da UI portuguesa
+   - Consent screen do Meta visível e pausada ~3s
+   - Embedded Signup conclui com sucesso (popup fecha, CRM mostra
+     "Conexão realizada com sucesso!")
+   - Disclaimer server-to-server explícito no slide intro + closing
+   - Handle do destinatário visível em todos envios
+
+5. **Resubmeter cada permission** com as notas técnicas atualizadas
+   (§3 do roteiro). Reforçar disclaimer server-to-server em cada nota.
+
+**Não submeter `business_management`, `manage_app_solution` nem
+`whatsapp_business_manage_events`.** Todas três fora do escopo do
+produto — ver bloco "Onde paramos" acima.
+
+### 0.B Firestore rules estritas em staging — INVESTIGAÇÃO PENDENTE
 
 Ver [`2026-05-06.md` §3.4](2026-05-06.md) pro contexto detalhado do
 bug. Resumo:
@@ -282,11 +364,18 @@ Revisar `logger.info`/`logger.warning` em `webhook.py`, `main.py`,
 `bot_service.py` pra confirmar zero PII (telefones, conteúdo de
 mensagem, tokens). CLAUDE.md §2 exige.
 
-### 5. Bloqueado até Meta aprovar App Review
-- Wipe + reonboarding canal coexistence em prod (Fase 4).
+### 5. Pós re-screencast aprovado (parcialmente destravado em 2026-05-08)
+- Wipe + reonboarding canal coexistence em prod (Fase 4) — destrava
+  assim que o re-screencast for aprovado pela Meta.
 - Promover staging → prod via wipe.
 - Onboarding cliente #2 com coexistence.
 - /send caminho feliz testável end-to-end.
+
+**Status:** as 2 perms `whatsapp_business_*` já foram aprovadas Advanced
+em 2026-05-08; o que falta é a Meta aceitar o novo screencast (que
+demonstra o caso de uso completo). Sem isso, embora o app tenha as
+permissions, o reviewer pode rejeitar a submissão em revisões futuras
+e exigir re-aprovação.
 
 ## Pontos de atenção
 
@@ -308,10 +397,11 @@ mensagem, tokens). CLAUDE.md §2 exige.
 ## Quick start (próxima sessão)
 
 ```powershell
-# 1. Ler este arquivo + o diário do 5/5
+# 1. Ler este arquivo + o diário do 5/8 + roteiro do screencast
 cd c:\Projetos\Hubloc\castro-intelligence
 code docs/internal/RETOMAR.md
-code docs/internal/2026-05-05.md
+code docs/internal/2026-05-08.md
+code docs/APP_REVIEW_SCREENCAST_SCRIPT.md
 
 # 2. Confirmar conta gcloud certa
 gcloud config get-value account
@@ -320,14 +410,19 @@ gcloud config get-value account
 # 3. Working tree deve estar limpo
 git status --short
 
-# 4. Smoke test rapido do que foi entregue
+# 4. (Opcional) Smoke test rapido do que ja existia
 ./.venv/Scripts/python.exe -m scripts.e2e_test_staging
 # espera: ✓ E2E PASSED (9/9)
 
 # 5. Abrir staging no browser
 # https://castro-crm-staging-286866630844.southamerica-east1.run.app
 
-# 6. Decidir proxima frente (ver "Proximos passos" acima)
+# 6. Frente principal: re-screencast App Review
+#    a) Painel Meta: revisar Configurador (ver §0 acima)
+#    b) Deploy prod com cleanup business_management
+#    c) Smoke test Embedded Signup em staging
+#    d) Gravar screencast seguindo APP_REVIEW_SCREENCAST_SCRIPT.md
+#    e) Resubmeter na pagina App Review
 ```
 
 ## Cloud Scheduler — comandos úteis (staging)
