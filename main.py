@@ -861,22 +861,7 @@ async def wa_messages(
     - Se conversation_id e fornecido: filtra por aquela thread (canal+wa_id).
     - Se nao: retorna timeline cross-channel do contato (legado).
     """
-    if conversation_id:
-        from firestore_common import collection as fs_coll
-        q = (
-            fs_coll("wa_messages")
-            .where("conversation_id", "==", conversation_id)
-            .order_by("created_at", direction="DESCENDING")
-            .limit(limit)
-        )
-        rows = []
-        for snap in q.stream():
-            data = snap.to_dict() or {}
-            if "id" not in data:
-                data["id"] = snap.id
-            rows.append(data)
-        return {"messages": rows}
-    messages = get_wa_conversation(contact_id, limit=limit)
+    messages = get_wa_conversation(contact_id, limit=limit, conversation_id=conversation_id)
     return {"messages": messages}
 
 
@@ -1923,6 +1908,137 @@ async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(
     deactivate_channel(channel_id)
     log_audit(current_user["id"], "CHANNEL_DELETE", f"id={channel_id} label={existing.get('label')}")
     return {"ok": True}
+
+
+@app.post("/api/admin/channels/{channel_id}/trigger-coex-sync")
+async def trigger_coex_sync(
+    channel_id: int,
+    sync_type: str = Query(default="both", description="smb_app_state_sync|history|both"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Dispara sync de contatos e/ou history para canal coexistence.
+
+    Doc Meta: POST /{phone_id}/smb_app_data com sync_type. Cada sync
+    so pode ser disparado UMA VEZ por signup. Se ja foi disparado
+    antes, Meta retorna erro. Janela de 24h apos signup — passou disso
+    precisa desligar canal e refazer signup.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    if sync_type not in ("smb_app_state_sync", "history", "both"):
+        raise HTTPException(status_code=400, detail="sync_type deve ser smb_app_state_sync, history, ou both")
+    channel = get_channel_by_id_from_db(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+    if str(channel.get("channel_type", "")) != CHANNEL_TYPE_COEXISTENCE:
+        raise HTTPException(status_code=400, detail="Apenas canais coexistence")
+    phone_id = str(channel.get("phone_number_id", "")).strip()
+    token = str(channel.get("access_token", "")).strip()
+    if not phone_id or not token:
+        raise HTTPException(status_code=400, detail="Canal sem phone_number_id ou access_token")
+
+    types_to_sync = ["smb_app_state_sync", "history"] if sync_type == "both" else [sync_type]
+    results: dict[str, dict] = {}
+    smb_data_url = f"{GRAPH_API_BASE}/{phone_id}/smb_app_data"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for stype in types_to_sync:
+            try:
+                resp = await client.post(
+                    smb_data_url,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"messaging_product": "whatsapp", "sync_type": stype},
+                )
+                if resp.status_code >= 400:
+                    detail = _meta_error_detail(resp)
+                    results[stype] = {"ok": False, "error": detail}
+                    logger.error("trigger-coex-sync %s falhou: %s", stype, detail)
+                else:
+                    body = resp.json()
+                    results[stype] = {"ok": True, "request_id": body.get("request_id", "")}
+                    logger.info("trigger-coex-sync %s OK | request_id=%s", stype, body.get("request_id", ""))
+            except httpx.RequestError as exc:
+                results[stype] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                logger.warning("trigger-coex-sync %s erro de rede: %s", stype, exc)
+
+    log_audit(
+        current_user["id"],
+        "TRIGGER_COEX_SYNC",
+        f"channel_id={channel_id} types={types_to_sync} results={results}",
+    )
+    return {"channel_id": channel_id, "results": results}
+
+
+# -- API: Pending webhook events (eventos da Meta sem canal resolvido) --
+
+@app.get("/api/admin/pending-webhook-events")
+async def list_pending_webhook_events(
+    status: str | None = Query(default=None, description="pending|resolved|failed"),
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista eventos da Meta que nao puderam ser processados imediatamente
+    (canal nao indexado ainda durante onboarding, phone_id sem canal,
+    excecao no processamento). Garantia de zero perda — operador retenta
+    apos o canal estar disponivel."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    from pending_events import list_pending_events
+    events = list_pending_events(status=status, limit=limit)
+    return {"events": events, "count": len(events)}
+
+
+@app.post("/api/admin/pending-webhook-events/{event_id}/retry")
+async def retry_pending_webhook_event(event_id: int, current_user: dict = Depends(get_current_user)):
+    """Re-roda process_webhook_payload com o payload original. Idempotente
+    via wa_message_id (save_wa_message detecta duplicata)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    from pending_events import get_pending_event, mark_event_attempt
+    event = get_pending_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    if event.get("status") == "resolved":
+        return {"status": "already_resolved", "id": event_id}
+    payload = event.get("payload") or {}
+    if not payload:
+        raise HTTPException(status_code=400, detail="Evento sem payload")
+    try:
+        await process_webhook_payload(payload, ws_notify_callback=broadcast_to_operators)
+        mark_event_attempt(event_id, success=True)
+        log_audit(current_user["id"], "PENDING_EVENT_RETRY", f"id={event_id} ok")
+        return {"status": "ok", "id": event_id}
+    except Exception as exc:
+        mark_event_attempt(event_id, success=False, error=f"{type(exc).__name__}: {exc}")
+        log_audit(current_user["id"], "PENDING_EVENT_RETRY", f"id={event_id} err={type(exc).__name__}")
+        raise HTTPException(status_code=502, detail=f"Falha ao reprocessar: {exc}")
+
+
+@app.post("/api/admin/pending-webhook-events/{event_id}/dismiss")
+async def dismiss_pending_webhook_event(event_id: int, current_user: dict = Depends(get_current_user)):
+    """Marca evento como definitivamente falho (nao retentar). Usar quando
+    intervencao confirma que o evento nao tem como ser recuperado."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    from pending_events import mark_event_failed, get_pending_event
+    if not get_pending_event(event_id):
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    mark_event_failed(event_id, error="dismissed_by_admin")
+    log_audit(current_user["id"], "PENDING_EVENT_DISMISS", f"id={event_id}")
+    return {"status": "dismissed", "id": event_id}
+
+
+@app.delete("/api/admin/pending-webhook-events/{event_id}")
+async def delete_pending_webhook_event_endpoint(event_id: int, current_user: dict = Depends(get_current_user)):
+    """Remove evento da fila. Use apos retry confirmado ou eventos sem
+    valor de retencao."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    from pending_events import delete_pending_event
+    if not delete_pending_event(event_id):
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    log_audit(current_user["id"], "PENDING_EVENT_DELETE", f"id={event_id}")
+    return {"status": "deleted", "id": event_id}
 
 
 async def _fetch_channel_billing_status(channel_id: int) -> dict:
@@ -3065,10 +3181,58 @@ async def embedded_signup_exchange(
         webhook_subscribed=webhook_subscribed,
     )
 
+    # 7. Disparar sync de contatos + history (coexistence apenas).
+    # Doc Meta: POST /{phone_id}/smb_app_data e necessario pra Meta
+    # comecar a entregar webhooks 'smb_app_state_sync' (contatos) e
+    # 'history' (mensagens dos ultimos 180 dias). Janela de 24h apos
+    # signup, depois disso precisa desligar e refazer signup. Cada sync
+    # so pode ser disparado UMA VEZ por signup.
+    sync_results: dict[str, dict] = {}
+    if is_coexistence:
+        smb_data_url = f"{GRAPH_API_BASE}/{phone_number_id}/smb_app_data"
+        for sync_type in ("smb_app_state_sync", "history"):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    sync_resp = await client.post(
+                        smb_data_url,
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"messaging_product": "whatsapp", "sync_type": sync_type},
+                    )
+                if sync_resp.status_code >= 400:
+                    detail = _meta_error_detail(sync_resp)
+                    logger.error(
+                        "Embedded Signup smb_app_data %s falhou: %s",
+                        sync_type, detail,
+                    )
+                    sync_results[sync_type] = {"ok": False, "error": detail}
+                else:
+                    body_json = sync_resp.json()
+                    sync_results[sync_type] = {
+                        "ok": True,
+                        "request_id": body_json.get("request_id", ""),
+                    }
+                    logger.info(
+                        "Embedded Signup smb_app_data %s OK | request_id=%s",
+                        sync_type, body_json.get("request_id", ""),
+                    )
+            except httpx.RequestError as exc:
+                # Erro de rede nao aborta signup. Admin pode redisparar
+                # via POST /api/admin/channels/{id}/trigger-coex-sync
+                # dentro da janela de 24h.
+                logger.warning(
+                    "Embedded Signup smb_app_data %s erro de rede (%s: %s) — "
+                    "canal segue criado, admin redispara via endpoint",
+                    sync_type, type(exc).__name__, exc,
+                )
+                sync_results[sync_type] = {"ok": False, "error": str(exc)}
+
     log_audit(
         current_user["id"],
         "EMBEDDED_SIGNUP",
-        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id}",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} syncs={list(sync_results.keys())}",
     )
 
     return {
@@ -3090,6 +3254,7 @@ async def embedded_signup_exchange(
         "is_official_business_account": is_official,
         "webhook_subscribed": webhook_subscribed,
         "subscribed_fields": subscribed_fields,
+        "coex_syncs": sync_results,
         "all_phones": [
             {
                 "id": p.get("id"),

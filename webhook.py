@@ -29,6 +29,7 @@ from bot_service import process_bot_message
 from firestore_common import set_tenant_context, reset_tenant_context
 from tenant_service import lookup_phone_routing
 from pii_redaction import redact_phone, redact_name
+from pending_events import enqueue_pending_event
 
 logger = logging.getLogger("castro_crm.webhook")
 
@@ -149,10 +150,15 @@ def validate_signature(payload_bytes, signature_header):
 def _resolve_webhook_channel(value):
     """Resolve o canal a partir dos metadados do webhook.
 
-    Retorna dict do canal ou None se nao encontrado.
-    Loga warning quando precisa cair no fallback default — eventos de
-    coexistence com metadata malformada acabavam roteados para o bot
-    sem deixar rastro.
+    Retorna (channel_dict, reason) onde reason e:
+      - None: canal resolvido normalmente.
+      - 'no_phone_number_id': metadata sem phone_number_id.
+      - 'no_channel_for_phone': phone_id nao bate com canal cadastrado.
+      - 'no_default_channel': fallback default tambem nao existe.
+
+    Quando channel e None, o caller deve enfileirar em
+    pending_webhook_events em vez de processar com canal sintetico
+    (default__) que nao casa com selectedThreadId no frontend.
     """
     metadata = value.get("metadata", {})
     phone_number_id = str(metadata.get("phone_number_id", "")).strip()
@@ -160,20 +166,24 @@ def _resolve_webhook_channel(value):
     if phone_number_id:
         channel = get_channel_by_phone_id(phone_number_id)
         if channel:
-            return channel
+            return channel, None
         logger.warning(
-            "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado; "
-            "usando canal default. Verifique se o canal foi criado via signup.",
+            "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado.",
             phone_number_id,
         )
-    else:
-        logger.warning(
-            "Webhook: metadata sem phone_number_id; usando canal default. "
-            "Payload metadata=%s",
-            metadata,
-        )
+        default = get_default_channel()
+        if default:
+            return default, "no_channel_for_phone"
+        return None, "no_channel_for_phone"
 
-    return get_default_channel()
+    logger.warning(
+        "Webhook: metadata sem phone_number_id. Payload metadata=%s",
+        metadata,
+    )
+    default = get_default_channel()
+    if default:
+        return default, "no_phone_number_id"
+    return None, "no_phone_number_id"
 
 
 async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str,
@@ -222,14 +232,22 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
         logger.error("[BOT] Erro ao enviar resposta: %s", e, exc_info=True)
 
 
+# Fields que dependem de canal resolvido para escrever mensagem/contato.
+# smb_app_state_sync entra aqui porque o upsert_wa_contact agora requer
+# channel_id pra gerar conversation_id deterministico. Eventos fora
+# dessa lista (statuses, account_update) nao precisam de canal.
+_CHANNEL_DEPENDENT_FIELDS = ("smb_message_echoes", "history", "messages", "smb_app_state_sync")
+
+
 async def process_webhook_payload(payload, ws_notify_callback=None):
     """
     Processa o payload completo do webhook.
-    Roteia por campo 'field' para suportar webhooks padrao e de coexistence.
-    Resolve o canal automaticamente a partir de metadata.phone_number_id e
-    o tenant a partir do canal. Seta tenant_context para que toda a
-    cadeia de save_wa_message/upsert_wa_contact opere em
-    tenants/{tenant_id}/* automaticamente.
+
+    Garantia anti-perda: nunca propaga exception ao caller — qualquer
+    erro/canal nao resolvido enfileira em pending_webhook_events e o
+    handler HTTP retorna 200 imediato pra Meta. Operadores reprocessam
+    via UI admin assim que o canal estiver indexado (ex: depois do
+    Embedded Signup completar).
     """
     if payload.get("object") != "whatsapp_business_account":
         return
@@ -238,30 +256,74 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
     # changes deste payload vem do mesmo phone_number_id (mesma WABA).
     first_value = ((payload.get("entry") or [{}])[0].get("changes") or [{}])[0].get("value", {})
     first_phone_id = str((first_value.get("metadata") or {}).get("phone_number_id") or "").strip()
-    first_channel = _resolve_webhook_channel(first_value)
+    first_channel, _first_reason = _resolve_webhook_channel(first_value)
     tenant_id = _resolve_webhook_tenant(first_channel, phone_number_id=first_phone_id)
     ctx_token = set_tenant_context(tenant_id)
     try:
         await _process_webhook_payload_inner(payload, ws_notify_callback)
+    except Exception as exc:
+        # Erro nao tratado durante processamento → enfileira pra retry
+        # humano em vez de devolver 5xx pra Meta.
+        try:
+            enqueue_pending_event(
+                payload=payload,
+                change_field="exception",
+                phone_number_id=first_phone_id,
+                reason=f"unhandled_exception:{type(exc).__name__}:{str(exc)[:200]}",
+            )
+        except Exception as enq_exc:
+            logger.error(
+                "Falha critica: nao consegui enfileirar payload pendente | erro=%s",
+                enq_exc, exc_info=True,
+            )
+        logger.error("Webhook processing error (enqueued): %s", exc, exc_info=True)
     finally:
         reset_tenant_context(ctx_token)
 
 
 async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
-    """Implementacao do processamento. Tenant_context ja setado pelo wrapper."""
+    """Implementacao do processamento. Tenant_context ja setado pelo wrapper.
+
+    Enfileira changes individuais que dependem de canal nao resolvido
+    em vez de processar com canal sintetico (default__) que nao casa
+    com selectedThreadId no frontend.
+    """
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             field = change.get("field", "")
 
+            # Determina field efetivo para enfileiramento (webhooks padrao
+            # da Cloud API entregam 'field=messages' mas o detection abaixo
+            # usa 'field=="" with messages key' historicamente).
+            effective_field = field if field else ("messages" if "messages" in value else "")
+
             # Resolve canal para este change
-            channel = _resolve_webhook_channel(value)
+            channel, reason = _resolve_webhook_channel(value)
+
+            # Eventos que dependem de canal pra serem persistidos
+            # corretamente. Sem canal, enfileira (zero perda).
+            if channel is None and effective_field in _CHANNEL_DEPENDENT_FIELDS:
+                phone_id = str((value.get("metadata") or {}).get("phone_number_id") or "").strip()
+                # Enfileira o payload INTEIRO (nao so o change) — facilita
+                # retry reusando process_webhook_payload e idempotencia
+                # via wa_message_id em save_wa_message.
+                enqueue_pending_event(
+                    payload=payload,
+                    change_field=effective_field,
+                    phone_number_id=phone_id,
+                    reason=reason or "no_channel",
+                )
+                # Para outros changes deste payload (se houver) seguimos
+                # o loop — eles podem ser smb_app_state_sync/etc que nao
+                # dependem de canal.
+                continue
 
             if field == "smb_message_echoes":
                 await _process_smb_message_echoes(value, ws_notify_callback, channel=channel)
 
             elif field == "smb_app_state_sync":
-                _process_smb_app_state_sync(value)
+                _process_smb_app_state_sync(value, channel=channel)
 
             elif field == "history":
                 await _process_history(value, ws_notify_callback, channel=channel)
@@ -727,7 +789,9 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
         else:
             content = f"[{msg_type}]"
 
-        # Salvar como outbound com source phone_app
+        # Salvar como outbound com source phone_app. operator_id=owner
+        # tambem (em smb_echoes o humano dono do numero digitou pelo
+        # celular) — sem isso o frontend rotula como "Bot".
         db_id = save_wa_message(
             wa_message_id=msg_id,
             contact_id=contact_id,
@@ -742,6 +806,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             filename=filename,
             status="sent",
             timestamp_wa=ts_iso,
+            operator_id=channel_owner_outer,
             channel_id=channel_id_outer,
             phone_number_id=channel_phone_id_outer,
             channel_owner_user_id=channel_owner_outer,
@@ -778,14 +843,26 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
 # Coexistence: smb_app_state_sync
 # ---------------------------------------------------------------------------
 
-def _process_smb_app_state_sync(value):
+def _process_smb_app_state_sync(value, channel=None):
     """
     Processa sincronizacao de contatos do app WhatsApp Business.
     Recebe add/remove de contatos da lista telefonica do celular.
+
+    Precisa de `channel` resolvido pra propagar `channel_id` no
+    upsert_wa_contact. Sem channel_id, upsert_wa_conversation interno
+    levanta ConversationIdError (defesa de save_wa_message contra
+    ids 'default__'). Caller resolve via _resolve_webhook_channel.
     """
     state_sync = value.get("state_sync", [])
     if not state_sync:
         return
+
+    # Channel context para enriquecer contatos sincronizados (mesma
+    # logica de _process_messages e _process_history).
+    sync_channel_id = channel.get("id") if channel else None
+    sync_channel_owner = channel.get("owner_user_id") if channel else None
+    sync_channel_phone = str(channel.get("phone_number_id", "")) if channel else ""
+    sync_channel_type = str(channel.get("channel_type", "")) if channel else ""
 
     for item in state_sync:
         item_type = item.get("type", "")
@@ -806,7 +883,13 @@ def _process_smb_app_state_sync(value):
         display_name = full_name or first_name
 
         if action == "add":
-            contact_id = upsert_wa_contact(normalized_phone, display_name)
+            contact_id = upsert_wa_contact(
+                normalized_phone, display_name,
+                channel_id=sync_channel_id,
+                phone_number_id=sync_channel_phone,
+                source_channel_type=sync_channel_type,
+                auto_assign_user_id=sync_channel_owner if sync_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+            )
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
                 redact_phone(normalized_phone), redact_name(display_name), contact_id,
@@ -888,9 +971,16 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
             )
             messages = thread.get("messages", [])
 
+            # Normaliza business_phone uma vez (nono digito BR) — comparacao
+            # com msg_from/msg_to crus dava direction errada quando empresa
+            # cadastrou o numero sem 9 e o webhook entrega com (ou vice-versa).
+            business_phone_normalized = normalize_br_phone(business_phone) if business_phone else ""
+
             for msg in messages:
-                msg_from = str(msg.get("from", "")).replace("+", "").replace(" ", "").replace("-", "")
-                msg_to = str(msg.get("to", "")).replace("+", "").replace(" ", "").replace("-", "")
+                msg_from_raw = str(msg.get("from", "")).replace("+", "").replace(" ", "").replace("-", "")
+                msg_to_raw = str(msg.get("to", "")).replace("+", "").replace(" ", "").replace("-", "")
+                msg_from = normalize_br_phone(msg_from_raw) if msg_from_raw else ""
+                msg_to = normalize_br_phone(msg_to_raw) if msg_to_raw else ""
                 msg_id = msg.get("id", "")
                 msg_type = msg.get("type", "unknown")
                 timestamp = msg.get("timestamp", "")
@@ -899,7 +989,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 msg_status = str(history_context.get("status", "")).lower()
 
                 # Determinar direcao: se 'from' e o telefone da empresa, e outbound
-                is_outbound = (msg_from == business_phone) or bool(msg_to)
+                is_outbound = (msg_from == business_phone_normalized) or bool(msg_to)
                 direction = "outbound" if is_outbound else "inbound"
 
                 # media_placeholder: midia sera enviada em webhook separado
@@ -912,6 +1002,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                         content="[Midia do historico - aguardando]",
                         status=msg_status or "delivered",
                         timestamp_wa=ts_iso,
+                        operator_id=hist_channel_owner if direction == "outbound" else None,
                         channel_id=hist_channel_id,
                         phone_number_id=hist_channel_phone,
                         channel_owner_user_id=hist_channel_owner,
@@ -1020,6 +1111,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     filename=filename,
                     status=msg_status or ("received" if direction == "inbound" else "sent"),
                     timestamp_wa=ts_iso,
+                    operator_id=hist_channel_owner if direction == "outbound" else None,
                     channel_id=hist_channel_id,
                     phone_number_id=hist_channel_phone,
                     channel_owner_user_id=hist_channel_owner,

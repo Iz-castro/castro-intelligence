@@ -542,14 +542,35 @@ def _resolve_display_name(declared_name, whatsapp_profile_name, phone_formatted)
 # consome a API por contact_id; quando a Fase 3 do plano for entregue,
 # o frontend passa a listar conversations e mostrar badges de canal.
 
+class ConversationIdError(ValueError):
+    """Raise quando channel_id ou wa_id nao podem gerar conversation_id
+    deterministico. Webhook handlers devem capturar e enfileirar em
+    pending_webhook_events em vez de salvar mensagem com id sintetico
+    (default__) que nao casa com selectedThreadId do frontend."""
+
+
 def _make_conversation_id(channel_id, wa_id):
-    """Gera id deterministico de conversation. Aceita channel_id None
-    (legado) — usa 'default' como prefixo nesse caso."""
+    """Gera id deterministico de conversation '{channel_id}__{wa_id}'.
+
+    Falha-loud com ConversationIdError se channel_id ou wa_id estiverem
+    ausentes. O fallback antigo ('default__{wa_id}') gerava ids que o
+    frontend nunca encontrava (selectedThreadId usa channel_id real),
+    deixando mensagens orfas invisiveis ao operador.
+
+    Normaliza wa_id (nono digito BR) defesa-em-profundidade — callers
+    como save_wa_message reusam contact.wa_id de docs antigos que
+    podem estar em forma 12-dig sem 9. Sem normalizar aqui, mensagem
+    nova sai com conversation_id divergente do que o frontend espera.
+    """
     if channel_id is None or channel_id == "":
-        prefix = "default"
-    else:
-        prefix = str(channel_id)
-    return f"{prefix}__{wa_id}"
+        raise ConversationIdError(
+            f"_make_conversation_id requer channel_id (wa_id={wa_id!r})"
+        )
+    if not wa_id:
+        raise ConversationIdError(
+            f"_make_conversation_id requer wa_id (channel_id={channel_id!r})"
+        )
+    return f"{channel_id}__{normalize_br_phone(wa_id)}"
 
 
 def upsert_wa_conversation(
@@ -750,13 +771,27 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             "last_message_at": now,
             "last_inbound_at": now,
         }
+        # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
+        # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
+        # webhook chegou com 13-dig), o doc fica preso na forma antiga e
+        # todas as conversations geradas a partir de contact.wa_id ficam
+        # com conversation_id divergente do selectedThreadId do frontend.
+        # Migra agora pra evitar threads orfas.
+        existing_wa = str(existing.get("wa_id", ""))
+        if existing_wa and existing_wa != wa_id:
+            updates["wa_id"] = wa_id
+            updates["phone_formatted"] = format_phone_br(wa_id)
+            logger.info(
+                "Contato %s migrado wa_id %s -> %s (nono digito BR)",
+                existing["id"], existing_wa, wa_id,
+            )
         # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name
         if display_name:
             updates["whatsapp_profile_name"] = display_name
             # Recalcular display_name efetivo
             declared = existing.get("declared_name", "")
             updates["display_name"] = _resolve_display_name(
-                declared, display_name, existing.get("phone_formatted", ""),
+                declared, display_name, updates.get("phone_formatted") or existing.get("phone_formatted", ""),
             )
         # Atualizar canal se ainda nao definido ou se mudou
         if channel_id is not None and not existing.get("channel_id"):
@@ -774,6 +809,11 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 if existing.get("qualification") == "novo":
                     updates["qualification"] = "em_atendimento"
         document("wa_contacts", existing["id"]).set(updates, merge=True)
+        # Reflete wa_id canonizado no dict local pra _maybe_upsert_conversation
+        # propagar a forma certa pra wa_conversations.
+        if updates.get("wa_id"):
+            existing = dict(existing)
+            existing["wa_id"] = updates["wa_id"]
         # Garante que a conversation deste (channel, wa_id) tambem existe.
         _maybe_upsert_conversation_for_existing_contact(
             existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
@@ -1230,9 +1270,24 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
     eff_wa_id = (contact or {}).get("wa_id", "")
     eff_phone_number_id = phone_number_id or (contact or {}).get("phone_number_id", "")
-    eff_conversation_id = conversation_id or (
-        _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
-    )
+    if conversation_id:
+        eff_conversation_id = conversation_id
+    else:
+        try:
+            eff_conversation_id = _make_conversation_id(eff_channel_id, eff_wa_id)
+        except ConversationIdError as exc:
+            # Mensagem que nao pode ter conversation_id deterministico
+            # ficaria invisivel pro frontend (filtra por selectedThreadId).
+            # Quem nos chama (webhook) deve enfileirar em
+            # pending_webhook_events. Mensagens system internas (transfer,
+            # etc.) podem pular o filtro com direction='system'.
+            if direction != "system":
+                logger.error(
+                    "save_wa_message abortado: %s | contact=%s direction=%s",
+                    exc, contact_id, direction,
+                )
+                raise
+            eff_conversation_id = None
     document("wa_messages", message_id).set({
         "id": message_id,
         "wa_message_id": effective_wa_message_id,
@@ -1303,12 +1358,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     return message_id
 
 
-def get_wa_conversation(contact_id, limit=50, offset=0):
-    q = (
-        collection("wa_messages")
-        .where("contact_id", "==", contact_id)
-        .order_by("created_at", direction="DESCENDING")
-    )
+def get_wa_conversation(contact_id, limit=50, offset=0, conversation_id=None):
+    """Retorna mensagens do contato em ordem cronologica real.
+
+    Ordena por `timestamp_wa` (quando a mensagem realmente aconteceu),
+    nao `created_at` (quando foi salva). Critico pro history sync —
+    mensagens antigas chegam horas/dias depois mas devem aparecer no
+    fundo da timeline, nao no topo.
+
+    Se conversation_id for passado, filtra apenas a thread (canal+wa_id)
+    correspondente — preserva isolamento entre canais (coexistence vs
+    standard) que o filtro legado por contact_id misturava.
+    """
+    q = collection("wa_messages").where("contact_id", "==", contact_id)
+    if conversation_id:
+        q = q.where("conversation_id", "==", conversation_id)
+    q = q.order_by("timestamp_wa", direction="DESCENDING")
     if limit:
         q = q.limit(limit + offset)
 

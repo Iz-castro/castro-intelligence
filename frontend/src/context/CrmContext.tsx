@@ -834,12 +834,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     let disposed = false;
     const baseRef = collection(bundle.db, config.firestore.collections.wa_messages);
     const messagesQuery = activeThreadId
-      ? query(baseRef, where("conversation_id", "==", activeThreadId), orderBy("created_at", "desc"), firestoreLimit(messageLimit))
-      : query(baseRef, where("contact_id", "==", activeConversationId), orderBy("created_at", "desc"), firestoreLimit(messageLimit));
+      ? query(baseRef, where("conversation_id", "==", activeThreadId), orderBy("timestamp_wa", "desc"), firestoreLimit(messageLimit))
+      : query(baseRef, where("contact_id", "==", activeConversationId), orderBy("timestamp_wa", "desc"), firestoreLimit(messageLimit));
     const unsubscribe = onSnapshot(
       messagesQuery,
       (snap) => {
-        const nextMessages = snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
+        // Ordena por timestamp_wa (data real da mensagem), com fallback
+        // para created_at em system messages legadas sem timestamp_wa.
+        const nextMessages = snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => {
+          const ta = a.timestamp_wa || a.created_at || "";
+          const tb = b.timestamp_wa || b.created_at || "";
+          return ta.localeCompare(tb);
+        });
         commitConversationMessages(activeConversationId, nextMessages);
       },
       (e) => !disposed && setError(`Snapshot da conversa falhou: ${errorText(e)}`),
