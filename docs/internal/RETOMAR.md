@@ -1,10 +1,17 @@
-# Contexto pra retomar — Coexistence validado em prod, screencast pendente
+# Contexto pra retomar — Coexistence completo em prod com history sincronizado
 
-> Snapshot atualizado em 2026-05-08 (fim do dia) após sessão longa
-> que validou coexistence end-to-end em prod, fixou 4 bugs reais
-> (nono dígito BR, httpx timeout no subscribe_apps, channel resolution
-> stale, firestore.rules prod faltando) e fez Fase 4 cutover parcial.
+> Snapshot atualizado em 2026-05-09 (madrugada do dia 10) após sessão
+> longa que (a) achou e fixou 5 bugs reais no caminho de
+> `conversation_id`, (b) introduziu sistema novo `pending_webhook_events`
+> pra zero perda, (c) wipe + reonboarding coex em prod, (d) cleanup
+> de 3 perms não-usadas na Meta + republish, (e) **descobriu gap
+> crítico: history sync precisava de `POST /smb_app_data` explícito**
+> — implementado auto-trigger no signup + endpoint admin de retrigger,
+> (f) ordenação de mensagens migrou de `created_at` pra `timestamp_wa`
+> (real), (g) **history sincronizou com sucesso: 7 contatos + 56
+> mensagens importadas e exibindo cronologicamente certas no CRM**.
 > Quando voltar, leia este arquivo primeiro, depois
+> [2026-05-09.md](2026-05-09.md) (sessão de hoje),
 > [2026-05-08.md](2026-05-08.md) §5 (sessão da tarde),
 > [2026-05-06.md](2026-05-06.md) e
 > [2026-05-05.md](2026-05-05.md) pra detalhe cronológico, ou
@@ -13,53 +20,88 @@
 
 ## Onde paramos
 
-**App Review parcialmente aprovado em 2026-05-08:**
-- ✅ `whatsapp_business_messaging` — Advanced Access
-- ✅ `whatsapp_business_management` — Advanced Access
-- ✅ `public_profile` — renovada
-- ❌ `business_management` — reprovada (é permission de Ads Manager,
-  não de Embedded Signup do WhatsApp; descartada do escopo)
+**App Review aprovado e cleanup feito em 2026-05-09:**
+- ✅ `whatsapp_business_messaging` — Advanced Access (5/8)
+- ✅ `whatsapp_business_management` — Advanced Access (5/8)
+- ✅ `public_profile` — renovada (5/8)
+- 🧹 Removidas no painel Meta em 5/9 (não usadas): `business_management`
+  (Ads Manager — reprovada), `manage_app_solution` (Solution Partners),
+  `whatsapp_business_manage_events` (Conversions API)
+- ✅ App republicado em 5/9 — Meta aceitou. Não precisa nova App
+  Review pra manter o que já tem.
 
-**Outras 2 permissions decididas como fora do escopo (mesma sessão):**
-- `manage_app_solution` — não se aplica (somos Tech Provider direto
-  pra clientes finais, não intermediamos Solution Partners)
-- `whatsapp_business_manage_events` — Conversions API for WhatsApp
-  não está implementada; pedir sem feature levaria a reprovação.
+**App Live em prod desde 2026-05-08.** Embedded Signup, send/receive,
+templates — tudo destravado pra clientes externos.
 
-**App Live em prod**: Rafa publicou (`Live mode`) em 2026-05-08.
-Embedded Signup, send/receive, templates — tudo destravado pra
-clientes externos.
+**Coexistence end-to-end validado em prod (2026-05-09):**
+- Mensagem mandada do app celular aparece no CRM via
+  `smb_message_echoes` ✓ (com `operator_id` populado, label "Equipe")
+- Resposta do CRM chega no celular do cliente ✓ (delivered)
+- Inbound do cliente chega no CRM via `messages` ✓
+- Canal coex (id=1, WABA `680503338460083`, phone `1055982807598158`,
+  "Izael Castro - +55 31 7195-7758") ativo, owner=2 (izael)
+- Webhook subscription confirmada via `GET /{waba}/subscribed_apps`
+  (resposta direta da Meta lista nosso app + URL do CRM)
 
-**Coexistence end-to-end validado em prod** (2026-05-08 tarde):
-mensagem mandada do app celular aparece no CRM via
-`smb_message_echoes`; resposta do CRM chega no celular do cliente;
-inbound do cliente chega no CRM via `messages`. Sem duplicação.
-Token funcional. Canal #1 coex (WABA `680503338460083`, phone
-`1055982807598158`, Castro Operações) ativo.
+**Revision prod ativa:** `castro-crm-00087-mkc` em 100% (3 deploys
+hoje: `00085-qxp` → `00086-kkn` → `00087-mkc`).
 
-**4 bugs reais foram fixados em prod nesta sessão** (ver
+**5 bugs reais do `conversation_id` fixados em 2026-05-09** (ver
+[2026-05-09.md §1-2](2026-05-09.md)):
+1. `_make_conversation_id` falha-loud sem `channel_id`/`wa_id` (em vez
+   de gerar `default__{wa_id}` órfão)
+2. `save_wa_message` propaga `ConversationIdError` (sem mais salvar
+   `conversation_id=None` silencioso)
+3. `upsert_wa_contact` canoniza `wa_id` pra forma 13-dig com 9 quando
+   acha contato via variante (12-dig)
+4. `_process_history` normaliza phones em `business_phone`/`msg_from`/
+   `msg_to` antes de calcular `is_outbound`
+5. `get_wa_conversation` aceita `conversation_id` opcional pra
+   preservar isolamento de canais no fallback legado
+6. **Bonus:** `operator_id = channel_owner_user_id` em `smb_echoes` e
+   history outbound — frontend para de mostrar "Bot" no echo do app.
+
+**Sistema novo `pending_webhook_events`** ([pending_events.py](../../pending_events.py)):
+fila global para webhooks da Meta que não puderam ser processados
+imediatamente (canal não indexado durante onboarding, exception no
+processamento). Webhook entrypoint nunca propaga 5xx pra Meta. 4
+endpoints admin novos:
+- `GET /api/admin/pending-webhook-events?status=pending`
+- `POST /api/admin/pending-webhook-events/{id}/retry`
+- `POST /api/admin/pending-webhook-events/{id}/dismiss`
+- `DELETE /api/admin/pending-webhook-events/{id}`
+
+UI da fila ainda **não foi feita** — endpoints prontos pra consumir.
+
+**Wipe Firestore prod feito manualmente em 5/9** (Rafa apagou todas as
+coleções pelo console). Reonboarding coex via Embedded Signup gerou:
+- 1 contato + 1 conversation + 4 mensagens (testes manuais)
+- users/operator_profiles/departments/audit_log recriados em
+  `tenants/hubloc/...` no primeiro acesso
+
+**Índices Firestore reduzidos de 19 → 9** ([firestore.indexes.json](../../firestore.indexes.json)):
+removidos 12 índices flat legados (`castro_crm_*`, `castro_crm_staging_*`)
+da era pré-Fase 2. Mantidos só os 9 `COLLECTION_GROUP` ativos
+(`wa_conversations`, `wa_messages`, `wa_contacts`, `wa_transfer_log`).
+Deploy: `firebase deploy --only firestore:indexes --force`.
+
+**Token .env rotacionado em 5/9 + Secret Manager v26.** Canal coex usa
+token próprio do Firestore (do signup), não afetado. Recomendado
+rotacionar de novo (token foi exposto no chat).
+
+**4 bugs adicionais fixados em 2026-05-08** (contexto histórico, ver
 [2026-05-08.md §5](2026-05-08.md)):
-1. `firestore.rules` prod sem rule pra `castro_crm_tenants` (snapshot
-   conversations falhando)
-2. `_process_messages` no webhook não normalizava `wa_id` BR (bug
-   nono dígito — mesmo cliente virava 2 contatos/conversations)
-3. `httpx.ReadTimeout` em `subscribe_apps` da Meta abortava o signup
-   inteiro (frontend pegou como "Internal Server Error" / "Unexpected
-   token 'I'...")
-4. `get_send_credentials` caía em fallback `get_default_channel`
-   quando cache stale entre instâncias Cloud Run, enviando pelo canal
-   errado com creds expiradas (401 Authentication Error)
+1. `firestore.rules` prod sem rule pra `castro_crm_tenants`
+2. `_process_messages` não normalizava `wa_id` BR (nono dígito)
+3. `httpx.ReadTimeout` em `subscribe_apps` abortando signup
+4. `get_send_credentials` caía em fallback default com cache stale
 
-Commits: `8c34311`, `b127015`, `c632580`, `1fe7379`. Prod em
-`castro-crm-00082-tm6`.
-
-Meta também reprovou o screencast por "não demonstrar a experiência
-completa do caso de uso" — faltou tela de consent + caso de uso
-end-to-end. **Refazer screencast cobrindo as 2 perms aprovadas é a
-frente crítica agora.** Roteiro novo pronto em
-[`docs/APP_REVIEW_SCREENCAST_SCRIPT.md`](../APP_REVIEW_SCREENCAST_SCRIPT.md)
-endereçando todos os pontos do feedback (login Meta completo, consent
-screen, server-to-server note, narração+legendas inglês com tooltips).
+**Screencast App Review:** Meta reprovou em 5/8 ("não demonstra
+experiência completa do caso de uso"). Refazer cobrindo as 2 perms
+aprovadas continua na lista. Roteiro pronto em
+[`docs/APP_REVIEW_SCREENCAST_SCRIPT.md`](../APP_REVIEW_SCREENCAST_SCRIPT.md).
+**Não bloqueia operação** — app está Live e funcional, perms aprovadas.
+Sem follow-up exigindo screencast novo após o cleanup/republish de 5/9.
 
 Código já limpo: `business_management` removida da tupla de detection
 em `main.py` (era fallback redundante) e neutralizada em
@@ -174,35 +216,50 @@ Referência: [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO
 ### Fase 4 — Wipe + Validação End-to-End ⚠️ EM ANDAMENTO
 - 1. Deploy staging ✓
 - 2. Validação staging (e2e 9/9 PASSED) ✓
-- 3. Deploy prod ✓ (`00082-tm6`)
-- 4. **Wipe Firestore prod ✓ parcial** — feito hoje 2026-05-08
-  preservando `users` (3), `operator_profiles` (3), `departments` (4),
-  `audit_log` (655). Apagou 58 docs (canais, contatos, conversations,
-  mensagens, audit_metrics, _meta tenant).
-- 5. Bootstrap tenant hubloc ✓ (preservado pelo wipe)
-- 6. Reonboarding canal coex via Embedded Signup ✓ (canal #2 ativo,
-  WABA `680503338460083`, Castro Operações)
-- **6.b Validações end-to-end pendentes:**
-  - Mensagem inbound webhook → conversation ✓ validado
-  - `_resolve_channel_creds` usa `conversation.channel_id` ✓ FIXADO
-    hoje (commit `1fe7379` com refresh sincrono pra cache stale)
-  - **Mesmo wa_id em standard + coex como 2 entradas distintas
-    ⏸️ NÃO TESTADO** (prod só tem coex agora, sem standard real
-    operando)
-  - **Bulk reassign exclui canais coex onde owner=user X
-    ⏸️ NÃO TESTADO**
-  - **UI badge de canal correto em cada linha ⏸️ NÃO TESTADO**
-  - **Painel de perfil unificado (mesmo cliente em múltiplas threads)
-    ⏸️ NÃO TESTADO**
-  - **Auditoria `sender_user_id != channel_owner_user_id` em
-    transferência ⏸️ NÃO TESTADO**
-  - **Isolamento multi-tenant (rules + backend filter) ⏸️ NÃO TESTADO**
-    — rules atuais são permissivas via `emailAllowed`; isolamento real
-    depende do bloco 2.9 ser concluído.
-- 7. **History sync via webhook `history` ⏸️ AGUARDANDO META** —
-  signup com "Compartilhar todas as conversas" foi 2026-05-08 19:47;
-  até fim do dia 0 events `[HISTORY]` chegaram. Janela oficial até 24h.
-  Se até 2026-05-09 19:47 não chegar nada: support ticket Meta.
+- 3. Deploy prod ✓ (`00085-qxp` em 5/9 com fixes do conversation_id +
+  fila pending + operator_id em smb_echoes)
+- 4. **Wipe Firestore prod ✓ refeito em 5/9** — Rafa apagou todas as
+  coleções pelo console. Re-bootstrap automático criou
+  `tenants/hubloc/users` (2), `operator_profiles` (2), `departments`
+  (4), `audit_log` (94 LOGIN_SUCCESS) na primeira sessão.
+- 5. Bootstrap tenant hubloc ✓ (recriado pelo primeiro acesso)
+- 6. Reonboarding canal coex via Embedded Signup ✓ em 5/9 (canal #1,
+  WABA `680503338460083`, "Izael Castro - +55 31 7195-7758",
+  owner_user_id=2). Verificação direta na Meta:
+  `GET /{waba}/subscribed_apps` retorna nosso app.
+- **6.b Validações end-to-end:**
+  - ✅ Mensagem inbound webhook → conversation (validado 5/9)
+  - ✅ `_resolve_channel_creds` usa `conversation.channel_id` (5/8)
+  - ✅ smb_echo do app celular → CRM (5/9)
+  - ✅ Resposta do CRM → cliente (delivered, 5/9)
+  - ⏸️ Mesmo wa_id em standard + coex como 2 entradas distintas (prod
+    tem só coex; standard #2 existe mas é canal legado sem uso real)
+  - ⏸️ Bulk reassign exclui canais coex onde owner=user X
+  - ⏸️ UI badge de canal correto em cada linha
+  - ⏸️ Painel de perfil unificado (mesmo cliente em múltiplas threads)
+  - ⏸️ Auditoria `sender_user_id != channel_owner_user_id` em
+    transferência real
+  - ⏸️ Isolamento multi-tenant (rules + backend filter) — rules
+    permissivas via `emailAllowed`; depende de 2.9.
+- 7. **History sync via webhook `history` ✅ FUNCIONOU em 2026-05-09** —
+  signup foi 02:21:42 UTC. Descoberto tarde na sessão que
+  `POST /{phone_id}/smb_app_data` precisa ser chamado explicitamente
+  (não é assíncrono "Meta entrega quando quiser"). Disparo manual em
+  ~03:30 UTC; webhook `[HISTORY]` chegou em <5min e completou em
+  ~3min: 5 threads, 56 mensagens, fases 0/1/2 todas com
+  `progress=100%`. `audit_log/history_sync_complete` registrado.
+
+  **Auto-trigger** agora roda no `embedded_signup_exchange` em
+  [main.py](../../main.py) pra signups futuros, e há endpoint admin
+  `POST /api/admin/channels/{id}/trigger-coex-sync?sync_type=both`
+  pra repair manual dentro da janela de 24h.
+
+  **Mensagens ordenadas cronologicamente** via `timestamp_wa` (não
+  `created_at`) tanto no backend quanto no frontend
+  ([CrmContext.tsx:837](../../frontend/src/context/CrmContext.tsx#L837),
+  [database_firestore.py:1320](../../database_firestore.py#L1320)).
+  Índices Firestore atualizados: `wa_messages` agora tem
+  `conversation_id+timestamp_wa` e `contact_id+timestamp_wa`.
 
 ### Pós-Fase 4 / Roadmap futuro
 
@@ -217,21 +274,33 @@ Itens registrados no plano que ficam pra depois:
 - UI dedicada "Importar últimos 6 meses" (já que `history` webhook
   funciona, falta só apresentar pro usuário)
 
-### Pendências operacionais (fora do plano, descobertas hoje)
+### Pendências operacionais (fora do plano)
 - **`bootstrap_default_channel` recria canal #N standard a cada deploy**
-  (lê `WHATSAPP_PHONE_NUMBER_ID`/`WHATSAPP_WABA_ID` env). Solução:
-  limpar essas env vars do Cloud Run prod quando confirmarmos que canal
-  legado não é mais necessário.
+  (lê `WHATSAPP_PHONE_NUMBER_ID`/`WHATSAPP_WABA_ID` env). Em prod 5/9
+  recriou canal #2 "Canal Principal" com WABA `1633469507697155`. Não
+  é usado pelo coex e gera 401 spam ao buscar billing-status. Solução:
+  `gcloud run services update castro-crm
+   --remove-env-vars=WHATSAPP_PHONE_NUMBER_ID,WHATSAPP_WABA_ID`.
 - **UI exibe `WHATSAPP_TOKEN` em texto** no modal "Conexão realizada"
-  (resíduo single-tenant). Token vai pro Firestore registry —
-  exposição desnecessária. Substituir por "Token salvo. Canal pronto."
+  ("Atualize o .env do servidor com os novos valores") — resíduo
+  single-tenant. Token vai pro Firestore registry. Substituir por
+  "Token salvo. Canal pronto."
 - **SA prod sem permissão IAM `auth.get_user`** → spam de
-  `INSUFFICIENT_PERMISSION` nos logs. Não-fatal (cai em fallback) mas
-  polui logs. Adicionar role `roles/firebase.admin` ou similar.
+  `INSUFFICIENT_PERMISSION` em logs. Adicionar role
+  `roles/firebase.admin` ou similar.
 - **Frontend faz polling agressivo em `/api/wa/channel/{id}/billing-status`**
   (~1 req/s). Deveria ter backoff em erro repetido.
-- **`next_sequence("channels")` reusa IDs em alguns cenários** (ver
-  task #52). Risco baixo agora, mas corrigir antes de cliente #2.
+- **`next_sequence("channels")` reusa IDs em alguns cenários** (task
+  #52). Risco baixo agora, mas corrigir antes de cliente #2.
+- **🆕 (5/9) "Equipe" deveria mostrar nome do operador.** Frontend
+  ([formatting.ts:35](../../frontend/src/utils/formatting.ts#L35)) usa
+  `message.operator_name` antes de cair em "Equipe". `_user_map` em
+  [database_firestore.py:1326-1336](../../database_firestore.py#L1326-L1336)
+  provavelmente não acha users que vivem em `tenants/{tid}/users`
+  (subcoleção). Bug cosmético, não bloqueia uso.
+- **🆕 (5/9) `WHATSAPP_TOKEN` foi exposto no chat** durante a sessão
+  de hoje. Recomendado rotacionar de novo + atualizar Secret Manager.
+  Considerar adicionar `.env` ao `.gitignore`.
 
 ---
 
@@ -378,47 +447,44 @@ Já estava no working tree do RETOMAR anterior — agora consolidado:
 
 ## Próximos passos (em ordem)
 
-### 0. App Review — gravar e submeter screencast (FRENTE CRÍTICA)
+### 1. Limpeza operacional rápida (low effort)
 
-Resultado de 2026-05-08: 2 perms aprovadas Advanced
-(`whatsapp_business_messaging` + `whatsapp_business_management`),
-`business_management` reprovada (descartada do escopo — não é necessária
-pra Embedded Signup do WhatsApp). Screencast anterior reprovado por
-não demonstrar experiência completa do caso de uso.
+- Limpar `WHATSAPP_PHONE_NUMBER_ID`/`WHATSAPP_WABA_ID` do Cloud Run
+  prod pra parar de recriar canal #2 standard a cada deploy:
+  ```powershell
+  gcloud run services update castro-crm `
+    --region=southamerica-east1 --project=project-26fb9c99-8ee9-4179-aef `
+    --remove-env-vars=WHATSAPP_PHONE_NUMBER_ID,WHATSAPP_WABA_ID
+  ```
+- Rotacionar `WHATSAPP_TOKEN` de novo na Meta + atualizar Secret
+  Manager (foi exposto no chat de 5/9).
+- Adicionar `.env` ao `.gitignore` se ainda não está.
 
-**Pré-requisitos JÁ ATENDIDOS** (sessão 2026-05-08 tarde):
+### 2. Bug cosmético — "Equipe" mostrar nome do operador
+
+`_user_map` em `database_firestore.py:1326-1336` não está achando
+users que vivem em `tenants/{tid}/users`. Investigar e ajustar
+provavelmente fazendo lookup via `_get_doc("users", id)` (que respeita
+tenant_context) em vez de query flat. Validar com a mensagem #3 do
+teste de 5/9 que está com `operator_id=2`.
+
+### 3. Re-screencast App Review (sem urgência operacional)
+
+App está Live, perms aprovadas, cleanup feito em 5/9 e Meta aceitou
+republish — não há follow-up pendente. Mas o screencast reprovado em
+5/8 segue como frente preservada. Roteiro pronto em
+[APP_REVIEW_SCREENCAST_SCRIPT.md](../APP_REVIEW_SCREENCAST_SCRIPT.md).
+
+**Pré-requisitos atendidos:**
 - ✅ App em Live mode
-- ✅ Configurador Meta verificado (Embedded Signup completou sem #2655111)
-- ✅ Canal coexistence ativo em prod com token válido
-- ✅ Coexistence end-to-end testado e funcional
-- ✅ Bug do nono dígito BR fixado (sem duplicação de threads)
-- ✅ Bug de channel resolution stale fixado (sem 401 ao enviar)
-
-**Sequência (curta — só falta gravar e submeter):**
-
-1. **Gravar screencast** seguindo
-   [APP_REVIEW_SCREENCAST_SCRIPT.md](../APP_REVIEW_SCREENCAST_SCRIPT.md).
-   Pontos críticos do feedback Meta de 2026-05-08:
-   - Narração em inglês + legendas em inglês visíveis
-   - Tooltips em inglês explicando elementos da UI em português
-   - Consent screen do Meta visível e pausada ~3s
-   - Embedded Signup conclui com sucesso (popup fecha, CRM mostra
-     "Conexão realizada com sucesso!")
-   - Disclaimer server-to-server explícito no slide intro + closing
-   - Handle do destinatário visível em todos envios
-
-2. **Resubmeter cada permission** com as notas técnicas atualizadas
-   (§3 do roteiro). Reforçar disclaimer server-to-server em cada nota.
-
-**Não submeter `business_management`, `manage_app_solution` nem
-`whatsapp_business_manage_events`.** Todas três fora do escopo do
-produto — ver bloco "Onde paramos" acima.
+- ✅ Canal coex ativo + funcional + validado end-to-end
+- ✅ Token coex válido sem expiração
+- ✅ Cleanup de perms não-usadas concluído
 
 **Cenário ideal pra gravar:** abrir nova aba anônima, login admin,
-preparar conta de teste, abrir o app WhatsApp Business no celular
-(coex confirmado), preparar 2-3 mensagens com cliente teste pra
-demonstrar bidirecional + echo. Estimar 30-45min de gravação +
-edição.
+abrir o app WhatsApp Business no celular (coex já confirmado),
+preparar 2-3 mensagens com cliente teste pra demonstrar bidirecional +
+echo. Estimar 30-45min.
 
 ### 0.B Firestore rules estritas em staging — INVESTIGAÇÃO PENDENTE
 
@@ -535,32 +601,38 @@ e exigir re-aprovação.
 ## Quick start (próxima sessão)
 
 ```powershell
-# 1. Ler este arquivo + o diário do 5/8 + roteiro do screencast
+# 1. Ler este arquivo + diário de 5/9
 cd c:\Projetos\Hubloc\castro-intelligence
 code docs/internal/RETOMAR.md
-code docs/internal/2026-05-08.md
-code docs/APP_REVIEW_SCREENCAST_SCRIPT.md
+code docs/internal/2026-05-09.md
 
 # 2. Confirmar conta gcloud certa
 gcloud config get-value account
 # deve retornar: rafaluisc@outlook.com
 
-# 3. Working tree deve estar limpo
+# 3. Checar se history da Meta finalmente chegou
+./.venv/Scripts/python.exe -c "
+import os
+os.environ['FIRESTORE_PROJECT_ID'] = 'project-26fb9c99-8ee9-4179-aef'
+os.environ['FIRESTORE_COLLECTION_PREFIX'] = 'castro_crm'
+from firestore_common import get_firestore_client, collection_name
+c = get_firestore_client()
+audit = list(c.collection(collection_name('tenants')).document('hubloc').collection('audit_log').where('action','==','history_sync_complete').stream())
+print(f'history_sync_complete: {len(audit)} eventos')
+msgs = list(c.collection(collection_name('tenants')).document('hubloc').collection('wa_messages').stream())
+print(f'wa_messages: {len(msgs)} docs')
+pending = list(c.collection(collection_name('pending_webhook_events')).stream())
+print(f'pending_webhook_events: {len(pending)} docs')
+"
+
+# 4. Checar logs pra HISTORY/SMB ECHO mais recentes
+gcloud run services logs read castro-crm --region=southamerica-east1 `
+  --project=project-26fb9c99-8ee9-4179-aef --limit=200 `
+  --format="value(timestamp,textPayload)" `
+  | Select-String "HISTORY|SMB ECHO|WA IN|PENDING"
+
+# 5. Working tree deve estar limpo
 git status --short
-
-# 4. (Opcional) Smoke test rapido do que ja existia
-./.venv/Scripts/python.exe -m scripts.e2e_test_staging
-# espera: ✓ E2E PASSED (9/9)
-
-# 5. Abrir staging no browser
-# https://castro-crm-staging-286866630844.southamerica-east1.run.app
-
-# 6. Frente principal: re-screencast App Review
-#    a) Painel Meta: revisar Configurador (ver §0 acima)
-#    b) Deploy prod com cleanup business_management
-#    c) Smoke test Embedded Signup em staging
-#    d) Gravar screencast seguindo APP_REVIEW_SCREENCAST_SCRIPT.md
-#    e) Resubmeter na pagina App Review
 ```
 
 ## Cloud Scheduler — comandos úteis (staging)
@@ -594,10 +666,45 @@ Após `jobs run`, validar com:
 
 ## URL e revisões úteis
 
-- **Staging:** https://castro-crm-staging-286866630844.southamerica-east1.run.app — `castro-crm-staging-00028-qbn`
-- **Produção:** `castro-crm`, `00077-qls` (Fase 1 apenas, intocada)
+- **Staging:** https://castro-crm-staging-286866630844.southamerica-east1.run.app — `castro-crm-staging-00029-bn5` (deploy de 5/9 com fixes do conversation_id + fila pending)
+- **Produção:** https://castro-crm-286866630844.southamerica-east1.run.app — `castro-crm-00085-qxp` (deploy de 5/9 com operator_id em smb_echoes + Secret Manager v26)
 - **Repo:** https://github.com/Iz-castro/castro-intelligence — branch `develop`
-- **Último commit:** `78234f7`
 - **Cloud Scheduler staging:** `castro-crm-staging-health-check` em
   `southamerica-east1` — schedule `0 9 * * *` (09:00 BRT diário), state
-  ENABLED.
+  ENABLED. **Prod ainda não criado.**
+
+### Snapshot Firestore prod pós-history sync 5/9
+
+```
+tenants/hubloc/
+  users (2)               — rafaluisc, izaeldecastro
+  operator_profiles (2)
+  departments (4)         — Geral, Vendas, Suporte, ...
+  audit_log (95+)         — LOGIN_SUCCESS_FIREBASE + history_sync_complete
+  wa_contacts (7)         — Rafael, Flavio Cpap, +447710..., 4 outros BR
+  wa_conversations (6)    — uma por wa_id, todas no canal coex id=1
+  wa_messages (56)        — history importado + testes; ordenadas por timestamp_wa real
+
+(global/flat)
+  channels (2)            — #1 coex (WABA 680503338460083), #2 standard legado (WABA 1633469507697155)
+  phone_routing (2)       — 1055982807598158 → coex, 1070927076104221 → standard
+  pending_webhook_events (0)
+  tenants (1)             — hubloc
+```
+
+### Inspecionar Firestore prod via Python (admin)
+
+Script ad-hoc rápido pra ler qualquer coleção sem token Firebase:
+
+```powershell
+cd c:\Projetos\Hubloc\castro-intelligence
+./.venv/Scripts/python.exe -c "
+import os
+os.environ['FIRESTORE_PROJECT_ID'] = 'project-26fb9c99-8ee9-4179-aef'
+os.environ['FIRESTORE_COLLECTION_PREFIX'] = 'castro_crm'
+from firestore_common import get_firestore_client, collection_name
+c = get_firestore_client()
+for snap in c.collection(collection_name('channels')).stream():
+    print(snap.to_dict())
+"
+```

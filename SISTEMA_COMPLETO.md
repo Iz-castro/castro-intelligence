@@ -34,6 +34,7 @@ Gerado por `scripts/build_sistema_completo.py`. Nao editar a mao.
 - [init_db.py](#init_dbpy)
 - [main.py](#mainpy)
 - [media.py](#mediapy)
+- [pending_events.py](#pending_eventspy)
 - [pii_redaction.py](#pii_redactionpy)
 - [seed_gchat.py](#seed_gchatpy)
 - [tenant_service.py](#tenant_servicepy)
@@ -262,110 +263,6 @@ faster-whisper==1.2.1
 {
   "indexes": [
     {
-      "collectionGroup": "castro_crm_wa_messages",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_wa_messages",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "direction", "order": "ASCENDING" },
-        { "fieldPath": "status", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_wa_contacts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "is_archived", "order": "ASCENDING" },
-        { "fieldPath": "last_message_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_wa_contacts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
-        { "fieldPath": "is_archived", "order": "ASCENDING" },
-        { "fieldPath": "last_message_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_wa_contacts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "department_id", "order": "ASCENDING" },
-        { "fieldPath": "is_archived", "order": "ASCENDING" },
-        { "fieldPath": "last_message_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_wa_transfer_log",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "DESCENDING" }
-      ]
-    },
-
-    {
-      "collectionGroup": "castro_crm_staging_wa_messages",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_staging_wa_messages",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "direction", "order": "ASCENDING" },
-        { "fieldPath": "status", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_staging_wa_contacts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "is_archived", "order": "ASCENDING" },
-        { "fieldPath": "last_message_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_staging_wa_contacts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
-        { "fieldPath": "is_archived", "order": "ASCENDING" },
-        { "fieldPath": "last_message_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_staging_wa_contacts",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "department_id", "order": "ASCENDING" },
-        { "fieldPath": "is_archived", "order": "ASCENDING" },
-        { "fieldPath": "last_message_at", "order": "DESCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "castro_crm_staging_wa_transfer_log",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "DESCENDING" }
-      ]
-    },
-
-    {
       "collectionGroup": "wa_conversations",
       "queryScope": "COLLECTION_GROUP",
       "fields": [
@@ -387,7 +284,7 @@ faster-whisper==1.2.1
       "queryScope": "COLLECTION_GROUP",
       "fields": [
         { "fieldPath": "conversation_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "DESCENDING" }
+        { "fieldPath": "timestamp_wa", "order": "DESCENDING" }
       ]
     },
     {
@@ -395,7 +292,16 @@ faster-whisper==1.2.1
       "queryScope": "COLLECTION_GROUP",
       "fields": [
         { "fieldPath": "contact_id", "order": "ASCENDING" },
-        { "fieldPath": "created_at", "order": "DESCENDING" }
+        { "fieldPath": "timestamp_wa", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_messages",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "contact_id", "order": "ASCENDING" },
+        { "fieldPath": "direction", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
       ]
     },
     {
@@ -422,6 +328,14 @@ faster-whisper==1.2.1
         { "fieldPath": "department_id", "order": "ASCENDING" },
         { "fieldPath": "is_archived", "order": "ASCENDING" },
         { "fieldPath": "last_message_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_transfer_log",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "contact_id", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
       ]
     }
   ],
@@ -3811,14 +3725,35 @@ def _resolve_display_name(declared_name, whatsapp_profile_name, phone_formatted)
 # consome a API por contact_id; quando a Fase 3 do plano for entregue,
 # o frontend passa a listar conversations e mostrar badges de canal.
 
+class ConversationIdError(ValueError):
+    """Raise quando channel_id ou wa_id nao podem gerar conversation_id
+    deterministico. Webhook handlers devem capturar e enfileirar em
+    pending_webhook_events em vez de salvar mensagem com id sintetico
+    (default__) que nao casa com selectedThreadId do frontend."""
+
+
 def _make_conversation_id(channel_id, wa_id):
-    """Gera id deterministico de conversation. Aceita channel_id None
-    (legado) — usa 'default' como prefixo nesse caso."""
+    """Gera id deterministico de conversation '{channel_id}__{wa_id}'.
+
+    Falha-loud com ConversationIdError se channel_id ou wa_id estiverem
+    ausentes. O fallback antigo ('default__{wa_id}') gerava ids que o
+    frontend nunca encontrava (selectedThreadId usa channel_id real),
+    deixando mensagens orfas invisiveis ao operador.
+
+    Normaliza wa_id (nono digito BR) defesa-em-profundidade — callers
+    como save_wa_message reusam contact.wa_id de docs antigos que
+    podem estar em forma 12-dig sem 9. Sem normalizar aqui, mensagem
+    nova sai com conversation_id divergente do que o frontend espera.
+    """
     if channel_id is None or channel_id == "":
-        prefix = "default"
-    else:
-        prefix = str(channel_id)
-    return f"{prefix}__{wa_id}"
+        raise ConversationIdError(
+            f"_make_conversation_id requer channel_id (wa_id={wa_id!r})"
+        )
+    if not wa_id:
+        raise ConversationIdError(
+            f"_make_conversation_id requer wa_id (channel_id={channel_id!r})"
+        )
+    return f"{channel_id}__{normalize_br_phone(wa_id)}"
 
 
 def upsert_wa_conversation(
@@ -4019,13 +3954,27 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             "last_message_at": now,
             "last_inbound_at": now,
         }
+        # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
+        # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
+        # webhook chegou com 13-dig), o doc fica preso na forma antiga e
+        # todas as conversations geradas a partir de contact.wa_id ficam
+        # com conversation_id divergente do selectedThreadId do frontend.
+        # Migra agora pra evitar threads orfas.
+        existing_wa = str(existing.get("wa_id", ""))
+        if existing_wa and existing_wa != wa_id:
+            updates["wa_id"] = wa_id
+            updates["phone_formatted"] = format_phone_br(wa_id)
+            logger.info(
+                "Contato %s migrado wa_id %s -> %s (nono digito BR)",
+                existing["id"], existing_wa, wa_id,
+            )
         # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name
         if display_name:
             updates["whatsapp_profile_name"] = display_name
             # Recalcular display_name efetivo
             declared = existing.get("declared_name", "")
             updates["display_name"] = _resolve_display_name(
-                declared, display_name, existing.get("phone_formatted", ""),
+                declared, display_name, updates.get("phone_formatted") or existing.get("phone_formatted", ""),
             )
         # Atualizar canal se ainda nao definido ou se mudou
         if channel_id is not None and not existing.get("channel_id"):
@@ -4043,6 +3992,11 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 if existing.get("qualification") == "novo":
                     updates["qualification"] = "em_atendimento"
         document("wa_contacts", existing["id"]).set(updates, merge=True)
+        # Reflete wa_id canonizado no dict local pra _maybe_upsert_conversation
+        # propagar a forma certa pra wa_conversations.
+        if updates.get("wa_id"):
+            existing = dict(existing)
+            existing["wa_id"] = updates["wa_id"]
         # Garante que a conversation deste (channel, wa_id) tambem existe.
         _maybe_upsert_conversation_for_existing_contact(
             existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
@@ -4499,9 +4453,24 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
     eff_wa_id = (contact or {}).get("wa_id", "")
     eff_phone_number_id = phone_number_id or (contact or {}).get("phone_number_id", "")
-    eff_conversation_id = conversation_id or (
-        _make_conversation_id(eff_channel_id, eff_wa_id) if eff_wa_id else None
-    )
+    if conversation_id:
+        eff_conversation_id = conversation_id
+    else:
+        try:
+            eff_conversation_id = _make_conversation_id(eff_channel_id, eff_wa_id)
+        except ConversationIdError as exc:
+            # Mensagem que nao pode ter conversation_id deterministico
+            # ficaria invisivel pro frontend (filtra por selectedThreadId).
+            # Quem nos chama (webhook) deve enfileirar em
+            # pending_webhook_events. Mensagens system internas (transfer,
+            # etc.) podem pular o filtro com direction='system'.
+            if direction != "system":
+                logger.error(
+                    "save_wa_message abortado: %s | contact=%s direction=%s",
+                    exc, contact_id, direction,
+                )
+                raise
+            eff_conversation_id = None
     document("wa_messages", message_id).set({
         "id": message_id,
         "wa_message_id": effective_wa_message_id,
@@ -4572,12 +4541,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     return message_id
 
 
-def get_wa_conversation(contact_id, limit=50, offset=0):
-    q = (
-        collection("wa_messages")
-        .where("contact_id", "==", contact_id)
-        .order_by("created_at", direction="DESCENDING")
-    )
+def get_wa_conversation(contact_id, limit=50, offset=0, conversation_id=None):
+    """Retorna mensagens do contato em ordem cronologica real.
+
+    Ordena por `timestamp_wa` (quando a mensagem realmente aconteceu),
+    nao `created_at` (quando foi salva). Critico pro history sync —
+    mensagens antigas chegam horas/dias depois mas devem aparecer no
+    fundo da timeline, nao no topo.
+
+    Se conversation_id for passado, filtra apenas a thread (canal+wa_id)
+    correspondente — preserva isolamento entre canais (coexistence vs
+    standard) que o filtro legado por contact_id misturava.
+    """
+    q = collection("wa_messages").where("contact_id", "==", contact_id)
+    if conversation_id:
+        q = q.where("conversation_id", "==", conversation_id)
+    q = q.order_by("timestamp_wa", direction="DESCENDING")
     if limit:
         q = q.limit(limit + offset)
 
@@ -6639,22 +6618,7 @@ async def wa_messages(
     - Se conversation_id e fornecido: filtra por aquela thread (canal+wa_id).
     - Se nao: retorna timeline cross-channel do contato (legado).
     """
-    if conversation_id:
-        from firestore_common import collection as fs_coll
-        q = (
-            fs_coll("wa_messages")
-            .where("conversation_id", "==", conversation_id)
-            .order_by("created_at", direction="DESCENDING")
-            .limit(limit)
-        )
-        rows = []
-        for snap in q.stream():
-            data = snap.to_dict() or {}
-            if "id" not in data:
-                data["id"] = snap.id
-            rows.append(data)
-        return {"messages": rows}
-    messages = get_wa_conversation(contact_id, limit=limit)
+    messages = get_wa_conversation(contact_id, limit=limit, conversation_id=conversation_id)
     return {"messages": messages}
 
 
@@ -7701,6 +7665,137 @@ async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(
     deactivate_channel(channel_id)
     log_audit(current_user["id"], "CHANNEL_DELETE", f"id={channel_id} label={existing.get('label')}")
     return {"ok": True}
+
+
+@app.post("/api/admin/channels/{channel_id}/trigger-coex-sync")
+async def trigger_coex_sync(
+    channel_id: int,
+    sync_type: str = Query(default="both", description="smb_app_state_sync|history|both"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Dispara sync de contatos e/ou history para canal coexistence.
+
+    Doc Meta: POST /{phone_id}/smb_app_data com sync_type. Cada sync
+    so pode ser disparado UMA VEZ por signup. Se ja foi disparado
+    antes, Meta retorna erro. Janela de 24h apos signup — passou disso
+    precisa desligar canal e refazer signup.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    if sync_type not in ("smb_app_state_sync", "history", "both"):
+        raise HTTPException(status_code=400, detail="sync_type deve ser smb_app_state_sync, history, ou both")
+    channel = get_channel_by_id_from_db(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+    if str(channel.get("channel_type", "")) != CHANNEL_TYPE_COEXISTENCE:
+        raise HTTPException(status_code=400, detail="Apenas canais coexistence")
+    phone_id = str(channel.get("phone_number_id", "")).strip()
+    token = str(channel.get("access_token", "")).strip()
+    if not phone_id or not token:
+        raise HTTPException(status_code=400, detail="Canal sem phone_number_id ou access_token")
+
+    types_to_sync = ["smb_app_state_sync", "history"] if sync_type == "both" else [sync_type]
+    results: dict[str, dict] = {}
+    smb_data_url = f"{GRAPH_API_BASE}/{phone_id}/smb_app_data"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for stype in types_to_sync:
+            try:
+                resp = await client.post(
+                    smb_data_url,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"messaging_product": "whatsapp", "sync_type": stype},
+                )
+                if resp.status_code >= 400:
+                    detail = _meta_error_detail(resp)
+                    results[stype] = {"ok": False, "error": detail}
+                    logger.error("trigger-coex-sync %s falhou: %s", stype, detail)
+                else:
+                    body = resp.json()
+                    results[stype] = {"ok": True, "request_id": body.get("request_id", "")}
+                    logger.info("trigger-coex-sync %s OK | request_id=%s", stype, body.get("request_id", ""))
+            except httpx.RequestError as exc:
+                results[stype] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                logger.warning("trigger-coex-sync %s erro de rede: %s", stype, exc)
+
+    log_audit(
+        current_user["id"],
+        "TRIGGER_COEX_SYNC",
+        f"channel_id={channel_id} types={types_to_sync} results={results}",
+    )
+    return {"channel_id": channel_id, "results": results}
+
+
+# -- API: Pending webhook events (eventos da Meta sem canal resolvido) --
+
+@app.get("/api/admin/pending-webhook-events")
+async def list_pending_webhook_events(
+    status: str | None = Query(default=None, description="pending|resolved|failed"),
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista eventos da Meta que nao puderam ser processados imediatamente
+    (canal nao indexado ainda durante onboarding, phone_id sem canal,
+    excecao no processamento). Garantia de zero perda — operador retenta
+    apos o canal estar disponivel."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    from pending_events import list_pending_events
+    events = list_pending_events(status=status, limit=limit)
+    return {"events": events, "count": len(events)}
+
+
+@app.post("/api/admin/pending-webhook-events/{event_id}/retry")
+async def retry_pending_webhook_event(event_id: int, current_user: dict = Depends(get_current_user)):
+    """Re-roda process_webhook_payload com o payload original. Idempotente
+    via wa_message_id (save_wa_message detecta duplicata)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    from pending_events import get_pending_event, mark_event_attempt
+    event = get_pending_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    if event.get("status") == "resolved":
+        return {"status": "already_resolved", "id": event_id}
+    payload = event.get("payload") or {}
+    if not payload:
+        raise HTTPException(status_code=400, detail="Evento sem payload")
+    try:
+        await process_webhook_payload(payload, ws_notify_callback=broadcast_to_operators)
+        mark_event_attempt(event_id, success=True)
+        log_audit(current_user["id"], "PENDING_EVENT_RETRY", f"id={event_id} ok")
+        return {"status": "ok", "id": event_id}
+    except Exception as exc:
+        mark_event_attempt(event_id, success=False, error=f"{type(exc).__name__}: {exc}")
+        log_audit(current_user["id"], "PENDING_EVENT_RETRY", f"id={event_id} err={type(exc).__name__}")
+        raise HTTPException(status_code=502, detail=f"Falha ao reprocessar: {exc}")
+
+
+@app.post("/api/admin/pending-webhook-events/{event_id}/dismiss")
+async def dismiss_pending_webhook_event(event_id: int, current_user: dict = Depends(get_current_user)):
+    """Marca evento como definitivamente falho (nao retentar). Usar quando
+    intervencao confirma que o evento nao tem como ser recuperado."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    from pending_events import mark_event_failed, get_pending_event
+    if not get_pending_event(event_id):
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    mark_event_failed(event_id, error="dismissed_by_admin")
+    log_audit(current_user["id"], "PENDING_EVENT_DISMISS", f"id={event_id}")
+    return {"status": "dismissed", "id": event_id}
+
+
+@app.delete("/api/admin/pending-webhook-events/{event_id}")
+async def delete_pending_webhook_event_endpoint(event_id: int, current_user: dict = Depends(get_current_user)):
+    """Remove evento da fila. Use apos retry confirmado ou eventos sem
+    valor de retencao."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin")
+    from pending_events import delete_pending_event
+    if not delete_pending_event(event_id):
+        raise HTTPException(status_code=404, detail="Evento nao encontrado")
+    log_audit(current_user["id"], "PENDING_EVENT_DELETE", f"id={event_id}")
+    return {"status": "deleted", "id": event_id}
 
 
 async def _fetch_channel_billing_status(channel_id: int) -> dict:
@@ -8843,10 +8938,58 @@ async def embedded_signup_exchange(
         webhook_subscribed=webhook_subscribed,
     )
 
+    # 7. Disparar sync de contatos + history (coexistence apenas).
+    # Doc Meta: POST /{phone_id}/smb_app_data e necessario pra Meta
+    # comecar a entregar webhooks 'smb_app_state_sync' (contatos) e
+    # 'history' (mensagens dos ultimos 180 dias). Janela de 24h apos
+    # signup, depois disso precisa desligar e refazer signup. Cada sync
+    # so pode ser disparado UMA VEZ por signup.
+    sync_results: dict[str, dict] = {}
+    if is_coexistence:
+        smb_data_url = f"{GRAPH_API_BASE}/{phone_number_id}/smb_app_data"
+        for sync_type in ("smb_app_state_sync", "history"):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    sync_resp = await client.post(
+                        smb_data_url,
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"messaging_product": "whatsapp", "sync_type": sync_type},
+                    )
+                if sync_resp.status_code >= 400:
+                    detail = _meta_error_detail(sync_resp)
+                    logger.error(
+                        "Embedded Signup smb_app_data %s falhou: %s",
+                        sync_type, detail,
+                    )
+                    sync_results[sync_type] = {"ok": False, "error": detail}
+                else:
+                    body_json = sync_resp.json()
+                    sync_results[sync_type] = {
+                        "ok": True,
+                        "request_id": body_json.get("request_id", ""),
+                    }
+                    logger.info(
+                        "Embedded Signup smb_app_data %s OK | request_id=%s",
+                        sync_type, body_json.get("request_id", ""),
+                    )
+            except httpx.RequestError as exc:
+                # Erro de rede nao aborta signup. Admin pode redisparar
+                # via POST /api/admin/channels/{id}/trigger-coex-sync
+                # dentro da janela de 24h.
+                logger.warning(
+                    "Embedded Signup smb_app_data %s erro de rede (%s: %s) — "
+                    "canal segue criado, admin redispara via endpoint",
+                    sync_type, type(exc).__name__, exc,
+                )
+                sync_results[sync_type] = {"ok": False, "error": str(exc)}
+
     log_audit(
         current_user["id"],
         "EMBEDDED_SIGNUP",
-        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id}",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} syncs={list(sync_results.keys())}",
     )
 
     return {
@@ -8868,6 +9011,7 @@ async def embedded_signup_exchange(
         "is_official_business_account": is_official,
         "webhook_subscribed": webhook_subscribed,
         "subscribed_fields": subscribed_fields,
+        "coex_syncs": sync_results,
         "all_phones": [
             {
                 "id": p.get("id"),
@@ -9502,6 +9646,168 @@ async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_mes
         except Exception as exc:
             logger.error("Erro ao enviar midia para %s: %s", redact_phone(wa_id), exc)
             return {"error": str(exc)}
+```
+
+## pending_events.py
+
+```python
+# -*- coding: utf-8 -*-
+
+"""
+Fila de webhooks pendentes — eventos da Meta que chegaram antes do canal
+correspondente estar indexado no Firestore (race entre Embedded Signup
+finalizar e o primeiro webhook chegar) ou cujo phone_number_id nao bate
+com nenhum canal cadastrado.
+
+Garantia: zero perda. Retornamos 200 imediatamente para a Meta nao
+penalizar o endpoint, persistimos o payload bruto + motivo, e expomos
+via UI admin pra retry/intervencao humana.
+
+A colecao e GLOBAL (fora de tenants/) porque o tenant_id e desconhecido
+ate o canal ser resolvido — esse e exatamente o motivo do evento estar
+pendente.
+
+Schema:
+    {
+        "id": int,
+        "received_at": datetime,
+        "change_field": str,           # "messages"/"smb_message_echoes"/etc
+        "phone_number_id": str,        # do payload, pode estar vazio
+        "reason": str,                 # "no_channel"/"no_default_channel"/...
+        "status": "pending"|"resolved"|"failed",
+        "attempts": int,
+        "last_attempt_at": datetime|None,
+        "last_error": str,
+        "payload": dict,               # payload bruto da Meta
+    }
+"""
+
+import logging
+from datetime import datetime, timezone
+
+from firestore_common import (
+    global_collection,
+    global_document,
+    get_firestore_client,
+    next_sequence,
+    utcnow,
+    normalize_record,
+)
+
+logger = logging.getLogger("castro_crm.pending_events")
+
+PENDING_COLLECTION = "pending_webhook_events"
+
+STATUS_PENDING = "pending"
+STATUS_RESOLVED = "resolved"
+STATUS_FAILED = "failed"
+
+
+def enqueue_pending_event(payload: dict, change_field: str,
+                          phone_number_id: str, reason: str) -> int:
+    """Persiste um evento pendente. Retorna event_id.
+
+    Chamada do webhook quando o canal nao puder ser resolvido pra um
+    change especifico. payload e o dict completo do webhook (entry+changes),
+    nao apenas o change pendente — facilita retry posterior reusando
+    process_webhook_payload.
+    """
+    event_id = next_sequence("pending_webhook_events")
+    doc = {
+        "id": event_id,
+        "received_at": utcnow(),
+        "change_field": str(change_field or ""),
+        "phone_number_id": str(phone_number_id or ""),
+        "reason": str(reason or ""),
+        "status": STATUS_PENDING,
+        "attempts": 0,
+        "last_attempt_at": None,
+        "last_error": "",
+        "payload": payload,
+    }
+    global_document(PENDING_COLLECTION, event_id).set(doc)
+    logger.warning(
+        "[PENDING] Evento enfileirado | id=%s field=%s phone_id=%s reason=%s",
+        event_id, change_field, phone_number_id, reason,
+    )
+    return event_id
+
+
+def list_pending_events(status: str | None = None, limit: int = 100) -> list[dict]:
+    """Lista eventos pendentes (mais recentes primeiro)."""
+    q = global_collection(PENDING_COLLECTION)
+    if status:
+        q = q.where("status", "==", status)
+    rows = []
+    for snap in q.stream():
+        data = snap.to_dict() or {}
+        if "id" not in data:
+            try:
+                data["id"] = int(snap.id)
+            except (TypeError, ValueError):
+                data["id"] = snap.id
+        rows.append(data)
+    rows.sort(
+        key=lambda r: r.get("received_at") or datetime.fromtimestamp(0, tz=timezone.utc),
+        reverse=True,
+    )
+    if limit:
+        rows = rows[:limit]
+    return [normalize_record(r) for r in rows]
+
+
+def get_pending_event(event_id: int) -> dict | None:
+    snap = global_document(PENDING_COLLECTION, event_id).get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+    if "id" not in data:
+        data["id"] = event_id
+    return normalize_record(data)
+
+
+def mark_event_attempt(event_id: int, success: bool, error: str = "") -> None:
+    """Atualiza contador de tentativas e status final."""
+    snap = global_document(PENDING_COLLECTION, event_id).get()
+    if not snap.exists:
+        return
+    current = snap.to_dict() or {}
+    attempts = int(current.get("attempts", 0)) + 1
+    updates = {
+        "attempts": attempts,
+        "last_attempt_at": utcnow(),
+        "last_error": "" if success else (error or "")[:500],
+        "status": STATUS_RESOLVED if success else STATUS_PENDING,
+    }
+    global_document(PENDING_COLLECTION, event_id).set(updates, merge=True)
+
+
+def mark_event_failed(event_id: int, error: str) -> None:
+    """Marca um evento como definitivamente falho (nao retentar)."""
+    global_document(PENDING_COLLECTION, event_id).set(
+        {
+            "status": STATUS_FAILED,
+            "last_attempt_at": utcnow(),
+            "last_error": (error or "")[:500],
+        },
+        merge=True,
+    )
+
+
+def delete_pending_event(event_id: int) -> bool:
+    snap = global_document(PENDING_COLLECTION, event_id).get()
+    if not snap.exists:
+        return False
+    global_document(PENDING_COLLECTION, event_id).delete()
+    return True
+
+
+def count_pending() -> int:
+    """Conta eventos com status='pending'. Usado em badges/health."""
+    count = 0
+    for _ in global_collection(PENDING_COLLECTION).where("status", "==", STATUS_PENDING).stream():
+        count += 1
+    return count
 ```
 
 ## pii_redaction.py
@@ -10598,6 +10904,7 @@ from bot_service import process_bot_message
 from firestore_common import set_tenant_context, reset_tenant_context
 from tenant_service import lookup_phone_routing
 from pii_redaction import redact_phone, redact_name
+from pending_events import enqueue_pending_event
 
 logger = logging.getLogger("castro_crm.webhook")
 
@@ -10718,10 +11025,15 @@ def validate_signature(payload_bytes, signature_header):
 def _resolve_webhook_channel(value):
     """Resolve o canal a partir dos metadados do webhook.
 
-    Retorna dict do canal ou None se nao encontrado.
-    Loga warning quando precisa cair no fallback default — eventos de
-    coexistence com metadata malformada acabavam roteados para o bot
-    sem deixar rastro.
+    Retorna (channel_dict, reason) onde reason e:
+      - None: canal resolvido normalmente.
+      - 'no_phone_number_id': metadata sem phone_number_id.
+      - 'no_channel_for_phone': phone_id nao bate com canal cadastrado.
+      - 'no_default_channel': fallback default tambem nao existe.
+
+    Quando channel e None, o caller deve enfileirar em
+    pending_webhook_events em vez de processar com canal sintetico
+    (default__) que nao casa com selectedThreadId no frontend.
     """
     metadata = value.get("metadata", {})
     phone_number_id = str(metadata.get("phone_number_id", "")).strip()
@@ -10729,20 +11041,24 @@ def _resolve_webhook_channel(value):
     if phone_number_id:
         channel = get_channel_by_phone_id(phone_number_id)
         if channel:
-            return channel
+            return channel, None
         logger.warning(
-            "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado; "
-            "usando canal default. Verifique se o canal foi criado via signup.",
+            "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado.",
             phone_number_id,
         )
-    else:
-        logger.warning(
-            "Webhook: metadata sem phone_number_id; usando canal default. "
-            "Payload metadata=%s",
-            metadata,
-        )
+        default = get_default_channel()
+        if default:
+            return default, "no_channel_for_phone"
+        return None, "no_channel_for_phone"
 
-    return get_default_channel()
+    logger.warning(
+        "Webhook: metadata sem phone_number_id. Payload metadata=%s",
+        metadata,
+    )
+    default = get_default_channel()
+    if default:
+        return default, "no_phone_number_id"
+    return None, "no_phone_number_id"
 
 
 async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str,
@@ -10791,14 +11107,22 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
         logger.error("[BOT] Erro ao enviar resposta: %s", e, exc_info=True)
 
 
+# Fields que dependem de canal resolvido para escrever mensagem/contato.
+# smb_app_state_sync entra aqui porque o upsert_wa_contact agora requer
+# channel_id pra gerar conversation_id deterministico. Eventos fora
+# dessa lista (statuses, account_update) nao precisam de canal.
+_CHANNEL_DEPENDENT_FIELDS = ("smb_message_echoes", "history", "messages", "smb_app_state_sync")
+
+
 async def process_webhook_payload(payload, ws_notify_callback=None):
     """
     Processa o payload completo do webhook.
-    Roteia por campo 'field' para suportar webhooks padrao e de coexistence.
-    Resolve o canal automaticamente a partir de metadata.phone_number_id e
-    o tenant a partir do canal. Seta tenant_context para que toda a
-    cadeia de save_wa_message/upsert_wa_contact opere em
-    tenants/{tenant_id}/* automaticamente.
+
+    Garantia anti-perda: nunca propaga exception ao caller — qualquer
+    erro/canal nao resolvido enfileira em pending_webhook_events e o
+    handler HTTP retorna 200 imediato pra Meta. Operadores reprocessam
+    via UI admin assim que o canal estiver indexado (ex: depois do
+    Embedded Signup completar).
     """
     if payload.get("object") != "whatsapp_business_account":
         return
@@ -10807,30 +11131,74 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
     # changes deste payload vem do mesmo phone_number_id (mesma WABA).
     first_value = ((payload.get("entry") or [{}])[0].get("changes") or [{}])[0].get("value", {})
     first_phone_id = str((first_value.get("metadata") or {}).get("phone_number_id") or "").strip()
-    first_channel = _resolve_webhook_channel(first_value)
+    first_channel, _first_reason = _resolve_webhook_channel(first_value)
     tenant_id = _resolve_webhook_tenant(first_channel, phone_number_id=first_phone_id)
     ctx_token = set_tenant_context(tenant_id)
     try:
         await _process_webhook_payload_inner(payload, ws_notify_callback)
+    except Exception as exc:
+        # Erro nao tratado durante processamento → enfileira pra retry
+        # humano em vez de devolver 5xx pra Meta.
+        try:
+            enqueue_pending_event(
+                payload=payload,
+                change_field="exception",
+                phone_number_id=first_phone_id,
+                reason=f"unhandled_exception:{type(exc).__name__}:{str(exc)[:200]}",
+            )
+        except Exception as enq_exc:
+            logger.error(
+                "Falha critica: nao consegui enfileirar payload pendente | erro=%s",
+                enq_exc, exc_info=True,
+            )
+        logger.error("Webhook processing error (enqueued): %s", exc, exc_info=True)
     finally:
         reset_tenant_context(ctx_token)
 
 
 async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
-    """Implementacao do processamento. Tenant_context ja setado pelo wrapper."""
+    """Implementacao do processamento. Tenant_context ja setado pelo wrapper.
+
+    Enfileira changes individuais que dependem de canal nao resolvido
+    em vez de processar com canal sintetico (default__) que nao casa
+    com selectedThreadId no frontend.
+    """
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             field = change.get("field", "")
 
+            # Determina field efetivo para enfileiramento (webhooks padrao
+            # da Cloud API entregam 'field=messages' mas o detection abaixo
+            # usa 'field=="" with messages key' historicamente).
+            effective_field = field if field else ("messages" if "messages" in value else "")
+
             # Resolve canal para este change
-            channel = _resolve_webhook_channel(value)
+            channel, reason = _resolve_webhook_channel(value)
+
+            # Eventos que dependem de canal pra serem persistidos
+            # corretamente. Sem canal, enfileira (zero perda).
+            if channel is None and effective_field in _CHANNEL_DEPENDENT_FIELDS:
+                phone_id = str((value.get("metadata") or {}).get("phone_number_id") or "").strip()
+                # Enfileira o payload INTEIRO (nao so o change) — facilita
+                # retry reusando process_webhook_payload e idempotencia
+                # via wa_message_id em save_wa_message.
+                enqueue_pending_event(
+                    payload=payload,
+                    change_field=effective_field,
+                    phone_number_id=phone_id,
+                    reason=reason or "no_channel",
+                )
+                # Para outros changes deste payload (se houver) seguimos
+                # o loop — eles podem ser smb_app_state_sync/etc que nao
+                # dependem de canal.
+                continue
 
             if field == "smb_message_echoes":
                 await _process_smb_message_echoes(value, ws_notify_callback, channel=channel)
 
             elif field == "smb_app_state_sync":
-                _process_smb_app_state_sync(value)
+                _process_smb_app_state_sync(value, channel=channel)
 
             elif field == "history":
                 await _process_history(value, ws_notify_callback, channel=channel)
@@ -11296,7 +11664,9 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
         else:
             content = f"[{msg_type}]"
 
-        # Salvar como outbound com source phone_app
+        # Salvar como outbound com source phone_app. operator_id=owner
+        # tambem (em smb_echoes o humano dono do numero digitou pelo
+        # celular) — sem isso o frontend rotula como "Bot".
         db_id = save_wa_message(
             wa_message_id=msg_id,
             contact_id=contact_id,
@@ -11311,6 +11681,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             filename=filename,
             status="sent",
             timestamp_wa=ts_iso,
+            operator_id=channel_owner_outer,
             channel_id=channel_id_outer,
             phone_number_id=channel_phone_id_outer,
             channel_owner_user_id=channel_owner_outer,
@@ -11347,14 +11718,26 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
 # Coexistence: smb_app_state_sync
 # ---------------------------------------------------------------------------
 
-def _process_smb_app_state_sync(value):
+def _process_smb_app_state_sync(value, channel=None):
     """
     Processa sincronizacao de contatos do app WhatsApp Business.
     Recebe add/remove de contatos da lista telefonica do celular.
+
+    Precisa de `channel` resolvido pra propagar `channel_id` no
+    upsert_wa_contact. Sem channel_id, upsert_wa_conversation interno
+    levanta ConversationIdError (defesa de save_wa_message contra
+    ids 'default__'). Caller resolve via _resolve_webhook_channel.
     """
     state_sync = value.get("state_sync", [])
     if not state_sync:
         return
+
+    # Channel context para enriquecer contatos sincronizados (mesma
+    # logica de _process_messages e _process_history).
+    sync_channel_id = channel.get("id") if channel else None
+    sync_channel_owner = channel.get("owner_user_id") if channel else None
+    sync_channel_phone = str(channel.get("phone_number_id", "")) if channel else ""
+    sync_channel_type = str(channel.get("channel_type", "")) if channel else ""
 
     for item in state_sync:
         item_type = item.get("type", "")
@@ -11375,7 +11758,13 @@ def _process_smb_app_state_sync(value):
         display_name = full_name or first_name
 
         if action == "add":
-            contact_id = upsert_wa_contact(normalized_phone, display_name)
+            contact_id = upsert_wa_contact(
+                normalized_phone, display_name,
+                channel_id=sync_channel_id,
+                phone_number_id=sync_channel_phone,
+                source_channel_type=sync_channel_type,
+                auto_assign_user_id=sync_channel_owner if sync_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+            )
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
                 redact_phone(normalized_phone), redact_name(display_name), contact_id,
@@ -11457,9 +11846,16 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
             )
             messages = thread.get("messages", [])
 
+            # Normaliza business_phone uma vez (nono digito BR) — comparacao
+            # com msg_from/msg_to crus dava direction errada quando empresa
+            # cadastrou o numero sem 9 e o webhook entrega com (ou vice-versa).
+            business_phone_normalized = normalize_br_phone(business_phone) if business_phone else ""
+
             for msg in messages:
-                msg_from = str(msg.get("from", "")).replace("+", "").replace(" ", "").replace("-", "")
-                msg_to = str(msg.get("to", "")).replace("+", "").replace(" ", "").replace("-", "")
+                msg_from_raw = str(msg.get("from", "")).replace("+", "").replace(" ", "").replace("-", "")
+                msg_to_raw = str(msg.get("to", "")).replace("+", "").replace(" ", "").replace("-", "")
+                msg_from = normalize_br_phone(msg_from_raw) if msg_from_raw else ""
+                msg_to = normalize_br_phone(msg_to_raw) if msg_to_raw else ""
                 msg_id = msg.get("id", "")
                 msg_type = msg.get("type", "unknown")
                 timestamp = msg.get("timestamp", "")
@@ -11468,7 +11864,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 msg_status = str(history_context.get("status", "")).lower()
 
                 # Determinar direcao: se 'from' e o telefone da empresa, e outbound
-                is_outbound = (msg_from == business_phone) or bool(msg_to)
+                is_outbound = (msg_from == business_phone_normalized) or bool(msg_to)
                 direction = "outbound" if is_outbound else "inbound"
 
                 # media_placeholder: midia sera enviada em webhook separado
@@ -11481,6 +11877,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                         content="[Midia do historico - aguardando]",
                         status=msg_status or "delivered",
                         timestamp_wa=ts_iso,
+                        operator_id=hist_channel_owner if direction == "outbound" else None,
                         channel_id=hist_channel_id,
                         phone_number_id=hist_channel_phone,
                         channel_owner_user_id=hist_channel_owner,
@@ -11589,6 +11986,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     filename=filename,
                     status=msg_status or ("received" if direction == "inbound" else "sent"),
                     timestamp_wa=ts_iso,
+                    operator_id=hist_channel_owner if direction == "outbound" else None,
                     channel_id=hist_channel_id,
                     phone_number_id=hist_channel_phone,
                     channel_owner_user_id=hist_channel_owner,
@@ -17204,12 +17602,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     let disposed = false;
     const baseRef = collection(bundle.db, config.firestore.collections.wa_messages);
     const messagesQuery = activeThreadId
-      ? query(baseRef, where("conversation_id", "==", activeThreadId), orderBy("created_at", "desc"), firestoreLimit(messageLimit))
-      : query(baseRef, where("contact_id", "==", activeConversationId), orderBy("created_at", "desc"), firestoreLimit(messageLimit));
+      ? query(baseRef, where("conversation_id", "==", activeThreadId), orderBy("timestamp_wa", "desc"), firestoreLimit(messageLimit))
+      : query(baseRef, where("contact_id", "==", activeConversationId), orderBy("timestamp_wa", "desc"), firestoreLimit(messageLimit));
     const unsubscribe = onSnapshot(
       messagesQuery,
       (snap) => {
-        const nextMessages = snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
+        // Ordena por timestamp_wa (data real da mensagem), com fallback
+        // para created_at em system messages legadas sem timestamp_wa.
+        const nextMessages = snap.docs.map((doc) => normalizeMessage(doc.data(), doc.id)).sort((a, b) => {
+          const ta = a.timestamp_wa || a.created_at || "";
+          const tb = b.timestamp_wa || b.created_at || "";
+          return ta.localeCompare(tb);
+        });
         commitConversationMessages(activeConversationId, nextMessages);
       },
       (e) => !disposed && setError(`Snapshot da conversa falhou: ${errorText(e)}`),
