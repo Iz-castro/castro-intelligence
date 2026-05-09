@@ -34,6 +34,7 @@ Gerado por `scripts/build_sistema_completo.py`. Nao editar a mao.
 - [init_db.py](#init_dbpy)
 - [main.py](#mainpy)
 - [media.py](#mediapy)
+- [pii_redaction.py](#pii_redactionpy)
 - [seed_gchat.py](#seed_gchatpy)
 - [tenant_service.py](#tenant_servicepy)
 - [test_meta_app_review.py](#test_meta_app_reviewpy)
@@ -63,9 +64,16 @@ Gerado por `scripts/build_sistema_completo.py`. Nao editar a mao.
 - [frontend/src/context/CrmContext.tsx](#frontendsrccontextcrmcontexttsx)
 - [frontend/src/components/gchat/InternalChatPanel.tsx](#frontendsrccomponentsgchatinternalchatpaneltsx)
 - [frontend/src/components/icons/index.tsx](#frontendsrccomponentsiconsindextsx)
+- [scripts/_check_meta_full_status.py](#scripts_check_meta_full_statuspy)
+- [scripts/_check_meta_subscription.py](#scripts_check_meta_subscriptionpy)
+- [scripts/_delete_orphan_conversations.py](#scripts_delete_orphan_conversationspy)
+- [scripts/_diag_channels_prod.py](#scripts_diag_channels_prodpy)
+- [scripts/_diag_send_state.py](#scripts_diag_send_statepy)
 - [scripts/build_sistema_completo.py](#scriptsbuild_sistema_completopy)
 - [scripts/create_test_users.py](#scriptscreate_test_userspy)
+- [scripts/delete_channel.py](#scriptsdelete_channelpy)
 - [scripts/e2e_test_staging.py](#scriptse2e_test_stagingpy)
+- [scripts/wipe_all_collections.py](#scriptswipe_all_collectionspy)
 
 ---
 
@@ -544,6 +552,25 @@ service cloud.firestore {
 
     match /castro_crm__meta/{docId} {
       allow read, write: if false;
+    }
+
+    // ====================================================================
+    // PROD — subcolecoes tenant-scoped (Fase 2C cutover).
+    // Backend retorna em /api/session paths como
+    // castro_crm_tenants/{tid}/wa_contacts, wa_conversations,
+    // wa_messages, etc. Frontend faz onSnapshot direto nesses paths.
+    // Rules permissivas espelhando staging (qualquer email autorizado
+    // pode ler/escrever). Sera substituido por rules tenant-based
+    // estritas com claim no JWT em sessao futura — ver
+    // docs/internal/firestore-rules-staging-strict.wip.
+    // ====================================================================
+
+    match /castro_crm_tenants/{tenantId} {
+      allow read, write: if emailAllowed();
+
+      match /{subcol=**} {
+        allow read, write: if emailAllowed();
+      }
     }
 
     // ====================================================================
@@ -1482,27 +1509,37 @@ def _resolve_tenant_id(decoded_token, user):
 
     Ordem de busca:
       1. custom_claims do token (preferencia — set por set_tenant_claims)
-      2. user.tenant_id (campo do doc do CRM, futuro Fase 2)
-      3. None (sistema single-tenant ainda — backend trata como legado)
+      2. user.tenant_id (campo do doc do CRM — raro, redundante com path)
+      3. tenant_context atual (foi setado em authenticate_firebase_token
+         como claim_tenant or _DEFAULT_TENANT). Caso comum hoje — usuario
+         que logou via SSO sem claim nunca teve seu JWT sincronizado.
+      4. None (sistema single-tenant ainda — backend trata como legado).
 
-    Quando claim e ausente mas user.tenant_id existe, ressincroniza
+    Quando claim e ausente mas algum fallback retorna tenant, ressincroniza
     custom_claims em background. Cliente precisa renovar token na
-    proxima request para o claim aparecer.
+    proxima request (getIdToken(true) ou logout/login) para o claim
+    aparecer no JWT — Firestore rules tenant-scoped dependem disso.
     """
     claim_tenant = (decoded_token or {}).get("tenant_id")
     if claim_tenant:
         return str(claim_tenant)
 
     db_tenant = (user or {}).get("tenant_id") if user else None
+    if not db_tenant:
+        # Fallback: tenant context atual (setado upstream em
+        # authenticate_firebase_token a partir do claim ou _DEFAULT_TENANT).
+        from firestore_common import get_tenant_context as _get_ctx
+        db_tenant = _get_ctx()
+
     if db_tenant:
-        firebase_uid = (user or {}).get("firebase_uid", "")
+        firebase_uid = (user or {}).get("firebase_uid", "") or (decoded_token or {}).get("uid", "")
         if firebase_uid:
             try:
-                set_tenant_claims(firebase_uid, str(db_tenant), role=user.get("role"))
+                set_tenant_claims(firebase_uid, str(db_tenant), role=(user or {}).get("role") or "operador")
                 logger.info(
                     "tenant_id sincronizado em custom_claims | user_id=%s tenant_id=%s "
                     "(usuario precisa renovar ID token para refletir)",
-                    user.get("id"), db_tenant,
+                    (user or {}).get("id"), db_tenant,
                 )
             except Exception as exc:
                 logger.warning("Falha ao sincronizar custom_claims: %s", exc)
@@ -2227,6 +2264,11 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
     """Retorna (access_token, phone_number_id, graph_api_base) para envio.
 
     Se channel_id for None, usa o canal default.
+    Quando channel_id e explicito mas nao encontrado no cache, faz UM
+    refresh sincrono e tenta de novo — protege contra cache stale entre
+    instancias do Cloud Run apos create_channel recente. Se ainda assim
+    nao for encontrado, falha em vez de cair em outro canal (caso
+    contrario o envio iria pelo canal default com creds erradas).
     Raises ValueError se o canal nao for encontrado.
     """
     from config import GRAPH_API_BASE, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN
@@ -2234,6 +2276,16 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
     channel = None
     if channel_id is not None:
         channel = get_channel(channel_id)
+        if channel is None:
+            # Cache stale entre instancias — recarrega do Firestore e
+            # tenta de novo antes de aceitar o miss.
+            refresh_channels()
+            channel = get_channel(channel_id)
+        if channel is None:
+            raise ValueError(
+                f"Canal {channel_id} solicitado nao existe (mesmo apos refresh). "
+                "Recusa-se a cair em canal default para evitar enviar pelo canal errado."
+            )
     if channel is None:
         channel = get_default_channel()
     if channel is None:
@@ -2393,9 +2445,17 @@ def refresh_coexistence_token(channel_id: int) -> bool:
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(url, params=params)
         if resp.status_code >= 400:
+            # NAO logar resp.text cru — pode conter token em sucesso parcial
+            # ou outros campos sensiveis. Extrai apenas a mensagem de erro
+            # estruturada do JSON da Graph API.
+            err_msg = ""
+            try:
+                err_msg = ((resp.json() or {}).get("error") or {}).get("message", "")
+            except Exception:
+                err_msg = "<unparseable>"
             logger.warning(
-                "refresh_coexistence_token: canal %s falhou status=%s body=%s",
-                channel_id, resp.status_code, resp.text[:300],
+                "refresh_coexistence_token: canal %s falhou status=%s erro=%s",
+                channel_id, resp.status_code, err_msg,
             )
             return False
         data = resp.json()
@@ -2405,7 +2465,12 @@ def refresh_coexistence_token(channel_id: int) -> bool:
 
     new_token = data.get("access_token")
     if not new_token:
-        logger.warning("refresh_coexistence_token: canal %s resposta sem access_token: %s", channel_id, data)
+        # Loga apenas as chaves do response (sem valores) — o que importa
+        # pra debug e qual campo veio (ex.: 'error' vs 'access_token').
+        logger.warning(
+            "refresh_coexistence_token: canal %s resposta sem access_token (campos=%s)",
+            channel_id, sorted((data or {}).keys()),
+        )
         return False
 
     expires_in = data.get("expires_in")
@@ -3773,9 +3838,14 @@ def upsert_wa_conversation(
 
     direction_for_unread: 'inbound' incrementa unread_count, outras
     direcoes nao mexem. None nao mexe (uso pelo upsert_wa_contact).
+
+    Normaliza o nono digito BR antes de calcular o conversation_id —
+    determinismo de id depende de wa_id canonico para nao criar
+    threads duplicadas pra mesmo cliente.
     """
     if wa_id is None or wa_id == "":
         raise ValueError("wa_id obrigatorio para upsert_wa_conversation")
+    wa_id = normalize_br_phone(wa_id)
     conversation_id = _make_conversation_id(channel_id, wa_id)
     now = utcnow()
     ref = document("wa_conversations", conversation_id)
@@ -3936,9 +4006,14 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
     ao operador dono do numero.
+
+    Normaliza o nono digito BR e busca tambem variantes (com/sem '9')
+    como defesa em profundidade contra callers que esquecam de
+    normalizar.
     """
+    wa_id = normalize_br_phone(wa_id)
     now = utcnow()
-    existing = _get_first_by_field("wa_contacts", "wa_id", wa_id)
+    existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
         updates = {
             "last_message_at": now,
@@ -4144,6 +4219,20 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         "last_inbound_at": None,
     }
     document("wa_contacts", contact_id).set(new_contact)
+    # Fase 3: cria conversation associada para o contato manual aparecer
+    # imediatamente na sidebar (que agora itera por threads, nao contatos).
+    try:
+        upsert_wa_conversation(
+            contact_id=contact_id,
+            wa_id=wa_id,
+            channel_id=channel_id,
+            source_channel_type=new_contact.get("source_channel_type", "standard"),
+            phone_number_id="",
+            auto_assign_user_id=user_id,
+            direction_for_unread=None,
+        )
+    except Exception as exc:
+        logger.warning("Falha ao criar conversation para contato manual %s: %s", contact_id, exc)
     return contact_id, None
 
 
@@ -4360,7 +4449,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     channel_id=None, phone_number_id="",
                     is_rating_message=False, visibility="all",
                     conversation_id=None,
-                    channel_owner_user_id=None, sender_user_id=None):
+                    channel_owner_user_id=None, sender_user_id=None,
+                    template_category=None, media_size_bytes=0):
     """Persiste mensagem WhatsApp.
 
     Auditoria coexistence (Fase 2C):
@@ -4373,6 +4463,12 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
 
     `conversation_id` pode ser passado explicitamente (caller ja resolveu
     a thread). Caso contrario, e derivado de (channel_id, contact.wa_id).
+
+    Visibilidade de uso (Fase 2.10.4):
+      - `template_category`: 'marketing'/'utility'/'authentication' quando
+        msg_type='template'; demais values mapeados pra 'unknown'.
+      - `media_size_bytes`: tamanho em bytes do payload de midia outbound.
+        Usado pra agregacao mensal em audit_metrics/usage_{YYYY_MM}.
     """
     if wa_message_id:
         existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
@@ -4465,6 +4561,13 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     increment_audit_metrics(
         direction=direction,
         operator_id=operator_id or (contact or {}).get("assigned_to"),
+    )
+    # Visibilidade de uso mensal (Fase 2.10.4 — usage_{YYYY_MM} per-tenant)
+    increment_usage_metrics(
+        direction=direction,
+        msg_type=msg_type,
+        template_category=template_category,
+        media_size_bytes=media_size_bytes,
     )
     return message_id
 
@@ -4646,14 +4749,121 @@ def increment_audit_metrics(direction, operator_id=None, is_new_lead=False, is_a
 
 
 def get_audit_metrics(date_from, date_to):
-    """Retorna metricas agregadas para o periodo."""
+    """Retorna metricas agregadas (daily/per-operator) para o periodo.
+
+    Pula docs com prefix `usage_` (agregacao mensal — get_monthly_usage).
+    """
     rows = []
     for snap in collection("audit_metrics").stream():
+        if snap.id.startswith("usage_"):
+            continue
         data = snap.to_dict() or {}
         date_str = data.get("date", "")
         if date_from <= date_str <= date_to:
             data["doc_id"] = snap.id
             rows.append(normalize_record(data))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Usage metrics mensal per-tenant (Fase 2.10.4)
+# ---------------------------------------------------------------------------
+#
+# Doc id: `usage_{YYYY-MM}` em tenants/{tid}/audit_metrics/.
+# Tenant scoping vem do ContextVar (collection() roteia automaticamente).
+# Increment atomico via firestore.Increment evita perda em concorrencia.
+
+def _usage_metrics_doc_id(year_month=None):
+    if not year_month:
+        year_month = utcnow().strftime("%Y-%m")
+    return f"usage_{year_month}"
+
+
+_VALID_TEMPLATE_CATEGORIES = ("marketing", "utility", "authentication")
+
+
+def increment_usage_metrics(direction, msg_type="", template_category=None, media_size_bytes=0):
+    """Incrementa usage_{YYYY_MM} do tenant atual com Increment atomico.
+
+    Campos atualizados conforme direction/msg_type:
+      - inbound  -> inbound_received++
+      - outbound + msg_type='template' -> templates_sent.{cat}++ (cat
+        normalizada pra marketing/utility/authentication ou 'unknown')
+      - outbound + outros msg_type -> free_form_sent++
+      - media_size_bytes>0 -> media_uploaded_bytes += bytes
+    """
+    now = utcnow()
+    year_month = now.strftime("%Y-%m")
+    doc_id = _usage_metrics_doc_id(year_month)
+
+    updates = {
+        "month": year_month,
+        "updated_at": now,
+    }
+
+    if direction == "inbound":
+        updates["inbound_received"] = firestore.Increment(1)
+    elif direction == "outbound":
+        if msg_type == "template":
+            cat = (template_category or "").strip().lower() or "unknown"
+            if cat not in _VALID_TEMPLATE_CATEGORIES:
+                cat = "unknown"
+            updates["templates_sent"] = {cat: firestore.Increment(1)}
+        else:
+            updates["free_form_sent"] = firestore.Increment(1)
+
+    if media_size_bytes and int(media_size_bytes) > 0:
+        updates["media_uploaded_bytes"] = firestore.Increment(int(media_size_bytes))
+
+    try:
+        document("audit_metrics", doc_id).set(updates, merge=True)
+    except Exception as exc:
+        logger.warning("Falha ao atualizar usage_metrics: %s", exc)
+
+
+def get_monthly_usage(year_month=None):
+    """Retorna usage_{YYYY_MM} do tenant atual.
+
+    year_month default = mes corrente (UTC). Retorna esqueleto zerado se
+    o doc ainda nao existe (mes sem trafego).
+    """
+    if not year_month:
+        year_month = utcnow().strftime("%Y-%m")
+    doc_id = _usage_metrics_doc_id(year_month)
+    snap = document("audit_metrics", doc_id).get()
+    if not snap.exists:
+        return {
+            "month": year_month,
+            "templates_sent": {},
+            "free_form_sent": 0,
+            "inbound_received": 0,
+            "media_uploaded_bytes": 0,
+        }
+    data = snap.to_dict() or {}
+    data.setdefault("month", year_month)
+    data.setdefault("templates_sent", {})
+    data.setdefault("free_form_sent", 0)
+    data.setdefault("inbound_received", 0)
+    data.setdefault("media_uploaded_bytes", 0)
+    return normalize_record(data)
+
+
+def get_usage_history(months=3):
+    """Retorna ultimos N meses de usage do tenant atual (mes corrente primeiro).
+
+    months e clampeado em [1, 24].
+    """
+    months = max(1, min(int(months or 3), 24))
+    now = utcnow()
+    rows = []
+    for offset in range(months):
+        year = now.year
+        month = now.month - offset
+        while month <= 0:
+            month += 12
+            year -= 1
+        ym = f"{year:04d}-{month:02d}"
+        rows.append(get_monthly_usage(ym))
     return rows
 
 
@@ -5625,6 +5835,7 @@ from database import (
     get_all_gc_conversations, get_gc_messages, save_gc_message,
     mark_gc_conversation_read, upsert_gc_conversation,
     get_audit_metrics, get_all_ratings,
+    get_monthly_usage, get_usage_history,
     get_assume_counter, decrement_assume_counter, increment_assume_counter,
     mark_contact_pending_response, clear_contact_pending_response,
     reset_assume_counter,
@@ -5640,6 +5851,7 @@ from firestore_common import (
     collection_name, document as fs_document, utcnow as fs_utcnow,
     set_tenant_context, tenant_context, get_tenant_context,
 )
+from pii_redaction import redact_phone, redact_name
 from tenant_service import (
     create_tenant, get_tenant, tenant_exists, lookup_phone_routing,
 )
@@ -5925,10 +6137,13 @@ def bootstrap_admin_user():
                 logger.warning("Falha ao setar custom_claim tenant_id no admin: %s", exc)
         logger.info(
             "Bootstrap admin Firebase sincronizado | email=%s tenant_id=%s",
-            BOOTSTRAP_ADMIN_EMAIL, tenant_id,
+            redact_name(BOOTSTRAP_ADMIN_EMAIL), tenant_id,
         )
     else:
-        logger.warning("Falha ao sincronizar bootstrap admin Firebase | email=%s", BOOTSTRAP_ADMIN_EMAIL)
+        logger.warning(
+            "Falha ao sincronizar bootstrap admin Firebase | email=%s",
+            redact_name(BOOTSTRAP_ADMIN_EMAIL),
+        )
 
 
 def bootstrap_departments():
@@ -6058,7 +6273,12 @@ async def webhook_verify(
     if hub_mode == "subscribe" and hub_verify_token == WHATSAPP_VERIFY_TOKEN:
         logger.info("Webhook verificado com sucesso")
         return PlainTextResponse(hub_challenge)
-    logger.warning("Falha na verificacao do webhook (token=%s)", hub_verify_token)
+    # NAO logar o token recebido (LGPD/secret leakage). Indica apenas o
+    # comprimento pra diferenciar "token vazio" de "token errado".
+    logger.warning(
+        "Falha na verificacao do webhook | mode=%s token_len=%s",
+        hub_mode, len(hub_verify_token or ""),
+    )
     return PlainTextResponse("Forbidden", status_code=403)
 
 
@@ -6748,7 +6968,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
         error_msg = result.get("error", {}).get("message", "Erro desconhecido")
-        logger.warning("Falha ao enviar texto para %s | status=%s | erro=%s", wa_id, resp.status_code, error_msg)
+        logger.warning("Falha ao enviar texto para %s | status=%s | erro=%s", redact_phone(wa_id), resp.status_code, error_msg)
         raise HTTPException(status_code=502, detail=error_msg)
 
 
@@ -6804,6 +7024,7 @@ async def wa_send_media(
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
+        media_size_bytes=len(file_content),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -6873,6 +7094,7 @@ async def wa_send_audio(
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
+        media_size_bytes=len(converted),
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -6886,6 +7108,10 @@ class WaSendTemplateRequest(BaseModel):
     template_name: str = "hello_world"
     language: str = "pt_BR"
     components: list[dict] | None = None  # [{type, sub_type?, index?, parameters: [{type:"text", text:"..."}]}]
+    # Categoria Meta (marketing/utility/authentication). Best-effort
+    # informada pelo frontend que ja conhece via /api/wa/templates.
+    # Quando ausente, contabilizada em templates_sent.unknown.
+    template_category: str | None = None
 
 
 @app.post("/api/wa/send-template")
@@ -6903,6 +7129,7 @@ async def wa_send_template(
         effective_template_name = body.template_name or template_name
         effective_language = body.language or language
         components = body.components or []
+        effective_template_category = body.template_category
     else:
         if contact_id is None:
             raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
@@ -6911,6 +7138,7 @@ async def wa_send_template(
         effective_template_name = template_name
         effective_language = language
         components = []
+        effective_template_category = None
 
     conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
     _check_conv_send_permission(conv, current_user)
@@ -6957,6 +7185,7 @@ async def wa_send_template(
             conversation_id=conv["id"],
             sender_user_id=current_user["id"],
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
+            template_category=effective_template_category,
         )
         log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
         return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
@@ -7198,8 +7427,10 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
         raise HTTPException(status_code=409, detail=error)
 
     contact = get_wa_contact(contact_id)
+    # Conversation determinística criada por upsert_wa_conversation (Fase 3).
+    conversation_id = f"{channel_id}__{wa_id}"
     log_audit(current_user["id"], "CONTACT_MANUAL_CREATE", f"Contato {contact_id}: {body.declared_name} ({wa_id})")
-    return {"contact": contact}
+    return {"contact": contact, "conversation_id": conversation_id}
 
 
 @app.put("/api/wa/contact/{contact_id}/declared-name")
@@ -7472,32 +7703,43 @@ async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(
     return {"ok": True}
 
 
-@app.get("/api/wa/channel/{channel_id}/billing-status")
-async def channel_billing_status(channel_id: int, current_user: dict = Depends(get_current_user)):
-    """Health-check do canal na Meta (Fase 2.10).
+async def _fetch_channel_billing_status(channel_id: int) -> dict:
+    """Helper reusavel: consulta Meta Graph API e retorna estado de billing
+    de um canal. Usado pelo endpoint admin (channel_billing_status) e pelo
+    cron de health-check (Fase 2.10.3).
 
-    Consulta GET /<WABA_ID>?fields=primary_funding_id,account_review_status
-    para descobrir se o cliente ja configurou metodo de pagamento. Sem
-    isso, templates de marketing/utility falham com erro #131009 ao
-    tentar enviar.
-
-    Resposta inclui has_payment_method (derivado de primary_funding_id),
-    account_review_status e quality_score quando disponiveis.
+    Em vez de raise, retorna dict com `ok=False` e `error` na falha.
     """
     from channel_service import get_channel, get_send_credentials
 
     channel = get_channel(channel_id)
     if not channel:
-        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+        return {
+            "channel_id": channel_id,
+            "ok": False,
+            "error": "channel_not_found",
+            "has_payment_method": False,
+        }
 
     waba_id = str(channel.get("waba_id") or "").strip()
     if not waba_id:
-        raise HTTPException(status_code=400, detail="Canal sem WABA_ID associado")
+        return {
+            "channel_id": channel_id,
+            "ok": False,
+            "error": "missing_waba_id",
+            "has_payment_method": False,
+        }
 
     try:
         token, _phone_id, api_base = get_send_credentials(channel_id)
     except ValueError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        return {
+            "channel_id": channel_id,
+            "waba_id": waba_id,
+            "ok": False,
+            "error": str(exc),
+            "has_payment_method": False,
+        }
 
     url = f"{api_base}/{waba_id}"
     params = {"fields": "primary_funding_id,account_review_status,health_status,owner_business_info"}
@@ -7507,12 +7749,11 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, params=params, headers=headers)
         if resp.status_code >= 400:
-            detail = _meta_error_detail(resp)
             return {
                 "channel_id": channel_id,
                 "waba_id": waba_id,
                 "ok": False,
-                "error": detail,
+                "error": _meta_error_detail(resp),
                 "has_payment_method": False,
             }
         data = resp.json()
@@ -7526,17 +7767,281 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
         }
 
     primary_funding_id = data.get("primary_funding_id") or ""
-    has_payment_method = bool(primary_funding_id)
     return {
         "channel_id": channel_id,
         "waba_id": waba_id,
         "ok": True,
-        "has_payment_method": has_payment_method,
+        "has_payment_method": bool(primary_funding_id),
         "primary_funding_id": primary_funding_id,
         "account_review_status": data.get("account_review_status"),
         "health_status": data.get("health_status"),
         "owner_business_info": data.get("owner_business_info"),
         "checked_at": fs_utcnow().isoformat(),
+    }
+
+
+@app.get("/api/wa/channel/{channel_id}/billing-status")
+async def channel_billing_status(channel_id: int, current_user: dict = Depends(get_current_user)):
+    """Health-check do canal na Meta (Fase 2.10).
+
+    Consulta GET /<WABA_ID>?fields=primary_funding_id,account_review_status
+    para descobrir se o cliente ja configurou metodo de pagamento. Sem
+    isso, templates de marketing/utility falham com erro #131009 ao
+    tentar enviar.
+    """
+    from channel_service import get_channel
+
+    channel = get_channel(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
+    waba_id = str(channel.get("waba_id") or "").strip()
+    if not waba_id:
+        raise HTTPException(status_code=400, detail="Canal sem WABA_ID associado")
+
+    res = await _fetch_channel_billing_status(channel_id)
+    if not res.get("ok") and res.get("error") in ("channel_not_found", "missing_waba_id"):
+        # Caminho rejeitado antes do helper — manter HTTPException pro endpoint admin
+        raise HTTPException(
+            status_code=404 if res["error"] == "channel_not_found" else 400,
+            detail=res["error"],
+        )
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Cron health-check (Fase 2.10.3) — Cloud Scheduler chama diariamente.
+# Computa estado consolidado por tenant em tenants/{tid}/health_status/current
+# e atualiza payment_method_status no doc flat de cada canal.
+# ---------------------------------------------------------------------------
+
+def _classify_payment_status(billing: dict, channel: dict) -> tuple[str, bool, bool]:
+    """Decide payment_method_status (ok|pending|error|expired) e flags
+    de token_expired/token_expiring_soon (so coexistence)."""
+    if not billing.get("ok"):
+        status = "error"
+    elif billing.get("has_payment_method"):
+        status = "ok"
+    else:
+        status = "pending"
+
+    token_expired = False
+    token_expiring = False
+    if channel.get("channel_type") == "coexistence":
+        expires_at_raw = channel.get("token_expires_at")
+        if expires_at_raw:
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(expires_at_raw).replace("Z", "+00:00")
+                )
+                now = datetime.now(timezone.utc)
+                if expires_at <= now:
+                    token_expired = True
+                    status = "expired"
+                elif expires_at - now <= timedelta(days=7):
+                    token_expiring = True
+            except (ValueError, TypeError):
+                pass
+    return status, token_expired, token_expiring
+
+
+async def _compute_tenant_health() -> dict:
+    """Executa dentro de tenant_context. Para cada canal ativo: chama
+    _fetch_channel_billing_status, classifica, persiste payment_method_status
+    no doc flat do canal. Retorna dict pronto pra gravar em
+    tenants/{tid}/health_status/current.
+    """
+    import asyncio
+    from channel_service import get_all_active_channels
+    from firestore_common import global_document
+
+    channels = get_all_active_channels()
+    if not channels:
+        return {
+            "checked_at": fs_utcnow().isoformat(),
+            "channels_total": 0,
+            "channels_pending_payment": 0,
+            "tokens_expiring_soon": 0,
+            "templates_recent_failures": 0,
+            "per_channel": [],
+        }
+
+    billing_results = await asyncio.gather(
+        *[_fetch_channel_billing_status(ch["id"]) for ch in channels],
+        return_exceptions=True,
+    )
+
+    channels_pending_payment = 0
+    tokens_expiring_soon = 0
+    per_channel: list[dict] = []
+    for ch, billing in zip(channels, billing_results):
+        if isinstance(billing, Exception):
+            billing = {
+                "channel_id": ch["id"],
+                "ok": False,
+                "error": str(billing),
+                "has_payment_method": False,
+            }
+        status, token_expired, token_expiring = _classify_payment_status(billing, ch)
+        if status == "pending":
+            channels_pending_payment += 1
+        if token_expiring:
+            tokens_expiring_soon += 1
+
+        try:
+            global_document("channels", ch["id"]).set({
+                "payment_method_status": status,
+                "payment_method_checked_at": fs_utcnow(),
+            }, merge=True)
+        except Exception as exc:
+            logger.warning(
+                "cron health: falha ao atualizar payment_method_status canal %s: %s",
+                ch["id"], exc,
+            )
+
+        per_channel.append({
+            "channel_id": ch["id"],
+            "label": ch.get("label", ""),
+            "channel_type": ch.get("channel_type"),
+            "payment_method_status": status,
+            "has_payment_method": billing.get("has_payment_method", False),
+            "account_review_status": billing.get("account_review_status"),
+            "token_expiring_soon": token_expiring,
+            "token_expired": token_expired,
+            "error": billing.get("error") if not billing.get("ok") else None,
+        })
+
+    return {
+        "checked_at": fs_utcnow().isoformat(),
+        "channels_total": len(channels),
+        "channels_pending_payment": channels_pending_payment,
+        "tokens_expiring_soon": tokens_expiring_soon,
+        "templates_recent_failures": 0,  # placeholder pra futura agregacao
+        "per_channel": per_channel,
+    }
+
+
+def _verify_oidc_token(token: str) -> None:
+    """Valida OIDC token Bearer (Cloud Scheduler nativo).
+
+    Cloud Scheduler com `--oidc-service-account-email=<sa>` e
+    `--oidc-token-audience=<url>` envia Authorization: Bearer <jwt>
+    onde o JWT eh assinado pelo Google e tem:
+      - iss = https://accounts.google.com
+      - aud = audience configurado no job
+      - email = SA do scheduler
+
+    Env vars (configuradas no Cloud Run):
+      CRON_OIDC_AUDIENCE          (obrigatorio, ex: a propria URL do endpoint)
+      CRON_OIDC_SERVICE_ACCOUNT   (opcional, email do SA esperado — strict)
+    """
+    audience = os.environ.get("CRON_OIDC_AUDIENCE", "").strip()
+    if not audience:
+        raise HTTPException(
+            status_code=503,
+            detail="CRON_OIDC_AUDIENCE nao configurado",
+        )
+    expected_sa = os.environ.get("CRON_OIDC_SERVICE_ACCOUNT", "").strip()
+
+    from google.oauth2 import id_token as _id_token
+    from google.auth.transport import requests as _ga_requests
+
+    try:
+        payload = _id_token.verify_oauth2_token(
+            token, _ga_requests.Request(), audience=audience
+        )
+    except ValueError as exc:
+        # Token invalido / mal-assinado / aud errada / iss errada / expirado
+        raise HTTPException(
+            status_code=401,
+            detail=f"OIDC token invalido: {exc}",
+        )
+
+    if expected_sa and payload.get("email") != expected_sa:
+        # Strict mode: rejeita se SA nao bate com o esperado
+        raise HTTPException(
+            status_code=401,
+            detail="OIDC SA mismatch",
+        )
+
+
+def _verify_cron_auth(request: Request) -> None:
+    """Aceita OIDC Bearer (Cloud Scheduler) OU header X-Cron-Secret.
+
+    Tenta primeiro o que estiver presente:
+      1. Authorization: Bearer ...  -> OIDC verify
+      2. X-Cron-Secret: ...         -> shared secret hmac compare
+      3. Nenhum                     -> 401
+
+    Cada metodo eh independente — falha de um nao cai no outro.
+    Em prod, mover pra OIDC e remover INTERNAL_CRON_SECRET (CRON_OIDC_*
+    sao suficientes); em staging/dev/CI, X-Cron-Secret continua util.
+    """
+    import hmac as _hmac
+
+    auth_header = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        _verify_oidc_token(auth_header[7:].strip())
+        return
+
+    secret_header = request.headers.get("X-Cron-Secret", "")
+    if secret_header:
+        expected = os.environ.get("INTERNAL_CRON_SECRET", "").strip()
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail="INTERNAL_CRON_SECRET nao configurado",
+            )
+        if not _hmac.compare_digest(secret_header.encode("utf-8"), expected.encode("utf-8")):
+            raise HTTPException(status_code=401, detail="X-Cron-Secret invalido")
+        return
+
+    raise HTTPException(
+        status_code=401,
+        detail="auth ausente: envie Authorization: Bearer <oidc> ou X-Cron-Secret",
+    )
+
+
+@app.post("/api/internal/cron/health-check")
+async def cron_health_check(request: Request):
+    """Cloud Scheduler chama diariamente. Itera tenants ativos, computa
+    estado consolidado e grava em tenants/{tid}/health_status/current.
+
+    Auth (qualquer um valida):
+      - Authorization: Bearer <OIDC token>  (Cloud Scheduler com
+        --oidc-service-account-email + --oidc-token-audience)
+      - X-Cron-Secret: <secret>             (header customizado, fallback
+        pra dev/staging onde OIDC nao tem SA configurado)
+    """
+    _verify_cron_auth(request)
+
+    from tenant_service import list_tenants
+    from firestore_common import set_tenant_context, reset_tenant_context, document as fs_doc
+
+    summary: list[dict] = []
+    for tenant in list_tenants(active_only=True):
+        tid = str(tenant.get("id") or "")
+        if not tid:
+            continue
+        token = set_tenant_context(tid)
+        try:
+            health = await _compute_tenant_health()
+            fs_doc("health_status", "current").set(health, merge=False)
+            summary.append({
+                "tenant_id": tid,
+                "channels_total": health["channels_total"],
+                "channels_pending_payment": health["channels_pending_payment"],
+                "tokens_expiring_soon": health["tokens_expiring_soon"],
+            })
+        except Exception as exc:
+            logger.warning("cron_health_check: tenant %s falhou: %s", tid, exc)
+            summary.append({"tenant_id": tid, "error": str(exc)})
+        finally:
+            reset_tenant_context(token)
+
+    return {
+        "checked_at": fs_utcnow().isoformat(),
+        "tenants_processed": len(summary),
+        "summary": summary,
     }
 
 
@@ -7961,6 +8466,52 @@ async def dashboard_ratings(
     return {"ratings": ratings}
 
 
+# -- API: Usage mensal per-tenant (Fase 2.10.4) --
+
+
+@app.get("/api/wa/usage/current-month")
+async def wa_usage_current_month(current_user: dict = Depends(get_current_user)):
+    """Retorna usage do mes corrente pro tenant atual (informativo).
+
+    Estrutura: { month, templates_sent: {marketing,utility,authentication,unknown},
+    free_form_sent, inbound_received, media_uploaded_bytes }.
+    Acessivel a admin/supervisor — visibilidade pra cruzar com fatura Meta.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    return get_monthly_usage()
+
+
+@app.get("/api/wa/usage/history")
+async def wa_usage_history(
+    months: int = Query(3, ge=1, le=24),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna ultimos N meses de usage do tenant atual (mes corrente primeiro)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    return {"months": get_usage_history(months)}
+
+
+@app.get("/api/wa/usage/{year_month}")
+async def wa_usage_specific_month(
+    year_month: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Retorna usage de um mes especifico (formato YYYY-MM)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    if len(year_month) != 7 or year_month[4] != "-":
+        raise HTTPException(status_code=400, detail="Formato esperado: YYYY-MM")
+    try:
+        y, m = year_month.split("-")
+        if not (1 <= int(m) <= 12) or not (2020 <= int(y) <= 2099):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato esperado: YYYY-MM")
+    return get_monthly_usage(year_month)
+
+
 # -- API: Export --
 
 
@@ -8133,7 +8684,7 @@ async def embedded_signup_exchange(
             for tid in scope.get("target_ids") or []:
                 if tid and tid not in waba_ids:
                     waba_ids.append(str(tid))
-        if scope_name in ("whatsapp_business_app_onboarding", "business_management"):
+        if scope_name == "whatsapp_business_app_onboarding":
             coexistence_scope_present = True
 
     if not waba_ids:
@@ -8201,7 +8752,7 @@ async def embedded_signup_exchange(
 
     logger.info(
         "Embedded Signup concluido | waba=%s phone_id=%s display=%s status=%s platform=%s tier=%s",
-        waba_id, phone_number_id, display_phone, status, platform_type, messaging_limit_tier,
+        waba_id, phone_number_id, redact_phone(display_phone), status, platform_type, messaging_limit_tier,
     )
 
     # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
@@ -8229,15 +8780,29 @@ async def embedded_signup_exchange(
         ]
 
     subscribe_url = f"{GRAPH_API_BASE}/{waba_id}/subscribed_apps"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        sub_resp = await client.post(
-            subscribe_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            json={"subscribed_fields": subscribed_fields},
+    sub_resp = None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            sub_resp = await client.post(
+                subscribe_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"subscribed_fields": subscribed_fields},
+            )
+    except httpx.RequestError as exc:
+        # ReadTimeout / ConnectError / etc na Meta sao transitorios e nao
+        # devem aborter o signup — o canal eh criado e o admin reinscreve
+        # o webhook depois (botao na UI ou rerun do signup).
+        logger.warning(
+            "Embedded Signup subscribed_apps falhou por erro de rede (%s: %s) "
+            "— canal segue criado, admin reassina webhook depois",
+            type(exc).__name__, exc,
         )
 
     webhook_subscribed = False
-    if sub_resp.status_code >= 400:
+    if sub_resp is None:
+        # Falha de rede — log ja emitido acima, continua com webhook=False
+        pass
+    elif sub_resp.status_code >= 400:
         sub_detail = _meta_error_detail(sub_resp)
         logger.error("Embedded Signup subscribed_apps falhou: %s", sub_detail)
         # Nao aborta: canal pode ser criado mesmo sem webhook (admin reassina depois)
@@ -8343,6 +8908,8 @@ import tempfile
 from datetime import datetime
 
 import httpx
+
+from pii_redaction import redact_phone
 
 from config import (
     WHATSAPP_TOKEN,
@@ -8756,7 +9323,17 @@ async def get_media_url(media_id, token=None):
         try:
             resp = await client.get(endpoint, headers=headers)
             if resp.status_code != 200:
-                logger.error("Falha ao obter URL da midia %s: %s", media_id, resp.text)
+                # NAO logar resp.text cru — pode ter URL assinada com token.
+                # Loga apenas a mensagem de erro estruturada.
+                err_msg = ""
+                try:
+                    err_msg = ((resp.json() or {}).get("error") or {}).get("message", "")
+                except Exception:
+                    err_msg = "<unparseable>"
+                logger.error(
+                    "Falha ao obter URL da midia %s | status=%s erro=%s",
+                    media_id, resp.status_code, err_msg,
+                )
                 return None
             data = resp.json()
             return {
@@ -8917,14 +9494,79 @@ async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_mes
             result = resp.json()
             if resp.status_code == 200:
                 wa_msg_id = result.get("messages", [{}])[0].get("id", "")
-                logger.info("[WA MEDIA OUT] %s -> %s (type=%s)", wa_id, wa_msg_id, msg_type)
+                logger.info("[WA MEDIA OUT] %s -> %s (type=%s)", redact_phone(wa_id), wa_msg_id, msg_type)
                 return {"wa_message_id": wa_msg_id, "status": "sent"}
             error = result.get("error", {}).get("message", "Erro desconhecido")
-            logger.error("[WA MEDIA FAIL] %s: %s", wa_id, error)
+            logger.error("[WA MEDIA FAIL] %s: %s", redact_phone(wa_id), error)
             return {"error": error}
         except Exception as exc:
-            logger.error("Erro ao enviar midia para %s: %s", wa_id, exc)
+            logger.error("Erro ao enviar midia para %s: %s", redact_phone(wa_id), exc)
             return {"error": str(exc)}
+```
+
+## pii_redaction.py
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Helpers de redacao para conformidade LGPD em logs.
+
+Diretriz CLAUDE.md secao 2: tokens, secrets e PII jamais em logs cleartext.
+
+Estes helpers permitem manter logs informativos pra debugging sem expor
+dados pessoais de clientes (telefone, nome, email) ou credenciais.
+"""
+
+from __future__ import annotations
+
+
+def redact_phone(phone: str | None, keep_last: int = 4) -> str:
+    """Mantem apenas os N ultimos digitos visiveis.
+
+    >>> redact_phone("5531999998888")
+    '***8888'
+    >>> redact_phone("31999998888", keep_last=2)
+    '***88'
+    >>> redact_phone(None)
+    '***'
+    >>> redact_phone("")
+    '***'
+    """
+    if not phone:
+        return "***"
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    if len(digits) <= keep_last:
+        return "***"
+    return f"***{digits[-keep_last:]}"
+
+
+def redact_name(name: str | None) -> str:
+    """Retorna primeira letra + comprimento total. Ex.: 'Joao' -> 'J*** (4)'.
+
+    Para nomes vazios/None retorna apenas '***'. Util pra distinguir
+    contatos diferentes sem expor identidade.
+    """
+    if not name:
+        return "***"
+    s = str(name).strip()
+    if not s:
+        return "***"
+    return f"{s[0]}*** ({len(s)})"
+
+
+def redact_secret(value: str | None, keep_first: int = 0) -> str:
+    """Retorna placeholder ou prefixo curto pra debug.
+
+    Default: nao mostra nada do valor (keep_first=0 -> '<redacted>').
+    Com keep_first>0, mostra os N primeiros chars (uso raro, pra
+    distinguir versoes de token).
+    """
+    if not value:
+        return "<empty>"
+    s = str(value)
+    if keep_first <= 0:
+        return "<redacted>"
+    return f"{s[:keep_first]}***"
 ```
 
 ## seed_gchat.py
@@ -9117,11 +9759,17 @@ _SLUG_RE = re.compile(r"^[a-z][a-z0-9\-]{2,63}$")
 
 _lock = threading.Lock()
 _tenants_by_id: dict[str, dict] = {}
-_last_refresh: float = 0
+# None = cache nunca foi populado (forca refresh na primeira call). Usar
+# valor numerico inicial 0 era bug: time.monotonic() retorna seconds desde
+# o container boot — pequeno na primeira call — entao 0 - 0.5 < 60 e o
+# refresh nao era disparado, deixando o cache vazio ate o TTL expirar.
+_last_refresh: float | None = None
 _CACHE_TTL_SECONDS = 60
 
 
 def _needs_refresh() -> bool:
+    if _last_refresh is None:
+        return True
     return time.monotonic() - _last_refresh > _CACHE_TTL_SECONDS
 
 
@@ -9313,13 +9961,27 @@ os testes de caso de uso na revisao do app Meta.
 Uso:
   python test_meta_app_review.py
   python test_meta_app_review.py --token SEU_TOKEN
-  python test_meta_app_review.py --section business_management
+  python test_meta_app_review.py --section whatsapp_business_management
   python test_meta_app_review.py --dry-run
 
 Secoes disponiveis:
-  business_management, whatsapp_business_management,
-  whatsapp_business_messaging, whatsapp_business_manage_events,
+  whatsapp_business_management, whatsapp_business_messaging,
   public_profile
+
+Permissions FORA do escopo do produto (revisao 2026-05-08):
+  - business_management: reprovada pela Meta — e permission de Ads
+    Manager (manage ad accounts, impressions, conversions), nao de
+    Embedded Signup do WhatsApp.
+  - manage_app_solution: nao se aplica — Castro Intelligence atende
+    clientes finais como Tech Provider direto, nao intermedia
+    Solution Partners.
+  - whatsapp_business_manage_events: caso de uso e Conversions API
+    for WhatsApp (eventos de conversao para Meta Events Manager) —
+    feature nao implementada no produto. Pedir sem implementacao
+    levaria a mesma reprovacao que business_management.
+
+As funcoes correspondentes permanecem comentadas como referencia
+historica — caso o roadmap mude e essas perms voltem ao escopo.
 """
 
 from __future__ import annotations
@@ -9443,19 +10105,21 @@ def run_test(label: str, method: str, path: str, token: str,
 
 
 # ---------------------------------------------------------------------------
-# Secao 1: business_management (0/1 obrigatoria)
+# Secao 1: business_management — DESCONTINUADA (App Review 2026-05-08)
 # ---------------------------------------------------------------------------
-
-def test_business_management(token: str, dry_run: bool = False) -> None:
-    print("\n=== business_management (0/1 obrigatoria) ===\n")
-
-    # Listar businesses do usuario — endpoint principal desta permissao
-    run_test("GET /me/businesses", "GET", "me/businesses",
-             token, params={"fields": "id,name,created_time"}, dry_run=dry_run)
-
-    # Consultar o app
-    run_test("GET /app", "GET", APP_ID,
-             token, params={"fields": "id,name,category"}, dry_run=dry_run)
+# A Meta reprovou em 2026-05-08 explicando que essa permission e para
+# gerenciar Ad Accounts (impressions, conversions, ad spend) — nao tem
+# relacao com Embedded Signup do WhatsApp. O fluxo de coexistence usa
+# whatsapp_business_management + whatsapp_business_messaging (ambas
+# aprovadas Advanced) + featureType=whatsapp_business_app_onboarding
+# no popup do FB.login. Codigo abaixo preservado como referencia.
+#
+# def test_business_management(token: str, dry_run: bool = False) -> None:
+#     print("\n=== business_management (0/1 obrigatoria) ===\n")
+#     run_test("GET /me/businesses", "GET", "me/businesses",
+#              token, params={"fields": "id,name,created_time"}, dry_run=dry_run)
+#     run_test("GET /app", "GET", APP_ID,
+#              token, params={"fields": "id,name,category"}, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -9570,34 +10234,33 @@ def test_whatsapp_business_messaging(token: str, dry_run: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Secao 4: whatsapp_business_manage_events
+# Secao 4: whatsapp_business_manage_events — DESCONTINUADA (2026-05-08)
 # ---------------------------------------------------------------------------
-
-def test_whatsapp_business_manage_events(token: str, dry_run: bool = False) -> None:
-    print("\n=== whatsapp_business_manage_events ===\n")
-
-    # manage_events precisa de App Access Token (APP_ID|APP_SECRET)
-    app_token = f"{APP_ID}|{APP_SECRET}" if APP_ID and APP_SECRET else ""
-    if not app_token:
-        print("  [SKIP] META_APP_ID ou META_APP_SECRET nao configurado")
-        return
-
-    # Listar subscriptions do app (requer app token)
-    run_test("GET app subscriptions", "GET", f"{APP_ID}/subscriptions",
-             app_token, dry_run=dry_run)
-
-    # Inscrever o app no campo messages (idempotente, requer app token)
-    run_test("POST subscribe webhook field", "POST", f"{APP_ID}/subscriptions",
-             app_token, body={
-                 "object": "whatsapp_business_account",
-                 "fields": "messages",
-                 "callback_url": "https://castro-crm-286866630844.southamerica-east1.run.app/webhook",
-                 "verify_token": "castro-webhook-2026",
-             }, dry_run=dry_run)
-
-    # Verificar WABA subscribed_apps (usa user token)
-    run_test("GET WABA subscribed_apps", "GET", f"{WABA_ID}/subscribed_apps",
-             token, dry_run=dry_run)
+# Caso de uso real dessa permission e Conversions API for WhatsApp —
+# enviar eventos (Purchase, Lead, AddToCart) para Meta Events Manager
+# e mensurar ROI de anuncios click-to-WhatsApp. Feature nao
+# implementada no produto. Pedir sem implementacao levaria a mesma
+# reprovacao que business_management ("nao demonstra caso de uso").
+# A implementacao original abaixo testava webhook subscriptions
+# (GET/POST /APP_ID/subscriptions), o que nao requer essa permission.
+#
+# def test_whatsapp_business_manage_events(token: str, dry_run: bool = False) -> None:
+#     print("\n=== whatsapp_business_manage_events ===\n")
+#     app_token = f"{APP_ID}|{APP_SECRET}" if APP_ID and APP_SECRET else ""
+#     if not app_token:
+#         print("  [SKIP] META_APP_ID ou META_APP_SECRET nao configurado")
+#         return
+#     run_test("GET app subscriptions", "GET", f"{APP_ID}/subscriptions",
+#              app_token, dry_run=dry_run)
+#     run_test("POST subscribe webhook field", "POST", f"{APP_ID}/subscriptions",
+#              app_token, body={
+#                  "object": "whatsapp_business_account",
+#                  "fields": "messages",
+#                  "callback_url": "https://castro-crm-286866630844.southamerica-east1.run.app/webhook",
+#                  "verify_token": "castro-webhook-2026",
+#              }, dry_run=dry_run)
+#     run_test("GET WABA subscribed_apps", "GET", f"{WABA_ID}/subscribed_apps",
+#              token, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -9629,10 +10292,11 @@ def test_public_profile(token: str, dry_run: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 ALL_SECTIONS = {
-    "business_management": test_business_management,
+    # Permissions fora do escopo (revisao 2026-05-08) — ver header:
+    #   business_management, manage_app_solution,
+    #   whatsapp_business_manage_events.
     "whatsapp_business_management": test_whatsapp_business_management,
     "whatsapp_business_messaging": test_whatsapp_business_messaging,
-    "whatsapp_business_manage_events": test_whatsapp_business_manage_events,
     "public_profile": test_public_profile,
 }
 
@@ -9933,6 +10597,7 @@ from channel_service import get_channel_by_phone_id, get_default_channel, CHANNE
 from bot_service import process_bot_message
 from firestore_common import set_tenant_context, reset_tenant_context
 from tenant_service import lookup_phone_routing
+from pii_redaction import redact_phone, redact_name
 
 logger = logging.getLogger("castro_crm.webhook")
 
@@ -10119,7 +10784,7 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             sender_user_id=None,
         )
         if resp.status_code == 200:
-            logger.info("[BOT] Resposta enviada para %s | contact=%d", wa_id, contact_id)
+            logger.info("[BOT] Resposta enviada para %s | contact=%d", redact_phone(wa_id), contact_id)
         else:
             logger.warning("[BOT] Falha ao enviar resposta | status=%s | erro=%s", resp.status_code, result)
     except Exception as e:
@@ -10196,7 +10861,10 @@ async def _process_messages(value, ws_notify_callback, channel=None):
     channel_token = str(channel.get("access_token", "")).strip() if channel else ""
 
     for msg in value.get("messages", []):
-        wa_id = msg.get("from", "")
+        # Normaliza nono digito BR — Meta entrega numero ora com '9' ora sem
+        # (numeros antigos/legados). Sem normalizacao, o mesmo cliente cria
+        # contatos e conversations duplicadas.
+        wa_id = normalize_br_phone(msg.get("from", ""))
         msg_id = msg.get("id", "")
         msg_type = msg.get("type", "unknown")
         timestamp = msg.get("timestamp", "")
@@ -10321,7 +10989,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             logger.info(
                 "Mensagem unsupported sem midia tratavel | keys=%s | wa_id=%s | id=%s",
                 sorted(msg.keys()),
-                wa_id,
+                redact_phone(wa_id),
                 msg_id[:20],
             )
 
@@ -10354,7 +11022,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
 
         logger.info(
             "[WA IN] %s (%s) | tipo=%s | id=%s",
-            contact_name, wa_id, effective_msg_type, msg_id[:20]
+            redact_name(contact_name), redact_phone(wa_id), effective_msg_type, msg_id[:20]
         )
 
         # -- Bot: processar mensagem se ativo e contato sem operador --
@@ -10710,7 +11378,7 @@ def _process_smb_app_state_sync(value):
             contact_id = upsert_wa_contact(normalized_phone, display_name)
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
-                normalized_phone, display_name, contact_id,
+                redact_phone(normalized_phone), redact_name(display_name), contact_id,
             )
 
         elif action == "remove":
@@ -11053,10 +11721,12 @@ def _process_account_update(value):
     event = str(value.get("event", "")).upper()
     phone_number = value.get("phone_number", "")
 
+    redacted_phone = redact_phone(phone_number)
+
     if event == "PARTNER_REMOVED":
         logger.warning(
             "[ACCOUNT] Cliente desconectou da API de Nuvem | phone=%s",
-            phone_number,
+            redacted_phone,
         )
         log_audit(
             user_id=None,
@@ -11065,7 +11735,7 @@ def _process_account_update(value):
         )
 
     elif event == "ACCOUNT_OFFBOARDED":
-        logger.warning("[ACCOUNT] Conta removida (offboarded) | phone=%s", phone_number)
+        logger.warning("[ACCOUNT] Conta removida (offboarded) | phone=%s", redacted_phone)
         log_audit(
             user_id=None,
             action="coexistence_offboarded",
@@ -11073,7 +11743,7 @@ def _process_account_update(value):
         )
 
     elif event == "ACCOUNT_RECONNECTED":
-        logger.info("[ACCOUNT] Conta reconectada | phone=%s", phone_number)
+        logger.info("[ACCOUNT] Conta reconectada | phone=%s", redacted_phone)
         log_audit(
             user_id=None,
             action="coexistence_reconnected",
@@ -11081,7 +11751,7 @@ def _process_account_update(value):
         )
 
     else:
-        logger.info("[ACCOUNT] Evento nao tratado: %s | phone=%s", event, phone_number)
+        logger.info("[ACCOUNT] Evento nao tratado: %s | phone=%s", event, redacted_phone)
 ```
 
 ## webhook_google_chat.py
@@ -11105,6 +11775,7 @@ from database import (
 )
 from google_chat import download_attachment
 from media import save_upload_media
+from pii_redaction import redact_name
 
 logger = logging.getLogger("castro_crm.webhook_gchat")
 
@@ -11305,7 +11976,7 @@ async def _process_gchat_message(message, space_id, space_name, sender_email, se
 
     logger.info(
         "[GC IN] %s (%s) | tipo=%s | space=%s",
-        sender_name, sender_email, msg_type, space_id,
+        redact_name(sender_name), redact_name(sender_email), msg_type, space_id,
     )
 
     return {}
@@ -13633,7 +14304,7 @@ export function resolveMessageMedia(message: ChatMessage): ResolvedMessageMedia 
 ## frontend/src/utils/normalization.ts
 
 ```ts
-import type { ChatMessage, Contact } from "../types";
+import type { ChatMessage, Contact, Conversation } from "../types";
 
 export function iso(value: unknown) {
   if (!value) return "";
@@ -13694,6 +14365,7 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
   return {
     id: num(record.id ?? docId),
     contact_id: num(record.contact_id),
+    conversation_id: record.conversation_id == null ? null : String(record.conversation_id),
     direction: String(record.direction || "system"),
     msg_type: String(record.msg_type || "text"),
     content: String(record.content || ""),
@@ -13702,6 +14374,8 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     filename: String(record.filename || ""),
     status: String(record.status || ""),
     operator_id: record.operator_id == null ? null : num(record.operator_id),
+    sender_user_id: record.sender_user_id == null ? null : num(record.sender_user_id),
+    channel_owner_user_id: record.channel_owner_user_id == null ? null : num(record.channel_owner_user_id),
     operator_name: String(record.operator_name || ""),
     created_at: iso(record.created_at),
     timestamp_wa: iso(record.timestamp_wa),
@@ -13713,6 +14387,40 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     phone_number_id: String(record.phone_number_id || ""),
     is_corrected: Boolean(record.is_corrected),
     corrected_by_message_id: record.corrected_by_message_id == null ? null : num(record.corrected_by_message_id),
+  };
+}
+
+export function normalizeConversation(record: Record<string, unknown>, docId: string): Conversation {
+  return {
+    id: String(record.id || docId),
+    contact_id: num(record.contact_id),
+    wa_id: String(record.wa_id || ""),
+    channel_id: record.channel_id == null ? null : num(record.channel_id),
+    channel_label: String(record.channel_label || ""),
+    channel_type: String(record.channel_type || ""),
+    channel_phone_number: String(record.channel_phone_number || ""),
+    source_channel_type: String(record.source_channel_type || ""),
+    phone_number_id: String(record.phone_number_id || ""),
+    assigned_to: record.assigned_to == null ? null : num(record.assigned_to),
+    assigned_to_uid: String(record.assigned_to_uid || ""),
+    department_id: record.department_id == null ? null : num(record.department_id),
+    unread_count: num(record.unread_count ?? record.unread ?? 0),
+    unread: num(record.unread ?? record.unread_count ?? 0),
+    status: String(record.status || "open"),
+    last_message_at: iso(record.last_message_at),
+    last_inbound_at: iso(record.last_inbound_at),
+    last_outbound_at: iso(record.last_outbound_at),
+    created_at: iso(record.created_at),
+    display_name: String(record.display_name || ""),
+    declared_name: String(record.declared_name || ""),
+    phone_formatted: String(record.phone_formatted || ""),
+    qualification: String(record.qualification || ""),
+    notes: String(record.notes || ""),
+    rating: record.rating == null ? null : num(record.rating),
+    is_archived: num(record.is_archived ?? 0),
+    contact_avatar_path: String(record.contact_avatar_path || ""),
+    attendance_protocol: String(record.attendance_protocol || ""),
+    attendance_started_at: iso(record.attendance_started_at),
   };
 }
 ```
@@ -13961,25 +14669,13 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
 }
 
 function ContactList() {
-  const { activeView, filteredContacts, conversations, selectedContactId, setSelectedContactId, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
 
-  // Fase 3: agrupa conversations por contact_id para descobrir quando um
-  // mesmo contato aparece em mais de um canal. Pra cada contato exibido:
-  //   - se nao tem conversations registradas (legado), mostra 1 linha;
-  //   - se tem 1 conversation, mostra 1 linha com badge do canal;
-  //   - se tem N conversations, mostra N linhas (uma por canal) com badges.
-  const conversationsByContact = new Map<number, Conversation[]>();
-  for (const conv of conversations) {
-    const list = conversationsByContact.get(conv.contact_id) || [];
-    list.push(conv);
-    conversationsByContact.set(conv.contact_id, list);
-  }
-  type RenderItem = { contact: Contact; conversation: Conversation | null };
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
-  // direto). Converte ambos para epoch ms para comparacao.
+  // direto). Converte ambos para epoch ms para ordenacao.
   const toMillis = (v: unknown): number => {
     if (!v) return 0;
     if (typeof v === "string") return new Date(v).getTime() || 0;
@@ -13993,18 +14689,21 @@ function ContactList() {
     }
     return 0;
   };
-  const renderItems: RenderItem[] = filteredContacts.flatMap((contact): RenderItem[] => {
-    const convs = conversationsByContact.get(contact.id) || [];
-    if (convs.length === 0) return [{ contact, conversation: null }];
-    return convs
-      .slice()
-      .sort((a, b) => toMillis(b.last_message_at) - toMillis(a.last_message_at))
-      .map((conversation): RenderItem => ({ contact, conversation }));
-  });
+  type RenderItem = { contact: Contact; conversation: Conversation };
+  // Fase 3.D: cada item da sidebar e uma Conversation. O Contact e
+  // resolvido via contactsById (join in-memory). Mesmo wa_id em 2 canais
+  // = 2 entradas distintas, com badge proprio do canal.
+  const renderItems: RenderItem[] = filteredConversations
+    .slice()
+    .sort((a, b) => toMillis(b.last_message_at) - toMillis(a.last_message_at))
+    .flatMap((conversation): RenderItem[] => {
+      const contact = contactsById.get(conversation.contact_id);
+      return contact ? [{ contact, conversation }] : [];
+    });
 
   const visibleTeamOperators = activeView === "equipe"
     ? operators
-      .filter((operator) => operator.id !== sessionUser?.id && filteredContacts.some((contact) => contact.assigned_to === operator.id))
+      .filter((operator) => operator.id !== sessionUser?.id && filteredConversations.some((conv) => conv.assigned_to === operator.id))
       .sort((left, right) => left.display_name.localeCompare(right.display_name))
     : [];
   return (
@@ -14040,24 +14739,20 @@ function ContactList() {
       </div>
       <div className="contact-list">
         {renderItems.map(({ contact, conversation }) => {
-          const assignedOperator = activeView === "equipe" ? findAssignedOperator(contact, operators) : null;
+          // Fase 3.D: assigned/department vem da Conversation (cutover Fase 2C);
+          // qualification/notes/avatar continuam no Contact.
+          const assignedOperator = activeView === "equipe"
+            ? (operators.find((o) => o.id === conversation.assigned_to) || null)
+            : null;
           const accent = assignedOperator ? operatorColor(assignedOperator.id) : null;
-          const itemKey = conversation ? `${contact.id}__${conversation.id}` : `${contact.id}`;
-          const lastMessageAt = conversation?.last_message_at || contact.last_message_at;
-          const unreadCount = conversation ? (conversation.unread ?? conversation.unread_count ?? 0) : (contact.unread ?? contact.unread_count ?? 0);
-          const channelLabel = conversation?.channel_label || "";
-          const channelType = conversation?.channel_type || conversation?.source_channel_type || contact.source_channel_type || "";
-          // V2 Fase 3: item ativo quando contact_id E thread_id batem.
-          // Se conversation e null (legado sem thread), so checa contact_id.
-          const isActive = selectedContactId === contact.id && (
-            conversation ? selectedThreadId === conversation.id : !selectedThreadId
-          );
-          const handleClick = () => {
-            setSelectedContactId(contact.id);
-            setSelectedThreadId(conversation ? conversation.id : null);
-          };
+          const lastMessageAt = conversation.last_message_at || contact.last_message_at;
+          const unreadCount = conversation.unread_count ?? conversation.unread ?? 0;
+          const channelLabel = conversation.channel_label || "";
+          const channelType = conversation.channel_type || conversation.source_channel_type || contact.source_channel_type || "";
+          const isActive = selectedThreadId === conversation.id;
+          const handleClick = () => setSelectedThreadId(conversation.id);
           return (
-            <button key={itemKey} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
+            <button key={conversation.id} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
               <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
               <div className="contact-copy">
                 <div className="row">
@@ -14076,7 +14771,7 @@ function ContactList() {
                     <span>{when(lastMessageAt)}</span>
                   </div>
                 </div>
-                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && contact.assigned_name ? ` · ${contact.assigned_name}` : ""}</div>
+                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
                 <div className="row">
                   <span className="chip">{contact.qualification || "novo"}</span>
                   {channelLabel ? (
@@ -15673,7 +16368,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 ## frontend/src/context/CrmContext.tsx
 
 ```tsx
-import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useRef, useState, type ReactNode } from "react";
+import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
 import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
@@ -15687,7 +16382,7 @@ import type {
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
 import { buildMessageReplyReference, formatRecordingTime, messageCopyText, messageMoment } from "../utils/formatting";
-import { normalizeContact, normalizeMessage } from "../utils/normalization";
+import { normalizeContact, normalizeConversation, normalizeMessage } from "../utils/normalization";
 import { applyTheme, themePref, transportPref } from "../utils/storage";
 import type { LightboxMedia } from "../utils/media";
 
@@ -15720,21 +16415,24 @@ type CrmContextValue = {
 
   // Contacts
   contacts: Contact[];
+  contactsById: Map<number, Contact>;
   conversations: Conversation[];
+  // selectedContactId é derivado de selectedThreadId -> conversation.contact_id.
+  // Para selecionar uma conversa, chame setSelectedThreadId(conversationId).
   selectedContactId: number | null;
   selectedThreadId: string | null;
   setSelectedThreadId: (id: string | null) => void;
-  setSelectedContactId: (id: number | null) => void;
   selectedContact: Contact | null;
+  selectedConversation: Conversation | null;
 
   // Views
   activeView: ActiveView;
   setActiveView: (v: ActiveView) => void;
-  novosContacts: Contact[];
-  meusContacts: Contact[];
-  nqContacts: Contact[];
-  equipeContacts: Contact[];
-  botContacts: Contact[];
+  novosConversations: Conversation[];
+  meusConversations: Conversation[];
+  nqConversations: Conversation[];
+  equipeConversations: Conversation[];
+  botConversations: Conversation[];
   novosUnread: number;
   meusUnread: number;
   nqUnread: number;
@@ -15742,7 +16440,7 @@ type CrmContextValue = {
   botUnread: number;
   equipeOperatorFilter: string;
   setEquipeOperatorFilter: (v: string) => void;
-  equipeFiltered: Contact[];
+  equipeFiltered: Conversation[];
 
   // Messages
   messages: ChatMessage[];
@@ -15894,8 +16592,8 @@ type CrmContextValue = {
   searchText: string;
   qualificationFilter: string;
   setQualificationFilter: (v: string) => void;
-  filteredContacts: Contact[];
-  viewContacts: Contact[];
+  filteredConversations: Conversation[];
+  viewConversations: Conversation[];
 
   // Notifications
   error: string;
@@ -15959,14 +16657,23 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Fase 3: lista de conversations (sub-threads por canal). Mesmo wa_id em
   // dois canais aparece como duas entradas distintas.
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const contactsById = useMemo(
+    () => new Map<number, Contact>(contacts.map((c) => [c.id, c])),
+    [contacts],
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
-  // Fase 3 V2: thread especifica (channel_id__wa_id) selecionada.
-  // Quando setada, ChatPanel filtra mensagens por conversation_id em vez
-  // de contact_id (que mostra timeline cross-channel).
+  // Fase 3 V2: selectedThreadId e a fonte unica de selecao na sidebar.
+  // selectedContactId vira derivado de selectedThreadId -> conversation.contact_id.
+  // Quando setado, ChatPanel filtra mensagens por conversation_id (nao
+  // cross-channel como o legado).
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const selectedConversation = useMemo(
+    () => (selectedThreadId ? conversations.find((c) => c.id === selectedThreadId) || null : null),
+    [conversations, selectedThreadId],
+  );
+  const selectedContactId = selectedConversation?.contact_id ?? null;
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
@@ -16063,46 +16770,89 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // -- Derived --
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
-  const selectedContact = contacts.find((c) => c.id === selectedContactId) || null;
-  const activeContact = contacts.find((c) => c.id === activeConversationId) || null;
+  const selectedContact = selectedContactId != null ? (contactsById.get(selectedContactId) || null) : null;
+  const activeContact = activeConversationId != null ? (contactsById.get(activeConversationId) || null) : null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
 
   const botEnabled = systemSettings.bot_enabled;
-  // Bot: contatos sem atribuicao, no fluxo do bot (ainda nao completaram)
-  const botContacts = botEnabled ? contacts.filter((c) => !c.assigned_to && c.qualification !== "nao_qualificado" && !c.bot_completed) : [];
-  // Novos: sem atribuicao. Com bot ativo, so mostra quem completou o bot ou nunca entrou.
-  // Sem bot, mostra todos sem atribuicao (comportamento original).
-  // Operador comum so ve contatos do seu departamento (ou sem departamento);
-  // admin/supervisor veem todos.
-  const novosContacts = contacts.filter((c) => {
-    if (c.assigned_to || c.qualification === "nao_qualificado") return false;
-    if (botEnabled && !c.bot_completed) return false;
-    if (!isManagerRole && c.department_id != null && c.department_id !== sessionUser?.department_id) return false;
-    return true;
-  });
-  // Meus: atribuidos ao usuario logado (inclui coexistence auto-atribuidos)
-  const meusContacts = contacts.filter((c) => c.assigned_to === sessionUser?.id);
-  // Nao qualificados
-  const nqContacts = contacts.filter((c) => c.qualification === "nao_qualificado");
-  // Equipe: atribuidos a outros operadores
-  // Operadores comuns NAO veem coexistence de outros; admin/supervisor veem tudo
-  const equipeContacts = contacts.filter((c) => {
-    if (!c.assigned_to || c.assigned_to === sessionUser?.id) return false;
-    if (!isManagerRole && c.source_channel_type === "coexistence") return false;
-    return true;
-  });
+  // Fase 3.D: filtros operam sobre conversations (sub-threads por canal).
+  // Mesmo wa_id em 2 canais = 2 entradas distintas em cada filtro. Campos
+  // que pertencem ao contato (qualification, bot_completed, notes) sao
+  // resolvidos via contactsById; o resto vem da propria conversation
+  // (assigned_to, department_id, source_channel_type, unread_count).
+  // Bot: sem atribuicao, no fluxo do bot (ainda nao completaram)
+  const botConversations = useMemo(() => {
+    if (!botEnabled) return [] as Conversation[];
+    return conversations.filter((conv) => {
+      if (conv.assigned_to) return false;
+      const c = contactsById.get(conv.contact_id);
+      if (!c) return false;
+      return c.qualification !== "nao_qualificado" && !c.bot_completed;
+    });
+  }, [botEnabled, conversations, contactsById]);
+  // Novos: sem atribuicao. Com bot ativo, so threads que ja completaram bot.
+  // Operador comum so ve threads do seu departamento (ou sem); admin/supervisor veem todas.
+  const novosConversations = useMemo(() => {
+    return conversations.filter((conv) => {
+      if (conv.assigned_to) return false;
+      const c = contactsById.get(conv.contact_id);
+      if (!c) return false;
+      if (c.qualification === "nao_qualificado") return false;
+      if (botEnabled && !c.bot_completed) return false;
+      if (!isManagerRole && conv.department_id != null && conv.department_id !== sessionUser?.department_id) return false;
+      return true;
+    });
+  }, [conversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
+  // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas)
+  const meusConversations = useMemo(
+    () => conversations.filter((conv) => conv.assigned_to === sessionUser?.id),
+    [conversations, sessionUser?.id],
+  );
+  // Nao qualificadas: qualification do contato e "nao_qualificado"
+  const nqConversations = useMemo(() => {
+    return conversations.filter((conv) => {
+      const c = contactsById.get(conv.contact_id);
+      return c?.qualification === "nao_qualificado";
+    });
+  }, [conversations, contactsById]);
+  // Equipe: atribuidas a outros operadores. Operadores comuns nao veem
+  // coexistence de outros; admin/supervisor veem tudo.
+  const equipeConversations = useMemo(() => {
+    return conversations.filter((conv) => {
+      if (!conv.assigned_to || conv.assigned_to === sessionUser?.id) return false;
+      if (!isManagerRole && conv.source_channel_type === "coexistence") return false;
+      return true;
+    });
+  }, [conversations, isManagerRole, sessionUser?.id]);
 
-  const botUnread = botContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const novosUnread = novosContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const meusUnread = meusContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const nqUnread = nqContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const equipeUnread = equipeContacts.reduce((s, c) => s + (c.unread || 0), 0);
-  const equipeFiltered = equipeOperatorFilter ? equipeContacts.filter((c) => String(c.assigned_to) === equipeOperatorFilter) : equipeContacts;
+  // Fase 3.D: unread agregado e a soma das conversations daquela view.
+  // Single source of truth — coerente com mark-read otimista por thread.
+  const sumUnread = (list: Conversation[]) =>
+    list.reduce((s, conv) => s + (conv.unread_count ?? conv.unread ?? 0), 0);
+  const botUnread = sumUnread(botConversations);
+  const novosUnread = sumUnread(novosConversations);
+  const meusUnread = sumUnread(meusConversations);
+  const nqUnread = sumUnread(nqConversations);
+  const equipeUnread = sumUnread(equipeConversations);
+  const equipeFiltered = equipeOperatorFilter
+    ? equipeConversations.filter((conv) => String(conv.assigned_to) === equipeOperatorFilter)
+    : equipeConversations;
 
-  const viewContacts = activeView === "bot" ? botContacts : activeView === "novos" ? novosContacts : activeView === "meus" ? meusContacts : activeView === "equipe" ? equipeFiltered : nqContacts;
-  const filteredContacts = viewContacts.filter((item) => {
-    const matchesSearch = !searchText || [item.display_name, item.phone_formatted || "", item.department_name || "", item.assigned_name || ""].join(" ").toLowerCase().includes(searchText);
-    const matchesQual = !qualificationFilter || item.qualification === qualificationFilter;
+  const viewConversations = activeView === "bot" ? botConversations
+    : activeView === "novos" ? novosConversations
+    : activeView === "meus" ? meusConversations
+    : activeView === "equipe" ? equipeFiltered
+    : nqConversations;
+  // Search e qualification filter operam no contato (denormalizado pra UX).
+  const filteredConversations = viewConversations.filter((conv) => {
+    const c = contactsById.get(conv.contact_id);
+    const matchesSearch = !searchText || [
+      c?.display_name || "",
+      c?.phone_formatted || "",
+      c?.department_name || "",
+      c?.assigned_name || "",
+    ].join(" ").toLowerCase().includes(searchText);
+    const matchesQual = !qualificationFilter || c?.qualification === qualificationFilter;
     return matchesSearch && matchesQual;
   });
 
@@ -16171,7 +16921,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     startTransition(() => setMessages(cachedMessages));
   }
 
-  function applyConversationReadLocally(contactId: number) {
+  function applyConversationReadLocally(contactId: number, conversationId?: string | null) {
     const cachedMessages = messageCacheRef.current.get(contactId);
     if (cachedMessages) {
       rememberConversationMessages(contactId, cachedMessages.map((message) => (
@@ -16181,9 +16931,17 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       )));
     }
     startTransition(() => {
-      setContacts((prev) => prev.map((contact) => (
-        contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
-      )));
+      // Fase 3: zera unread da conversation alvo (se houver), nao do contato
+      // inteiro — outras threads do mesmo contato podem ter unread proprio.
+      if (conversationId) {
+        setConversations((prev) => prev.map((conv) => (
+          conv.id === conversationId ? { ...conv, unread: 0, unread_count: 0 } : conv
+        )));
+      } else {
+        setContacts((prev) => prev.map((contact) => (
+          contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
+        )));
+      }
       if (selectedContactIdRef.current === contactId) {
         setMessages((prev) => {
           const nextMessages = prev.map((message) => (
@@ -16304,11 +17062,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     });
   }, [bundle]);
 
-  // Auto-select contact
+  // Auto-select primeira conversation se nada selecionado (ou seleção orfã).
   useEffect(() => {
-    if (!contacts.length) { setSelectedContactId(null); return; }
-    if (!selectedContactId || !contacts.some((c) => c.id === selectedContactId)) setSelectedContactId(contacts[0].id);
-  }, [contacts, selectedContactId]);
+    if (!conversations.length) {
+      if (selectedThreadId) setSelectedThreadId(null);
+      return;
+    }
+    if (!selectedThreadId || !conversations.some((c) => c.id === selectedThreadId)) {
+      setSelectedThreadId(conversations[0].id);
+    }
+  }, [conversations, selectedThreadId]);
 
   // Track the selected conversation and restore its recent in-memory cache immediately.
   useEffect(() => {
@@ -16417,35 +17180,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle || !sessionUser || !config) return undefined;
     if (!snapshotMode || !config.firestore.collections.wa_conversations) return undefined;
     let disposed = false;
-    // Normaliza Firestore Timestamp -> string ISO para campos de tempo
-    const tsToIso = (v: unknown): string | undefined => {
-      if (!v) return undefined;
-      if (typeof v === "string") return v;
-      if (v instanceof Date) return v.toISOString();
-      if (typeof v === "object" && v !== null && typeof (v as { toDate?: () => Date }).toDate === "function") {
-        return (v as { toDate: () => Date }).toDate().toISOString();
-      }
-      if (typeof v === "object" && v !== null && "seconds" in v) {
-        return new Date(Number((v as { seconds: number }).seconds) * 1000).toISOString();
-      }
-      return undefined;
-    };
     const ref = collection(bundle.db, config.firestore.collections.wa_conversations);
     const unsubscribe = onSnapshot(
       ref,
       (snap) => {
         if (disposed) return;
-        const next = snap.docs.map((doc) => {
-          const data = doc.data() as Record<string, unknown>;
-          return {
-            ...data,
-            id: typeof data.id === "string" || typeof data.id === "number" ? String(data.id) : doc.id,
-            last_message_at: tsToIso(data.last_message_at),
-            last_inbound_at: tsToIso(data.last_inbound_at),
-            last_outbound_at: tsToIso(data.last_outbound_at),
-            created_at: tsToIso(data.created_at),
-          } as Conversation;
-        });
+        const next = snap.docs.map((doc) => normalizeConversation(doc.data() as Record<string, unknown>, doc.id));
         startTransition(() => setConversations(next));
       },
       (e) => !disposed && setError(`Snapshot de conversations falhou: ${errorText(e)}`),
@@ -16546,7 +17286,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         .then(() => {
           if (cancelled) return;
           markingReadContactIdRef.current = null;
-          applyConversationReadLocally(activeConversationId);
+          applyConversationReadLocally(activeConversationId, threadIdAtMark);
         })
         .catch((e) => {
           if (cancelled) return;
@@ -17041,14 +17781,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setBusyCreateContact(true); setError("");
       const payload: Record<string, unknown> = { declared_name, phone };
       if (channel_id) payload.channel_id = channel_id;
-      const res = await sendJson(bundle.auth, "/api/wa/contact/manual", payload) as { contact: Record<string, unknown> };
+      const res = await sendJson(bundle.auth, "/api/wa/contact/manual", payload) as { contact: Record<string, unknown>; conversation_id?: string };
       const contact = normalizeContact(res.contact, String(res.contact.id));
       setContacts(prev => {
         const exists = prev.some(c => c.id === contact.id);
         if (exists) return prev.map(c => c.id === contact.id ? contact : c);
         return [contact, ...prev];
       });
-      setSelectedContactId(contact.id);
+      // Backend retorna conversation_id deterministico do contato manual
+      // (Fase 3). Setamos a thread direto — o snapshot listener vai trazer
+      // a Conversation logo em seguida.
+      if (res.conversation_id) {
+        setSelectedThreadId(res.conversation_id);
+      }
       setActiveView("meus");
       setNotice("Contato criado.");
       return contact;
@@ -17123,9 +17868,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout,
-    contacts, conversations, selectedContactId, setSelectedContactId, selectedContact,
+    contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
-    activeView, setActiveView, novosContacts, meusContacts, nqContacts, equipeContacts, botContacts, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
+    activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
     replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,
@@ -17145,7 +17890,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
-    search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredContacts, viewContacts,
+    search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     refreshPollingViews,
   };
@@ -17567,6 +18312,337 @@ export function MapPinIcon() {
 }
 ```
 
+## scripts/_check_meta_full_status.py
+
+```python
+"""Diagnostico Meta-side completo: WABA + phones + subscribed_apps + app webhook."""
+import json
+import os
+import urllib.error
+import urllib.request
+
+from firestore_common import collection_name, get_firestore_client
+
+
+def graph_get(path, token, params=None):
+    qs = "?access_token=" + token
+    if params:
+        for k, v in params.items():
+            qs += "&{}={}".format(k, v)
+    url = "https://graph.facebook.com/v22.0/{}{}".format(path, qs)
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            return {"_error": json.loads(body), "_status": e.code}
+        except Exception:
+            return {"_error_raw": body, "_status": e.code}
+
+
+c = get_firestore_client()
+channel = None
+for d in c.collection(collection_name("channels")).stream():
+    data = d.to_dict() or {}
+    if data.get("channel_type") == "coexistence":
+        channel = data
+        break
+
+if not channel:
+    print("Sem canal coexistence.")
+    raise SystemExit(1)
+
+waba = channel["waba_id"]
+phone_id = channel["phone_number_id"]
+token = channel["access_token"]
+print("Canal #{} | WABA={} | phone_id={} | webhook_sub={}".format(
+    channel.get("id"), waba, phone_id, channel.get("webhook_subscribed")))
+print()
+
+print("=== GET /WABA?fields=id,name,timezone_id,account_review_status ===")
+r = graph_get(waba, token, {"fields": "id,name,timezone_id,account_review_status,business_verification_status,country,creation_time"})
+print(json.dumps(r, indent=2)[:1000])
+print()
+
+print("=== GET /WABA/subscribed_apps ===")
+r = graph_get("{}/subscribed_apps".format(waba), token)
+print(json.dumps(r, indent=2)[:1500])
+print()
+
+print("=== GET /phone_id?fields=... (sem smb_app_data) ===")
+r = graph_get(phone_id, token, {
+    "fields": "id,display_phone_number,verified_name,platform_type,quality_rating,status,code_verification_status,is_official_business_account,name_status,messaging_limit_tier",
+})
+print(json.dumps(r, indent=2)[:1500])
+print()
+
+# Tentar campos alternativos pra coexistence
+print("=== GET /phone_id?fields=throughput,account_mode,certificate ===")
+r = graph_get(phone_id, token, {"fields": "throughput,account_mode,certificate,health_status"})
+print(json.dumps(r, indent=2)[:800])
+print()
+
+# App-level subscriptions (precisa app_token)
+app_id = os.getenv("META_APP_ID", "1434723791183375")
+app_secret = os.getenv("META_APP_SECRET", "")
+if app_secret:
+    print("=== GET /APP/subscriptions (com app_access_token) ===")
+    app_token = "{}|{}".format(app_id, app_secret)
+    r = graph_get("{}/subscriptions".format(app_id), app_token)
+    print(json.dumps(r, indent=2)[:2000])
+else:
+    print("META_APP_SECRET nao no env — pula app subscriptions check.")
+```
+
+## scripts/_check_meta_subscription.py
+
+```python
+"""Verifica via Graph API se o app esta subscrito na WABA."""
+import os
+import urllib.request
+import urllib.error
+import json
+
+from firestore_common import get_firestore_client, collection_name
+
+c = get_firestore_client()
+
+channel = None
+for d in c.collection(collection_name("channels")).stream():
+    data = d.to_dict() or {}
+    if data.get("channel_type") == "coexistence":
+        channel = data
+        break
+
+if not channel:
+    print("Nenhum canal coexistence encontrado.")
+    raise SystemExit(1)
+
+waba_id = channel.get("waba_id")
+token = channel.get("access_token")
+print("WABA: {} (canal #{})".format(waba_id, channel.get("id")))
+
+url = "https://graph.facebook.com/v22.0/{}/subscribed_apps?fields=whatsapp_business_api_data,subscribed_fields,override_callback_uri&access_token={}".format(waba_id, token)
+try:
+    with urllib.request.urlopen(url, timeout=20) as resp:
+        body = resp.read().decode("utf-8")
+        data = json.loads(body)
+        apps = data.get("data", [])
+        print("Apps subscribed: {}".format(len(apps)))
+        for app in apps:
+            wa_app = app.get("whatsapp_business_api_data", {})
+            print("  app_id={} link={} fields={}".format(
+                wa_app.get("id"),
+                wa_app.get("link"),
+                app.get("subscribed_fields") or app.get("override_callback_uri"),
+            ))
+            print("  full_app: {}".format(json.dumps(app, indent=2)[:600]))
+except urllib.error.HTTPError as e:
+    print("HTTP {}".format(e.code))
+    err_body = e.read().decode("utf-8", errors="replace")
+    print("  body: {}".format(err_body[:400]))
+except Exception as e:
+    print("Erro: {}".format(e))
+```
+
+## scripts/_delete_orphan_conversations.py
+
+```python
+"""Apaga wa_conversations e wa_messages cujo channel_id aponta para
+um canal que nao existe mais (canal deletado).
+
+Uso:
+  $env:FIRESTORE_PROJECT_ID = "project-26fb9c99-8ee9-4179-aef"
+  $env:FIRESTORE_COLLECTION_PREFIX = "castro_crm"
+  ./.venv/Scripts/python.exe -m scripts._delete_orphan_conversations
+  ./.venv/Scripts/python.exe -m scripts._delete_orphan_conversations --confirm
+"""
+import argparse
+import sys
+
+from firestore_common import get_firestore_client, collection_name
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--tenant-id", default="hubloc")
+    p.add_argument("--confirm", action="store_true")
+    args = p.parse_args()
+
+    c = get_firestore_client()
+    tenant_root = c.collection(collection_name("tenants")).document(args.tenant_id)
+
+    existing_channel_ids = set()
+    for d in c.collection(collection_name("channels")).stream():
+        data = d.to_dict() or {}
+        existing_channel_ids.add(data.get("id"))
+    print(f"Canais existentes (flat): {sorted(existing_channel_ids)}")
+
+    convs_to_delete = []
+    msgs_to_delete_by_conv = {}
+
+    for d in tenant_root.collection("wa_conversations").stream():
+        data = d.to_dict() or {}
+        ch = data.get("channel_id")
+        if ch not in existing_channel_ids:
+            convs_to_delete.append((d.id, ch, data.get("wa_id")))
+
+    for cid, ch, wa in convs_to_delete:
+        msgs = list(
+            tenant_root.collection("wa_messages")
+            .where("conversation_id", "==", cid)
+            .stream()
+        )
+        if msgs:
+            msgs_to_delete_by_conv[cid] = [m.id for m in msgs]
+
+    print()
+    print(f"=== Conversations orfas (channel deletado) ===")
+    for cid, ch, wa in convs_to_delete:
+        n_msgs = len(msgs_to_delete_by_conv.get(cid, []))
+        print(f"  conv_id={cid} (channel_id={ch}, wa_id={wa}, msgs={n_msgs})")
+    if not convs_to_delete:
+        print("  (nenhuma — nada a fazer)")
+        return 0
+
+    if not args.confirm:
+        print()
+        print("DRY-RUN. Adicione --confirm para executar.")
+        return 0
+
+    print()
+    print("=== Executando ===")
+    for cid, _, _ in convs_to_delete:
+        for mid in msgs_to_delete_by_conv.get(cid, []):
+            tenant_root.collection("wa_messages").document(mid).delete()
+        n_msgs = len(msgs_to_delete_by_conv.get(cid, []))
+        tenant_root.collection("wa_conversations").document(cid).delete()
+        print(f"  deletada conv_id={cid} (+{n_msgs} mensagens)")
+
+    print()
+    print("Limpeza concluida.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## scripts/_diag_channels_prod.py
+
+```python
+"""Diagnostico rapido de canais e phone_routing em prod.
+
+Uso (PowerShell):
+  $env:FIRESTORE_PROJECT_ID = "project-26fb9c99-8ee9-4179-aef"
+  $env:FIRESTORE_COLLECTION_PREFIX = "castro_crm"
+  ./.venv/Scripts/python.exe -m scripts._diag_channels_prod
+"""
+import os
+from firestore_common import get_firestore_client, collection_name
+
+c = get_firestore_client()
+
+print("=== Canais flat castro_crm_channels (full) ===")
+for d in c.collection(collection_name("channels")).stream():
+    data = d.to_dict() or {}
+    print(
+        "doc_id={} id={} type={} phone_id={} waba={} platform={} display={} owner_uid={} expires={} created={} updated={} webhook_sub={}".format(
+            d.id,
+            data.get("id"),
+            data.get("channel_type"),
+            data.get("phone_number_id"),
+            data.get("waba_id"),
+            data.get("platform_type"),
+            data.get("display_phone_number"),
+            data.get("owner_user_id"),
+            data.get("token_expires_at"),
+            data.get("created_at"),
+            data.get("updated_at"),
+            data.get("webhook_subscribed"),
+        )
+    )
+
+print()
+print("=== phone_routing flat ===")
+for d in c.collection(collection_name("phone_routing")).stream():
+    data = d.to_dict() or {}
+    print(
+        "phone_id={} -> tenant={} channel_id={}".format(
+            d.id, data.get("tenant_id"), data.get("channel_id")
+        )
+    )
+
+print()
+print("=== wa_conversations em tenants/hubloc (amostra) ===")
+convs = list(
+    c.collection(collection_name("tenants"))
+    .document("hubloc")
+    .collection("wa_conversations")
+    .limit(20)
+    .stream()
+)
+print("count_amostra={}".format(len(convs)))
+for d in convs[:5]:
+    data = d.to_dict() or {}
+    print(
+        "id={} channel={} wa_id={} last={}".format(
+            d.id,
+            data.get("channel_id"),
+            data.get("wa_id"),
+            data.get("last_message_at"),
+        )
+    )
+
+print()
+print("=== wa_messages em tenants/hubloc (count amostra ate 50) ===")
+msgs = list(
+    c.collection(collection_name("tenants"))
+    .document("hubloc")
+    .collection("wa_messages")
+    .limit(50)
+    .stream()
+)
+print("count_amostra={}".format(len(msgs)))
+```
+
+## scripts/_diag_send_state.py
+
+```python
+"""Diagnostico do estado pra debug do send error."""
+import os
+from firestore_common import get_firestore_client, collection_name
+
+c = get_firestore_client()
+hub = c.collection(collection_name("tenants")).document("hubloc")
+
+print("=== contact wa_id=5531983440484 ===")
+for d in hub.collection("wa_contacts").where("wa_id", "==", "5531983440484").stream():
+    data = d.to_dict() or {}
+    keys = ["id", "channel_id", "phone_number_id", "wa_id",
+            "display_name", "source_channel_type"]
+    for k in keys:
+        print("  {}={}".format(k, data.get(k)))
+
+print()
+print("=== conversations wa_id=5531983440484 ===")
+for d in hub.collection("wa_conversations").where("wa_id", "==", "5531983440484").stream():
+    data = d.to_dict() or {}
+    print("  conv_id={} contact={} channel={} phone={} src={}".format(
+        d.id,
+        data.get("contact_id"),
+        data.get("channel_id"),
+        data.get("phone_number_id"),
+        data.get("source_channel_type"),
+    ))
+
+print()
+print("=== _meta counters global ===")
+doc = c.collection("castro_crm__meta").document("counters").get()
+print("  {}".format(doc.to_dict()))
+```
+
 ## scripts/build_sistema_completo.py
 
 ```python
@@ -17889,6 +18965,85 @@ if __name__ == "__main__":
     main()
 ```
 
+## scripts/delete_channel.py
+
+```python
+"""Deleta um canal flat e limpa entries do phone_routing apontando pra ele.
+
+Uso (PowerShell):
+  $env:FIRESTORE_PROJECT_ID = "project-26fb9c99-8ee9-4179-aef"
+  $env:FIRESTORE_COLLECTION_PREFIX = "castro_crm"  # ou "castro_crm_staging"
+  ./.venv/Scripts/python.exe -m scripts.delete_channel --channel-id 1
+
+Sem --confirm e que mostra o plano (dry-run). Com --confirm executa.
+"""
+import argparse
+import sys
+
+from firestore_common import get_firestore_client, collection_name
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--channel-id", type=int, required=True)
+    p.add_argument("--confirm", action="store_true")
+    args = p.parse_args()
+
+    cid = args.channel_id
+    c = get_firestore_client()
+
+    ch_ref = c.collection(collection_name("channels")).document(str(cid))
+    ch_doc = ch_ref.get()
+    if not ch_doc.exists:
+        print(f"Canal {cid} nao existe.")
+        return 1
+
+    ch_data = ch_doc.to_dict() or {}
+    print("=== Canal a deletar ===")
+    print(f"  doc_id={ch_doc.id}")
+    print(f"  type={ch_data.get('channel_type')}")
+    print(f"  phone_id={ch_data.get('phone_number_id')}")
+    print(f"  waba={ch_data.get('waba_id')}")
+    print(f"  display={ch_data.get('display_phone_number')}")
+    print(f"  label={ch_data.get('label')}")
+
+    routing_to_delete = []
+    for d in c.collection(collection_name("phone_routing")).stream():
+        data = d.to_dict() or {}
+        if data.get("channel_id") == cid:
+            routing_to_delete.append(d.id)
+
+    print()
+    print(f"=== phone_routing entries apontando pra channel_id={cid} ===")
+    for pid in routing_to_delete:
+        print(f"  {pid}")
+    if not routing_to_delete:
+        print("  (nenhuma)")
+
+    if not args.confirm:
+        print()
+        print("DRY-RUN. Adicione --confirm para executar.")
+        return 0
+
+    print()
+    print("=== Executando ===")
+    for pid in routing_to_delete:
+        c.collection(collection_name("phone_routing")).document(pid).delete()
+        print(f"  phone_routing/{pid} deletado")
+
+    ch_ref.delete()
+    print(f"  channels/{cid} deletado")
+
+    print()
+    print("Pronto. Reinicie o backend (ou aguarde o cache TTL ~60s) "
+          "para refletir.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
 ## scripts/e2e_test_staging.py
 
 ```python
@@ -17910,7 +19065,24 @@ Executa, em sequencia:
        - 2 contatos (X e Y)
        - 3 conversations: 100__X, 200__X, 200__Y
        - 4 mensagens, cada uma com conversation_id correto
-  6. Imprime relatorio.
+  6. (Cutover Fase 2C) Loga como BOOTSTRAP_ADMIN_EMAIL e exercita
+     POST /api/wa/conversation/{id}/read sobre a thread 100__X.
+     Valida que unread_count zera so dela; threads 200__X e 200__Y
+     mantem unread; mensagens inbound da thread 100 ficam status=read,
+     enquanto inbound da 200 permanece received.
+  7. (Cutover Fase 2C) POST /api/wa/send com conversation_id inexistente
+     espera HTTP 404 — prova que _resolve_send_target rejeita antes da
+     chamada Meta (caminho feliz nao testado: tokens dos canais sao fake
+     e a Graph API recusaria).
+  8. (Fase 2.10.4) Valida usage_{YYYY_MM} per-tenant: le o doc Firestore
+     em tenants/hubloc/audit_metrics/usage_{YYYY-MM} e tambem o endpoint
+     GET /api/wa/usage/current-month. Confirma inbound_received >= 4
+     (4 webhooks disparados no passo 4) e estrutura de retorno.
+  9. (Fase 2.10.3) POST /api/internal/cron/health-check com header
+     X-Cron-Secret. Itera tenants ativos, grava
+     tenants/{tid}/health_status/current. Valida que doc do hubloc tem
+     channels_total >= 2 (canais e2e 100/200) e per_channel populado.
+  10. Imprime relatorio.
 
 Uso (local com gcloud auth ja configurado):
     python -m scripts.e2e_test_staging
@@ -17920,6 +19092,8 @@ Variaveis de ambiente necessarias:
     FIRESTORE_COLLECTION_PREFIX  (default: castro_crm_staging)
     STAGING_URL                  (default: castro-crm-staging URL)
     WHATSAPP_APP_SECRET          (lido do GCP Secret Manager se ausente)
+    FIREBASE_WEB_API_KEY         (lido do Cloud Run env se ausente)
+    BOOTSTRAP_ADMIN_EMAIL        (lido do Cloud Run env se ausente)
 """
 
 from __future__ import annotations
@@ -17980,6 +19154,231 @@ def get_app_secret() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cloud Run env reader (para FIREBASE_WEB_API_KEY, BOOTSTRAP_ADMIN_EMAIL etc)
+# ---------------------------------------------------------------------------
+
+_cloud_run_env_cache: dict[str, str] | None = None
+
+
+def _read_cloud_run_env() -> dict[str, str]:
+    """Le todas as env vars do servico castro-crm-staging via gcloud.
+
+    Resolve `valueFrom.secretKeyRef` chamando `gcloud secrets versions
+    access` (caso o env tenha sido configurado via --update-secrets).
+    Requer `roles/secretmanager.secretAccessor` no usuario corrente."""
+    global _cloud_run_env_cache
+    if _cloud_run_env_cache is not None:
+        return _cloud_run_env_cache
+    cmd = [
+        "gcloud", "run", "services", "describe", "castro-crm-staging",
+        "--region", "southamerica-east1",
+        "--project", os.environ["FIRESTORE_PROJECT_ID"],
+        "--format", "json",
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+    if out.returncode != 0:
+        _cloud_run_env_cache = {}
+        return _cloud_run_env_cache
+    try:
+        data = json.loads(out.stdout)
+        containers = (data.get("spec", {}).get("template", {}).get("spec", {})
+                          .get("containers", []) or [])
+        env_list = (containers[0].get("env", []) if containers else []) or []
+        resolved: dict[str, str] = {}
+        for e in env_list:
+            name = e.get("name")
+            if not name:
+                continue
+            v = e.get("value", "")
+            if v:
+                resolved[name] = v
+                continue
+            ref = (e.get("valueFrom") or {}).get("secretKeyRef") or {}
+            secret_name = ref.get("name", "")
+            secret_key = ref.get("key", "latest") or "latest"
+            if not secret_name:
+                continue
+            try:
+                cmd2 = [
+                    "gcloud", "secrets", "versions", "access", secret_key,
+                    f"--secret={secret_name}",
+                    "--project", os.environ["FIRESTORE_PROJECT_ID"],
+                ]
+                out2 = subprocess.run(cmd2, capture_output=True, text=True, shell=True)
+                if out2.returncode == 0:
+                    resolved[name] = out2.stdout.rstrip("\n")
+            except Exception:
+                pass
+        _cloud_run_env_cache = resolved
+    except Exception:
+        _cloud_run_env_cache = {}
+    return _cloud_run_env_cache
+
+
+def get_env_or_cloud_run(name: str) -> str:
+    cached = os.environ.get(name, "").strip()
+    if cached:
+        return cached
+    return (_read_cloud_run_env().get(name) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Auth helper — admin idToken via Firebase custom token + REST exchange
+# ---------------------------------------------------------------------------
+
+_E2E_SIGNER_SA = (
+    "castro-crm-run@project-26fb9c99-8ee9-4179-aef.iam.gserviceaccount.com"
+)
+
+
+def mint_admin_id_token() -> tuple[str, str] | None:
+    """Retorna (id_token, admin_email) ou None se auth nao pode ser
+    estabelecida (skip com warning amarelo nos passos 6-7).
+
+    Cria custom token assinado pela SA do Cloud Run staging (precisa
+    iam.serviceAccountTokenCreator no usuario corrente) e troca por
+    idToken via REST. Evita BOOTSTRAP_ADMIN_PASSWORD (que nao existe —
+    admin loga via Google SSO)."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import firebase_admin
+    from firebase_admin import auth as fb_auth, credentials as fb_credentials
+
+    api_key = get_env_or_cloud_run("FIREBASE_WEB_API_KEY")
+    if not api_key:
+        print(_yellow("  [skip] FIREBASE_WEB_API_KEY indisponivel"))
+        return None
+    admin_email = get_env_or_cloud_run("BOOTSTRAP_ADMIN_EMAIL")
+    if not admin_email:
+        print(_yellow("  [skip] BOOTSTRAP_ADMIN_EMAIL indisponivel"))
+        return None
+
+    try:
+        e2e_app = firebase_admin.get_app("e2e_signer")
+    except ValueError:
+        e2e_app = firebase_admin.initialize_app(
+            credential=fb_credentials.ApplicationDefault(),
+            options={
+                "projectId": os.environ["FIRESTORE_PROJECT_ID"],
+                "serviceAccountId": _E2E_SIGNER_SA,
+            },
+            name="e2e_signer",
+        )
+
+    try:
+        user = fb_auth.get_user_by_email(admin_email, app=e2e_app)
+    except Exception as exc:
+        print(_yellow(f"  [skip] get_user_by_email falhou: {exc}"))
+        return None
+    try:
+        custom_token = fb_auth.create_custom_token(
+            user.uid,
+            developer_claims={"tenant_id": "hubloc"},
+            app=e2e_app,
+        )
+    except Exception as exc:
+        print(_yellow(
+            f"  [skip] create_custom_token falhou: {exc}\n"
+            "         (usuario corrente precisa de roles/iam.serviceAccountTokenCreator "
+            f"em {_E2E_SIGNER_SA})"
+        ))
+        return None
+    if isinstance(custom_token, bytes):
+        custom_token = custom_token.decode("utf-8")
+
+    url = (
+        "https://identitytoolkit.googleapis.com/v1/accounts:"
+        f"signInWithCustomToken?key={api_key}"
+    )
+    body = json.dumps({"token": custom_token, "returnSecureToken": True}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(_yellow(
+            f"  [skip] signInWithCustomToken falhou: {e.code} "
+            f"{e.read().decode('utf-8', 'ignore')}"
+        ))
+        return None
+    return payload["idToken"], admin_email
+
+
+def http_post_authed(path: str, id_token: str, body: dict | None = None) -> tuple[int, dict | str]:
+    url = STAGING_URL + path
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {id_token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
+def http_get_authed(path: str, id_token: str) -> tuple[int, dict | str]:
+    url = STAGING_URL + path
+    req = urllib.request.Request(
+        url, method="GET",
+        headers={"Authorization": f"Bearer {id_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
+def http_post_cron(path: str, cron_secret: str, body: dict | None = None) -> tuple[int, dict | str]:
+    """POST sem Firebase auth, com header X-Cron-Secret (Fase 2.10.3)."""
+    url = STAGING_URL + path
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Cron-Secret": cron_secret,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
+# ---------------------------------------------------------------------------
 # Firestore helpers (lazy import — depende do path)
 # ---------------------------------------------------------------------------
 
@@ -18006,12 +19405,16 @@ def get_clients():
 # ---------------------------------------------------------------------------
 
 def step_wipe(c) -> None:
-    print(_bold("\n[1/5] Wipe do tenant hubloc + canais fake"))
+    print(_bold("\n[1/9] Wipe do tenant hubloc + canais fake"))
     client = c["client"]
     coll_name = c["coll_name"]
+    utcnow = c["utcnow"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
 
-    counts = {"contacts": 0, "conversations": 0, "messages": 0, "transfer_log": 0, "channels_fake": 0}
+    counts = {
+        "contacts": 0, "conversations": 0, "messages": 0,
+        "transfer_log": 0, "channels_fake": 0, "usage_current_month": 0,
+    }
 
     for sub in ("wa_contacts", "wa_conversations", "wa_messages", "wa_transfer_log"):
         for snap in hubloc.collection(sub).stream():
@@ -18025,13 +19428,25 @@ def step_wipe(c) -> None:
             snap.reference.delete()
             counts["channels_fake"] += 1
 
+    # Limpa apenas usage_{YYYY_MM} do mes corrente (Fase 2.10.4) pra
+    # garantir contagem deterministica do passo 8. Daily docs (usados
+    # pelo dashboard de auditoria existente) sao preservados.
+    year_month = utcnow().strftime("%Y-%m")
+    try:
+        usage_ref = hubloc.collection("audit_metrics").document(f"usage_{year_month}")
+        if usage_ref.get().exists:
+            usage_ref.delete()
+            counts["usage_current_month"] = 1
+    except Exception as exc:
+        print(f"  aviso: falha ao limpar usage_{year_month}: {exc}")
+
     for k, v in counts.items():
         print(f"  removidos {k}: {v}")
     print(_green("  ✓ wipe completo"))
 
 
 def step_create_channels(c) -> None:
-    print(_bold("\n[2/5] Criando 2 canais ficticios para teste"))
+    print(_bold("\n[2/9] Criando 2 canais ficticios para teste"))
     utcnow = c["utcnow"]
     flat_doc = c["flat_doc"]
 
@@ -18078,7 +19493,7 @@ def step_create_channels(c) -> None:
 
 
 def step_wait_cache():
-    print(_bold("\n[3/5] Aguardando 70s para cache de canais reciclar no Cloud Run"))
+    print(_bold("\n[3/9] Aguardando 70s para cache de canais reciclar no Cloud Run"))
     print(f"  cache TTL = 60s; aguardamos um pouco a mais...")
     for remaining in range(70, 0, -10):
         print(f"  {remaining}s...", end="\r")
@@ -18136,7 +19551,7 @@ def make_payload(phone_number_id: str, wa_id: str, profile_name: str, msg_id: st
 
 
 def step_send_webhooks(secret: str) -> None:
-    print(_bold("\n[4/5] Disparando 4 webhooks Meta-shape"))
+    print(_bold("\n[4/9] Disparando 4 webhooks Meta-shape"))
     wa_x = "5531777771111"
     wa_y = "5531777772222"
 
@@ -18159,7 +19574,7 @@ def step_send_webhooks(secret: str) -> None:
 
 
 def step_verify(c) -> int:
-    print(_bold("\n[5/5] Verificando estado final no Firestore"))
+    print(_bold("\n[5/9] Verificando estado final dos webhooks no Firestore"))
     coll_name = c["coll_name"]
     client = c["client"]
     hubloc = client.collection(coll_name("tenants")).document("hubloc")
@@ -18219,6 +19634,224 @@ def step_verify(c) -> int:
     return 0
 
 
+def _conv_doc(c, conv_id: str):
+    coll_name = c["coll_name"]
+    client = c["client"]
+    return (client.collection(coll_name("tenants")).document("hubloc")
+                  .collection("wa_conversations").document(conv_id).get())
+
+
+def step_post_mark_read(c, id_token: str) -> int:
+    """Cutover Fase 2C: POST /api/wa/conversation/{id}/read marca leitura
+    de uma thread especifica e nao das outras do mesmo contato."""
+    print(_bold("\n[6/9] POST /api/wa/conversation/{id}/read (cutover Fase 2C)"))
+    coll_name = c["coll_name"]
+    client = c["client"]
+    hubloc = client.collection(coll_name("tenants")).document("hubloc")
+
+    target_conv = "100__5531777771111"
+
+    before_target = (_conv_doc(c, target_conv).to_dict() or {}).get("unread_count")
+    before_other_x = (_conv_doc(c, "200__5531777771111").to_dict() or {}).get("unread_count")
+    before_y = (_conv_doc(c, "200__5531777772222").to_dict() or {}).get("unread_count")
+    print(f"  antes: {target_conv}.unread={before_target}, "
+          f"200__X.unread={before_other_x}, 200__Y.unread={before_y}")
+
+    status, payload = http_post_authed(f"/api/wa/conversation/{target_conv}/read", id_token)
+    if status != 200:
+        print(_red(f"  ✗ POST retornou {status}: {payload}"))
+        return 1
+    print(f"  ✓ POST status=200 payload={payload}")
+
+    after_target = (_conv_doc(c, target_conv).to_dict() or {}).get("unread_count")
+    after_other_x = (_conv_doc(c, "200__5531777771111").to_dict() or {}).get("unread_count")
+    after_y = (_conv_doc(c, "200__5531777772222").to_dict() or {}).get("unread_count")
+    print(f"  depois: {target_conv}.unread={after_target}, "
+          f"200__X.unread={after_other_x}, 200__Y.unread={after_y}")
+
+    failures = []
+    if after_target != 0:
+        failures.append(f"{target_conv}.unread esperado=0 obtido={after_target}")
+    if after_other_x != before_other_x:
+        failures.append(f"200__X.unread mudou (esperado {before_other_x} estavel, obtido {after_other_x})")
+    if after_y != before_y:
+        failures.append(f"200__Y.unread mudou (esperado {before_y} estavel, obtido {after_y})")
+
+    # mensagens inbound da thread alvo devem estar status=read; das outras
+    # threads do MESMO contato (200__X) devem manter received.
+    msgs = list(hubloc.collection("wa_messages").stream())
+    for s in msgs:
+        d = s.to_dict() or {}
+        if d.get("direction") != "inbound":
+            continue
+        conv = d.get("conversation_id")
+        st = d.get("status")
+        if conv == target_conv and st != "read":
+            failures.append(f"msg {d.get('id')} ({conv}) esperado read, obtido {st}")
+        if conv == "200__5531777771111" and st == "read":
+            failures.append(f"msg {d.get('id')} ({conv}) virou read sem solicitacao (cross-channel leak!)")
+
+    if failures:
+        print(_red("  ✗ FALHAS:"))
+        for f in failures:
+            print(_red(f"    - {f}"))
+        return 1
+    print(_green("  ✓ mark-read isolado por thread"))
+    return 0
+
+
+def step_post_send_validation(c, id_token: str) -> int:
+    """Cutover Fase 2C: POST /api/wa/send com conversation_id inexistente
+    deve retornar 404, provando que _resolve_send_target rejeita antes de
+    chamar Meta. Caminho feliz nao testado (canais fake, tokens fake)."""
+    print(_bold("\n[7/9] POST /api/wa/send com conversation_id invalido (cutover Fase 2C)"))
+
+    bad_conv = "9999__inexistente"
+    status, payload = http_post_authed(
+        "/api/wa/send", id_token,
+        {"conversation_id": bad_conv, "content": "ignored"},
+    )
+    print(f"  POST conversation_id={bad_conv} -> status={status}")
+    if status != 404:
+        print(_red(f"  ✗ esperado 404, obtido {status}: {payload}"))
+        return 1
+
+    # Tambem valida que sem nem conversation_id nem contact_id retorna 4xx
+    status2, payload2 = http_post_authed(
+        "/api/wa/send", id_token, {"content": "no target"},
+    )
+    print(f"  POST sem target -> status={status2}")
+    if status2 not in (400, 422):
+        print(_red(f"  ✗ esperado 400/422, obtido {status2}: {payload2}"))
+        return 1
+
+    print(_green("  ✓ _resolve_send_target rejeita antes de chegar em Meta"))
+    return 0
+
+
+def step_validate_usage(c, id_token: str) -> int:
+    """Fase 2.10.4: usage_{YYYY_MM} per-tenant.
+
+    Apos os 4 webhooks inbound (passo 4), espera:
+      tenants/hubloc/audit_metrics/usage_{YYYY-MM}.inbound_received >= 4
+    Tambem exercita GET /api/wa/usage/current-month e compara.
+    """
+    print(_bold("\n[8/9] Validando usage_{YYYY_MM} per-tenant (Fase 2.10.4)"))
+    coll_name = c["coll_name"]
+    client = c["client"]
+    utcnow = c["utcnow"]
+    year_month = utcnow().strftime("%Y-%m")
+    doc_id = f"usage_{year_month}"
+    hubloc = client.collection(coll_name("tenants")).document("hubloc")
+
+    snap = hubloc.collection("audit_metrics").document(doc_id).get()
+    if not snap.exists:
+        print(_red(f"  ✗ doc {doc_id} nao existe em tenants/hubloc/audit_metrics"))
+        return 1
+    data = snap.to_dict() or {}
+    inbound = int(data.get("inbound_received") or 0)
+    free_form = int(data.get("free_form_sent") or 0)
+    templates = data.get("templates_sent") or {}
+    media_bytes = int(data.get("media_uploaded_bytes") or 0)
+    print(f"  doc:           tenants/hubloc/audit_metrics/{doc_id}")
+    print(f"  month:         {data.get('month')}")
+    print(f"  inbound_received={inbound}, free_form_sent={free_form}, "
+          f"media_uploaded_bytes={media_bytes}")
+    print(f"  templates_sent: {templates}")
+
+    failures = []
+    if inbound < 4:
+        failures.append(f"inbound_received esperado>=4 obtido={inbound}")
+    elif inbound > 4:
+        print(_yellow(
+            f"  [warn] inbound_received={inbound} (esperado=4) — provavel "
+            "trafego paralelo no staging entre wipe e e2e"
+        ))
+    if data.get("month") != year_month:
+        failures.append(f"month esperado={year_month} obtido={data.get('month')}")
+
+    # Tambem exercita o endpoint REST
+    status, payload = http_get_authed("/api/wa/usage/current-month", id_token)
+    if status != 200:
+        failures.append(f"GET /api/wa/usage/current-month status={status} payload={payload}")
+    else:
+        api_inbound = int((payload or {}).get("inbound_received") or 0)
+        if api_inbound != inbound:
+            failures.append(
+                f"GET retornou inbound_received={api_inbound}, Firestore={inbound}"
+            )
+        print(f"  GET /api/wa/usage/current-month -> 200 inbound={api_inbound}")
+
+    if failures:
+        print(_red("  ✗ FALHAS:"))
+        for f in failures:
+            print(_red(f"    - {f}"))
+        return 1
+    print(_green("  ✓ usage_{YYYY_MM} consistente com webhooks disparados"))
+    return 0
+
+
+def step_cron_health_check(c) -> int:
+    """Fase 2.10.3: cron health-check.
+
+    POST /api/internal/cron/health-check com header X-Cron-Secret. Itera
+    tenants ativos, grava tenants/{tid}/health_status/current. Valida
+    estrutura do doc do hubloc apos a chamada.
+    """
+    print(_bold("\n[9/9] POST /api/internal/cron/health-check (Fase 2.10.3)"))
+    cron_secret = get_env_or_cloud_run("INTERNAL_CRON_SECRET")
+    if not cron_secret:
+        print(_yellow(
+            "  [skip] INTERNAL_CRON_SECRET indisponivel no Cloud Run env nem local. "
+            "Defina via gcloud run services update castro-crm-staging "
+            "--update-env-vars INTERNAL_CRON_SECRET=..."
+        ))
+        return 0  # skip nao falha
+
+    status, payload = http_post_cron("/api/internal/cron/health-check", cron_secret)
+    if status != 200:
+        print(_red(f"  ✗ POST status={status} payload={payload}"))
+        return 1
+    print(f"  ✓ POST status=200 tenants_processed={payload.get('tenants_processed')}")
+    print(f"  summary: {payload.get('summary')}")
+
+    coll_name = c["coll_name"]
+    client = c["client"]
+    hubloc = client.collection(coll_name("tenants")).document("hubloc")
+    snap = hubloc.collection("health_status").document("current").get()
+    if not snap.exists:
+        print(_red("  ✗ tenants/hubloc/health_status/current nao existe pos-cron"))
+        return 1
+    data = snap.to_dict() or {}
+    channels_total = int(data.get("channels_total") or 0)
+    per_channel = data.get("per_channel") or []
+    print(f"  doc tenants/hubloc/health_status/current:")
+    print(f"    channels_total={channels_total}, "
+          f"channels_pending_payment={data.get('channels_pending_payment')}, "
+          f"tokens_expiring_soon={data.get('tokens_expiring_soon')}")
+    for ch in per_channel:
+        print(f"    channel_id={ch.get('channel_id')} type={ch.get('channel_type')} "
+              f"status={ch.get('payment_method_status')} error={ch.get('error') or '-'}")
+
+    failures = []
+    if channels_total < 2:
+        failures.append(
+            f"channels_total esperado>=2 (canais e2e 100/200) obtido={channels_total}"
+        )
+    if not per_channel:
+        failures.append("per_channel vazio")
+    if not data.get("checked_at"):
+        failures.append("checked_at ausente")
+
+    if failures:
+        print(_red("  ✗ FALHAS:"))
+        for f in failures:
+            print(_red(f"    - {f}"))
+        return 1
+    print(_green("  ✓ health_status gravado com per_channel coerente"))
+    return 0
+
+
 def main() -> int:
     print(_bold(f"E2E test against {STAGING_URL}"))
     secret = get_app_secret()
@@ -18232,12 +19865,338 @@ def main() -> int:
     step_wait_cache()
     step_send_webhooks(secret)
     rc = step_verify(c)
+    if rc != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passos 1-5)")))
+        return rc
 
-    if rc == 0:
-        print(_green(_bold("\n✓ E2E PASSED")))
+    auth = mint_admin_id_token()
+    if auth is None:
+        print(_yellow(_bold("\n⚠ Passos 6-7 pulados (auth indisponivel) — passos 1-5 OK")))
+        print(_green(_bold("\n✓ E2E PASSED (parcial)")))
+        return 0
+    id_token, admin_email = auth
+    print(_bold(f"\nAuth: idToken obtido para {admin_email}"))
+
+    rc6 = step_post_mark_read(c, id_token)
+    if rc6 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 6 mark-read)")))
+        return rc6
+
+    rc7 = step_post_send_validation(c, id_token)
+    if rc7 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 7 send validation)")))
+        return rc7
+
+    rc8 = step_validate_usage(c, id_token)
+    if rc8 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 8 usage_{YYYY_MM})")))
+        return rc8
+
+    rc9 = step_cron_health_check(c)
+    if rc9 != 0:
+        print(_red(_bold("\n✗ E2E FAILED (passo 9 cron health-check)")))
+        return rc9
+
+    print(_green(_bold("\n✓ E2E PASSED")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## scripts/wipe_all_collections.py
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Wipe controlado de um tenant em ambiente staging/prod (Fase 4).
+
+Uso:
+    # Dry-run (default — nada e apagado, so mostra o plano):
+    python -m scripts.wipe_all_collections --tenant-id hubloc
+
+    # Wipe completo do tenant (preserva users/departments por default):
+    python -m scripts.wipe_all_collections --tenant-id hubloc --confirm
+
+    # Wipe total (incluindo users/operator_profiles/departments):
+    python -m scripts.wipe_all_collections --tenant-id hubloc --confirm --purge-users
+
+    # Wipe tambem os channels flat e phone_routing relacionados ao tenant:
+    python -m scripts.wipe_all_collections --tenant-id hubloc --confirm --purge-channels
+
+NUNCA apaga:
+- Doc raiz tenants/{tid} (preserva nome/plano/billing/settings).
+- Colecao tenants flat (lista de tenants).
+- _meta global (counters cross-tenant).
+- audit_log: por default e preservado tambem (LGPD: trilha de
+  auditoria sobrevive ao wipe). Use --purge-audit-log se realmente
+  quiser apagar.
+
+Variaveis de ambiente:
+    FIRESTORE_PROJECT_ID         (obrigatorio)
+    FIRESTORE_COLLECTION_PREFIX  (obrigatorio, default castro_crm em prod)
+
+Confirmacao de seguranca: alem de --confirm, pede que o operador
+digite "WIPE" interativamente — protege contra rerun acidental em
+shell history ou CI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from typing import Callable
+
+# Permite rodar como `python -m scripts.wipe_all_collections` ou
+# `python scripts/wipe_all_collections.py`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from firestore_common import (  # noqa: E402
+    collection_name,
+    get_firestore_client,
+    global_collection,
+    tenant_doc_ref,
+)
+
+
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
+
+
+def _yellow(s: str) -> str:
+    return f"\033[33m{s}\033[0m"
+
+
+def _bold(s: str) -> str:
+    return f"\033[1m{s}\033[0m"
+
+
+# Subcolecoes preservadas por default (mesmo com --confirm). User pode
+# liberar via flags --purge-users / --purge-audit-log.
+DEFAULT_SKIP = frozenset()
+USER_PRESERVED = frozenset({"users", "operator_profiles", "departments"})
+AUDIT_PRESERVED = frozenset({"audit_log"})
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Wipe controlado de um tenant (Fase 4 cutover)."
+    )
+    p.add_argument(
+        "--tenant-id", required=True,
+        help="Slug do tenant a apagar (ex: hubloc).",
+    )
+    p.add_argument(
+        "--confirm", action="store_true",
+        help="Executa de fato. Sem isso, dry-run.",
+    )
+    p.add_argument(
+        "--purge-users", action="store_true",
+        help="Tambem apaga users/operator_profiles/departments. Default: preserva.",
+    )
+    p.add_argument(
+        "--purge-audit-log", action="store_true",
+        help="Tambem apaga audit_log. Default: preserva (LGPD).",
+    )
+    p.add_argument(
+        "--purge-channels", action="store_true",
+        help="Tambem apaga channels flat + phone_routing entries do tenant.",
+    )
+    p.add_argument(
+        "--no-interactive", action="store_true",
+        help="Pula confirmacao interativa 'WIPE' (uso em CI). Cuidado.",
+    )
+    return p.parse_args()
+
+
+def discover_tenant_subcollections(tid: str) -> list[str]:
+    """Lista subcolecoes que existem em tenants/{tid}/.
+
+    Usa list_subcollections do Admin SDK — retorna apenas as que tem
+    pelo menos 1 doc.
+    """
+    refs = list(tenant_doc_ref(tid).collections())
+    return sorted(c.id for c in refs)
+
+
+def count_docs(ref) -> int:
+    """Conta docs em uma colecao. Usa Aggregation (count) quando
+    disponivel, senao stream-count."""
+    try:
+        results = ref.count().get()
+        if results and results[0]:
+            value = results[0][0].value
+            return int(value) if value is not None else 0
+    except Exception:
+        pass
+    return sum(1 for _ in ref.stream())
+
+
+def recursive_delete_doc(doc_ref) -> int:
+    """Apaga um doc + todas suas subcolecoes recursivamente. Retorna
+    total de docs apagados (incluindo o proprio doc)."""
+    deleted = 0
+    for subcol in doc_ref.collections():
+        for snap in subcol.stream():
+            deleted += recursive_delete_doc(snap.reference)
+    doc_ref.delete()
+    deleted += 1
+    return deleted
+
+
+def batch_delete_collection(ref, batch_size: int = 200) -> int:
+    """Apaga todos os docs de uma colecao em batches. Trata subcolecoes
+    nested (recursive). Retorna total."""
+    total = 0
+    while True:
+        batch = list(ref.limit(batch_size).stream())
+        if not batch:
+            break
+        for snap in batch:
+            total += recursive_delete_doc(snap.reference)
+    return total
+
+
+def collect_flat_targets(
+    tenant_id: str, purge_channels: bool
+) -> list[tuple[str, Callable[[dict], bool], str]]:
+    """Retorna [(collection_name, predicate, description)] de colecoes flat
+    cuja exclusao depende do escopo do tenant."""
+    targets: list[tuple[str, Callable[[dict], bool], str]] = []
+    if purge_channels:
+        # Hoje channels eh single-tenant flat. Quando passar pra
+        # subcolecao, este predicate precisa ajustar.
+        targets.append((
+            "channels",
+            lambda d: True,
+            "todos os canais (single-tenant flat)",
+        ))
+        targets.append((
+            "phone_routing",
+            lambda d: d.get("tenant_id") == tenant_id,
+            f"entries de phone_routing apontando pra tenant_id={tenant_id}",
+        ))
+    return targets
+
+
+def main() -> int:
+    args = parse_args()
+    tid = args.tenant_id
+
+    project_id = os.environ.get("FIRESTORE_PROJECT_ID", "<unset>")
+    prefix = os.environ.get("FIRESTORE_COLLECTION_PREFIX", "<unset>")
+
+    print(_bold(f"\n=== WIPE TENANT: {tid} ==="))
+    print(f"  project={project_id}")
+    print(f"  prefix= {prefix}")
+    print(f"  modo:   {'CONFIRMED (vai apagar)' if args.confirm else 'DRY-RUN (nada apagado)'}")
+
+    # Verifica que o doc do tenant existe (sanity check)
+    tenant_ref = tenant_doc_ref(tid)
+    snap = tenant_ref.get()
+    if not snap.exists:
+        print(_red(f"\n  ✗ tenant '{tid}' nao existe no Firestore"))
+        print(_red(f"    path: {prefix}_tenants/{tid}"))
+        return 2
+    tdata = snap.to_dict() or {}
+    print(f"  tenant: name={tdata.get('name')!r} plan={tdata.get('plan')} active={tdata.get('is_active')}")
+
+    skip = set(DEFAULT_SKIP)
+    if not args.purge_users:
+        skip.update(USER_PRESERVED)
+    if not args.purge_audit_log:
+        skip.update(AUDIT_PRESERVED)
+
+    subcols = discover_tenant_subcollections(tid)
+    flat_targets = collect_flat_targets(tid, args.purge_channels)
+
+    # Plan output
+    print(_bold(f"\n=== PLANO ==="))
+    print(f"\nSubcolecoes em tenants/{tid}/:")
+    if not subcols:
+        print(f"  (nenhuma — tenant ja esta vazio)")
     else:
-        print(_red(_bold("\n✗ E2E FAILED")))
-    return rc
+        for sc in subcols:
+            ref = tenant_ref.collection(sc)
+            n = count_docs(ref)
+            marker = _yellow("[SKIP]") if sc in skip else _red("[WIPE]")
+            note = ""
+            if sc in USER_PRESERVED and not args.purge_users:
+                note = "  (use --purge-users)"
+            elif sc in AUDIT_PRESERVED and not args.purge_audit_log:
+                note = "  (use --purge-audit-log)"
+            print(f"  {marker} {sc:30s} {n:6d} docs{note}")
+
+    print(f"\nColecoes flat (escopo {tid}):")
+    if not flat_targets:
+        print(f"  (nenhuma — use --purge-channels pra incluir channels/phone_routing)")
+    else:
+        for col_name, predicate, desc in flat_targets:
+            try:
+                n = sum(
+                    1 for snap in global_collection(col_name).stream()
+                    if predicate(snap.to_dict() or {})
+                )
+            except Exception as exc:
+                print(f"  [WARN] count em {col_name}: {exc}")
+                n = -1
+            print(f"  {_red('[WIPE]')} {col_name:30s} {n:6d} docs — {desc}")
+
+    print(f"\nNUNCA apagado:")
+    print(f"  - Doc raiz tenants/{tid} (preservado)")
+    print(f"  - Colecao tenants flat (preservada)")
+    print(f"  - _meta global (preservado)")
+
+    if not args.confirm:
+        print(_yellow(_bold("\n[DRY-RUN] Nada foi apagado. Use --confirm para executar.")))
+        return 0
+
+    if not args.no_interactive:
+        print(_red(_bold(
+            f"\n!!! ATENCAO !!!\n"
+            f"Esta operacao apaga PERMANENTEMENTE os dados acima do tenant '{tid}'\n"
+            f"em {prefix} (project {project_id}). NAO HA UNDO.\n"
+        )))
+        print("Digite 'WIPE' (em maiusculas, sem aspas) pra confirmar:")
+        try:
+            answer = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer != "WIPE":
+            print(_yellow("\nCancelado pelo operador."))
+            return 1
+
+    # Execute
+    print(_bold(f"\n=== EXECUTANDO ==="))
+    grand_total = 0
+    for sc in subcols:
+        if sc in skip:
+            continue
+        ref = tenant_ref.collection(sc)
+        deleted = batch_delete_collection(ref)
+        grand_total += deleted
+        print(f"  apagado tenants/{tid}/{sc}: {deleted} docs")
+
+    for col_name, predicate, desc in flat_targets:
+        deleted = 0
+        for snap in global_collection(col_name).stream():
+            if predicate(snap.to_dict() or {}):
+                snap.reference.delete()
+                deleted += 1
+        grand_total += deleted
+        print(f"  apagado {col_name}: {deleted} docs")
+
+    print(_green(_bold(
+        f"\n✓ Wipe completo. Total apagado: {grand_total} docs.\n"
+        f"  Tenant doc tenants/{tid} preservado."
+    )))
+    return 0
 
 
 if __name__ == "__main__":

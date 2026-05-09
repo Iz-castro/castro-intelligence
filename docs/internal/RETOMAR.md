@@ -111,10 +111,129 @@ Secret Manager (`castro-crm-internal-cron-secret:latest`) — fallback
 pra e2e/CI que continuam usando header `X-Cron-Secret`. Backend aceita
 ambos via `_verify_cron_auth` (precedence: OIDC primeiro).
 
-**Produção:** intocada (`castro-crm`, `00077-qls`). Aguardando aprovação
-Meta App Review pra cutover prod (Fase 4). Cloud Scheduler prod
-**ainda não criado** — comandos OIDC + Secret Manager documentados em
-`docs/deploy/RUNBOOK_CUTOVER_PROD.md` §6.
+**Produção:** revision `castro-crm-00082-tm6` ativa (deploy de hoje
+com cleanup business_management + fix nono dígito + fix httpx timeout
++ fix get_send_credentials). Cutover Fase 4 **executado parcialmente
+hoje** (wipe tenant hubloc preservando users/audit_log + reonboarding
+canal coex via Embedded Signup com Advanced Access). Cloud Scheduler
+prod **ainda não criado** — comandos OIDC + Secret Manager
+documentados em `docs/deploy/RUNBOOK_CUTOVER_PROD.md` §6.
+
+---
+
+## Status do Plano Coexistence — o que falta
+
+Referência: [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md).
+
+### Fase 1 — Embed Signup Fixes ✅ Concluída e validada
+- 1.1-1.6 todas as fixes do plano original ✓
+- **+ 4 bugs adicionais fixados em 2026-05-08** (nono dígito BR, httpx
+  timeout no subscribe_apps, channel resolution stale, firestore.rules
+  prod). Embedded Signup completou end-to-end em prod com sucesso.
+
+### Fase 2 — Multi-Tenant + Sub-Threads (Backend) ✅ Concluída
+- 2.1 Modelo Firestore subcoleções `tenants/{tid}/*` ✓
+- 2.2 helpers `tenant_path/tenant_collection/tenant_document` ✓
+- 2.3 `database_firestore.py` refatorado com `tenant_id` ✓
+- 2.4 endpoints com `conversation_id` canônico ✓
+- 2.5 webhook multi-tenant + `phone_routing` global ✓
+- 2.6 `bot_service` per-conversation ✓
+- 2.7 Firebase Auth custom claims (`tenant_id`, `role`) ✓
+- 2.8 `firestore.indexes.json` ✓
+- **2.9 `firestore.rules` ⚠️ PARCIAL** — permissivas via `emailAllowed()`
+  em prod e staging. Rules estritas via custom claim `tenant_id` foram
+  WIP em staging mas falhavam no snapshot `wa_messages`; preservadas em
+  [`firestore-rules-staging-strict.wip`](firestore-rules-staging-strict.wip).
+  Investigação retomada **só após** estabilizar fluxo principal.
+- 2.10 Billing & Onboarding awareness:
+  - 2.10.1 `GET /api/wa/channel/{id}/billing-status` ✓
+  - 2.10.2 tradução erros Meta → 402 ✓ (commit `b15268a`)
+  - 2.10.3 Cron health-check ✓ em staging (OIDC + Secret Manager).
+    **Pendente: criar Cloud Scheduler em prod** (mesmo pattern, comandos
+    em `RUNBOOK_CUTOVER_PROD.md` §6).
+  - 2.10.4 `usage_{YYYY_MM}` per-tenant + endpoints ✓
+
+### Fase 3 — Frontend ⚠️ PARCIAL
+- 3.1-3.4 backend mudanças refletidas no frontend (types, context,
+  App.tsx, normalization) ✓
+- **3.5 Onboarding & Billing UI ⚠️ FALTA quase tudo:**
+  - `<BillingHealthBanner/>` — **parcial** (versão básica existe; falta
+    o `<TenantHealthBanner/>` mais informativo lendo
+    `tenants/{tid}/health_status` via snapshot)
+  - **`/setup` checklist (admin) — FALTA** (CONTA / WHATSAPP /
+    PAGAMENTO / OPERADORES / TEMPLATES com tooltips e estados)
+  - **Modal de erro 402 no envio de template — FALTA** (link pro
+    Business Manager Meta)
+  - **Card "Uso este mês" no dashboard — FALTA** (consome
+    `GET /api/wa/usage/current-month`)
+  - **Gráfico histórico (opcional) — FALTA** (consome
+    `/api/wa/usage/history?months=6`)
+  - Frontend passa `template_category` em send-template — **FALTA**
+    (backend já aceita; basta repassar do `/api/wa/templates`)
+
+### Fase 4 — Wipe + Validação End-to-End ⚠️ EM ANDAMENTO
+- 1. Deploy staging ✓
+- 2. Validação staging (e2e 9/9 PASSED) ✓
+- 3. Deploy prod ✓ (`00082-tm6`)
+- 4. **Wipe Firestore prod ✓ parcial** — feito hoje 2026-05-08
+  preservando `users` (3), `operator_profiles` (3), `departments` (4),
+  `audit_log` (655). Apagou 58 docs (canais, contatos, conversations,
+  mensagens, audit_metrics, _meta tenant).
+- 5. Bootstrap tenant hubloc ✓ (preservado pelo wipe)
+- 6. Reonboarding canal coex via Embedded Signup ✓ (canal #2 ativo,
+  WABA `680503338460083`, Castro Operações)
+- **6.b Validações end-to-end pendentes:**
+  - Mensagem inbound webhook → conversation ✓ validado
+  - `_resolve_channel_creds` usa `conversation.channel_id` ✓ FIXADO
+    hoje (commit `1fe7379` com refresh sincrono pra cache stale)
+  - **Mesmo wa_id em standard + coex como 2 entradas distintas
+    ⏸️ NÃO TESTADO** (prod só tem coex agora, sem standard real
+    operando)
+  - **Bulk reassign exclui canais coex onde owner=user X
+    ⏸️ NÃO TESTADO**
+  - **UI badge de canal correto em cada linha ⏸️ NÃO TESTADO**
+  - **Painel de perfil unificado (mesmo cliente em múltiplas threads)
+    ⏸️ NÃO TESTADO**
+  - **Auditoria `sender_user_id != channel_owner_user_id` em
+    transferência ⏸️ NÃO TESTADO**
+  - **Isolamento multi-tenant (rules + backend filter) ⏸️ NÃO TESTADO**
+    — rules atuais são permissivas via `emailAllowed`; isolamento real
+    depende do bloco 2.9 ser concluído.
+- 7. **History sync via webhook `history` ⏸️ AGUARDANDO META** —
+  signup com "Compartilhar todas as conversas" foi 2026-05-08 19:47;
+  até fim do dia 0 events `[HISTORY]` chegaram. Janela oficial até 24h.
+  Se até 2026-05-09 19:47 não chegar nada: support ticket Meta.
+
+### Pós-Fase 4 / Roadmap futuro
+
+Itens registrados no plano que ficam pra depois:
+- Onboarding self-service de novo tenant (super-admin UI)
+- Self-service signup cliente (landing → cartão → tenant criado)
+- Billing automation (Stripe/Asaas/Iugu pra mensalidade SaaS)
+- White-label (sub-domínio próprio do tenant)
+- Cross-tenant analytics (super-admin Castro Intelligence)
+- Backup/export per-tenant (recursive export pra compliance LGPD)
+- Limites enforced por plano (Starter 5k msg/mês com block)
+- UI dedicada "Importar últimos 6 meses" (já que `history` webhook
+  funciona, falta só apresentar pro usuário)
+
+### Pendências operacionais (fora do plano, descobertas hoje)
+- **`bootstrap_default_channel` recria canal #N standard a cada deploy**
+  (lê `WHATSAPP_PHONE_NUMBER_ID`/`WHATSAPP_WABA_ID` env). Solução:
+  limpar essas env vars do Cloud Run prod quando confirmarmos que canal
+  legado não é mais necessário.
+- **UI exibe `WHATSAPP_TOKEN` em texto** no modal "Conexão realizada"
+  (resíduo single-tenant). Token vai pro Firestore registry —
+  exposição desnecessária. Substituir por "Token salvo. Canal pronto."
+- **SA prod sem permissão IAM `auth.get_user`** → spam de
+  `INSUFFICIENT_PERMISSION` nos logs. Não-fatal (cai em fallback) mas
+  polui logs. Adicionar role `roles/firebase.admin` ou similar.
+- **Frontend faz polling agressivo em `/api/wa/channel/{id}/billing-status`**
+  (~1 req/s). Deveria ter backoff em erro repetido.
+- **`next_sequence("channels")` reusa IDs em alguns cenários** (ver
+  task #52). Risco baixo agora, mas corrigir antes de cliente #2.
+
+---
 
 ## Validação — todos os 9 passos do e2e PASSED
 
