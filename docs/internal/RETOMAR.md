@@ -1,22 +1,64 @@
-# Contexto pra retomar — Coexistence completo em prod com history sincronizado
+# Contexto pra retomar — Coexistence completo + contact picker com agenda do telefone
 
-> Snapshot atualizado em 2026-05-09 (madrugada do dia 10) após sessão
-> longa que (a) achou e fixou 5 bugs reais no caminho de
-> `conversation_id`, (b) introduziu sistema novo `pending_webhook_events`
-> pra zero perda, (c) wipe + reonboarding coex em prod, (d) cleanup
-> de 3 perms não-usadas na Meta + republish, (e) **descobriu gap
-> crítico: history sync precisava de `POST /smb_app_data` explícito**
-> — implementado auto-trigger no signup + endpoint admin de retrigger,
-> (f) ordenação de mensagens migrou de `created_at` pra `timestamp_wa`
-> (real), (g) **history sincronizou com sucesso: 7 contatos + 56
-> mensagens importadas e exibindo cronologicamente certas no CRM**.
+> Snapshot atualizado em 2026-05-11 (noite). Sessao de hoje resolveu
+> UX da sidebar apos o `smb_app_state_sync` ter sincronizado 160
+> contatos da agenda do dono e poluido a lista com 155 conversations
+> vazias. Introduzido **contact picker** (icone de agenda) com cache
+> em memoria LGPD-safe + endpoint pra materializar conversation
+> on-demand. Histórico anterior preservado abaixo.
 > Quando voltar, leia este arquivo primeiro, depois
-> [2026-05-09.md](2026-05-09.md) (sessão de hoje),
+> [2026-05-11.md](2026-05-11.md) (sessão mais recente),
+> [2026-05-09.md](2026-05-09.md) (history sync + bugs conversation_id),
 > [2026-05-08.md](2026-05-08.md) §5 (sessão da tarde),
 > [2026-05-06.md](2026-05-06.md) e
 > [2026-05-05.md](2026-05-05.md) pra detalhe cronológico, ou
 > [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md)
 > pra detalhe arquitetural.
+
+## Sessao 2026-05-11 — Contact picker com agenda do telefone
+
+**Problema:** `smb_app_state_sync` sincronizava 160 contatos da agenda
+e o `upsert_wa_contact` cascateava em `upsert_wa_conversation` criando
+155 conversations VAZIAS com `last_message_at=now`. Sidebar (orderBy
+last_message_at desc + limit 50) empurrava as 5 reais do history pra
+fora da janela.
+
+**Fixes (commit `c4c9632`):**
+- `upsert_wa_contact` aceita `from_message_event=False` — state_sync
+  agora cria contato sem conversation e sem `last_message_at`
+- Backfill ja executado em prod: 155 convs vazias deletadas, 155
+  contatos com `last_message_at` zerado
+- Endpoint `GET /api/wa/contacts/all?q=` lista todos os contatos
+  ordenados alfabeticamente (independente do snapshot de 50)
+- Endpoint `POST /api/wa/conversation/open` materializa conversation
+  on-demand quando operador clica num contato da agenda
+- Modal `NewContactModal` reformulado: header "Total de contatos (N)" +
+  busca + lista alfabetica + botao "+ Novo contato" (que abre o form
+  original)
+- Botao `+` virou icone de agenda (`AddressBookIcon`)
+- Sidebar header ganha sub-linha "Y contatos cadastrados"
+- Cache em memoria do contact picker (sem localStorage — LGPD-safe).
+  Pre-aquecido pelo effect do `ContactList`, busca filtra local
+- Fix race condition do auto-select: insercao otimista da conversation
+  no estado antes do `setSelectedThreadId` (sem isso o effect resetava
+  a selecao pra primeira conv ate o snapshot Firestore propagar)
+
+**Revisao prod ativa apos hoje:** `castro-crm-00090-bmb`.
+
+Ver detalhes em [2026-05-11.md](2026-05-11.md).
+
+## Sessao 2026-05-09 — History sync + bugs conversation_id
+
+Snapshot anterior (2026-05-09 madrugada do dia 10) após sessão longa
+que (a) achou e fixou 5 bugs reais no caminho de
+`conversation_id`, (b) introduziu sistema novo `pending_webhook_events`
+pra zero perda, (c) wipe + reonboarding coex em prod, (d) cleanup
+de 3 perms não-usadas na Meta + republish, (e) **descobriu gap
+crítico: history sync precisava de `POST /smb_app_data` explícito**
+— implementado auto-trigger no signup + endpoint admin de retrigger,
+(f) ordenação de mensagens migrou de `created_at` pra `timestamp_wa`
+(real), (g) **history sincronizou com sucesso: 7 contatos + 56
+mensagens importadas e exibindo cronologicamente certas no CRM**.
 
 ## Onde paramos
 
@@ -43,8 +85,9 @@ templates — tudo destravado pra clientes externos.
 - Webhook subscription confirmada via `GET /{waba}/subscribed_apps`
   (resposta direta da Meta lista nosso app + URL do CRM)
 
-**Revision prod ativa:** `castro-crm-00087-mkc` em 100% (3 deploys
-hoje: `00085-qxp` → `00086-kkn` → `00087-mkc`).
+**Revision prod ativa:** `castro-crm-00090-bmb` em 100% (sessao de 5/11
+fez 3 deploys: `00088-f5r` → `00089-n5m` → `00090-bmb`; sessao de 5/9
+tinha fechado em `00087-mkc`).
 
 **5 bugs reais do `conversation_id` fixados em 2026-05-09** (ver
 [2026-05-09.md §1-2](2026-05-09.md)):
@@ -673,16 +716,16 @@ Após `jobs run`, validar com:
   `southamerica-east1` — schedule `0 9 * * *` (09:00 BRT diário), state
   ENABLED. **Prod ainda não criado.**
 
-### Snapshot Firestore prod pós-history sync 5/9
+### Snapshot Firestore prod apos sessao 5/11
 
 ```
 tenants/hubloc/
   users (2)               — rafaluisc, izaeldecastro
   operator_profiles (2)
   departments (4)         — Geral, Vendas, Suporte, ...
-  audit_log (95+)         — LOGIN_SUCCESS_FIREBASE + history_sync_complete
-  wa_contacts (7)         — Rafael, Flavio Cpap, +447710..., 4 outros BR
-  wa_conversations (6)    — uma por wa_id, todas no canal coex id=1
+  audit_log               — LOGIN_SUCCESS + history_sync_complete + WA_CONVERSATION_OPEN
+  wa_contacts (160)       — 5 com conversas reais + 155 da agenda do telefone (state_sync)
+  wa_conversations (5)    — so com mensagens; agenda nao polui mais (5/11 fix)
   wa_messages (56)        — history importado + testes; ordenadas por timestamp_wa real
 
 (global/flat)
