@@ -753,7 +753,8 @@ def mark_wa_conversation_read_by_id(conversation_id):
 
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
-                      auto_assign_user_id=None):
+                      auto_assign_user_id=None,
+                      from_message_event=True):
     """Cria ou atualiza um contato WhatsApp.
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
@@ -762,15 +763,25 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     Normaliza o nono digito BR e busca tambem variantes (com/sem '9')
     como defesa em profundidade contra callers que esquecam de
     normalizar.
+
+    `from_message_event=True` (default): caller veio de evento real de
+    mensagem (_process_messages, _process_smb_message_echoes,
+    _process_history). Atualiza `last_message_at`/`last_inbound_at` e
+    cria/atualiza a `wa_conversation` correspondente.
+
+    `from_message_event=False`: caller e o `_process_smb_app_state_sync`
+    (sincronizacao da agenda telefonica do dono). Nao popula timestamps
+    de mensagem nem cria conversation — contato fica disponivel pra
+    busca/seleção, mas só vira thread quando houver mensagem real.
     """
     wa_id = normalize_br_phone(wa_id)
     now = utcnow()
     existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
-        updates = {
-            "last_message_at": now,
-            "last_inbound_at": now,
-        }
+        updates = {}
+        if from_message_event:
+            updates["last_message_at"] = now
+            updates["last_inbound_at"] = now
         # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
         # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
         # webhook chegou com 13-dig), o doc fica preso na forma antiga e
@@ -815,9 +826,11 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             existing = dict(existing)
             existing["wa_id"] = updates["wa_id"]
         # Garante que a conversation deste (channel, wa_id) tambem existe.
-        _maybe_upsert_conversation_for_existing_contact(
-            existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
-        )
+        # Pulado em state_sync — contato existe sem thread ate ter mensagem.
+        if from_message_event:
+            _maybe_upsert_conversation_for_existing_contact(
+                existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
+            )
         return existing["id"]
 
     phone_formatted = format_phone_br(wa_id)
@@ -828,7 +841,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "display_name": _resolve_display_name("", display_name, phone_formatted),
         "declared_name": "",
         "whatsapp_profile_name": display_name or "",
-        "created_source": "webhook",
+        "created_source": "webhook" if from_message_event else "state_sync",
         "created_by_user_id": None,
         "phone_formatted": phone_formatted,
         "profile_picture_url": "",
@@ -848,8 +861,11 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "is_archived": 0,
         "unread_count": 0,
         "first_seen_at": now,
-        "last_message_at": now,
-        "last_inbound_at": now,
+        # Timestamps de mensagem so populados quando vem de evento real.
+        # state_sync (agenda telefonica) deixa null pra contato nao aparecer
+        # no orderBy("last_message_at") da sidebar.
+        "last_message_at": now if from_message_event else None,
+        "last_inbound_at": now if from_message_event else None,
     }
     # Auto-atribuir para coexistence
     if auto_assign_user_id:
@@ -861,15 +877,18 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             if user.get("department_id"):
                 new_contact["department_id"] = user["department_id"]
     document("wa_contacts", contact_id).set(new_contact)
-    # Upsert conversation correspondente (Fase 2 — sub-threads por canal)
-    upsert_wa_conversation(
-        contact_id=contact_id,
-        wa_id=wa_id,
-        channel_id=channel_id,
-        source_channel_type=source_channel_type,
-        phone_number_id=phone_number_id,
-        auto_assign_user_id=auto_assign_user_id,
-    )
+    # Upsert conversation correspondente (Fase 2 — sub-threads por canal).
+    # Pulado em state_sync: thread so nasce com mensagem real, pra nao
+    # poluir sidebar com 165 contatos da agenda telefonica.
+    if from_message_event:
+        upsert_wa_conversation(
+            contact_id=contact_id,
+            wa_id=wa_id,
+            channel_id=channel_id,
+            source_channel_type=source_channel_type,
+            phone_number_id=phone_number_id,
+            auto_assign_user_id=auto_assign_user_id,
+        )
     return contact_id
 
 

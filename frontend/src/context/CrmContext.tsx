@@ -154,6 +154,12 @@ type CrmContextValue = {
   updateDeclaredName: (contact_id: number, declared_name: string) => Promise<void>;
   busyCreateContact: boolean;
 
+  // Contact picker — lista TODOS contatos do tenant (inclui state_sync da agenda).
+  // Cache em memoria do provider (zera no logout/fechar aba — LGPD-safe).
+  loadAllContacts: (q?: string) => Promise<{ contacts: Contact[]; total: number }>;
+  refreshAllContacts: () => Promise<void>;
+  openConversationForContact: (contact_id: number, channel_id?: number) => Promise<string | null>;
+
   // Message correction
   correctMessage: (messageId: number, newContent: string) => Promise<boolean>;
   correctionTarget: ChatMessage | null;
@@ -287,6 +293,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Fase 3: lista de conversations (sub-threads por canal). Mesmo wa_id em
   // dois canais aparece como duas entradas distintas.
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  // Cache em memoria de TODOS os contatos do tenant (inclui agenda
+  // sincronizada via smb_app_state_sync que nao aparece na sidebar).
+  // null = ainda nao carregado; array = carregado (mesmo se vazio).
+  // Zera junto com o provider (logout/refresh/aba fechada) — sem
+  // persistencia em localStorage por LGPD.
+  const [allContactsCache, setAllContactsCache] = useState<Contact[] | null>(null);
   const contactsById = useMemo(
     () => new Map<number, Contact>(contacts.map((c) => [c.id, c])),
     [contacts],
@@ -1424,6 +1436,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         if (exists) return prev.map(c => c.id === contact.id ? contact : c);
         return [contact, ...prev];
       });
+      // Invalida cache do contact picker — novo contato precisa
+      // aparecer no proximo open do modal.
+      setAllContactsCache(null);
       // Backend retorna conversation_id deterministico do contato manual
       // (Fase 3). Setamos a thread direto — o snapshot listener vai trazer
       // a Conversation logo em seguida.
@@ -1435,6 +1450,80 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       return contact;
     } catch (e) { setError(errorText(e)); return null; }
     finally { setBusyCreateContact(false); }
+  }
+
+  async function loadAllContacts(q?: string): Promise<{ contacts: Contact[]; total: number }> {
+    if (!bundle) return { contacts: [], total: 0 };
+    // Carrega a lista completa uma vez por sessao e cacheia em memoria.
+    // Busca subsequente filtra local sobre o cache (instantanea).
+    let cache = allContactsCache;
+    if (!cache) {
+      try {
+        const res = await getJson<{ contacts: Record<string, unknown>[]; total: number; returned: number }>(
+          bundle.auth, "/api/wa/contacts/all",
+        );
+        cache = (res.contacts || []).map((c) => normalizeContact(c, String(c.id)));
+        setAllContactsCache(cache);
+      } catch (e) {
+        setError(errorText(e));
+        return { contacts: [], total: 0 };
+      }
+    }
+    if (q && q.trim()) {
+      const needle = q.trim().toLowerCase();
+      const filtered = cache.filter((c) => (
+        (c.display_name || "").toLowerCase().includes(needle) ||
+        (c.declared_name || "").toLowerCase().includes(needle) ||
+        (c.whatsapp_profile_name || "").toLowerCase().includes(needle) ||
+        (c.wa_id || "").toLowerCase().includes(needle) ||
+        (c.phone_formatted || "").toLowerCase().includes(needle)
+      ));
+      return { contacts: filtered, total: cache.length };
+    }
+    return { contacts: cache, total: cache.length };
+  }
+
+  async function refreshAllContacts(): Promise<void> {
+    // Forca reload do cache. Util apos criar contato manual ou
+    // se admin sabe que houve sincronizacao nova.
+    setAllContactsCache(null);
+  }
+
+  async function openConversationForContact(contact_id: number, channel_id?: number): Promise<string | null> {
+    if (!bundle) return null;
+    try {
+      setError("");
+      const payload: Record<string, unknown> = { contact_id };
+      if (channel_id) payload.channel_id = channel_id;
+      const res = await sendJson(bundle.auth, "/api/wa/conversation/open", payload) as {
+        conversation_id: string; contact_id: number; channel_id: number;
+      };
+      // Insercao otimista no estado local pra evitar race com o snapshot
+      // listener. Sem isso, o auto-select effect (que reseta seleção
+      // quando selectedThreadId nao esta na lista de conversations)
+      // sobrescreve nossa selecao antes do snapshot Firestore propagar.
+      if (res.conversation_id) {
+        setConversations((prev) => {
+          if (prev.some((c) => c.id === res.conversation_id)) return prev;
+          const optimistic = normalizeConversation({
+            id: res.conversation_id,
+            contact_id: res.contact_id,
+            channel_id: res.channel_id,
+            assigned_to: sessionUser?.id ?? null,
+            assigned_to_uid: sessionUser?.firebase_uid ?? "",
+            status: "open",
+            unread_count: 0,
+          }, res.conversation_id);
+          return [optimistic, ...prev];
+        });
+        setSelectedThreadId(res.conversation_id);
+        setActiveView("meus");
+      }
+      return res.conversation_id || null;
+    } catch (e) {
+      setError(errorText(e));
+      return null;
+    }
   }
 
   async function updateDeclaredName(contact_id: number, declared_name: string) {
@@ -1521,6 +1610,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
+    loadAllContacts, refreshAllContacts, openConversationForContact,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,

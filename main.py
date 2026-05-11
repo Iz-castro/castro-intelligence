@@ -787,6 +787,92 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
     return {"contacts": contacts}
 
 
+@app.get("/api/wa/contacts/all")
+async def wa_contacts_all(
+    q: str | None = Query(default=None, description="Busca por nome ou telefone"),
+    limit: int = Query(default=500, ge=1, le=2000),
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista TODOS os contatos do tenant — usado pelo modal de selecao
+    (botao + da sidebar) que mostra tambem contatos da agenda telefonica
+    sincronizada via smb_app_state_sync, nao so quem tem conversa ativa.
+
+    Diferente de /api/wa/contacts (que usa orderBy('last_message_at')
+    e exclui contatos sem mensagem), aqui retornamos ordenados
+    alfabeticamente por display_name. Aceita filtro 'q' pra busca
+    parcial em display_name, declared_name, whatsapp_profile_name e
+    wa_id.
+    """
+    from firestore_common import collection as fs_coll
+    rows = []
+    for snap in fs_coll("wa_contacts").stream():
+        d = snap.to_dict() or {}
+        if int(d.get("is_archived", 0) or 0) != 0:
+            continue
+        rows.append(d)
+
+    if q:
+        needle = q.strip().lower()
+        if needle:
+            def _match(c):
+                return any(
+                    needle in str(c.get(field, "") or "").lower()
+                    for field in ("display_name", "declared_name", "whatsapp_profile_name", "wa_id", "phone_formatted")
+                )
+            rows = [c for c in rows if _match(c)]
+
+    rows.sort(key=lambda c: str(c.get("display_name", "") or "").lower())
+    total = len(rows)
+    rows = rows[:limit]
+    return {"contacts": rows, "total": total, "returned": len(rows)}
+
+
+@app.post("/api/wa/conversation/open")
+async def wa_conversation_open(request: Request, current_user: dict = Depends(get_current_user)):
+    """Abre (ou cria) a conversation pra um contato + canal especifico.
+
+    Usado quando o operador clica num contato da agenda telefonica que
+    ainda nao tem thread no CRM — precisamos materializar a conversation
+    pra ela aparecer na sidebar e o operador conseguir mandar template
+    ou esperar mensagem do cliente.
+
+    Body: { contact_id: int, channel_id?: int }
+    Retorna o conversation_id determinístico.
+    """
+    body = await request.json()
+    contact_id = body.get("contact_id")
+    if contact_id is None:
+        raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+    contact = get_wa_contact(int(contact_id))
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    channel_id = body.get("channel_id") or contact.get("channel_id")
+    if channel_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="channel_id obrigatorio (contato sem canal associado)",
+        )
+    from database import upsert_wa_conversation
+    wa_id = str(contact.get("wa_id") or "")
+    if not wa_id:
+        raise HTTPException(status_code=400, detail="Contato sem wa_id")
+    conversation_id = upsert_wa_conversation(
+        contact_id=int(contact_id),
+        wa_id=wa_id,
+        channel_id=int(channel_id),
+        source_channel_type=str(contact.get("source_channel_type", "") or ""),
+        phone_number_id=str(contact.get("phone_number_id", "") or ""),
+        auto_assign_user_id=current_user["id"],
+        direction_for_unread=None,
+    )
+    log_audit(
+        current_user["id"],
+        "WA_CONVERSATION_OPEN",
+        f"contact_id={contact_id} channel_id={channel_id} conv_id={conversation_id}",
+    )
+    return {"conversation_id": conversation_id, "contact_id": int(contact_id), "channel_id": int(channel_id)}
+
+
 @app.get("/api/wa/conversations")
 async def wa_conversations(current_user: dict = Depends(get_current_user)):
     """Retorna lista de conversations enriquecidas (Fase 3 multi-canal).

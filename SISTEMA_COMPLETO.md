@@ -3936,7 +3936,8 @@ def mark_wa_conversation_read_by_id(conversation_id):
 
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
-                      auto_assign_user_id=None):
+                      auto_assign_user_id=None,
+                      from_message_event=True):
     """Cria ou atualiza um contato WhatsApp.
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
@@ -3945,15 +3946,25 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     Normaliza o nono digito BR e busca tambem variantes (com/sem '9')
     como defesa em profundidade contra callers que esquecam de
     normalizar.
+
+    `from_message_event=True` (default): caller veio de evento real de
+    mensagem (_process_messages, _process_smb_message_echoes,
+    _process_history). Atualiza `last_message_at`/`last_inbound_at` e
+    cria/atualiza a `wa_conversation` correspondente.
+
+    `from_message_event=False`: caller e o `_process_smb_app_state_sync`
+    (sincronizacao da agenda telefonica do dono). Nao popula timestamps
+    de mensagem nem cria conversation — contato fica disponivel pra
+    busca/seleção, mas só vira thread quando houver mensagem real.
     """
     wa_id = normalize_br_phone(wa_id)
     now = utcnow()
     existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
-        updates = {
-            "last_message_at": now,
-            "last_inbound_at": now,
-        }
+        updates = {}
+        if from_message_event:
+            updates["last_message_at"] = now
+            updates["last_inbound_at"] = now
         # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
         # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
         # webhook chegou com 13-dig), o doc fica preso na forma antiga e
@@ -3998,9 +4009,11 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             existing = dict(existing)
             existing["wa_id"] = updates["wa_id"]
         # Garante que a conversation deste (channel, wa_id) tambem existe.
-        _maybe_upsert_conversation_for_existing_contact(
-            existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
-        )
+        # Pulado em state_sync — contato existe sem thread ate ter mensagem.
+        if from_message_event:
+            _maybe_upsert_conversation_for_existing_contact(
+                existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
+            )
         return existing["id"]
 
     phone_formatted = format_phone_br(wa_id)
@@ -4011,7 +4024,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "display_name": _resolve_display_name("", display_name, phone_formatted),
         "declared_name": "",
         "whatsapp_profile_name": display_name or "",
-        "created_source": "webhook",
+        "created_source": "webhook" if from_message_event else "state_sync",
         "created_by_user_id": None,
         "phone_formatted": phone_formatted,
         "profile_picture_url": "",
@@ -4031,8 +4044,11 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "is_archived": 0,
         "unread_count": 0,
         "first_seen_at": now,
-        "last_message_at": now,
-        "last_inbound_at": now,
+        # Timestamps de mensagem so populados quando vem de evento real.
+        # state_sync (agenda telefonica) deixa null pra contato nao aparecer
+        # no orderBy("last_message_at") da sidebar.
+        "last_message_at": now if from_message_event else None,
+        "last_inbound_at": now if from_message_event else None,
     }
     # Auto-atribuir para coexistence
     if auto_assign_user_id:
@@ -4044,15 +4060,18 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             if user.get("department_id"):
                 new_contact["department_id"] = user["department_id"]
     document("wa_contacts", contact_id).set(new_contact)
-    # Upsert conversation correspondente (Fase 2 — sub-threads por canal)
-    upsert_wa_conversation(
-        contact_id=contact_id,
-        wa_id=wa_id,
-        channel_id=channel_id,
-        source_channel_type=source_channel_type,
-        phone_number_id=phone_number_id,
-        auto_assign_user_id=auto_assign_user_id,
-    )
+    # Upsert conversation correspondente (Fase 2 — sub-threads por canal).
+    # Pulado em state_sync: thread so nasce com mensagem real, pra nao
+    # poluir sidebar com 165 contatos da agenda telefonica.
+    if from_message_event:
+        upsert_wa_conversation(
+            contact_id=contact_id,
+            wa_id=wa_id,
+            channel_id=channel_id,
+            source_channel_type=source_channel_type,
+            phone_number_id=phone_number_id,
+            auto_assign_user_id=auto_assign_user_id,
+        )
     return contact_id
 
 
@@ -6542,6 +6561,92 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
     for c in contacts:
         c["unread"] = int(c.get("unread_count", 0))
     return {"contacts": contacts}
+
+
+@app.get("/api/wa/contacts/all")
+async def wa_contacts_all(
+    q: str | None = Query(default=None, description="Busca por nome ou telefone"),
+    limit: int = Query(default=500, ge=1, le=2000),
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista TODOS os contatos do tenant — usado pelo modal de selecao
+    (botao + da sidebar) que mostra tambem contatos da agenda telefonica
+    sincronizada via smb_app_state_sync, nao so quem tem conversa ativa.
+
+    Diferente de /api/wa/contacts (que usa orderBy('last_message_at')
+    e exclui contatos sem mensagem), aqui retornamos ordenados
+    alfabeticamente por display_name. Aceita filtro 'q' pra busca
+    parcial em display_name, declared_name, whatsapp_profile_name e
+    wa_id.
+    """
+    from firestore_common import collection as fs_coll
+    rows = []
+    for snap in fs_coll("wa_contacts").stream():
+        d = snap.to_dict() or {}
+        if int(d.get("is_archived", 0) or 0) != 0:
+            continue
+        rows.append(d)
+
+    if q:
+        needle = q.strip().lower()
+        if needle:
+            def _match(c):
+                return any(
+                    needle in str(c.get(field, "") or "").lower()
+                    for field in ("display_name", "declared_name", "whatsapp_profile_name", "wa_id", "phone_formatted")
+                )
+            rows = [c for c in rows if _match(c)]
+
+    rows.sort(key=lambda c: str(c.get("display_name", "") or "").lower())
+    total = len(rows)
+    rows = rows[:limit]
+    return {"contacts": rows, "total": total, "returned": len(rows)}
+
+
+@app.post("/api/wa/conversation/open")
+async def wa_conversation_open(request: Request, current_user: dict = Depends(get_current_user)):
+    """Abre (ou cria) a conversation pra um contato + canal especifico.
+
+    Usado quando o operador clica num contato da agenda telefonica que
+    ainda nao tem thread no CRM — precisamos materializar a conversation
+    pra ela aparecer na sidebar e o operador conseguir mandar template
+    ou esperar mensagem do cliente.
+
+    Body: { contact_id: int, channel_id?: int }
+    Retorna o conversation_id determinístico.
+    """
+    body = await request.json()
+    contact_id = body.get("contact_id")
+    if contact_id is None:
+        raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+    contact = get_wa_contact(int(contact_id))
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    channel_id = body.get("channel_id") or contact.get("channel_id")
+    if channel_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="channel_id obrigatorio (contato sem canal associado)",
+        )
+    from database import upsert_wa_conversation
+    wa_id = str(contact.get("wa_id") or "")
+    if not wa_id:
+        raise HTTPException(status_code=400, detail="Contato sem wa_id")
+    conversation_id = upsert_wa_conversation(
+        contact_id=int(contact_id),
+        wa_id=wa_id,
+        channel_id=int(channel_id),
+        source_channel_type=str(contact.get("source_channel_type", "") or ""),
+        phone_number_id=str(contact.get("phone_number_id", "") or ""),
+        auto_assign_user_id=current_user["id"],
+        direction_for_unread=None,
+    )
+    log_audit(
+        current_user["id"],
+        "WA_CONVERSATION_OPEN",
+        f"contact_id={contact_id} channel_id={channel_id} conv_id={conversation_id}",
+    )
+    return {"conversation_id": conversation_id, "contact_id": int(contact_id), "channel_id": int(channel_id)}
 
 
 @app.get("/api/wa/conversations")
@@ -11758,12 +11863,18 @@ def _process_smb_app_state_sync(value, channel=None):
         display_name = full_name or first_name
 
         if action == "add":
+            # from_message_event=False — contato vem da agenda telefonica
+            # do dono, nao de uma conversa real. Nao cria wa_conversation
+            # nem popula last_message_at, evitando poluir a sidebar com
+            # threads vazias. Quando o operador iniciar conversa ou o
+            # cliente mandar mensagem, ai sim a thread nasce.
             contact_id = upsert_wa_contact(
                 normalized_phone, display_name,
                 channel_id=sync_channel_id,
                 phone_number_id=sync_channel_phone,
                 source_channel_type=sync_channel_type,
-                auto_assign_user_id=sync_channel_owner if sync_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+                auto_assign_user_id=None,  # state_sync nao atribui
+                from_message_event=False,
             )
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
@@ -14869,7 +14980,7 @@ export function applyTheme(theme: "dark" | "light") {
 ```tsx
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
-import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
+import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
@@ -15027,12 +15138,35 @@ function NavBar() {
   );
 }
 
+type ContactPickerMode = "list" | "create";
+
 function NewContactModal({ onClose }: { onClose: () => void }) {
-  const { createManualContact, busyCreateContact, channels } = useCrm();
+  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact } = useCrm();
+  const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const availableChannels = channels.filter(ch => ch.is_active);
   const [channelId, setChannelId] = useState<number | "">(availableChannels.length === 1 ? availableChannels[0].id : "");
+  const [search, setSearchLocal] = useState("");
+  const [allContacts, setAllContacts] = useState<Contact[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loadingList, setLoadingList] = useState(false);
+  const [busyOpen, setBusyOpen] = useState(false);
+
+  // Carrega contatos quando entra no modo list ou quando search muda (debounce).
+  useEffect(() => {
+    if (mode !== "list") return;
+    let disposed = false;
+    setLoadingList(true);
+    const handle = window.setTimeout(async () => {
+      const res = await loadAllContacts(search);
+      if (disposed) return;
+      setAllContacts(res.contacts);
+      setTotal(res.total);
+      setLoadingList(false);
+    }, search ? 250 : 0);
+    return () => { disposed = true; window.clearTimeout(handle); };
+  }, [mode, search, loadAllContacts]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -15041,34 +15175,120 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     if (result) onClose();
   }
 
+  async function handlePickContact(contact: Contact) {
+    if (busyOpen) return;
+    setBusyOpen(true);
+    try {
+      const channel = contact.channel_id || (availableChannels.length === 1 ? availableChannels[0].id : undefined);
+      const convId = await openConversationForContact(contact.id, channel);
+      if (convId) onClose();
+    } finally {
+      setBusyOpen(false);
+    }
+  }
+
+  if (mode === "create") {
+    return (
+      <div className="lightbox" role="dialog" aria-modal="true" aria-label="Novo contato" onClick={onClose}>
+        <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
+        <div className="settings-modal" style={{ width: "min(420px, 92vw)" }} onClick={(e) => e.stopPropagation()}>
+          <p className="eyebrow">Novo contato</p>
+          <h2 style={{ margin: "0 0 1rem" }}>Criar contato manual</h2>
+          <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required />
+            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required />
+            {availableChannels.length > 1 && (
+              <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")}>
+                <option value="">Selecionar canal</option>
+                {availableChannels.map(ch => <option key={ch.id} value={ch.id}>{ch.label || ch.display_phone_number}</option>)}
+              </select>
+            )}
+            <div style={{ display: "flex", gap: "0.5rem", justifyContent: "space-between" }}>
+              <button type="button" className="ghost" onClick={() => setMode("list")}>Voltar</button>
+              <div style={{ display: "flex", gap: "0.5rem" }}>
+                <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
+                <button type="submit" className="primary" disabled={busyCreateContact || !name.trim() || !phone.trim()}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Novo contato" onClick={onClose}>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Selecionar contato" onClick={onClose}>
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
-      <div className="settings-modal" style={{ width: "min(420px, 92vw)" }} onClick={(e) => e.stopPropagation()}>
-        <p className="eyebrow">Novo contato</p>
-        <h2 style={{ margin: "0 0 1rem" }}>Criar contato manual</h2>
-        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required />
-          <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required />
-          {availableChannels.length > 1 && (
-            <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")}>
-              <option value="">Selecionar canal</option>
-              {availableChannels.map(ch => <option key={ch.id} value={ch.id}>{ch.label || ch.display_phone_number}</option>)}
-            </select>
+      <div className="settings-modal" style={{ width: "min(520px, 92vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.5rem" }}>
+          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({total})</p>
+        </div>
+        <input
+          value={search}
+          onChange={(e) => setSearchLocal(e.target.value)}
+          placeholder="Buscar contato por nome ou telefone"
+          autoFocus
+          style={{ marginBottom: "0.75rem" }}
+        />
+        <button
+          type="button"
+          className="primary"
+          onClick={() => setMode("create")}
+          style={{ width: "100%", marginBottom: "0.75rem" }}
+        >
+          + Novo contato
+        </button>
+        <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
+          <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>Contatos Salvos</p>
+          {loadingList && allContacts.length === 0 ? (
+            <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
+          ) : allContacts.length === 0 ? (
+            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : "Nenhum contato sincronizado."}</p>
+          ) : (
+            <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+              {allContacts.map((c) => (
+                <li key={c.id}>
+                  <button
+                    type="button"
+                    onClick={() => handlePickContact(c)}
+                    disabled={busyOpen}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "0.5rem 0.75rem",
+                      background: "transparent",
+                      border: "none",
+                      borderBottom: "1px solid var(--border-soft, #1c2029)",
+                      color: "inherit",
+                      cursor: busyOpen ? "default" : "pointer",
+                    }}
+                  >
+                    <div style={{ fontWeight: 500 }}>{c.display_name || c.declared_name || c.wa_id}</div>
+                    <div className="sub">{c.phone_formatted || c.wa_id}</div>
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
-          <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
-            <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
-            <button type="submit" className="primary" disabled={busyCreateContact || !name.trim() || !phone.trim()}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
-          </div>
-        </form>
+        </div>
       </div>
     </div>
   );
 }
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, loadAllContacts } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
+  // Total de contatos do tenant (inclui agenda telefonica do state_sync,
+  // nao apenas conversas ativas). Usado no header da sidebar.
+  const [totalContacts, setTotalContacts] = useState(0);
+  useEffect(() => {
+    let disposed = false;
+    void loadAllContacts().then((res) => {
+      if (!disposed) setTotalContacts(res.total);
+    });
+    return () => { disposed = true; };
+  }, [loadAllContacts]);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
 
   // Helper robusto: last_message_at pode vir como string ISO (do polling
@@ -15107,7 +15327,13 @@ function ContactList() {
   return (
     <aside className="panel sidebar">
       <div className={`panel-head ${activeView === "equipe" ? "panel-head--stacked" : ""}`}>
-        <div><p className="eyebrow">{viewTitle}</p><h2>{renderItems.length} conversa{renderItems.length !== 1 ? "s" : ""}</h2></div>
+        <div>
+          <p className="eyebrow">{viewTitle}</p>
+          <h2>{renderItems.length} conversa{renderItems.length !== 1 ? "s" : ""}</h2>
+          {totalContacts > 0 && activeView === "meus" ? (
+            <p className="sub" style={{ marginTop: "0.15rem" }}>{totalContacts} contato{totalContacts !== 1 ? "s" : ""} cadastrado{totalContacts !== 1 ? "s" : ""}</p>
+          ) : null}
+        </div>
         {activeView === "equipe" && visibleTeamOperators.length ? (
           <div className="operator-presence-strip" aria-label="Operadores com conversas visiveis">
             {visibleTeamOperators.map((operator) => {
@@ -15130,7 +15356,7 @@ function ContactList() {
       <div className="toolbar">
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar contato" />
         {activeView === "meus" && <>
-          <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Novo contato" aria-label="Novo contato"><PlusIcon /></button>
+          <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Selecionar ou criar contato" aria-label="Selecionar contato"><AddressBookIcon /></button>
           <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>
         </>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
@@ -16922,6 +17148,12 @@ type CrmContextValue = {
   updateDeclaredName: (contact_id: number, declared_name: string) => Promise<void>;
   busyCreateContact: boolean;
 
+  // Contact picker — lista TODOS contatos do tenant (inclui state_sync da agenda).
+  // Cache em memoria do provider (zera no logout/fechar aba — LGPD-safe).
+  loadAllContacts: (q?: string) => Promise<{ contacts: Contact[]; total: number }>;
+  refreshAllContacts: () => Promise<void>;
+  openConversationForContact: (contact_id: number, channel_id?: number) => Promise<string | null>;
+
   // Message correction
   correctMessage: (messageId: number, newContent: string) => Promise<boolean>;
   correctionTarget: ChatMessage | null;
@@ -17055,6 +17287,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Fase 3: lista de conversations (sub-threads por canal). Mesmo wa_id em
   // dois canais aparece como duas entradas distintas.
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  // Cache em memoria de TODOS os contatos do tenant (inclui agenda
+  // sincronizada via smb_app_state_sync que nao aparece na sidebar).
+  // null = ainda nao carregado; array = carregado (mesmo se vazio).
+  // Zera junto com o provider (logout/refresh/aba fechada) — sem
+  // persistencia em localStorage por LGPD.
+  const [allContactsCache, setAllContactsCache] = useState<Contact[] | null>(null);
   const contactsById = useMemo(
     () => new Map<number, Contact>(contacts.map((c) => [c.id, c])),
     [contacts],
@@ -18192,6 +18430,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         if (exists) return prev.map(c => c.id === contact.id ? contact : c);
         return [contact, ...prev];
       });
+      // Invalida cache do contact picker — novo contato precisa
+      // aparecer no proximo open do modal.
+      setAllContactsCache(null);
       // Backend retorna conversation_id deterministico do contato manual
       // (Fase 3). Setamos a thread direto — o snapshot listener vai trazer
       // a Conversation logo em seguida.
@@ -18203,6 +18444,80 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       return contact;
     } catch (e) { setError(errorText(e)); return null; }
     finally { setBusyCreateContact(false); }
+  }
+
+  async function loadAllContacts(q?: string): Promise<{ contacts: Contact[]; total: number }> {
+    if (!bundle) return { contacts: [], total: 0 };
+    // Carrega a lista completa uma vez por sessao e cacheia em memoria.
+    // Busca subsequente filtra local sobre o cache (instantanea).
+    let cache = allContactsCache;
+    if (!cache) {
+      try {
+        const res = await getJson<{ contacts: Record<string, unknown>[]; total: number; returned: number }>(
+          bundle.auth, "/api/wa/contacts/all",
+        );
+        cache = (res.contacts || []).map((c) => normalizeContact(c, String(c.id)));
+        setAllContactsCache(cache);
+      } catch (e) {
+        setError(errorText(e));
+        return { contacts: [], total: 0 };
+      }
+    }
+    if (q && q.trim()) {
+      const needle = q.trim().toLowerCase();
+      const filtered = cache.filter((c) => (
+        (c.display_name || "").toLowerCase().includes(needle) ||
+        (c.declared_name || "").toLowerCase().includes(needle) ||
+        (c.whatsapp_profile_name || "").toLowerCase().includes(needle) ||
+        (c.wa_id || "").toLowerCase().includes(needle) ||
+        (c.phone_formatted || "").toLowerCase().includes(needle)
+      ));
+      return { contacts: filtered, total: cache.length };
+    }
+    return { contacts: cache, total: cache.length };
+  }
+
+  async function refreshAllContacts(): Promise<void> {
+    // Forca reload do cache. Util apos criar contato manual ou
+    // se admin sabe que houve sincronizacao nova.
+    setAllContactsCache(null);
+  }
+
+  async function openConversationForContact(contact_id: number, channel_id?: number): Promise<string | null> {
+    if (!bundle) return null;
+    try {
+      setError("");
+      const payload: Record<string, unknown> = { contact_id };
+      if (channel_id) payload.channel_id = channel_id;
+      const res = await sendJson(bundle.auth, "/api/wa/conversation/open", payload) as {
+        conversation_id: string; contact_id: number; channel_id: number;
+      };
+      // Insercao otimista no estado local pra evitar race com o snapshot
+      // listener. Sem isso, o auto-select effect (que reseta seleção
+      // quando selectedThreadId nao esta na lista de conversations)
+      // sobrescreve nossa selecao antes do snapshot Firestore propagar.
+      if (res.conversation_id) {
+        setConversations((prev) => {
+          if (prev.some((c) => c.id === res.conversation_id)) return prev;
+          const optimistic = normalizeConversation({
+            id: res.conversation_id,
+            contact_id: res.contact_id,
+            channel_id: res.channel_id,
+            assigned_to: sessionUser?.id ?? null,
+            assigned_to_uid: sessionUser?.firebase_uid ?? "",
+            status: "open",
+            unread_count: 0,
+          }, res.conversation_id);
+          return [optimistic, ...prev];
+        });
+        setSelectedThreadId(res.conversation_id);
+        setActiveView("meus");
+      }
+      return res.conversation_id || null;
+    } catch (e) {
+      setError(errorText(e));
+      return null;
+    }
   }
 
   async function updateDeclaredName(contact_id: number, declared_name: string) {
@@ -18289,6 +18604,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
+    loadAllContacts, refreshAllContacts, openConversationForContact,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
@@ -18603,6 +18919,17 @@ export function PlusIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function AddressBookIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5z" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+      <path d="M3 8h2M3 12h2M3 16h2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      <circle cx="11" cy="11" r="2.4" fill="none" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M7.5 17c.7-1.9 2-2.9 3.5-2.9s2.8 1 3.5 2.9" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
     </svg>
   );
 }

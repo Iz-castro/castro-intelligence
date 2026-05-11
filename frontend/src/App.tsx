@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
-import { MoonIcon, SunIcon, GearIcon, PlusIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
+import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
 import { useClickOutside } from "./hooks/useClickOutside";
@@ -158,12 +158,35 @@ function NavBar() {
   );
 }
 
+type ContactPickerMode = "list" | "create";
+
 function NewContactModal({ onClose }: { onClose: () => void }) {
-  const { createManualContact, busyCreateContact, channels } = useCrm();
+  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact } = useCrm();
+  const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const availableChannels = channels.filter(ch => ch.is_active);
   const [channelId, setChannelId] = useState<number | "">(availableChannels.length === 1 ? availableChannels[0].id : "");
+  const [search, setSearchLocal] = useState("");
+  const [allContacts, setAllContacts] = useState<Contact[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loadingList, setLoadingList] = useState(false);
+  const [busyOpen, setBusyOpen] = useState(false);
+
+  // Carrega contatos quando entra no modo list ou quando search muda (debounce).
+  useEffect(() => {
+    if (mode !== "list") return;
+    let disposed = false;
+    setLoadingList(true);
+    const handle = window.setTimeout(async () => {
+      const res = await loadAllContacts(search);
+      if (disposed) return;
+      setAllContacts(res.contacts);
+      setTotal(res.total);
+      setLoadingList(false);
+    }, search ? 250 : 0);
+    return () => { disposed = true; window.clearTimeout(handle); };
+  }, [mode, search, loadAllContacts]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -172,34 +195,120 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     if (result) onClose();
   }
 
+  async function handlePickContact(contact: Contact) {
+    if (busyOpen) return;
+    setBusyOpen(true);
+    try {
+      const channel = contact.channel_id || (availableChannels.length === 1 ? availableChannels[0].id : undefined);
+      const convId = await openConversationForContact(contact.id, channel);
+      if (convId) onClose();
+    } finally {
+      setBusyOpen(false);
+    }
+  }
+
+  if (mode === "create") {
+    return (
+      <div className="lightbox" role="dialog" aria-modal="true" aria-label="Novo contato" onClick={onClose}>
+        <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
+        <div className="settings-modal" style={{ width: "min(420px, 92vw)" }} onClick={(e) => e.stopPropagation()}>
+          <p className="eyebrow">Novo contato</p>
+          <h2 style={{ margin: "0 0 1rem" }}>Criar contato manual</h2>
+          <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required />
+            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required />
+            {availableChannels.length > 1 && (
+              <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")}>
+                <option value="">Selecionar canal</option>
+                {availableChannels.map(ch => <option key={ch.id} value={ch.id}>{ch.label || ch.display_phone_number}</option>)}
+              </select>
+            )}
+            <div style={{ display: "flex", gap: "0.5rem", justifyContent: "space-between" }}>
+              <button type="button" className="ghost" onClick={() => setMode("list")}>Voltar</button>
+              <div style={{ display: "flex", gap: "0.5rem" }}>
+                <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
+                <button type="submit" className="primary" disabled={busyCreateContact || !name.trim() || !phone.trim()}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Novo contato" onClick={onClose}>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Selecionar contato" onClick={onClose}>
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
-      <div className="settings-modal" style={{ width: "min(420px, 92vw)" }} onClick={(e) => e.stopPropagation()}>
-        <p className="eyebrow">Novo contato</p>
-        <h2 style={{ margin: "0 0 1rem" }}>Criar contato manual</h2>
-        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required />
-          <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required />
-          {availableChannels.length > 1 && (
-            <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")}>
-              <option value="">Selecionar canal</option>
-              {availableChannels.map(ch => <option key={ch.id} value={ch.id}>{ch.label || ch.display_phone_number}</option>)}
-            </select>
+      <div className="settings-modal" style={{ width: "min(520px, 92vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.5rem" }}>
+          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({total})</p>
+        </div>
+        <input
+          value={search}
+          onChange={(e) => setSearchLocal(e.target.value)}
+          placeholder="Buscar contato por nome ou telefone"
+          autoFocus
+          style={{ marginBottom: "0.75rem" }}
+        />
+        <button
+          type="button"
+          className="primary"
+          onClick={() => setMode("create")}
+          style={{ width: "100%", marginBottom: "0.75rem" }}
+        >
+          + Novo contato
+        </button>
+        <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
+          <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>Contatos Salvos</p>
+          {loadingList && allContacts.length === 0 ? (
+            <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
+          ) : allContacts.length === 0 ? (
+            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : "Nenhum contato sincronizado."}</p>
+          ) : (
+            <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+              {allContacts.map((c) => (
+                <li key={c.id}>
+                  <button
+                    type="button"
+                    onClick={() => handlePickContact(c)}
+                    disabled={busyOpen}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "0.5rem 0.75rem",
+                      background: "transparent",
+                      border: "none",
+                      borderBottom: "1px solid var(--border-soft, #1c2029)",
+                      color: "inherit",
+                      cursor: busyOpen ? "default" : "pointer",
+                    }}
+                  >
+                    <div style={{ fontWeight: 500 }}>{c.display_name || c.declared_name || c.wa_id}</div>
+                    <div className="sub">{c.phone_formatted || c.wa_id}</div>
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
-          <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
-            <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
-            <button type="submit" className="primary" disabled={busyCreateContact || !name.trim() || !phone.trim()}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
-          </div>
-        </form>
+        </div>
       </div>
     </div>
   );
 }
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, loadAllContacts } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
+  // Total de contatos do tenant (inclui agenda telefonica do state_sync,
+  // nao apenas conversas ativas). Usado no header da sidebar.
+  const [totalContacts, setTotalContacts] = useState(0);
+  useEffect(() => {
+    let disposed = false;
+    void loadAllContacts().then((res) => {
+      if (!disposed) setTotalContacts(res.total);
+    });
+    return () => { disposed = true; };
+  }, [loadAllContacts]);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
 
   // Helper robusto: last_message_at pode vir como string ISO (do polling
@@ -238,7 +347,13 @@ function ContactList() {
   return (
     <aside className="panel sidebar">
       <div className={`panel-head ${activeView === "equipe" ? "panel-head--stacked" : ""}`}>
-        <div><p className="eyebrow">{viewTitle}</p><h2>{renderItems.length} conversa{renderItems.length !== 1 ? "s" : ""}</h2></div>
+        <div>
+          <p className="eyebrow">{viewTitle}</p>
+          <h2>{renderItems.length} conversa{renderItems.length !== 1 ? "s" : ""}</h2>
+          {totalContacts > 0 && activeView === "meus" ? (
+            <p className="sub" style={{ marginTop: "0.15rem" }}>{totalContacts} contato{totalContacts !== 1 ? "s" : ""} cadastrado{totalContacts !== 1 ? "s" : ""}</p>
+          ) : null}
+        </div>
         {activeView === "equipe" && visibleTeamOperators.length ? (
           <div className="operator-presence-strip" aria-label="Operadores com conversas visiveis">
             {visibleTeamOperators.map((operator) => {
@@ -261,7 +376,7 @@ function ContactList() {
       <div className="toolbar">
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar contato" />
         {activeView === "meus" && <>
-          <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Novo contato" aria-label="Novo contato"><PlusIcon /></button>
+          <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Selecionar ou criar contato" aria-label="Selecionar contato"><AddressBookIcon /></button>
           <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>
         </>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}

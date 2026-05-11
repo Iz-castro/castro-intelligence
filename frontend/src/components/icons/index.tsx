@@ -6,6 +6,17 @@ export function PlusIcon() {
   );
 }
 
+export function AddressBookIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5z" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+      <path d="M3 8h2M3 12h2M3 16h2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      <circle cx="11" cy="11" r="2.4" fill="none" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M7.5 17c.7-1.9 2-2.9 3.5-2.9s2.8 1 3.5 2.9" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function PhotoIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">

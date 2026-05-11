@@ -883,12 +883,18 @@ def _process_smb_app_state_sync(value, channel=None):
         display_name = full_name or first_name
 
         if action == "add":
+            # from_message_event=False — contato vem da agenda telefonica
+            # do dono, nao de uma conversa real. Nao cria wa_conversation
+            # nem popula last_message_at, evitando poluir a sidebar com
+            # threads vazias. Quando o operador iniciar conversa ou o
+            # cliente mandar mensagem, ai sim a thread nasce.
             contact_id = upsert_wa_contact(
                 normalized_phone, display_name,
                 channel_id=sync_channel_id,
                 phone_number_id=sync_channel_phone,
                 source_channel_type=sync_channel_type,
-                auto_assign_user_id=sync_channel_owner if sync_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+                auto_assign_user_id=None,  # state_sync nao atribui
+                from_message_event=False,
             )
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
