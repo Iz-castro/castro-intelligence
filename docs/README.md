@@ -20,6 +20,7 @@ A leitura recomendada agora e:
 - `deploy/`: deploy, infraestrutura, variaveis de ambiente e operacao
 - `product/`: regras de negocio, fluxos operacionais e capacidades do CRM
 - `decisions/`: registros de decisoes tecnicas e trade-offs
+- `compliance/`: RoPA, RIPD e mapeamento LGPD (versao interna e versao cliente)
 - `internal/`: notas locais, diarios e contexto temporario
 
 ## Regras praticas
@@ -40,3 +41,5 @@ A leitura recomendada agora e:
 - [Task - Prod Hubloc + Coexistence](TASK_PROD_HUBLOC_COEXISTENCE.md)
 - [Task - Edicao de Mensagens WhatsApp no CRM](TASK_FEATURE_EDICAO_MENSAGENS_WHATSAPP_CRM.md)
 - [Task - Spike API Edicao de Mensagens WhatsApp](TASK_SPIKE_API_EDICAO_MENSAGENS_WHATSAPP.md)
+- [LGPD - RoPA/RIPD versao cliente](compliance/LGPD_RoPA_RIPD_CLIENTE.md)
+- [LGPD - RoPA/RIPD versao interna](compliance/LGPD_RoPA_RIPD_INTERNO.md) (CONFIDENCIAL - uso interno, nao compartilhar com cliente)

@@ -299,6 +299,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Zera junto com o provider (logout/refresh/aba fechada) — sem
   // persistencia em localStorage por LGPD.
   const [allContactsCache, setAllContactsCache] = useState<Contact[] | null>(null);
+  const [allContactsCacheTotal, setAllContactsCacheTotal] = useState<number>(0);
   const contactsById = useMemo(
     () => new Map<number, Contact>(contacts.map((c) => [c.id, c])),
     [contacts],
@@ -1439,6 +1440,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // Invalida cache do contact picker — novo contato precisa
       // aparecer no proximo open do modal.
       setAllContactsCache(null);
+      setAllContactsCacheTotal(0);
       // Backend retorna conversation_id deterministico do contato manual
       // (Fase 3). Setamos a thread direto — o snapshot listener vai trazer
       // a Conversation logo em seguida.
@@ -1457,13 +1459,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // Carrega a lista completa uma vez por sessao e cacheia em memoria.
     // Busca subsequente filtra local sobre o cache (instantanea).
     let cache = allContactsCache;
+    let totalFromBackend = allContactsCacheTotal;
     if (!cache) {
       try {
         const res = await getJson<{ contacts: Record<string, unknown>[]; total: number; returned: number }>(
-          bundle.auth, "/api/wa/contacts/all",
+          bundle.auth, "/api/wa/contacts/all?limit=10000",
         );
         cache = (res.contacts || []).map((c) => normalizeContact(c, String(c.id)));
+        totalFromBackend = res.total ?? cache.length;
         setAllContactsCache(cache);
+        setAllContactsCacheTotal(totalFromBackend);
       } catch (e) {
         setError(errorText(e));
         return { contacts: [], total: 0 };
@@ -1478,15 +1483,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         (c.wa_id || "").toLowerCase().includes(needle) ||
         (c.phone_formatted || "").toLowerCase().includes(needle)
       ));
-      return { contacts: filtered, total: cache.length };
+      return { contacts: filtered, total: totalFromBackend };
     }
-    return { contacts: cache, total: cache.length };
+    return { contacts: cache, total: totalFromBackend };
   }
 
   async function refreshAllContacts(): Promise<void> {
     // Forca reload do cache. Util apos criar contato manual ou
     // se admin sabe que houve sincronizacao nova.
     setAllContactsCache(null);
+    setAllContactsCacheTotal(0);
   }
 
   async function openConversationForContact(contact_id: number, channel_id?: number): Promise<string | null> {

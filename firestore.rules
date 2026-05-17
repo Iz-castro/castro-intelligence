@@ -3,8 +3,8 @@ service cloud.firestore {
   match /databases/{database}/documents {
     // Estas rules precisam usar o mesmo prefixo definido em FIRESTORE_COLLECTION_PREFIX.
     // No ambiente atual, as collections reais sao "castro_crm_*".
-    // Regra temporaria de teste:
-    // libera somente o email abaixo. Depois troque para o dominio oficial da empresa.
+    // Whitelist single-tenant (hubloc) — quando entrar tenant #2, mover whitelist
+    // para tenants/{tid}.allowed_email_domains e usar claim tenant_id.
     function signedIn() {
       return request.auth != null && request.auth.token.email != null;
     }
@@ -13,7 +13,7 @@ service cloud.firestore {
       return signedIn() && (
         request.auth.token.email == 'rafaluisc@outlook.com' ||
         request.auth.token.email == 'izaeldecastro@gmail.com' ||
-        request.auth.token.email.matches('.*@centralloc\\.com\\.br')
+        request.auth.token.email.matches('.*@hubloc\\.com\\.br')
       );
     }
 

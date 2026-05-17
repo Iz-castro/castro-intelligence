@@ -1,8 +1,8 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    // Regra temporaria de teste:
-    // libera somente o email abaixo. Depois troque para o dominio oficial da empresa.
+    // Whitelist single-tenant (hubloc) — quando entrar tenant #2, mover whitelist
+    // para tenants/{tid}.allowed_email_domains e usar claim tenant_id.
     function signedIn() {
       return request.auth != null && request.auth.token.email != null;
     }
@@ -11,7 +11,7 @@ service firebase.storage {
       return signedIn() && (
         request.auth.token.email == 'rafaluisc@outlook.com' ||
         request.auth.token.email == 'izaeldecastro@gmail.com' ||
-        request.auth.token.email.matches('.*@centralloc\\.com\\.br')
+        request.auth.token.email.matches('.*@hubloc\\.com\\.br')
       );
     }
 

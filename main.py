@@ -3,8 +3,19 @@
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from time import monotonic as _monotonic
 
 import httpx
+
+# Caches in-memory por instancia Cloud Run. Reduzem hits Meta Graph API
+# que estouram rate limit per-WABA (#80008) quando frontend faz polling
+# agressivo de billing-status / templates. Cache miss em outra instancia
+# Cloud Run resulta em apenas 1 hit extra na Meta — bem dentro do limite.
+_templates_cache: "dict[int, tuple[float, dict]]" = {}
+_billing_cache: "dict[int, tuple[float, dict]]" = {}
+_TEMPLATES_TTL_S = 60.0
+_BILLING_TTL_S_OK = 300.0   # billing OK: cache 5min
+_BILLING_TTL_S_ERR = 30.0   # billing erro/rate-limited: cache 30s (evita re-bater)
 from fastapi import (
     FastAPI, Request,
     HTTPException, Depends, Query, UploadFile, File, Form,
@@ -790,7 +801,7 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
 @app.get("/api/wa/contacts/all")
 async def wa_contacts_all(
     q: str | None = Query(default=None, description="Busca por nome ou telefone"),
-    limit: int = Query(default=500, ge=1, le=2000),
+    limit: int = Query(default=5000, ge=1, le=10000),
     current_user: dict = Depends(get_current_user),
 ):
     """Lista TODOS os contatos do tenant — usado pelo modal de selecao
@@ -798,10 +809,10 @@ async def wa_contacts_all(
     sincronizada via smb_app_state_sync, nao so quem tem conversa ativa.
 
     Diferente de /api/wa/contacts (que usa orderBy('last_message_at')
-    e exclui contatos sem mensagem), aqui retornamos ordenados
-    alfabeticamente por display_name. Aceita filtro 'q' pra busca
-    parcial em display_name, declared_name, whatsapp_profile_name e
-    wa_id.
+    e exclui contatos sem mensagem), aqui retornamos ordenados com
+    contatos COM nome real antes de contatos sem nome (telefones).
+    Aceita filtro 'q' pra busca parcial em display_name,
+    declared_name, whatsapp_profile_name e wa_id.
     """
     from firestore_common import collection as fs_coll
     rows = []
@@ -821,7 +832,20 @@ async def wa_contacts_all(
                 )
             rows = [c for c in rows if _match(c)]
 
-    rows.sort(key=lambda c: str(c.get("display_name", "") or "").lower())
+    def _sort_key(c):
+        # Prioriza nome real (declared > whatsapp_profile_name > display_name
+        # com letra) sobre fallback de telefone. Dentro de cada grupo,
+        # alfabético ASC.
+        declared = str(c.get("declared_name") or "").strip()
+        wpn = str(c.get("whatsapp_profile_name") or "").strip()
+        display = str(c.get("display_name") or "").strip()
+        # nome efetivo pra ordenacao
+        effective = declared or wpn or display
+        # 0 = nome real (comeca com letra). 1 = sem nome (telefone/simbolo).
+        has_real_name = bool(effective) and effective[0].isalpha()
+        return (0 if has_real_name else 1, effective.lower())
+
+    rows.sort(key=_sort_key)
     total = len(rows)
     rows = rows[:limit]
     return {"contacts": rows, "total": total, "returned": len(rows)}
@@ -1524,6 +1548,12 @@ async def wa_list_templates(
     if not waba_id:
         raise HTTPException(status_code=503, detail=f"Canal {channel.get('id')} sem waba_id")
 
+    resolved_channel_id = int(channel.get("id") or 0)
+    now = _monotonic()
+    cached = _templates_cache.get(resolved_channel_id)
+    if cached and (now - cached[0]) < _TEMPLATES_TTL_S:
+        return cached[1]
+
     try:
         token, _phone_id, api_base = get_send_credentials(channel.get("id"))
     except ValueError as exc:
@@ -1556,13 +1586,15 @@ async def wa_list_templates(
 
     approved = [t for t in templates if str(t.get("status", "")).upper() == "APPROVED"]
     approved.sort(key=lambda t: (str(t.get("category", "")), str(t.get("name", ""))))
-    return {
+    result = {
         "channel_id": channel.get("id"),
         "waba_id": waba_id,
         "total": len(templates),
         "approved_count": len(approved),
         "templates": approved,
     }
+    _templates_cache[resolved_channel_id] = (now, result)
+    return result
 
 
 # -- API: Correcao de mensagem (Cenario C) --
@@ -2222,6 +2254,11 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
     if not waba_id:
         raise HTTPException(status_code=400, detail="Canal sem WABA_ID associado")
 
+    now = _monotonic()
+    cached = _billing_cache.get(channel_id)
+    if cached and (now - cached[0]) < (_BILLING_TTL_S_OK if cached[1].get("ok") else _BILLING_TTL_S_ERR):
+        return cached[1]
+
     res = await _fetch_channel_billing_status(channel_id)
     if not res.get("ok") and res.get("error") in ("channel_not_found", "missing_waba_id"):
         # Caminho rejeitado antes do helper — manter HTTPException pro endpoint admin
@@ -2229,6 +2266,7 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
             status_code=404 if res["error"] == "channel_not_found" else 400,
             detail=res["error"],
         )
+    _billing_cache[channel_id] = (now, res)
     return res
 
 
