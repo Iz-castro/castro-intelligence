@@ -238,6 +238,16 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
 # dessa lista (statuses, account_update) nao precisam de canal.
 _CHANNEL_DEPENDENT_FIELDS = ("smb_message_echoes", "history", "messages", "smb_app_state_sync")
 
+# Fields que auto-atribuem contato ao dono do canal coexistence. Se o
+# canal resolve mas owner_user_id ainda nao foi populado (corrida: sync
+# de historico comeca na criacao do canal, owner setado logo depois),
+# processar agora criaria contato ORFAO (assigned_to_uid="") no pool
+# compartilhado — visivel a todo operador (bug isolamento LGPD). Nesses
+# casos enfileira pra retry (mesma logica zero-perda de canal ausente).
+# smb_app_state_sync fica de fora de proposito: nao atribui (e agenda
+# telefonica, nao historico de conversa).
+_COEX_OWNER_REQUIRED_FIELDS = ("smb_message_echoes", "history", "messages")
+
 
 async def process_webhook_payload(payload, ws_notify_callback=None):
     """
@@ -317,6 +327,30 @@ async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
                 # Para outros changes deste payload (se houver) seguimos
                 # o loop — eles podem ser smb_app_state_sync/etc que nao
                 # dependem de canal.
+                continue
+
+            # Canal coexistence resolvido mas SEM owner ainda: enfileira
+            # em vez de processar (senao cria contato orfao no pool —
+            # exatamente o bug que gerou os 3571 orfaos do channel 2).
+            # Retry pega o owner ja populado.
+            if (
+                channel is not None
+                and str(channel.get("channel_type", "")) == CHANNEL_TYPE_COEXISTENCE
+                and not channel.get("owner_user_id")
+                and effective_field in _COEX_OWNER_REQUIRED_FIELDS
+            ):
+                phone_id = str((value.get("metadata") or {}).get("phone_number_id") or "").strip()
+                logger.warning(
+                    "Webhook coexistence sem owner_user_id (channel_id=%s) — "
+                    "enfileirando %s p/ evitar contato orfao.",
+                    channel.get("id"), effective_field,
+                )
+                enqueue_pending_event(
+                    payload=payload,
+                    change_field=effective_field,
+                    phone_number_id=phone_id,
+                    reason="coex_no_owner",
+                )
                 continue
 
             if field == "smb_message_echoes":

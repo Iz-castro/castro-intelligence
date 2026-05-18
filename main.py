@@ -54,6 +54,7 @@ from database import (
     get_department_by_id, update_department, deactivate_department,
     assign_wa_contact, assign_wa_conversation, get_transfer_history,
     return_contact_to_bot, get_contacts_by_assigned_user,
+    get_wa_contacts_scoped_for_user,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user,
     upsert_firebase_user, get_user_by_email,
@@ -815,12 +816,25 @@ async def wa_contacts_all(
     declared_name, whatsapp_profile_name e wa_id.
     """
     from firestore_common import collection as fs_coll
+    privileged = current_user.get("role") in ("admin", "supervisor")
     rows = []
-    for snap in fs_coll("wa_contacts").stream():
-        d = snap.to_dict() or {}
-        if int(d.get("is_archived", 0) or 0) != 0:
-            continue
-        rows.append(d)
+    if privileged:
+        # Admin/supervisor enxerga toda a agenda do tenant (paridade #1).
+        for snap in fs_coll("wa_contacts").stream():
+            d = snap.to_dict() or {}
+            if int(d.get("is_archived", 0) or 0) != 0:
+                continue
+            rows.append(d)
+    else:
+        # Operador comum: SO a propria agenda. Isolamento LGPD (nao expoe
+        # contatos de outro operador/cliente) + corte de leitura (nao
+        # varre os ~milhares de docs do tenant a cada sessao).
+        for d in get_wa_contacts_scoped_for_user(
+            current_user.get("id"), current_user.get("department_id"),
+        ):
+            if int(d.get("is_archived", 0) or 0) != 0:
+                continue
+            rows.append(d)
 
     if q:
         needle = q.strip().lower()

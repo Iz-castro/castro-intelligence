@@ -410,6 +410,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const markingReadContactIdRef = useRef<number | null>(null);
   const selectedContactIdRef = useRef<number | null>(null);
   const messageCacheRef = useRef<Map<number, ChatMessage[]>>(new Map());
+  // Quando true, o efeito de auto-select NAO abre conversations[0]
+  // automaticamente — usado apos uma desselecao explicita (ex.:
+  // transferencia de atendimento) pra manter o placeholder do ChatPanel.
+  // Limpado assim que o usuario seleciona qualquer conversa.
+  const holdEmptySelectionRef = useRef(false);
 
   // -- Derived --
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
@@ -643,6 +648,54 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       .slice(0, 50);
   }
 
+  // Escopo de conversations por operador — espelha buildContactSnapshotTargets.
+  // Admin/supervisor: todas as conversas do tenant (paridade com contatos).
+  // Operador comum: so atribuidas a si, sem dono, ou do seu departamento.
+  // Sem orderBy/limit de proposito: queries de igualdade simples nao exigem
+  // indice composto novo (Fase 1 nao mexe em indices/rules). Ordenacao e
+  // dedupe sao feitos client-side em mergeVisibleConversations.
+  function buildConversationSnapshotTargets() {
+    if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return [];
+
+    const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
+
+    if (sessionUser.role === "admin" || sessionUser.role === "supervisor") {
+      return [{ key: "all", ref: query(waConversations) }];
+    }
+
+    const targets: { key: string; ref: ReturnType<typeof query> }[] = [
+      { key: "unassigned:blank", ref: query(waConversations, where("assigned_to_uid", "==", "")) },
+      { key: "unassigned:null", ref: query(waConversations, where("assigned_to_uid", "==", null)) },
+    ];
+
+    if (sessionUser.firebase_uid) {
+      targets.push({
+        key: `mine:${sessionUser.firebase_uid}`,
+        ref: query(waConversations, where("assigned_to_uid", "==", sessionUser.firebase_uid)),
+      });
+    }
+
+    if (sessionUser.department_id != null) {
+      targets.push({
+        key: `department:${sessionUser.department_id}`,
+        ref: query(waConversations, where("department_id", "==", sessionUser.department_id)),
+      });
+    }
+
+    return targets;
+  }
+
+  function mergeVisibleConversations(groups: Conversation[][]) {
+    const merged = new Map<string, Conversation>();
+    for (const group of groups) {
+      for (const conv of group) {
+        merged.set(conv.id, conv);
+      }
+    }
+    return Array.from(merged.values())
+      .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
+  }
+
   // =========================================================================
   // Effects
   // =========================================================================
@@ -706,14 +759,22 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }, [bundle]);
 
   // Auto-select primeira conversation se nada selecionado (ou seleção orfã).
+  // Excecao: apos desselecao explicita (holdEmptySelectionRef, ex.:
+  // transferencia) mantem o placeholder em vez de pular pra conversations[0].
   useEffect(() => {
-    if (!conversations.length) {
-      if (selectedThreadId) setSelectedThreadId(null);
+    if (selectedThreadId) {
+      // Algo selecionado -> cancela o "segurar vazio". Se a conversa saiu
+      // da lista (orfa), mantem o comportamento legado: pula pra 1a ou
+      // limpa se a lista esvaziou.
+      holdEmptySelectionRef.current = false;
+      if (!conversations.some((c) => c.id === selectedThreadId)) {
+        setSelectedThreadId(conversations.length ? conversations[0].id : null);
+      }
       return;
     }
-    if (!selectedThreadId || !conversations.some((c) => c.id === selectedThreadId)) {
-      setSelectedThreadId(conversations[0].id);
-    }
+    if (!conversations.length) return;
+    if (holdEmptySelectionRef.current) return;
+    setSelectedThreadId(conversations[0].id);
   }, [conversations, selectedThreadId]);
 
   // Track the selected conversation and restore its recent in-memory cache immediately.
@@ -816,25 +877,47 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       disposed = true;
       unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
-  }, [bundle, config, sessionUser, snapshotMode]);
+    // Deps primitivas (nao os objetos config/sessionUser): onIdTokenChanged
+    // dispara a cada refresh de token e recria esses objetos com os mesmos
+    // valores — depender da identidade causava teardown/re-subscribe (e
+    // re-leitura completa) recorrente. Re-subscreve so se o escopo mudar.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundle, snapshotMode, config?.firestore.collections.wa_contacts, sessionUser?.role, sessionUser?.firebase_uid, sessionUser?.department_id]);
 
-  // Snapshot: wa_conversations (Fase 3 — sub-threads por canal)
+  // Snapshot: wa_conversations (Fase 3 — sub-threads por canal).
+  // Escopado por operador (espelha o listener de contatos): operador comum
+  // so recebe do servidor as conversas do seu escopo — isolamento e corte
+  // de leitura. Admin/supervisor segue recebendo todas (paridade #1).
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
     if (!snapshotMode || !config.firestore.collections.wa_conversations) return undefined;
     let disposed = false;
-    const ref = collection(bundle.db, config.firestore.collections.wa_conversations);
-    const unsubscribe = onSnapshot(
+    const targets = buildConversationSnapshotTargets();
+    const partialConversations = new Map<string, Conversation[]>();
+
+    const publish = () => {
+      if (disposed) return;
+      const next = mergeVisibleConversations(Array.from(partialConversations.values()));
+      startTransition(() => setConversations(next));
+    };
+
+    const unsubscribers = targets.map(({ key, ref }) => onSnapshot(
       ref,
       (snap) => {
         if (disposed) return;
-        const next = snap.docs.map((doc) => normalizeConversation(doc.data() as Record<string, unknown>, doc.id));
-        startTransition(() => setConversations(next));
+        partialConversations.set(key, snap.docs.map((doc) => normalizeConversation(doc.data() as Record<string, unknown>, doc.id)));
+        publish();
       },
       (e) => !disposed && setError(`Snapshot de conversations falhou: ${errorText(e)}`),
-    );
-    return () => { disposed = true; unsubscribe(); };
-  }, [bundle, config, sessionUser, snapshotMode]);
+    ));
+
+    return () => {
+      disposed = true;
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
+    // Deps primitivas — ver nota no listener de contatos acima.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundle, snapshotMode, config?.firestore.collections.wa_conversations, sessionUser?.role, sessionUser?.firebase_uid, sessionUser?.department_id]);
 
   // Snapshot: selected conversation/thread
   // V2 Fase 3: se activeThreadId setado, filtra por conversation_id
@@ -1556,6 +1639,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setBusyTransfer(true); setError(""); setNotice("");
       await sendJson(bundle.auth, "/api/wa/transfer", { ...buildSendTarget(), to_user_id: Number(toUserId), to_department_id: toDepartmentId ? Number(toDepartmentId) : null, reason: transferReason, summary: transferSummary });
       setTransferReason(""); setTransferSummary(""); setNotice("Atendimento transferido.");
+      // Conversa saiu das maos deste operador: fecha o chat e volta pro
+      // placeholder ("Selecione um contato..."). holdEmptySelectionRef
+      // impede o auto-select de reabrir conversations[0].
+      holdEmptySelectionRef.current = true;
+      setSelectedThreadId(null);
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusyTransfer(false); }

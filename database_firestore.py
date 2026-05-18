@@ -1188,6 +1188,38 @@ def get_contacts_by_assigned_user(user_id):
     return _normalize_many(rows)
 
 
+def get_wa_contacts_scoped_for_user(user_id, department_id=None):
+    """Contatos visiveis a um operador comum — espelha canSeeContactScoped
+    (firestore.rules) e buildContactSnapshotTargets (frontend): atribuidos
+    a si, sem atribuicao, ou do mesmo departamento.
+
+    Usa queries de igualdade (sem orderBy) — nao exige indice composto e
+    evita varrer a colecao inteira do tenant (corte de leitura + isolamento
+    LGPD). Dedup por doc id. Retorna dicts crus normalizados; o caller
+    aplica filtro is_archived / busca / ordenacao.
+    """
+    col = collection("wa_contacts")
+    seen = {}
+
+    def _collect(query):
+        for snapshot in query.stream():
+            data = snapshot.to_dict() or {}
+            if not data:
+                continue
+            data.setdefault("id", snapshot.id)
+            seen[snapshot.id] = data
+
+    if user_id is not None:
+        _collect(col.where("assigned_to", "==", user_id))
+    # Sem atribuicao (campo "" ou None) — pool visivel a qualquer operador.
+    _collect(col.where("assigned_to_uid", "==", ""))
+    _collect(col.where("assigned_to_uid", "==", None))
+    if department_id is not None:
+        _collect(col.where("department_id", "==", department_id))
+
+    return [normalize_record(dict(row)) for row in seen.values()]
+
+
 def insert_transfer_system_message(contact_id, content, operator_id=None,
                                    conversation_id=None, channel_id=None):
     return save_wa_message(
