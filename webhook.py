@@ -898,6 +898,13 @@ def _process_smb_app_state_sync(value, channel=None):
     sync_channel_phone = str(channel.get("phone_number_id", "")) if channel else ""
     sync_channel_type = str(channel.get("channel_type", "")) if channel else ""
 
+    # Dedup intra-lote: o state_sync pode trazer o MESMO numero varias
+    # vezes no payload. upsert_wa_contact faz find-then-create nao-atomico
+    # (query where wa_id== + next_sequence) — em rajada a query nao enxerga
+    # o doc recem-criado e nasce duplicata (ids consecutivos pro mesmo
+    # numero). Resolver o mesmo numero uma vez por lote elimina a corrida.
+    processed_add = {}  # normalized_phone -> contact_id
+
     for item in state_sync:
         item_type = item.get("type", "")
         if item_type != "contact":
@@ -917,6 +924,10 @@ def _process_smb_app_state_sync(value, channel=None):
         display_name = full_name or first_name
 
         if action == "add":
+            # Ja sincronizado neste lote — nao re-upsertar (evita a
+            # duplicata por corrida find-then-create).
+            if normalized_phone in processed_add:
+                continue
             # from_message_event=False — contato vem da agenda telefonica
             # do dono, nao de uma conversa real. Nao cria wa_conversation
             # nem popula last_message_at, evitando poluir a sidebar com
@@ -930,6 +941,7 @@ def _process_smb_app_state_sync(value, channel=None):
                 auto_assign_user_id=None,  # state_sync nao atribui
                 from_message_event=False,
             )
+            processed_add[normalized_phone] = contact_id
             logger.info(
                 "[SMB SYNC] Contato sincronizado | phone=%s name=%s id=%s",
                 redact_phone(normalized_phone), redact_name(display_name), contact_id,
@@ -940,11 +952,14 @@ def _process_smb_app_state_sync(value, channel=None):
             # O contato pode ter historico de mensagens que precisa ser preservado.
             logger.info(
                 "[SMB SYNC] Contato removido no celular (preservado no CRM) | phone=%s name=%s",
-                normalized_phone, display_name,
+                redact_phone(normalized_phone), redact_name(display_name),
             )
 
         else:
-            logger.warning("[SMB SYNC] Acao desconhecida: %s | phone=%s", action, phone)
+            logger.warning(
+                "[SMB SYNC] Acao desconhecida: %s | phone=%s",
+                action, redact_phone(normalize_br_phone(phone)),
+            )
 
 
 # ---------------------------------------------------------------------------
