@@ -10,6 +10,8 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
+from starlette.concurrency import run_in_threadpool
+
 from config import (
     REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS,
@@ -357,7 +359,14 @@ async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
                 await _process_smb_message_echoes(value, ws_notify_callback, channel=channel)
 
             elif field == "smb_app_state_sync":
-                _process_smb_app_state_sync(value, channel=channel)
+                # 100% sincrono e pesado (loop da agenda inteira, ~9000).
+                # Roda em threadpool pra NAO congelar o event loop do
+                # uvicorn (--workers 1) — outras requests (admin, outros
+                # webhooks) seguem servidas durante a onda. Mantem o
+                # modelo de durabilidade (ainda dentro da request; erro
+                # nao tratado cai no enqueue de process_webhook_payload).
+                # anyio copia o contextvar de tenant pra thread.
+                await run_in_threadpool(_process_smb_app_state_sync, value, channel)
 
             elif field == "history":
                 await _process_history(value, ws_notify_callback, channel=channel)
