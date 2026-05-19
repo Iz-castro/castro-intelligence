@@ -47,56 +47,6 @@ service cloud.firestore {
       );
     }
 
-    // ====================================================================
-    // Fase 2 — helpers tenant-scoped estritos (PLANO_COEXISTENCE §2.9).
-    // Isolamento por tenant+operador via custom claims tenant_id/role no
-    // JWT. Claims auditados presentes em 100% dos operadores antes do
-    // deploy (scripts/_diag_claims). Backend Admin SDK ignora rules.
-    // ====================================================================
-    function tokenTenantId() {
-      return signedIn() && request.auth.token.tenant_id != null
-        ? string(request.auth.token.tenant_id)
-        : '';
-    }
-
-    function tokenRole() {
-      return signedIn() && request.auth.token.role != null
-        ? string(request.auth.token.role)
-        : '';
-    }
-
-    function ownsTenant(tid) {
-      return emailAllowed() && tokenTenantId() == tid;
-    }
-
-    function isPrivilegedInTenant(tid) {
-      return ownsTenant(tid) && (tokenRole() == 'admin' || tokenRole() == 'supervisor');
-    }
-
-    function tenantOperatorProfile(tid) {
-      return get(/databases/$(database)/documents/castro_crm_tenants/$(tid)/operator_profiles/$(request.auth.uid));
-    }
-
-    function tenantOperatorActive(tid) {
-      return ownsTenant(tid) &&
-        exists(/databases/$(database)/documents/castro_crm_tenants/$(tid)/operator_profiles/$(request.auth.uid)) &&
-        (tenantOperatorProfile(tid).data.is_active == 1 ||
-         tenantOperatorProfile(tid).data.is_active == true);
-    }
-
-    function canSeeContactScoped(tid) {
-      // Privilegiado le todos do tenant; operador so atribuidos a si,
-      // sem atribuicao, ou do mesmo departamento. Short-circuit em
-      // isPrivilegedInTenant evita get() de profile no caso admin.
-      return ownsTenant(tid) && (
-        isPrivilegedInTenant(tid) ||
-        resource.data.assigned_to_uid == request.auth.uid ||
-        resource.data.assigned_to_uid == '' ||
-        resource.data.assigned_to_uid == null ||
-        resource.data.department_id == tenantOperatorProfile(tid).data.department_id
-      );
-    }
-
     match /castro_crm_operator_profiles/{uid} {
       allow read: if emailAllowed() && (uid == request.auth.uid || operatorActive());
       allow write: if false;
@@ -171,120 +121,21 @@ service cloud.firestore {
     }
 
     // ====================================================================
-    // PROD — subcolecoes tenant-scoped ESTRITAS (Fase 2, PLANO §2.9).
-    // Substitui o bloco permissivo (allow if emailAllowed) que expunha
-    // toda a agenda do tenant a qualquer operador autorizado. Frontend
-    // ja consome tenant_collections via /api/session; claims
-    // tenant_id/role auditados em 100% dos operadores antes do deploy.
-    // Subcolecoes nao listadas: deny por padrao (sem match recursivo).
+    // PROD — subcolecoes tenant-scoped (Fase 2C cutover).
+    // Backend retorna em /api/session paths como
+    // castro_crm_tenants/{tid}/wa_contacts, wa_conversations,
+    // wa_messages, etc. Frontend faz onSnapshot direto nesses paths.
+    // Rules permissivas espelhando staging (qualquer email autorizado
+    // pode ler/escrever). Sera substituido por rules tenant-based
+    // estritas com claim no JWT em sessao futura — ver
+    // docs/internal/firestore-rules-staging-strict.wip.
     // ====================================================================
 
     match /castro_crm_tenants/{tenantId} {
-      allow read: if tenantOperatorActive(tenantId);
-      allow write: if false;
+      allow read, write: if emailAllowed();
 
-      match /operator_profiles/{uid} {
-        allow read: if ownsTenant(tenantId) && (
-          uid == request.auth.uid || isPrivilegedInTenant(tenantId)
-        );
-        allow write: if false;
-      }
-
-      match /users/{userId} {
-        allow read, write: if false;
-      }
-
-      match /departments/{deptId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /wa_contacts/{contactId} {
-        allow read: if canSeeContactScoped(tenantId);
-        allow write: if false;
-      }
-
-      match /wa_conversations/{convId} {
-        allow read: if canSeeContactScoped(tenantId);
-        allow write: if false;
-      }
-
-      match /wa_messages/{messageId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /wa_message_status/{docId} {
-        allow read, write: if false;
-      }
-
-      match /wa_transfer_log/{transferId} {
-        allow read: if isPrivilegedInTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /bot_states/{convId} {
-        allow read, write: if false;
-      }
-
-      match /system_settings/{docId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /user_settings/{userId} {
-        allow read, write: if false;
-      }
-
-      match /audit_log/{docId} {
-        allow read: if isPrivilegedInTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /audit_metrics/{docId} {
-        allow read: if isPrivilegedInTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /health_status/{docId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /gc_conversations/{convId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /gc_messages/{messageId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /messages/{messageId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-      }
-
-      match /internal_unread/{docId} {
-        allow read, write: if false;
-      }
-
-      match /operator_assume_counters/{userId} {
-        allow read, write: if false;
-      }
-
-      match /_meta/{docId} {
-        allow read, write: if false;
-      }
-
-      match /media_assets/{assetId} {
-        allow read: if ownsTenant(tenantId);
-        allow write: if false;
-        match /chunks/{chunkId} {
-          allow read: if ownsTenant(tenantId);
-          allow write: if false;
-        }
+      match /{subcol=**} {
+        allow read, write: if emailAllowed();
       }
     }
 
