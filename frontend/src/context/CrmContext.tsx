@@ -415,6 +415,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // transferencia de atendimento) pra manter o placeholder do ChatPanel.
   // Limpado assim que o usuario seleciona qualquer conversa.
   const holdEmptySelectionRef = useRef(false);
+  // Single-flight do /api/wa/contacts/all (endpoint pesado: varre a
+  // agenda inteira). Sem isso, varios gatilhos concorrentes com cache
+  // ainda null disparam N requisicoes identicas simultaneas (visto em
+  // prod: 5 chamadas em 0,1s -> 429). Colapsa concorrentes numa so.
+  const allContactsInflightRef = useRef<Promise<{ base: Contact[]; total: number }> | null>(null);
 
   // -- Derived --
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
@@ -1537,29 +1542,50 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyCreateContact(false); }
   }
 
+  // Garante a lista completa carregada (1x por sessao) com SINGLE-FLIGHT:
+  // se ja existe uma busca em andamento, os chamadores concorrentes
+  // aguardam a MESMA promessa em vez de abrir novas requisicoes pesadas.
+  async function ensureAllContactsLoaded(): Promise<{ base: Contact[]; total: number }> {
+    if (allContactsCache) return { base: allContactsCache, total: allContactsCacheTotal };
+    if (allContactsInflightRef.current) return allContactsInflightRef.current;
+    if (!bundle) return { base: [], total: 0 };
+    const p = (async () => {
+      const res = await getJson<{ contacts: Record<string, unknown>[]; total: number; returned: number }>(
+        bundle.auth, "/api/wa/contacts/all?limit=10000",
+      );
+      const base = (res.contacts || []).map((c) => normalizeContact(c, String(c.id)));
+      const total = res.total ?? base.length;
+      setAllContactsCache(base);
+      setAllContactsCacheTotal(total);
+      return { base, total };
+    })();
+    allContactsInflightRef.current = p;
+    try {
+      return await p;
+    } finally {
+      // Libera pro proximo gatilho (em falha, permite nova tentativa —
+      // mas 1 de cada vez, nunca a rajada de N simultaneas).
+      allContactsInflightRef.current = null;
+    }
+  }
+
   async function loadAllContacts(q?: string): Promise<{ contacts: Contact[]; total: number }> {
     if (!bundle) return { contacts: [], total: 0 };
     // Carrega a lista completa uma vez por sessao e cacheia em memoria.
     // Busca subsequente filtra local sobre o cache (instantanea).
-    let cache = allContactsCache;
-    let totalFromBackend = allContactsCacheTotal;
-    if (!cache) {
-      try {
-        const res = await getJson<{ contacts: Record<string, unknown>[]; total: number; returned: number }>(
-          bundle.auth, "/api/wa/contacts/all?limit=10000",
-        );
-        cache = (res.contacts || []).map((c) => normalizeContact(c, String(c.id)));
-        totalFromBackend = res.total ?? cache.length;
-        setAllContactsCache(cache);
-        setAllContactsCacheTotal(totalFromBackend);
-      } catch (e) {
-        setError(errorText(e));
-        return { contacts: [], total: 0 };
-      }
+    let base: Contact[];
+    let totalFromBackend: number;
+    try {
+      const r = await ensureAllContactsLoaded();
+      base = r.base;
+      totalFromBackend = r.total;
+    } catch (e) {
+      setError(errorText(e));
+      return { contacts: [], total: 0 };
     }
     if (q && q.trim()) {
       const needle = q.trim().toLowerCase();
-      const filtered = cache.filter((c) => (
+      const filtered = base.filter((c) => (
         (c.display_name || "").toLowerCase().includes(needle) ||
         (c.declared_name || "").toLowerCase().includes(needle) ||
         (c.whatsapp_profile_name || "").toLowerCase().includes(needle) ||
@@ -1568,7 +1594,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       ));
       return { contacts: filtered, total: totalFromBackend };
     }
-    return { contacts: cache, total: totalFromBackend };
+    return { contacts: base, total: totalFromBackend };
   }
 
   async function refreshAllContacts(): Promise<void> {
