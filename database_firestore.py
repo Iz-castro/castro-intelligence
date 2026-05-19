@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from google.api_core import exceptions as gcloud_exceptions
 from google.cloud import firestore
 
 from firestore_common import (
@@ -778,60 +780,10 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     now = utcnow()
     existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
-        updates = {}
-        if from_message_event:
-            updates["last_message_at"] = now
-            updates["last_inbound_at"] = now
-        # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
-        # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
-        # webhook chegou com 13-dig), o doc fica preso na forma antiga e
-        # todas as conversations geradas a partir de contact.wa_id ficam
-        # com conversation_id divergente do selectedThreadId do frontend.
-        # Migra agora pra evitar threads orfas.
-        existing_wa = str(existing.get("wa_id", ""))
-        if existing_wa and existing_wa != wa_id:
-            updates["wa_id"] = wa_id
-            updates["phone_formatted"] = format_phone_br(wa_id)
-            logger.info(
-                "Contato %s migrado wa_id %s -> %s (nono digito BR)",
-                existing["id"], existing_wa, wa_id,
-            )
-        # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name
-        if display_name:
-            updates["whatsapp_profile_name"] = display_name
-            # Recalcular display_name efetivo
-            declared = existing.get("declared_name", "")
-            updates["display_name"] = _resolve_display_name(
-                declared, display_name, updates.get("phone_formatted") or existing.get("phone_formatted", ""),
-            )
-        # Atualizar canal se ainda nao definido ou se mudou
-        if channel_id is not None and not existing.get("channel_id"):
-            updates["channel_id"] = channel_id
-            updates["phone_number_id"] = phone_number_id
-            updates["source_channel_type"] = source_channel_type
-        # Auto-atribuir para coexistence se nao atribuido
-        if auto_assign_user_id and not existing.get("assigned_to"):
-            user = _get_doc("users", auto_assign_user_id)
-            if user:
-                updates["assigned_to"] = auto_assign_user_id
-                updates["assigned_to_uid"] = user.get("firebase_uid", "")
-                if not existing.get("department_id") and user.get("department_id"):
-                    updates["department_id"] = user["department_id"]
-                if existing.get("qualification") == "novo":
-                    updates["qualification"] = "em_atendimento"
-        document("wa_contacts", existing["id"]).set(updates, merge=True)
-        # Reflete wa_id canonizado no dict local pra _maybe_upsert_conversation
-        # propagar a forma certa pra wa_conversations.
-        if updates.get("wa_id"):
-            existing = dict(existing)
-            existing["wa_id"] = updates["wa_id"]
-        # Garante que a conversation deste (channel, wa_id) tambem existe.
-        # Pulado em state_sync — contato existe sem thread ate ter mensagem.
-        if from_message_event:
-            _maybe_upsert_conversation_for_existing_contact(
-                existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
-            )
-        return existing["id"]
+        return _update_existing_wa_contact(
+            existing, wa_id, display_name, channel_id, phone_number_id,
+            source_channel_type, auto_assign_user_id, from_message_event, now,
+        )
 
     phone_formatted = format_phone_br(wa_id)
     contact_id = next_sequence("wa_contacts")
@@ -876,6 +828,33 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             new_contact["qualification"] = "em_atendimento"
             if user.get("department_id"):
                 new_contact["department_id"] = user["department_id"]
+    # Garantia anti-duplicata: claim atomico do wa_id num doc-indice
+    # (doc id = wa_id canonico). document().create() falha se ja existe —
+    # primitiva global e atomica, imune ao lag de query que causava as
+    # duplicatas em rajada/concorrencia (inclusive cross-instancia).
+    idx_ref = document("wa_contact_index", wa_id)
+    try:
+        idx_ref.create({"contact_id": contact_id, "created_at": now})
+    except gcloud_exceptions.AlreadyExists:
+        # Outra request/instancia reivindicou este wa_id concorrentemente.
+        # Usa o vencedor (get por id e fortemente consistente, sem lag de
+        # query). Janela ms entre claim e gravacao do doc -> retry curto.
+        winner_id = (idx_ref.get().to_dict() or {}).get("contact_id")
+        winner = None
+        for _ in range(5):
+            winner = _get_doc("wa_contacts", winner_id) if winner_id is not None else None
+            if winner:
+                break
+            time.sleep(0.1)
+        if winner:
+            return _update_existing_wa_contact(
+                winner, wa_id, display_name, channel_id, phone_number_id,
+                source_channel_type, auto_assign_user_id, from_message_event, now,
+            )
+        logger.warning(
+            "wa_contact_index %s aponta p/ contato inexistente (%s) — recriando",
+            wa_id, winner_id,
+        )
     document("wa_contacts", contact_id).set(new_contact)
     # Upsert conversation correspondente (Fase 2 — sub-threads por canal).
     # Pulado em state_sync: thread so nasce com mensagem real, pra nao
@@ -890,6 +869,68 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             auto_assign_user_id=auto_assign_user_id,
         )
     return contact_id
+
+
+def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
+                                phone_number_id, source_channel_type,
+                                auto_assign_user_id, from_message_event, now):
+    """Aplica updates a um contato JA existente. Usado pelo caminho normal
+    (achado por wa_id) e pelo fallback do claim atomico (corrida perdida).
+    Retorna o contact_id."""
+    updates = {}
+    if from_message_event:
+        updates["last_message_at"] = now
+        updates["last_inbound_at"] = now
+    # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
+    # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
+    # webhook chegou com 13-dig), o doc fica preso na forma antiga e
+    # todas as conversations geradas a partir de contact.wa_id ficam
+    # com conversation_id divergente do selectedThreadId do frontend.
+    # Migra agora pra evitar threads orfas.
+    existing_wa = str(existing.get("wa_id", ""))
+    if existing_wa and existing_wa != wa_id:
+        updates["wa_id"] = wa_id
+        updates["phone_formatted"] = format_phone_br(wa_id)
+        logger.info(
+            "Contato %s migrado wa_id %s -> %s (nono digito BR)",
+            existing["id"], existing_wa, wa_id,
+        )
+    # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name
+    if display_name:
+        updates["whatsapp_profile_name"] = display_name
+        # Recalcular display_name efetivo
+        declared = existing.get("declared_name", "")
+        updates["display_name"] = _resolve_display_name(
+            declared, display_name, updates.get("phone_formatted") or existing.get("phone_formatted", ""),
+        )
+    # Atualizar canal se ainda nao definido ou se mudou
+    if channel_id is not None and not existing.get("channel_id"):
+        updates["channel_id"] = channel_id
+        updates["phone_number_id"] = phone_number_id
+        updates["source_channel_type"] = source_channel_type
+    # Auto-atribuir para coexistence se nao atribuido
+    if auto_assign_user_id and not existing.get("assigned_to"):
+        user = _get_doc("users", auto_assign_user_id)
+        if user:
+            updates["assigned_to"] = auto_assign_user_id
+            updates["assigned_to_uid"] = user.get("firebase_uid", "")
+            if not existing.get("department_id") and user.get("department_id"):
+                updates["department_id"] = user["department_id"]
+            if existing.get("qualification") == "novo":
+                updates["qualification"] = "em_atendimento"
+    document("wa_contacts", existing["id"]).set(updates, merge=True)
+    # Reflete wa_id canonizado no dict local pra _maybe_upsert_conversation
+    # propagar a forma certa pra wa_conversations.
+    if updates.get("wa_id"):
+        existing = dict(existing)
+        existing["wa_id"] = updates["wa_id"]
+    # Garante que a conversation deste (channel, wa_id) tambem existe.
+    # Pulado em state_sync — contato existe sem thread ate ter mensagem.
+    if from_message_event:
+        _maybe_upsert_conversation_for_existing_contact(
+            existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
+        )
+    return existing["id"]
 
 
 def _maybe_upsert_conversation_for_existing_contact(existing_contact, channel_id, source_channel_type, phone_number_id, auto_assign_user_id):
