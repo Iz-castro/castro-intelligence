@@ -420,6 +420,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // ainda null disparam N requisicoes identicas simultaneas (visto em
   // prod: 5 chamadas em 0,1s -> 429). Colapsa concorrentes numa so.
   const allContactsInflightRef = useRef<Promise<{ base: Contact[]; total: number }> | null>(null);
+  // UID Firebase atualmente carregado. Usado p/ detectar TROCA de
+  // identidade (logout/login/troca de conta no mesmo navegador) e zerar
+  // todo estado do usuario anterior — sem zerar em refresh de token
+  // (~1h, mesmo uid). Evita vazamento LGPD entre sessoes (ex.: operador
+  // logando no PC de um admin via dados ainda em memoria).
+  const loadedUidRef = useRef<string | null>(null);
 
   // -- Derived --
   const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
@@ -721,12 +727,50 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return () => { cancelled = true; };
   }, []);
 
+  // Zera TODO estado sensivel/por-usuario em memoria. Chamado ao
+  // deslogar e ao TROCAR de identidade (antes de carregar a nova
+  // sessao). Sem isso, dados do usuario anterior — em especial o
+  // allContactsCache (agenda inteira carregada por um admin) e os
+  // arrays contacts/conversations — ficam visiveis ao proximo usuario
+  // ate um hard refresh (vazamento LGPD em PC compartilhado).
+  function resetUserScopedState() {
+    setContacts([]);
+    setConversations([]);
+    setMessages([]);
+    setAllContactsCache(null);
+    setAllContactsCacheTotal(0);
+    allContactsInflightRef.current = null;
+    messageCacheRef.current.clear();
+    setSelectedThreadId(null);
+    setActiveThreadId(null);
+    setActiveConversationId(null);
+    holdEmptySelectionRef.current = false;
+    setOperators([]);
+    setDepartments([]);
+    setChannels([]);
+    setDraft("");
+    setReplyTarget(null);
+    setSearch("");
+    setQualificationFilter("");
+    setEquipeOperatorFilter("");
+    setNotice("");
+    setError("");
+  }
+
   // Auth listener
   useEffect(() => {
     if (!bundle) return undefined;
     return onIdTokenChanged(bundle.auth, async (user) => {
       setFirebaseUser(user);
-      if (!user) { setSessionUser(null); setContacts([]); setMessages([]); return; }
+      const newUid = user?.uid ?? null;
+      // Logout OU troca de identidade -> limpa tudo do usuario anterior
+      // ANTES de carregar a nova sessao. Refresh de token (mesmo uid)
+      // NAO reseta (senao limparia a sessao ativa a cada ~1h).
+      if (newUid !== loadedUidRef.current) {
+        resetUserScopedState();
+        loadedUidRef.current = newUid;
+      }
+      if (!user) { setSessionUser(null); return; }
       try {
         const session = await getJson<{
           user: SessionUser;
