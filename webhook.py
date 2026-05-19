@@ -938,7 +938,17 @@ def _process_smb_app_state_sync(value, channel=None):
                 channel_id=sync_channel_id,
                 phone_number_id=sync_channel_phone,
                 source_channel_type=sync_channel_type,
-                auto_assign_user_id=None,  # state_sync nao atribui
+                # Coexistence: a agenda E do dono do numero — pertence ao
+                # operador dono do canal, NAO e pool compartilhado (LGPD:
+                # senao a agenda pessoal do supervisor vaza p/ todo
+                # operador via bucket assigned_to_uid==''). Standard:
+                # segue sem atribuicao (modelo diferente). Espelha
+                # _process_messages / _process_history.
+                auto_assign_user_id=(
+                    sync_channel_owner
+                    if sync_channel_type == CHANNEL_TYPE_COEXISTENCE
+                    else None
+                ),
                 from_message_event=False,
             )
             processed_add[normalized_phone] = contact_id
