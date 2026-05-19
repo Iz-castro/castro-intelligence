@@ -1,3 +1,13 @@
+// ============================================================================
+// STATUS 2026-05-19: o bloco tenant-scoped ESTRITO deste rascunho foi
+// PORTADO E APLICADO EM PRODUCAO (prefixo castro_crm_) — commit 11592f2,
+// `firebase deploy --only firestore:rules`, validado ao vivo (gerencia/
+// izael admins OK, teste1 operador escopado). Ver docs/internal/2026-05-19.md.
+// Este arquivo permanece como referencia/base do design (e ainda descreve
+// o modelo p/ o prefixo staging castro_crm_staging_, NAO aplicado lá).
+// Backup do estado anterior das rules de prod:
+// firestore.rules.bak-20260519-162720
+// ============================================================================
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {

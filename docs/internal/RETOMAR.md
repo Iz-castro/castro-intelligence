@@ -1,19 +1,33 @@
 # Contexto pra retomar — Coexistence completo + contact picker com agenda do telefone
 
-> Snapshot atualizado em 2026-05-11 (noite). Sessao de hoje resolveu
-> UX da sidebar apos o `smb_app_state_sync` ter sincronizado 160
-> contatos da agenda do dono e poluido a lista com 155 conversations
-> vazias. Introduzido **contact picker** (icone de agenda) com cache
-> em memoria LGPD-safe + endpoint pra materializar conversation
-> on-demand. Histórico anterior preservado abaixo.
-> Quando voltar, leia este arquivo primeiro, depois
-> [2026-05-11.md](2026-05-11.md) (sessão mais recente),
-> [2026-05-09.md](2026-05-09.md) (history sync + bugs conversation_id),
-> [2026-05-08.md](2026-05-08.md) §5 (sessão da tarde),
-> [2026-05-06.md](2026-05-06.md) e
+> **Snapshot atualizado em 2026-05-19.** Dia de incidente+remediação
+> em prod: isolamento por operador (#2), fix transferência (#3), surto
+> de duplicatas do `state_sync`, e 429 de capacidade no Cloud Run.
+>
+> **Estado de prod (fim 2026-05-19):**
+> - **Fase 2 rules estritas: DEPLOYADAS em prod e VALIDADAS** (gerencia
+>   e izael admins OK; teste1 operador escopado). A
+>   `firestore-rules-staging-strict.wip` foi portada e aplicada.
+> - Duplicatas: **resolvidas** — `upsert_wa_contact` agora get-or-create
+>   atômico (`wa_contact_index` + `.create()`), provado em prod.
+> - `state_sync` de canal coexistence agora **atribui ao dono** (LGPD);
+>   órfãos legados backfillados → `gerencia`. Pool vazio.
+> - Capacidade: Cloud Run `maxScale 40`/`concurrency 8` + webhook
+>   `state_sync` em threadpool + frontend single-flight.
+> - **Firestore PITR habilitado** (7 dias).
+>
+> ⏳ **PENDENTE p/ próxima onda da Meta (amanhã):** provar
+> `state_sync→dono` e ausência de 429 (runbook em
+> [2026-05-19.md](2026-05-19.md) §6). ⚠️ O dedupe de 634 contatos foi
+> **irreversível por log** (bug já corrigido) — rollback só via PITR.
+>
+> **Leia primeiro [2026-05-19.md](2026-05-19.md)** (sessão mais recente,
+> com runbook das verificações pendentes e rollbacks), depois
+> [2026-05-11.md](2026-05-11.md), [2026-05-09.md](2026-05-09.md),
+> [2026-05-08.md](2026-05-08.md) §5, [2026-05-06.md](2026-05-06.md),
 > [2026-05-05.md](2026-05-05.md) pra detalhe cronológico, ou
 > [PLANO_COEXISTENCE_REFATORACAO.md](../PLANO_COEXISTENCE_REFATORACAO.md)
-> pra detalhe arquitetural.
+> pra detalhe arquitetural. Histórico anterior preservado abaixo.
 
 ## Sessao 2026-05-11 — Contact picker com agenda do telefone
 
