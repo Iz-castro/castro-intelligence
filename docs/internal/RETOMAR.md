@@ -1,5 +1,14 @@
 # Contexto pra retomar — Coexistence completo + contact picker com agenda do telefone
 
+> **Adendo 2026-05-21:** WABA mismatch em `/api/wa/send-template`
+> (Meta #132001) **resolvido e deployado** (commit `577b74a`, revisão
+> `castro-crm-00105-954`). Backend valida template por-WABA antes da Meta
+> (guard 422); frontend lista templates pela WABA do canal da thread. O
+> "template do Izael não aparece" reportado depois **não era bug** — era
+> status `PENDING` na WABA do canal 3 (a Meta aprovou e funcionou).
+> Aprendizado: aprovação de template é **por-WABA**. Detalhe em
+> [2026-05-21.md](2026-05-21.md); diag `scripts/_diag_templates_by_waba.py`.
+>
 > **Snapshot atualizado em 2026-05-19.** Dia de incidente+remediação
 > em prod: isolamento por operador (#2), fix transferência (#3), surto
 > de duplicatas do `state_sync`, e 429 de capacidade no Cloud Run.
@@ -21,8 +30,10 @@
 > [2026-05-19.md](2026-05-19.md) §6). ⚠️ O dedupe de 634 contatos foi
 > **irreversível por log** (bug já corrigido) — rollback só via PITR.
 >
-> **Leia primeiro [2026-05-19.md](2026-05-19.md)** (sessão mais recente,
-> com runbook das verificações pendentes e rollbacks), depois
+> **Leia primeiro [2026-05-21.md](2026-05-21.md)** (sessão mais recente,
+> fix do WABA mismatch + causa-raiz do template PENDING), depois
+> [2026-05-19.md](2026-05-19.md) (incidente+remediação, runbook das
+> verificações pendentes e rollbacks), depois
 > [2026-05-11.md](2026-05-11.md), [2026-05-09.md](2026-05-09.md),
 > [2026-05-08.md](2026-05-08.md) §5, [2026-05-06.md](2026-05-06.md),
 > [2026-05-05.md](2026-05-05.md) pra detalhe cronológico, ou
