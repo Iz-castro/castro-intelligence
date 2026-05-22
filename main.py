@@ -1433,6 +1433,66 @@ async def wa_send_audio(
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": "audio", "media_path": local_result["path"]}
 
 
+async def _load_approved_templates_for_channel(channel: dict) -> dict:
+    # Compartilhado entre /api/wa/templates (UI) e /api/wa/send-template
+    # (guard anti-WABA-mismatch #132001). Reusa _templates_cache (TTL 60s).
+    # Levanta ValueError quando canal nao tem waba_id; HTTPException 502/503
+    # quando a Meta/credenciais falham.
+    from channel_service import get_send_credentials
+
+    waba_id = str(channel.get("waba_id", "")).strip()
+    if not waba_id:
+        raise ValueError(f"Canal {channel.get('id')} sem waba_id")
+
+    resolved_channel_id = int(channel.get("id") or 0)
+    now = _monotonic()
+    cached = _templates_cache.get(resolved_channel_id)
+    if cached and (now - cached[0]) < _TEMPLATES_TTL_S:
+        return cached[1]
+
+    try:
+        token, _phone_id, api_base = get_send_credentials(channel.get("id"))
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    url = f"{api_base}/{waba_id}/message_templates"
+    params = {
+        "fields": "name,language,category,status,components,id",
+        "limit": 100,
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+
+    templates: list[dict] = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        next_url: str | None = url
+        next_params: dict | None = params
+        while next_url:
+            resp = await client.get(next_url, params=next_params, headers=headers)
+            if resp.status_code >= 400:
+                try:
+                    err = resp.json().get("error", {}).get("message", resp.text[:300])
+                except Exception:
+                    err = resp.text[:300]
+                raise HTTPException(status_code=502, detail=f"Meta retornou erro: {err}")
+            data = resp.json()
+            templates.extend(data.get("data", []) or [])
+            paging = data.get("paging") or {}
+            next_url = paging.get("next")
+            next_params = None
+
+    approved = [t for t in templates if str(t.get("status", "")).upper() == "APPROVED"]
+    approved.sort(key=lambda t: (str(t.get("category", "")), str(t.get("name", ""))))
+    result = {
+        "channel_id": channel.get("id"),
+        "waba_id": waba_id,
+        "total": len(templates),
+        "approved_count": len(approved),
+        "templates": approved,
+    }
+    _templates_cache[resolved_channel_id] = (now, result)
+    return result
+
+
 class WaSendTemplateRequest(BaseModel):
     conversation_id: str | None = None
     contact_id: int | None = None
@@ -1476,6 +1536,58 @@ async def wa_send_template(
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
+
+    # Guard anti-WABA-mismatch (Meta #132001): templates sao por-WABA e
+    # tenants com >1 coexistence tem WABAs distintas. Se o frontend
+    # listou templates de outra WABA (ex.: filtro pelo canal do contato
+    # mas thread aberta pertence a outro canal apos transferencia), o
+    # POST falha com 132001. Validamos antes server-side, reusando o
+    # cache de listagem (TTL=60s) pra nao bater na Meta extra.
+    # Falha do helper (Meta indisponivel) NAO bloqueia o envio — deixa
+    # a Meta decidir; so 422 do mismatch sobe.
+    if channel:
+        try:
+            approved = await _load_approved_templates_for_channel(channel)
+            templates_list = approved.get("templates", []) or []
+            matched = any(
+                t.get("name") == effective_template_name
+                and str(t.get("language", "")) == effective_language
+                for t in templates_list
+            )
+            if not matched:
+                waba_id = approved.get("waba_id", "?")
+                display = channel.get("display_phone_number") or channel.get("phone_number_id") or "?"
+                logger.warning(
+                    "send-template WABA mismatch: template=%s lang=%s channel_id=%s waba=%s",
+                    effective_template_name, effective_language, channel.get("id"), waba_id,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Template '{effective_template_name}' ({effective_language}) "
+                        f"nao esta aprovado na WABA {waba_id} do canal "
+                        f"{channel.get('id')} ({display}). Selecione um template "
+                        f"aprovado nesta WABA ou submeta-o no Business Manager."
+                    ),
+                )
+        except HTTPException as exc:
+            if exc.status_code == 422:
+                raise
+            logger.warning(
+                "send-template guard skip (helper indisponivel %s): %s",
+                exc.status_code, exc.detail,
+            )
+        except ValueError as exc:
+            logger.warning("send-template guard skip (canal sem waba_id): %s", exc)
+
+    logger.info(
+        "WA_SEND_TEMPLATE channel_id=%s waba=%s template=%s lang=%s",
+        channel.get("id") if channel else None,
+        str((channel or {}).get("waba_id", "")) or None,
+        effective_template_name,
+        effective_language,
+    )
+
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     template_payload: dict = {
@@ -1552,63 +1664,16 @@ async def wa_list_templates(
     current_user: dict = Depends(get_current_user),
 ):
     """Lista templates aprovados da WABA do canal (ou canal default)."""
-    from channel_service import get_channel, get_default_channel, get_send_credentials
+    from channel_service import get_channel, get_default_channel
 
     channel = get_channel(channel_id) if channel_id is not None else get_default_channel()
     if channel is None:
         raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
 
-    waba_id = str(channel.get("waba_id", "")).strip()
-    if not waba_id:
-        raise HTTPException(status_code=503, detail=f"Canal {channel.get('id')} sem waba_id")
-
-    resolved_channel_id = int(channel.get("id") or 0)
-    now = _monotonic()
-    cached = _templates_cache.get(resolved_channel_id)
-    if cached and (now - cached[0]) < _TEMPLATES_TTL_S:
-        return cached[1]
-
     try:
-        token, _phone_id, api_base = get_send_credentials(channel.get("id"))
+        return await _load_approved_templates_for_channel(channel)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-
-    url = f"{api_base}/{waba_id}/message_templates"
-    params = {
-        "fields": "name,language,category,status,components,id",
-        "limit": 100,
-    }
-    headers = {"Authorization": f"Bearer {token}"}
-
-    templates: list[dict] = []
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        next_url: str | None = url
-        next_params: dict | None = params
-        while next_url:
-            resp = await client.get(next_url, params=next_params, headers=headers)
-            if resp.status_code >= 400:
-                try:
-                    err = resp.json().get("error", {}).get("message", resp.text[:300])
-                except Exception:
-                    err = resp.text[:300]
-                raise HTTPException(status_code=502, detail=f"Meta retornou erro: {err}")
-            data = resp.json()
-            templates.extend(data.get("data", []) or [])
-            paging = data.get("paging") or {}
-            next_url = paging.get("next")
-            next_params = None
-
-    approved = [t for t in templates if str(t.get("status", "")).upper() == "APPROVED"]
-    approved.sort(key=lambda t: (str(t.get("category", "")), str(t.get("name", ""))))
-    result = {
-        "channel_id": channel.get("id"),
-        "waba_id": waba_id,
-        "total": len(templates),
-        "approved_count": len(approved),
-        "templates": approved,
-    }
-    _templates_cache[resolved_channel_id] = (now, result)
-    return result
 
 
 # -- API: Correcao de mensagem (Cenario C) --
