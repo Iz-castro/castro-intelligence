@@ -3,6 +3,7 @@ import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { resolveMessageMedia } from "./utils/media";
+import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
@@ -113,7 +114,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
-              {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
+              {(sessionUser.role === "admin" || sessionUser.role === "supervisor" || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
               {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
@@ -161,7 +162,7 @@ function NavBar() {
 type ContactPickerMode = "list" | "create";
 
 function NewContactModal({ onClose }: { onClose: () => void }) {
-  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact } = useCrm();
+  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact, operators, sessionUser, isManagerRole } = useCrm();
   const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -172,6 +173,10 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
   const [total, setTotal] = useState(0);
   const [loadingList, setLoadingList] = useState(false);
   const [busyOpen, setBusyOpen] = useState(false);
+  // Filtro de agenda por operador atribuido (so privilegiado ve a agenda toda):
+  // null = Todos; sessionUser.id = "Meus"; outro id = carteira daquele operador.
+  // Client-side sobre os contatos ja carregados — sem leitura extra no Firestore.
+  const [ownerFilter, setOwnerFilter] = useState<number | null>(null);
 
   // Carrega contatos quando entra no modo list ou quando search muda (debounce).
   useEffect(() => {
@@ -207,6 +212,8 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     }
   }
 
+  const visibleContacts = ownerFilter == null ? allContacts : allContacts.filter((c) => (c.assigned_to ?? null) === ownerFilter);
+
   if (mode === "create") {
     return (
       <div className="lightbox" role="dialog" aria-modal="true" aria-label="Novo contato" onClick={onClose}>
@@ -241,7 +248,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" style={{ width: "min(520px, 92vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.5rem" }}>
-          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({total})</p>
+          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({ownerFilter == null ? total : visibleContacts.length})</p>
         </div>
         <input
           value={search}
@@ -258,15 +265,24 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
         >
           + Novo contato
         </button>
+        {isManagerRole && operators.length > 0 ? (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", marginBottom: "0.6rem" }}>
+            <button type="button" className={ownerFilter === sessionUser?.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(sessionUser?.id ?? null)}>Meus</button>
+            {operators.filter((o) => o.id !== sessionUser?.id).map((o) => (
+              <button key={o.id} type="button" className={ownerFilter === o.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(o.id)} title={o.display_name}>{o.display_name.split(" ")[0]}</button>
+            ))}
+            <button type="button" className={ownerFilter == null ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(null)}>Todos</button>
+          </div>
+        ) : null}
         <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
           <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>Contatos Salvos</p>
           {loadingList && allContacts.length === 0 ? (
             <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
-          ) : allContacts.length === 0 ? (
-            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : "Nenhum contato sincronizado."}</p>
+          ) : visibleContacts.length === 0 ? (
+            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato sincronizado."}</p>
           ) : (
             <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {allContacts.map((c) => (
+              {visibleContacts.map((c) => (
                 <li key={c.id}>
                   <button
                     type="button"
@@ -476,7 +492,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
@@ -489,11 +505,19 @@ function ChatPanel() {
   const [openMessageMenuId, setOpenMessageMenuId] = useState<number | null>(null);
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+  const [busyTakeover, setBusyTakeover] = useState(false);
   const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
   const selectedOperator = activeView === "equipe" ? findAssignedOperator(selectedContact, operators) : null;
   const selectedOperatorColor = selectedOperator ? operatorColor(selectedOperator.id) : null;
   const noInboundWindow = selectedContact && !selectedContact.last_inbound_at;
   const isManualContact = selectedContact?.created_source === "manual";
+  // Takeover temporario (coexistence): lead de outro operador escreveu neste numero.
+  const takeoverStatus = selectedThread?.takeover_status;
+  const isTakeoverPending = takeoverStatus === "pending";
+  const isTakeoverActive = takeoverStatus === "active";
+  const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
+  const doTakeover = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await takeoverConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
+  const doReturn = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await returnConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
   const chatIsEmpty = selectedContact && visibleMessages.length === 0;
   useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
 
@@ -630,6 +654,17 @@ function ChatPanel() {
           </div>
         </div>
 
+        {(isTakeoverPending || isTakeoverActive) ? (
+          <div className={`alert ${isTakeoverPending ? "danger" : "success"}`} style={{ alignItems: "center", gap: "0.6rem" }}>
+            <span style={{ flex: 1 }}>
+              {isTakeoverPending
+                ? <>Este contato pertence a <strong>{leadOwnerName}</strong>. Assuma para responder sem transferir o lead.</>
+                : <>Voce assumiu este atendimento temporariamente — lead de <strong>{leadOwnerName}</strong>.</>}
+            </span>
+            {isTakeoverActive ? <button type="button" className="ghost" style={{ whiteSpace: "nowrap" }} disabled={busyTakeover} onClick={() => void doReturn()}>{busyTakeover ? "..." : "Encerrar e devolver"}</button> : null}
+          </div>
+        ) : null}
+
         {editingNickname ? (
           <form className="toolbar" onSubmit={(e) => { e.preventDefault(); void updateDeclaredName(selectedContact.id, nicknameInput.trim()); setEditingNickname(false); }} style={{ gap: "0.4rem" }}>
             <input value={nicknameInput} onChange={(e) => setNicknameInput(e.target.value)} placeholder="Apelido do contato (vazio para remover)" autoFocus style={{ flex: 1 }} />
@@ -688,7 +723,12 @@ function ChatPanel() {
           ))}</div>
         )}
 
-        {noInboundWindow ? (
+        {isTakeoverPending ? (
+          <div className="composer" style={{ padding: "0.8rem 1rem", flexDirection: "column", gap: "0.5rem" }}>
+            <div className="sub" style={{ textAlign: "center", width: "100%" }}>Contato de {leadOwnerName}. Assuma para responder sem transferir o lead.</div>
+            <button type="button" className="assume-btn" style={{ background: "var(--danger)", borderColor: "var(--danger)" }} disabled={busyTakeover} onClick={() => void doTakeover()}>{busyTakeover ? "Assumindo..." : "Assumir atendimento temporariamente"}</button>
+          </div>
+        ) : noInboundWindow ? (
           <div className="composer" style={{ padding: "0.8rem 1rem" }}>
             <div className="sub" style={{ textAlign: "center", width: "100%" }}>Janela de 24h indisponivel. Use o menu de templates para iniciar a conversa.</div>
           </div>
@@ -960,7 +1000,7 @@ function CollapsibleCard({ title, defaultOpen = true, children }: { title: strin
 }
 
 function DetailPanel() {
-  const { bundle, selectedContact, selectedThreadId, conversations, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, setError, setNotice, refreshPollingViews } = useCrm();
+  const { bundle, selectedContact, selectedThreadId, conversations, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
   const [bulkFromUser, setBulkFromUser] = useState<number | "">("");
   const [bulkAction, setBulkAction] = useState<"return_to_bot" | "transfer">("return_to_bot");
@@ -1067,10 +1107,22 @@ function DetailPanel() {
                       <button className="ghost" style={{ padding: "0.5rem 0.7rem" }} onClick={() => setEditingUserId(null)}>✕</button>
                     </div>
                   </div>
+                ) : coexEditingUserId === op.id ? (
+                  <div className="admin-user-edit">
+                    <input type="tel" value={coexPhoneInput} onChange={(e) => setCoexPhoneInput(e.target.value)} placeholder="Numero coex (ex: 5531999990000)" />
+                    <span className="sub" style={{ fontSize: "0.66rem", lineHeight: 1.3 }}>Numero corporativo que o operador vai conectar. Libera o Embedded Signup pra ele.</span>
+                    <div style={{ display: "flex", gap: "0.4rem" }}>
+                      <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveCoex(op.id)} disabled={busyCoexUpdate}>{busyCoexUpdate ? "..." : "Salvar"}</button>
+                      {op.coex_authorized ? <button className="ghost" style={{ padding: "0.5rem 0.7rem", color: "var(--danger)" }} onClick={() => void revokeCoex(op.id)} disabled={busyCoexUpdate} title="Revogar autorizacao">⊘</button> : null}
+                      <button className="ghost" style={{ padding: "0.5rem 0.7rem" }} onClick={() => cancelEditCoex()}>✕</button>
+                    </div>
+                  </div>
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: "0.25rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <span className="chip" style={{ fontSize: "0.68rem" }}>{op.role}</span>
+                    {op.coex_authorized ? <span className="chip" style={{ fontSize: "0.62rem" }} title={op.coex_phone ? `Coex liberado: ${op.coex_phone}` : "Coex liberado"}>📱 Coex</span> : null}
                     {sessionUser?.role === "admin" && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)}>Editar</button>}
+                    {isManagerRole && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditCoex(op)} title="Autorizar WhatsApp coexistence do operador">Coex</button>}
                     <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} disabled={busyResetCounter === op.id} onClick={() => void resetAssumeCounter(op.id, op.display_name)} title="Resetar contador">{busyResetCounter === op.id ? "..." : "Reset"}</button>
                   </div>
                 )}
@@ -1788,20 +1840,7 @@ function NotificationsTab() {
       audio.volume = 0.5;
       audio.play().catch(() => {});
     } else {
-      try {
-        const ctx = new AudioContext();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.frequency.value = fallbackFreq;
-        osc.type = fallbackFreq > 800 ? "sine" : "square";
-        gain.gain.value = 0.3;
-        osc.start();
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
-        osc.stop(ctx.currentTime + 0.4);
-        setTimeout(() => ctx.close(), 600);
-      } catch { /* audio not available */ }
+      playBeep({ freq: fallbackFreq, type: fallbackFreq > 800 ? "sine" : "square", gain: 0.3, duration: 0.4 });
     }
   }, []);
 

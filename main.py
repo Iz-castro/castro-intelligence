@@ -56,7 +56,7 @@ from database import (
     return_contact_to_bot, get_contacts_by_assigned_user,
     get_wa_contacts_scoped_for_user,
     update_user_avatar, get_user_avatar,
-    update_user, deactivate_user,
+    update_user, deactivate_user, set_coex_authorization,
     upsert_firebase_user, get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message, set_attendance_protocol,
@@ -64,6 +64,7 @@ from database import (
     create_manual_wa_contact, update_wa_contact_declared_name,
     mark_message_corrected,
     get_wa_conversation_by_id, upsert_wa_conversation,
+    set_conversation_takeover_active, clear_conversation_takeover,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -131,6 +132,20 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    # O Embedded Signup (FB.login) e o Firebase Auth abrem um popup e
+    # precisam checar window.closed / window.opener pra concluir o fluxo.
+    # A policy padrao do Chrome (same-origin) bloqueia essa chamada e gera
+    # "Cross-Origin-Opener-Policy policy would block the window.closed call".
+    # same-origin-allow-popups libera a comunicacao com o popup sem abrir mao
+    # do isolamento entre origens distintas. NAO setamos COEP (require-corp)
+    # de proposito: quebraria o carregamento de assets/sdk de terceiros.
+    response = await call_next(request)
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
+    return response
 
 
 # Middleware HTTP que extrai tenant_id do JWT ANTES do endpoint e seta o
@@ -721,6 +736,40 @@ async def admin_deactivate_user(user_id: int, current_user: dict = Depends(get_c
     return {"status": "ok"}
 
 
+@app.post("/api/admin/users/{user_id}/coex")
+async def admin_authorize_coex(user_id: int, request: Request, current_user: dict = Depends(get_current_user)):
+    """Autoriza um usuario (tipicamente operador) a fazer o proprio Embedded
+    Signup coexistence. O admin/supervisor pre-cadastra o numero corporativo
+    que sera conectado: isso libera a tela 'WhatsApp Coexistence' pra esse
+    operador e o /exchange exige que o numero conectado bata com o autorizado.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Permissao negada")
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+    body = await request.json()
+    phone_digits = "".join(ch for ch in str(body.get("phone", "")) if ch.isdigit())
+    if len(phone_digits) < 10:
+        raise HTTPException(status_code=400, detail="Numero invalido. Informe DDI+DDD+numero (ex: 5531999990000).")
+    set_coex_authorization(user_id, phone_digits, authorized=True)
+    # LGPD: nao logar o numero completo — so os 4 ultimos digitos.
+    log_audit(current_user["id"], "COEX_AUTHORIZE", f"user={user_id} phone=...{phone_digits[-4:]}")
+    return {"status": "ok", "user_id": user_id, "coex_phone": phone_digits}
+
+
+@app.delete("/api/admin/users/{user_id}/coex")
+async def admin_revoke_coex(user_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Permissao negada")
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+    set_coex_authorization(user_id, "", authorized=False)
+    log_audit(current_user["id"], "COEX_REVOKE", f"user={user_id}")
+    return {"status": "ok", "user_id": user_id}
+
+
 @app.get("/api/admin/roles")
 async def list_roles(current_user: dict = Depends(get_current_user)):
     return {"roles": ROLE_OPTIONS}
@@ -1179,6 +1228,10 @@ def _check_conv_send_permission(conversation: dict, current_user: dict):
     por thread em vez de por contato — admite que o mesmo cliente em
     canais diferentes seja atendido por gente diferente).
     """
+    # Takeover temporario: durante 'pending' o operador precisa assumir antes
+    # de responder (o frontend ja bloqueia o composer; isto fecha a brecha via API).
+    if conversation.get("takeover_status") == "pending":
+        raise HTTPException(status_code=403, detail="Assuma o atendimento temporario antes de responder")
     assigned = conversation.get("assigned_to")
     if assigned and assigned != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
@@ -1950,6 +2003,44 @@ async def mark_conversation_read(conversation_id: str, current_user: dict = Depe
         return {"status": "ok", "updated_count": 0}
     updated_count = mark_wa_conversation_read_by_id(conversation_id)
     return {"status": "ok", "updated_count": updated_count}
+
+
+@app.post("/api/wa/conversation/{conversation_id}/takeover")
+async def conversation_takeover(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Operador dono do numero assume um atendimento temporario: um cliente que
+    e lead de outro operador mandou mensagem pro numero dele. NAO transfere a
+    posse do lead — so libera este operador a responder nesta thread."""
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+    handler = conv.get("takeover_handler_user_id")
+    privileged = current_user.get("role") in ("admin", "supervisor")
+    if handler and int(handler) != current_user["id"] and not privileged:
+        raise HTTPException(status_code=403, detail="Apenas o dono do numero pode assumir este atendimento")
+    set_conversation_takeover_active(conversation_id, current_user["id"])
+    log_audit(current_user["id"], "TAKEOVER_START", f"conv={conversation_id} lead_owner={conv.get('lead_owner_user_id')}")
+    return {"status": "ok", "conversation_id": conversation_id}
+
+
+@app.post("/api/wa/conversation/{conversation_id}/return")
+async def conversation_return(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Encerra o atendimento temporario e devolve o lead ao dono original.
+    O historico fica no contato; novas mensagens nesse canal reabrem 'pending'."""
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+    lead_owner = conv.get("lead_owner_user_id")
+    clear_conversation_takeover(conversation_id)
+    contact_id = conv.get("contact_id")
+    if contact_id is not None:
+        lead_name = (get_user_by_id(lead_owner) or {}).get("display_name", "operador de origem") if lead_owner else "operador de origem"
+        insert_transfer_system_message(
+            contact_id,
+            f"Atendimento temporario encerrado por {current_user.get('display_name', 'operador')} e devolvido para {lead_name}.",
+            current_user["id"],
+        )
+    log_audit(current_user["id"], "TAKEOVER_RETURN", f"conv={conversation_id} lead_owner={lead_owner}")
+    return {"status": "ok", "conversation_id": conversation_id}
 
 
 @app.delete("/api/wa/contact/{contact_id}")
@@ -2797,6 +2888,8 @@ async def list_operators(current_user: dict = Depends(get_current_user)):
             "role": u.get("role", "operador"),
             "email": u.get("email", ""),
             "firebase_uid": u.get("firebase_uid", ""),
+            "coex_authorized": u.get("coex_authorized", 0),
+            "coex_phone": u.get("coex_phone", ""),
         }
         for u in users if u.get("is_active")
     ]
@@ -3103,8 +3196,8 @@ async def export_data(
 @app.get("/api/admin/embedded-signup/config")
 async def embedded_signup_config(current_user: dict = Depends(get_current_user)):
     """Retorna configuracao necessaria para o frontend iniciar o Embedded Signup."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem acessar o signup")
+    if current_user.get("role") not in ("admin", "supervisor") and not current_user.get("coex_authorized"):
+        raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     missing: list[str] = []
     if not META_APP_ID:
         missing.append("META_APP_ID")
@@ -3161,8 +3254,8 @@ async def embedded_signup_exchange(
     current_user: dict = Depends(get_current_user),
 ):
     """Troca o code do Embedded Signup por token e descobre WABA/Phone IDs."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem realizar signup")
+    if current_user.get("role") not in ("admin", "supervisor") and not current_user.get("coex_authorized"):
+        raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     if not META_APP_ID or not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
 
@@ -3299,7 +3392,30 @@ async def embedded_signup_exchange(
     # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
     is_coexistence = body.channel_type == "coexistence"
     channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
-    owner_id = (body.owner_user_id or current_user["id"]) if is_coexistence else None
+    is_privileged = current_user.get("role") in ("admin", "supervisor")
+    # Operador autorizado so conecta canal COEX do PROPRIO numero: ignora
+    # owner_user_id do body (so admin/supervisor atribui canal a outro user) e
+    # nao pode criar canal standard.
+    if not is_privileged and not is_coexistence:
+        raise HTTPException(status_code=403, detail="Operador so pode conectar canal coexistence do proprio numero.")
+    if is_coexistence:
+        owner_id = body.owner_user_id if (is_privileged and body.owner_user_id) else current_user["id"]
+    else:
+        owner_id = None
+    # Validacao do numero pre-autorizado: se o usuario tem numero coex autorizado
+    # pelo admin, o numero conectado no signup TEM que bater (LGPD + politica de
+    # numeros corporativos). normalize_br_phone trata o 9o digito BR.
+    expected_phone = "".join(ch for ch in str(current_user.get("coex_phone") or "") if ch.isdigit())
+    if is_coexistence and expected_phone:
+        got_phone = "".join(ch for ch in str(display_phone or "") if ch.isdigit())
+        if normalize_br_phone(expected_phone) != normalize_br_phone(got_phone):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Numero conectado (...{got_phone[-4:] or '????'}) difere do autorizado "
+                    f"(...{expected_phone[-4:]}). Conecte o numero cadastrado pelo admin."
+                ),
+            )
 
     # 5. Registrar webhook do app no WABA com os fields apropriados
     if is_coexistence:

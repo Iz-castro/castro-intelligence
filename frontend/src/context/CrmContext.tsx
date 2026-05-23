@@ -2,7 +2,7 @@ import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, 
 import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
 import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
-import { getJson, putJson, sendForm, sendJson } from "../api";
+import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
   ActiveView, Channel, ChatMessage, ClientConfig, Contact, Conversation, Department,
@@ -15,6 +15,7 @@ import { buildMessageReplyReference, formatRecordingTime, messageCopyText, messa
 import { normalizeContact, normalizeConversation, normalizeMessage } from "../utils/normalization";
 import { applyTheme, themePref, transportPref } from "../utils/storage";
 import type { LightboxMedia } from "../utils/media";
+import { installAudioUnlock, playBeep } from "../utils/audio";
 
 // ---------------------------------------------------------------------------
 // Context value shape
@@ -207,6 +208,16 @@ type CrmContextValue = {
   busyRoleUpdate: boolean;
   startEditUser: (op: Operator) => void;
   saveUserRole: (userId: number) => Promise<void>;
+  coexEditingUserId: number | null;
+  coexPhoneInput: string;
+  setCoexPhoneInput: (v: string) => void;
+  busyCoexUpdate: boolean;
+  startEditCoex: (op: Operator) => void;
+  cancelEditCoex: () => void;
+  saveCoex: (userId: number) => Promise<void>;
+  revokeCoex: (userId: number) => Promise<void>;
+  takeoverConversation: (conversationId: string) => Promise<void>;
+  returnConversation: (conversationId: string) => Promise<void>;
 
   // Settings
   showSettings: SettingsPage;
@@ -300,10 +311,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // persistencia em localStorage por LGPD.
   const [allContactsCache, setAllContactsCache] = useState<Contact[] | null>(null);
   const [allContactsCacheTotal, setAllContactsCacheTotal] = useState<number>(0);
-  const contactsById = useMemo(
-    () => new Map<number, Contact>(contacts.map((c) => [c.id, c])),
-    [contacts],
-  );
+  // Contatos puxados sob demanda porque sao referenciados por uma conversa
+  // atribuida a este operador mas estao FORA do snapshot escopado dele
+  // (ex.: takeover — lead de outro operador escreveu no numero dele).
+  const [extraContacts, setExtraContacts] = useState<Map<number, Contact>>(new Map());
+  const contactsById = useMemo(() => {
+    const m = new Map<number, Contact>(contacts.map((c) => [c.id, c]));
+    extraContacts.forEach((c, id) => { if (!m.has(id)) m.set(id, c); });
+    return m;
+  }, [contacts, extraContacts]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
   // Fase 3 V2: selectedThreadId e a fonte unica de selecao na sidebar.
@@ -317,6 +333,39 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     [conversations, selectedThreadId],
   );
   const selectedContactId = selectedConversation?.contact_id ?? null;
+
+  // Lazy-load de contatos referenciados por conversas do operador que estao
+  // fora do snapshot escopado dele (caso takeover). So buscamos ids que ja
+  // aparecem em conversas no estado do operador — nao varre o tenant.
+  const fetchedExtraRef = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    if (!bundle) return;
+    const localIds = new Set(contacts.map((c) => c.id));
+    const missing = Array.from(new Set(
+      conversations
+        .map((c) => c.contact_id)
+        .filter((id): id is number => typeof id === "number" && !localIds.has(id) && !fetchedExtraRef.current.has(id)),
+    ));
+    if (missing.length === 0) return;
+    let disposed = false;
+    missing.forEach((id) => fetchedExtraRef.current.add(id));
+    void Promise.all(missing.map((id) =>
+      getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
+        .then((res) => normalizeContact(res.contact, String(res.contact.id)))
+        .catch(() => null),
+    )).then((fetched) => {
+      if (disposed) return;
+      const valid = fetched.filter((c): c is Contact => !!c);
+      if (!valid.length) return;
+      setExtraContacts((prev) => {
+        const next = new Map(prev);
+        valid.forEach((c) => next.set(c.id, c));
+        return next;
+      });
+    });
+    return () => { disposed = true; };
+  }, [conversations, contacts, bundle]);
+
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
@@ -385,6 +434,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [editRole, setEditRole] = useState("");
   const [editDeptId, setEditDeptId] = useState<number | "">("");
   const [busyRoleUpdate, setBusyRoleUpdate] = useState(false);
+  const [coexEditingUserId, setCoexEditingUserId] = useState<number | null>(null);
+  const [coexPhoneInput, setCoexPhoneInput] = useState("");
+  const [busyCoexUpdate, setBusyCoexUpdate] = useState(false);
 
   // -- Settings --
   const [showSettings, setShowSettings] = useState<SettingsPage>(false);
@@ -1090,6 +1142,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const alarmIntervalRef = useRef<number | null>(null);
   const alarmAudioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Destrava o Web Audio no primeiro gesto do usuario — Chrome bloqueia o
+  // AudioContext antes de qualquer interacao (warning "was not allowed to start").
+  useEffect(() => { installAudioUnlock(); }, []);
+
   // Beep for all users when total unread increases
   useEffect(() => {
     if (!sessionUser || !systemSettings.notification_sound_enabled) {
@@ -1107,21 +1163,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         audio.volume = 0.5;
         audio.play().catch(() => {});
       } else {
-        // Default beep via Web Audio API
-        try {
-          const ctx = new AudioContext();
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.connect(gain);
-          gain.connect(ctx.destination);
-          osc.frequency.value = 880;
-          osc.type = "sine";
-          gain.gain.value = 0.3;
-          osc.start();
-          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
-          osc.stop(ctx.currentTime + 0.3);
-          setTimeout(() => ctx.close(), 500);
-        } catch { /* audio not available */ }
+        playBeep({ freq: 880, type: "sine", gain: 0.3, duration: 0.3 });
       }
     }
   }, [contacts, sessionUser, systemSettings.notification_sound_enabled, systemSettings.notification_sound_path]);
@@ -1168,24 +1210,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           alarmAudioRef.current.currentTime = 0;
           alarmAudioRef.current.play().catch(() => {});
         } else {
-          // Default alarm: two-tone beep
-          try {
-            const ctx = new AudioContext();
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.frequency.value = 660;
-            osc.type = "square";
-            gain.gain.value = 0.25;
-            osc.start();
-            osc.frequency.setValueAtTime(880, ctx.currentTime + 0.15);
-            osc.frequency.setValueAtTime(660, ctx.currentTime + 0.3);
-            osc.frequency.setValueAtTime(880, ctx.currentTime + 0.45);
-            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
-            osc.stop(ctx.currentTime + 0.6);
-            setTimeout(() => ctx.close(), 800);
-          } catch { /* audio not available */ }
+          playBeep({
+            freq: 660, type: "square", gain: 0.25, duration: 0.6,
+            steps: [{ freq: 880, at: 0.15 }, { freq: 660, at: 0.3 }, { freq: 880, at: 0.45 }],
+          });
         }
       } else {
         // No overdue messages — stop alarm audio if playing
@@ -1472,6 +1500,36 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try { setBusyRoleUpdate(true); setError(""); await putJson(bundle.auth, `/api/admin/users/${userId}`, { role: editRole, department_id: editDeptId || null }); setNotice("Usuario atualizado."); setEditingUserId(null); if (!snapshotMode) await refreshPollingViews(); }
     catch (e) { setError(errorText(e)); }
     finally { setBusyRoleUpdate(false); }
+  }
+
+  function startEditCoex(op: Operator) { setCoexEditingUserId(op.id); setCoexPhoneInput(op.coex_phone || ""); }
+  function cancelEditCoex() { setCoexEditingUserId(null); setCoexPhoneInput(""); }
+  async function saveCoex(userId: number) {
+    if (!bundle) return;
+    const digits = coexPhoneInput.replace(/\D/g, "");
+    if (digits.length < 10) { setError("Numero invalido. Informe DDI+DDD+numero (ex: 5531999990000)."); return; }
+    try { setBusyCoexUpdate(true); setError(""); await sendJson(bundle.auth, `/api/admin/users/${userId}/coex`, { phone: digits }); setNotice("Coexistence liberado para o operador."); setCoexEditingUserId(null); setCoexPhoneInput(""); setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators")); }
+    catch (e) { setError(errorText(e)); }
+    finally { setBusyCoexUpdate(false); }
+  }
+  async function revokeCoex(userId: number) {
+    if (!bundle) return;
+    try { setBusyCoexUpdate(true); setError(""); await deleteJson(bundle.auth, `/api/admin/users/${userId}/coex`); setNotice("Autorizacao coexistence revogada."); setCoexEditingUserId(null); setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators")); }
+    catch (e) { setError(errorText(e)); }
+    finally { setBusyCoexUpdate(false); }
+  }
+
+  // Takeover temporario: o snapshot realtime propaga a mudanca de status, entao
+  // nao precisamos refresh manual aqui.
+  async function takeoverConversation(conversationId: string) {
+    if (!bundle) return;
+    try { setError(""); await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/takeover`); setNotice("Atendimento assumido temporariamente."); }
+    catch (e) { setError(errorText(e)); }
+  }
+  async function returnConversation(conversationId: string) {
+    if (!bundle) return;
+    try { setError(""); await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/return`); setNotice("Atendimento devolvido ao operador de origem."); }
+    catch (e) { setError(errorText(e)); }
   }
 
   function startCorrection(message: ChatMessage) {
@@ -1779,6 +1837,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
+    coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
+    takeoverConversation, returnConversation,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredConversations, viewConversations,
     error, setError, notice, setNotice,

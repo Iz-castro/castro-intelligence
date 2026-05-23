@@ -115,5 +115,8 @@ export function normalizeConversation(record: Record<string, unknown>, docId: st
     contact_avatar_path: String(record.contact_avatar_path || ""),
     attendance_protocol: String(record.attendance_protocol || ""),
     attendance_started_at: iso(record.attendance_started_at),
+    takeover_status: String(record.takeover_status || "none"),
+    lead_owner_user_id: record.lead_owner_user_id == null ? null : num(record.lead_owner_user_id),
+    takeover_handler_user_id: record.takeover_handler_user_id == null ? null : num(record.takeover_handler_user_id),
   };
 }

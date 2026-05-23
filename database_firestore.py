@@ -145,6 +145,8 @@ def _sync_operator_profile_from_user(user):
         "role": user.get("role", "operador"),
         "department_id": user.get("department_id"),
         "is_active": user.get("is_active", 1),
+        "coex_authorized": user.get("coex_authorized", 0),
+        "coex_phone": user.get("coex_phone", ""),
         "updated_at": utcnow(),
     }, merge=True)
 
@@ -305,6 +307,8 @@ def get_user_by_id(user_id):
         "created_at": row.get("created_at"),
         "last_login": row.get("last_login"),
         "avatar_path": row.get("avatar_path", ""),
+        "coex_authorized": row.get("coex_authorized", 0),
+        "coex_phone": row.get("coex_phone", ""),
     })
 
 
@@ -338,6 +342,8 @@ def create_user(username, display_name, password_hash, department_id=None, role=
         "firebase_uid": "",
         "auth_provider": "firebase",
         "avatar_path": "",
+        "coex_authorized": 0,
+        "coex_phone": "",
         "is_active": 1,
         "created_at": utcnow(),
         "last_login": None,
@@ -362,6 +368,26 @@ def update_user(user_id, display_name=None, department_id=None, role=None):
     if updated:
         _sync_operator_profile_from_user(updated)
     return True
+
+
+def set_coex_authorization(user_id, phone, authorized=True):
+    """Marca/desmarca um usuario como autorizado a fazer Embedded Signup
+    coexistence do proprio numero.
+
+    `phone` e o numero pre-autorizado pelo admin (guardado so com digitos,
+    canonico); o /exchange compara com o numero conectado no signup. Setar
+    authorized=False revoga a autorizacao e limpa o numero.
+    """
+    phone_clean = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    fields = {
+        "coex_authorized": 1 if authorized else 0,
+        "coex_phone": phone_clean if authorized else "",
+    }
+    document("users", user_id).set(fields, merge=True)
+    updated = _get_doc("users", user_id)
+    if updated:
+        _sync_operator_profile_from_user(updated)
+    return get_user_by_id(user_id)
 
 
 def deactivate_user(user_id):
@@ -724,6 +750,54 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
         "created_at": utcnow(),
     })
     return {"from_user_id": from_user, "to_user_id": to_user_id, "contact_id": contact_id}
+
+
+def flag_conversation_takeover(conversation_id, lead_owner_user_id, handler_user_id):
+    """Marca a conversa como 'pending' takeover temporario.
+
+    Cenario: a mensagem chegou no canal de handler_user_id (dono do numero),
+    mas o lead ja pertence a lead_owner_user_id (outro operador). A UI oferece
+    "assumir temporariamente" sem roubar o lead. Idempotente — NAO reverte uma
+    sessao ja 'active' (operador ja assumiu).
+    """
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        return False
+    if conv.get("takeover_status") == "active":
+        return False
+    document("wa_conversations", conversation_id).set({
+        "takeover_status": "pending",
+        "lead_owner_user_id": lead_owner_user_id,
+        "takeover_handler_user_id": handler_user_id,
+    }, merge=True)
+    return True
+
+
+def set_conversation_takeover_active(conversation_id, handler_user_id):
+    """O operador dono do numero (handler) assume o atendimento temporario."""
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        return None
+    document("wa_conversations", conversation_id).set({
+        "takeover_status": "active",
+        "takeover_handler_user_id": handler_user_id,
+        "takeover_started_at": utcnow(),
+    }, merge=True)
+    return get_wa_conversation_by_id(conversation_id)
+
+
+def clear_conversation_takeover(conversation_id):
+    """Encerra a sessao temporaria e devolve o lead ao dono (status -> 'none').
+    O historico fica atrelado ao contato; proximas mensagens nesse canal
+    reabrem como 'pending'."""
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        return None
+    document("wa_conversations", conversation_id).set({
+        "takeover_status": "none",
+        "takeover_started_at": None,
+    }, merge=True)
+    return get_wa_conversation_by_id(conversation_id)
 
 
 def mark_wa_conversation_read_by_id(conversation_id):

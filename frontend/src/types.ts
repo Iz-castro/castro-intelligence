@@ -37,6 +37,8 @@ export type SessionUser = {
   firebase_uid?: string;
   avatar_path?: string;
   is_active?: number;
+  coex_authorized?: number;
+  coex_phone?: string;
 };
 
 export type BotKey = "comercial" | "financeiro" | "administrativo" | "sac";
@@ -77,6 +79,8 @@ export type Operator = {
   role: string;
   email?: string;
   firebase_uid?: string;
+  coex_authorized?: number;
+  coex_phone?: string;
 };
 
 export type Contact = {
@@ -149,6 +153,11 @@ export type Conversation = {
   contact_avatar_path?: string;
   attendance_protocol?: string;
   attendance_started_at?: string;
+  // Takeover temporario (coexistence multi-operador): quando um lead de outro
+  // operador manda mensagem pro numero deste operador.
+  takeover_status?: "none" | "pending" | "active" | string;
+  lead_owner_user_id?: number | null;
+  takeover_handler_user_id?: number | null;
 };
 
 export type MessageReplyReference = {

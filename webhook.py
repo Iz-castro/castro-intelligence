@@ -19,7 +19,7 @@ from config import (
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN,
 )
 from database import (
-    upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit,
+    upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit, flag_conversation_takeover,
     update_wa_message_transcription,
     get_user_by_id, get_wa_message_by_wa_message_id, get_wa_contact,
     assign_wa_contact, update_wa_contact_qualification,
@@ -560,6 +560,17 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             "[WA IN] %s (%s) | tipo=%s | id=%s",
             redact_name(contact_name), redact_phone(wa_id), effective_msg_type, msg_id[:20]
         )
+
+        # -- Takeover temporario (coexistence) --
+        # A mensagem chegou no canal de channel_owner_id (dono do numero), mas o
+        # lead ja pertence a outro operador (contact.assigned_to). Marca a
+        # conversa como 'pending' pra UI oferecer "assumir temporariamente" sem
+        # roubar o lead. Cliente novo (sem dono previo) nao gera conflito.
+        if channel_type == CHANNEL_TYPE_COEXISTENCE and channel_owner_id:
+            _ct = get_wa_contact(contact_id)
+            _lead_owner = (_ct or {}).get("assigned_to")
+            if _lead_owner and _lead_owner != channel_owner_id:
+                flag_conversation_takeover(f"{channel_id}__{wa_id}", _lead_owner, channel_owner_id)
 
         # -- Bot: processar mensagem se ativo e contato sem operador --
         # Gate: nao dispara se contato ja foi qualificado pelo bot (bot_completed=True)
