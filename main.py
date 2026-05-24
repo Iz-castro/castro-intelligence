@@ -32,7 +32,7 @@ from config import (
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
-    QUALIFICATION_OPTIONS, ROLE_OPTIONS,
+    QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
@@ -64,7 +64,7 @@ from database import (
     create_manual_wa_contact, update_wa_contact_declared_name,
     mark_message_corrected,
     get_wa_conversation_by_id, upsert_wa_conversation,
-    set_conversation_takeover_active, clear_conversation_takeover,
+    set_conversation_takeover_active, clear_conversation_takeover, expire_stale_takeovers,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -2675,6 +2675,49 @@ async def cron_health_check(request: Request):
         "tenants_processed": len(summary),
         "summary": summary,
     }
+
+
+@app.post("/api/internal/cron/expire-takeovers")
+async def cron_expire_takeovers(request: Request):
+    """Cloud Scheduler chama periodicamente. Devolve automaticamente as sessoes
+    de takeover 'active' inativas ha mais de TAKEOVER_TIMEOUT_HOURS (inatividade
+    total: sem inbound nem outbound). Mesma auth do health-check.
+
+    OBS: enquanto o Cloud Scheduler de prod nao existir, este endpoint so roda
+    se chamado manualmente (armado, mas dormente).
+    """
+    _verify_cron_auth(request)
+    from firestore_common import set_tenant_context, reset_tenant_context
+    from tenant_service import list_tenants
+
+    summary: list[dict] = []
+    total = 0
+    for tenant in list_tenants(active_only=True):
+        tid = str(tenant.get("id") or "")
+        if not tid:
+            continue
+        token = set_tenant_context(tid)
+        try:
+            expired = expire_stale_takeovers(TAKEOVER_TIMEOUT_HOURS)
+            for e in expired:
+                contact_id = e.get("contact_id")
+                if contact_id is not None:
+                    insert_transfer_system_message(
+                        contact_id,
+                        "Atendimento temporario devolvido automaticamente por inatividade.",
+                        None,
+                    )
+                log_audit(None, "TAKEOVER_AUTO_RETURN", f"conv={e.get('conversation_id')} lead_owner={e.get('lead_owner_user_id')}")
+            if expired:
+                summary.append({"tenant_id": tid, "expired": len(expired)})
+            total += len(expired)
+        except Exception as exc:
+            logger.error("expire-takeovers tenant %s falhou: %s", tid, exc)
+            summary.append({"tenant_id": tid, "error": str(exc)})
+        finally:
+            reset_tenant_context(token)
+
+    return {"status": "ok", "timeout_hours": TAKEOVER_TIMEOUT_HOURS, "expired_total": total, "tenants": summary}
 
 
 @app.get("/api/wa/contact/{contact_id}")

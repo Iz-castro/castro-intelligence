@@ -216,7 +216,7 @@ type CrmContextValue = {
   cancelEditCoex: () => void;
   saveCoex: (userId: number) => Promise<void>;
   revokeCoex: (userId: number) => Promise<void>;
-  takeoverConversation: (conversationId: string) => Promise<void>;
+  takeoverConversation: (conversationId: string, greetMessage?: string) => Promise<void>;
   returnConversation: (conversationId: string) => Promise<void>;
 
   // Settings
@@ -1521,10 +1521,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Takeover temporario: o snapshot realtime propaga a mudanca de status, entao
   // nao precisamos refresh manual aqui.
-  async function takeoverConversation(conversationId: string) {
+  async function takeoverConversation(conversationId: string, greetMessage?: string) {
     if (!bundle) return;
-    try { setError(""); await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/takeover`); setNotice("Atendimento assumido temporariamente."); }
-    catch (e) { setError(errorText(e)); }
+    try { setError(""); await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/takeover`); }
+    catch (e) { setError(errorText(e)); return; }
+    const msg = (greetMessage || "").trim();
+    if (!msg) { setNotice("Atendimento assumido temporariamente."); return; }
+    // Janela de 24h: o cliente acabou de escrever, entao em geral esta aberta.
+    // Se estiver fechada, o /send recusa e avisamos (sem reverter o takeover).
+    try { await sendJson(bundle.auth, `/api/wa/send`, { conversation_id: conversationId, content: msg }); setNotice("Atendimento assumido e mensagem enviada."); }
+    catch (e) { setNotice("Atendimento assumido. A mensagem nao pode ser enviada: " + errorText(e)); }
   }
   async function returnConversation(conversationId: string) {
     if (!bundle) return;

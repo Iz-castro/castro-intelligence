@@ -143,6 +143,11 @@ ROLE_OPTIONS = [
     "operador",
 ]
 
+# -- Takeover temporario (coexistence) --
+# Horas de inatividade TOTAL (sem inbound nem outbound) antes de o sistema
+# devolver automaticamente uma sessao de takeover 'active' ao dono do lead.
+TAKEOVER_TIMEOUT_HOURS = int(os.environ.get("TAKEOVER_TIMEOUT_HOURS", "3"))
+
 # -- Bootstrap inicial --
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 BOOTSTRAP_ADMIN_DISPLAY_NAME = os.getenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Administrador")

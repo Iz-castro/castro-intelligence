@@ -800,6 +800,42 @@ def clear_conversation_takeover(conversation_id):
     return get_wa_conversation_by_id(conversation_id)
 
 
+def expire_stale_takeovers(max_idle_hours):
+    """Devolve sessoes de takeover 'active' inativas ha mais de max_idle_hours.
+
+    Inatividade TOTAL: usa last_message_at (atualizado em inbound E outbound),
+    com fallback pra takeover_started_at. Opera no tenant_context atual. Retorna
+    lista de {conversation_id, contact_id, lead_owner_user_id} dos devolvidos.
+    """
+    from datetime import timedelta
+    cutoff = utcnow() - timedelta(hours=max_idle_hours)
+    expired = []
+    for snap in collection("wa_conversations").where("takeover_status", "==", "active").stream():
+        conv = snap.to_dict() or {}
+        last = conv.get("last_message_at") or conv.get("takeover_started_at")
+        if isinstance(last, str):
+            try:
+                last = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            except ValueError:
+                last = None
+        try:
+            stale = last is not None and last < cutoff
+        except TypeError:
+            stale = False  # naive vs aware — nao arrisca devolver indevido
+        if not stale:
+            continue
+        cid = snap.id
+        document("wa_conversations", cid).set(
+            {"takeover_status": "none", "takeover_started_at": None}, merge=True,
+        )
+        expired.append({
+            "conversation_id": cid,
+            "contact_id": conv.get("contact_id"),
+            "lead_owner_user_id": conv.get("lead_owner_user_id"),
+        })
+    return expired
+
+
 def mark_wa_conversation_read_by_id(conversation_id):
     """Marca como lidas as mensagens inbound de uma conversation especifica.
     Usa filtro por conversation_id (Fase 2C) — nao colide entre threads do

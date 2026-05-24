@@ -506,6 +506,8 @@ function ChatPanel() {
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
   const [busyTakeover, setBusyTakeover] = useState(false);
+  const [showTakeoverPrompt, setShowTakeoverPrompt] = useState(false);
+  const [greetDraft, setGreetDraft] = useState("");
   const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
   const selectedOperator = activeView === "equipe" ? findAssignedOperator(selectedContact, operators) : null;
   const selectedOperatorColor = selectedOperator ? operatorColor(selectedOperator.id) : null;
@@ -516,7 +518,10 @@ function ChatPanel() {
   const isTakeoverPending = takeoverStatus === "pending";
   const isTakeoverActive = takeoverStatus === "active";
   const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
-  const doTakeover = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await takeoverConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
+  const clientGreetName = selectedContact?.declared_name || selectedContact?.whatsapp_profile_name || "";
+  const greetSuggestion = `Ola${clientGreetName ? " " + clientGreetName : ""}! Aqui e ${sessionUser?.display_name || "o atendimento"}. Vi no nosso sistema que voce costuma falar com ${leadOwnerName}. Como voce me chamou por aqui, como posso te ajudar hoje?`;
+  const openTakeoverPrompt = () => { setGreetDraft(greetSuggestion); setShowTakeoverPrompt(true); };
+  const confirmTakeover = async (withMessage: boolean) => { if (!selectedThreadId) return; setBusyTakeover(true); try { await takeoverConversation(selectedThreadId, withMessage ? greetDraft : undefined); setShowTakeoverPrompt(false); } finally { setBusyTakeover(false); } };
   const doReturn = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await returnConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
   const chatIsEmpty = selectedContact && visibleMessages.length === 0;
   useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
@@ -725,8 +730,22 @@ function ChatPanel() {
 
         {isTakeoverPending ? (
           <div className="composer" style={{ padding: "0.8rem 1rem", flexDirection: "column", gap: "0.5rem" }}>
-            <div className="sub" style={{ textAlign: "center", width: "100%" }}>Contato de {leadOwnerName}. Assuma para responder sem transferir o lead.</div>
-            <button type="button" className="assume-btn" style={{ background: "var(--danger)", borderColor: "var(--danger)" }} disabled={busyTakeover} onClick={() => void doTakeover()}>{busyTakeover ? "Assumindo..." : "Assumir atendimento temporariamente"}</button>
+            {showTakeoverPrompt ? (
+              <>
+                <span className="sub" style={{ width: "100%" }}>Mensagem ao cliente (opcional, editavel):</span>
+                <textarea value={greetDraft} onChange={(e) => setGreetDraft(e.target.value)} rows={3} style={{ width: "100%", resize: "vertical" }} />
+                <div style={{ display: "flex", gap: "0.5rem", width: "100%", flexWrap: "wrap" }}>
+                  <button type="button" className="primary" style={{ flex: 1 }} disabled={busyTakeover} onClick={() => void confirmTakeover(true)}>{busyTakeover ? "..." : "Assumir e enviar"}</button>
+                  <button type="button" className="ghost" disabled={busyTakeover} onClick={() => void confirmTakeover(false)}>Assumir sem mensagem</button>
+                  <button type="button" className="ghost" disabled={busyTakeover} onClick={() => setShowTakeoverPrompt(false)}>Cancelar</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="sub" style={{ textAlign: "center", width: "100%" }}>Contato de {leadOwnerName}. Assuma para responder sem transferir o lead.</div>
+                <button type="button" className="assume-btn" style={{ background: "var(--danger)", borderColor: "var(--danger)" }} disabled={busyTakeover} onClick={openTakeoverPrompt}>Assumir atendimento temporariamente</button>
+              </>
+            )}
           </div>
         ) : noInboundWindow ? (
           <div className="composer" style={{ padding: "0.8rem 1rem" }}>
