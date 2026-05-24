@@ -1,5 +1,29 @@
 # Contexto pra retomar — Coexistence completo + contact picker com agenda do telefone
 
+> **Adendo 2026-05-24:** onda de features pós-validação dos gates de
+> onboarding coex. Detalhe completo em [2026-05-24.md](2026-05-24.md).
+> Revisão prod ativa: `castro-crm-00109-w6n`.
+> - **Gates de onboarding reconfirmados (2026-05-22):** rules estritas LIVE,
+>   claims 4/4, `state_sync→dono` (órfãos=0), 0 duplicatas, 0 429/24h.
+> - **Coex self-signup por operador** (commit `242ed3e`, deployado): admin
+>   pré-autoriza o número (botão "Coex" → `coex_authorized`/`coex_phone`) e o
+>   **operador faz o próprio Embedded Signup, virando owner** do canal. Gate
+>   relaxado + trava `owner=self` + validação do número conectado (422).
+> - **Filtro da agenda** Meus/UserN/Todos por `assigned_to` (client-side, sem
+>   leitura extra). `created_by_user_id` é `None` em coex/webhook — por isso
+>   `assigned_to`, não creator.
+> - **Fixes de console:** COOP `same-origin-allow-popups`, favicon, AudioContext.
+> - **Takeover temporário** (lead que fala com 2 operadores coex): Fase 1
+>   (`242ed3e`) + Fase 2 (`1c8cdc9`), deployado. Banner + bloqueio + Assumir/
+>   Devolver; saudação opcional ao assumir (menciona o dono); timeout de
+>   devolução automático (`TAKEOVER_TIMEOUT_HOURS=3`) via **1º Cloud Scheduler
+>   de prod** (`castro-crm-expire-takeovers`, `*/30`, OIDC).
+> - **Aprendizados:** sync coex é **one-shot por número** (re-onboarding → Meta
+>   #135000, 0 contatos); contato é global (1 por `wa_id`).
+> - **Pendências:** health-check billing (Fase 2.10.3) **só em staging** — job
+>   de prod nunca criado (código está em prod); `<TenantHealthBanner/>` (Fase
+>   3.5); limpar canal 4 (duplicata de teste); escopar `GET /contact/{id}`.
+>
 > **Adendo 2026-05-21:** WABA mismatch em `/api/wa/send-template`
 > (Meta #132001) **resolvido e deployado** (commit `577b74a`, revisão
 > `castro-crm-00105-954`). Backend valida template por-WABA antes da Meta
@@ -30,8 +54,10 @@
 > [2026-05-19.md](2026-05-19.md) §6). ⚠️ O dedupe de 634 contatos foi
 > **irreversível por log** (bug já corrigido) — rollback só via PITR.
 >
-> **Leia primeiro [2026-05-21.md](2026-05-21.md)** (sessão mais recente,
-> fix do WABA mismatch + causa-raiz do template PENDING), depois
+> **Leia primeiro [2026-05-24.md](2026-05-24.md)** (sessão mais recente:
+> onboarding de operadores coex, self-signup, filtro de agenda, takeover
+> temporário e Cloud Scheduler), depois [2026-05-21.md](2026-05-21.md)
+> (fix do WABA mismatch + causa-raiz do template PENDING), depois
 > [2026-05-19.md](2026-05-19.md) (incidente+remediação, runbook das
 > verificações pendentes e rollbacks), depois
 > [2026-05-11.md](2026-05-11.md), [2026-05-09.md](2026-05-09.md),
