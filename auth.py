@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from config import (
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
@@ -25,6 +26,32 @@ logger = logging.getLogger("castro_crm.auth")
 # pre-existentes do CRM Hubloc operam neste tenant ate que o custom_claim
 # correspondente seja propagado.
 _DEFAULT_TENANT = "hubloc"
+
+# authenticate_firebase_token roda em TODO request autenticado (validacao de
+# token na dependency get_current_user), nao apenas no login. Logar
+# LOGIN_SUCCESS a cada chamada gravava no audit em toda request e, sob rajada
+# de requests paralelos, saturava o contador de sequence do audit no Firestore
+# (contencao de transacao -> 409 -> 500). Registramos no maximo um LOGIN_SUCCESS
+# por janela de sessao por usuario.
+_LOGIN_AUDIT_WINDOW = timedelta(minutes=30)
+
+
+def _is_new_login_session(previous_login):
+    """True se o ultimo login foi ha mais que a janela (ou nunca), indicando
+    uma nova sessao que merece audit. Caso contrario e apenas mais um request
+    da mesma sessao e nao deve gerar escrita de auditoria."""
+    if not previous_login:
+        return True
+    if isinstance(previous_login, str):
+        try:
+            previous_login = datetime.fromisoformat(previous_login.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+    if not isinstance(previous_login, datetime):
+        return True
+    if previous_login.tzinfo is None:
+        previous_login = previous_login.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - previous_login > _LOGIN_AUDIT_WINDOW
 
 
 def _resolve_tenant_id(decoded_token, user):
@@ -128,8 +155,12 @@ def authenticate_firebase_token(id_token, ip_address=""):
     if not user.get("is_active", 1):
         return {"success": False, "status_code": 403, "error": "Usuario desativado"}
 
+    # Captura o ultimo login ANTES de atualizar para decidir se este request
+    # inaugura uma nova sessao (merece audit) ou e mais uma chamada da mesma.
+    previous_login = user.get("last_login")
     update_last_login(user["id"])
-    log_audit(user["id"], "LOGIN_SUCCESS_FIREBASE", email or firebase_uid, ip_address)
+    if _is_new_login_session(previous_login):
+        log_audit(user["id"], "LOGIN_SUCCESS_FIREBASE", email or firebase_uid, ip_address)
 
     # Resolve e anexa tenant_id ao user retornado.
     # No estado atual (pre Fase 2.B/C), tenant_id pode ser None — backend

@@ -1883,15 +1883,28 @@ def get_all_ratings(date_from=None, date_to=None):
 
 
 def log_audit(user_id, action, detail="", ip_address=""):
-    audit_id = next_sequence("audit_log")
-    document("audit_log", audit_id).set({
-        "id": audit_id,
-        "user_id": user_id,
-        "action": action,
-        "detail": detail or "",
-        "ip_address": ip_address or "",
-        "created_at": utcnow(),
-    })
+    # ID auto-gerado pelo Firestore (nao sequencial). O contador via
+    # next_sequence() era um documento unico e virava hotspot de escrita:
+    # sob rajada de requests a transacao abortava por contencao (409) e
+    # estourava 500. O id do audit nunca e lido como sequencial em lugar
+    # algum, entao doc-id automatico remove o hotspot.
+    # Best-effort: uma falha de auditoria nunca deve derrubar o request que
+    # a originou — loga warning e segue.
+    try:
+        ref = collection("audit_log").document()
+        ref.set({
+            "id": ref.id,
+            "user_id": user_id,
+            "action": action,
+            "detail": detail or "",
+            "ip_address": ip_address or "",
+            "created_at": utcnow(),
+        })
+    except Exception:
+        logger.warning(
+            "log_audit falhou (nao-fatal): action=%s user_id=%s",
+            action, user_id, exc_info=True,
+        )
 
 
 def format_phone_br(wa_id):
