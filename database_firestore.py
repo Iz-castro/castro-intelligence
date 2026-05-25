@@ -1210,8 +1210,11 @@ def get_wa_contact(contact_id):
     return _enrich_contact(_get_doc("wa_contacts", contact_id))
 
 
-def get_all_wa_contacts(include_archived=False):
-    rows = [row for row in _all_docs("wa_contacts") if row]
+def _enrich_and_sort_contacts(rows, include_archived=False):
+    """Aplica filtro is_archived, ordena por last_message_at desc e enriquece
+    com nome/role do operador e nome do departamento (batch, sem N+1).
+    Compartilhado por get_all_wa_contacts e get_wa_contacts_visible_to."""
+    rows = [row for row in rows if row]
     if not include_archived:
         rows = [row for row in rows if not row.get("is_archived")]
     rows = _sort_records(rows, "last_message_at", reverse=True)
@@ -1233,6 +1236,27 @@ def get_all_wa_contacts(include_archived=False):
         item["department_name"] = department.get("name", "") if department else ""
         enriched.append(normalize_record(item))
     return enriched
+
+
+def get_all_wa_contacts(include_archived=False):
+    return _enrich_and_sort_contacts(_all_docs("wa_contacts"), include_archived=include_archived)
+
+
+def get_wa_contacts_visible_to(user_id, department_id=None, role=None, include_archived=False):
+    """Contatos visiveis a um usuario, com o mesmo enriquecimento/ordenacao de
+    get_all_wa_contacts.
+
+    Admin/supervisor enxergam todos. Operador comum ve apenas o proprio escopo
+    (atribuidos a si, sem dono, ou do mesmo departamento) — espelha as
+    Firestore rules do caminho de snapshot e evita varrer/expor a agenda
+    inteira do tenant (milhares de contatos da agenda coex) no fallback de
+    polling do frontend. Isolamento LGPD + corte de leitura.
+    """
+    if role in ("admin", "supervisor"):
+        rows = _all_docs("wa_contacts")
+    else:
+        rows = get_wa_contacts_scoped_for_user(user_id, department_id)
+    return _enrich_and_sort_contacts(rows, include_archived=include_archived)
 
 
 def update_wa_contact_qualification(contact_id, qualification, notes=""):
@@ -1635,18 +1659,16 @@ def update_wa_message_transcription(db_id: int, transcription: str):
 
 
 def update_wa_message_status(wa_message_id, status, timestamp_wa=""):
+    # Atualiza o status vigente na propria mensagem. A colecao-historico
+    # wa_message_status foi descontinuada: era write-only (sem leitor em
+    # backend/scripts/frontend) e cada webhook de status (sent/delivered/
+    # read) custava +1 transacao next_sequence +1 escrita — mesmo padrao de
+    # contencao de contador do incidente do audit_log, multiplicado por ~3x
+    # por mensagem enviada. Transicoes detalhadas, quando necessarias, ficam
+    # disponiveis via GET /{Message-History-ID}/events da Graph API.
     target = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
     if target:
         document("wa_messages", target["id"]).set({"status": status}, merge=True)
-
-    status_id = next_sequence("wa_message_status")
-    document("wa_message_status", status_id).set({
-        "id": status_id,
-        "wa_message_id": wa_message_id,
-        "status": status,
-        "timestamp_wa": _coerce_timestamp(timestamp_wa),
-        "created_at": utcnow(),
-    })
 
 
 def get_wa_unread_count():

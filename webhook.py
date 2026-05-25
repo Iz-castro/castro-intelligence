@@ -566,9 +566,15 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # lead ja pertence a outro operador (contact.assigned_to). Marca a
         # conversa como 'pending' pra UI oferecer "assumir temporariamente" sem
         # roubar o lead. Cliente novo (sem dono previo) nao gera conflito.
+        # Leitura unica do contato, reaproveitada pelo takeover e pelo gate
+        # do bot (antes eram 3 get_wa_contact por inbound). _contact_fresh
+        # abaixo so re-le do banco se o bot rodar — process_bot_message e a
+        # unica fonte de mutacao do contato nesta janela.
+        contact_row = get_wa_contact(contact_id)
+        bot_ran = False
+
         if channel_type == CHANNEL_TYPE_COEXISTENCE and channel_owner_id:
-            _ct = get_wa_contact(contact_id)
-            _lead_owner = (_ct or {}).get("assigned_to")
+            _lead_owner = (contact_row or {}).get("assigned_to")
             if _lead_owner and _lead_owner != channel_owner_id:
                 flag_conversation_takeover(f"{channel_id}__{wa_id}", _lead_owner, channel_owner_id)
 
@@ -577,12 +583,12 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # mesmo que ainda nao tenha operador atribuido. O contato esta na fila
         # do departamento e redirigir pro bot reiniciaria o fluxo do zero.
         if effective_msg_type == "text" and content.strip():
-            _contact_for_bot = get_wa_contact(contact_id)
             if (
-                _contact_for_bot
-                and not _contact_for_bot.get("assigned_to")
-                and not _contact_for_bot.get("bot_completed")
+                contact_row
+                and not contact_row.get("assigned_to")
+                and not contact_row.get("bot_completed")
             ):
+                bot_ran = True
                 bot_reply = process_bot_message(contact_id, content, contact_name)
                 if bot_reply:
                     _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
@@ -594,7 +600,9 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                     )
 
         # -- Lead convertido: capturar rating ou rerouting --
-        _contact_fresh = get_wa_contact(contact_id)
+        # Re-le do banco apenas se o bot rodou (pode ter mudado qualification/
+        # bot_completed). Sem bot, contact_row do topo ainda reflete o estado.
+        _contact_fresh = get_wa_contact(contact_id) if bot_ran else contact_row
         if _contact_fresh and _contact_fresh.get("qualification") == "convertido":
             _has_pending_rating = (
                 _contact_fresh.get("rating_requested_at")
@@ -712,6 +720,22 @@ def _parse_unix_timestamp(timestamp):
         return datetime.now(timezone.utc).isoformat()
 
 
+def _media_already_downloaded(wa_message_id):
+    """True se a mensagem ja existe localmente com media_path preenchido.
+
+    Evita re-baixar midia (2 requisicoes Graph + escrita no storage) quando
+    o mesmo webhook e reentregue: retry da Meta em non-2xx, retry de
+    pending_webhook_events, ou reprocesso do payload inteiro. save_wa_message
+    ja e idempotente por wa_message_id, mas o download_media acontece ANTES
+    dele — sem este gate, uma unica reentrega de um chunk de history
+    re-baixa todas as midias daquele chunk (pressao no rate limit #4 da App).
+    """
+    if not wa_message_id:
+        return False
+    existing = get_wa_message_by_wa_message_id(wa_message_id)
+    return bool(existing and existing.get("media_path"))
+
+
 def _get_business_phone_number(metadata):
     """Extrai o numero do telefone comercial do metadata do webhook."""
     return str(metadata.get("display_phone_number", "")).replace("+", "").replace(" ", "").replace("-", "")
@@ -746,6 +770,9 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             logger.warning("[SMB ECHO] Mensagem sem destinatario | id=%s", msg_id[:20])
             continue
 
+        # Reentrega: se o echo ja foi salvo com midia, nao re-baixar.
+        skip_media = _media_already_downloaded(msg_id)
+
         # Normalizar telefone do cliente e criar/atualizar contato
         normalized_phone = normalize_br_phone(customer_phone)
         contact_id = upsert_wa_contact(
@@ -775,7 +802,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             media_id_str = image.get("id", "")
             media_mime = image.get("mime_type", "")
             content = image.get("caption", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "image")
                 if media_result:
                     media_path = media_result["path"]
@@ -785,7 +812,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             audio = echo.get("audio", {}) if isinstance(echo.get("audio"), dict) else {}
             media_id_str = audio.get("id", "")
             media_mime = audio.get("mime_type", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "audio")
                 if media_result:
                     media_path = media_result["path"]
@@ -797,7 +824,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             media_id_str = video.get("id", "")
             media_mime = video.get("mime_type", "")
             content = video.get("caption", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "video")
                 if media_result:
                     media_path = media_result["path"]
@@ -807,7 +834,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             sticker = echo.get("sticker", {}) if isinstance(echo.get("sticker"), dict) else {}
             media_id_str = sticker.get("id", "")
             media_mime = sticker.get("mime_type", "image/webp")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "sticker")
                 if media_result:
                     media_path = media_result["path"]
@@ -819,7 +846,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             media_mime = doc.get("mime_type", "")
             filename = doc.get("filename", "")
             content = doc.get("caption", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "document", filename)
                 if media_result:
                     media_path = media_result["path"]
@@ -1072,6 +1099,9 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 ts_iso = _parse_unix_timestamp(timestamp)
                 history_context = msg.get("history_context", {})
                 msg_status = str(history_context.get("status", "")).lower()
+                # Reentrega de chunk de history (retry Meta / pending_events):
+                # nao re-baixar midia ja persistida.
+                skip_media = _media_already_downloaded(msg_id)
 
                 # Determinar direcao: se 'from' e o telefone da empresa, e outbound
                 is_outbound = (msg_from == business_phone_normalized) or bool(msg_to)
@@ -1114,7 +1144,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     media_id_str = image.get("id", "")
                     media_mime = image.get("mime_type", "")
                     content = image.get("caption", "")
-                    if media_id_str:
+                    if media_id_str and not skip_media:
                         media_result = await download_media(media_id_str, "image")
                         if media_result:
                             media_path = media_result["path"]
@@ -1124,7 +1154,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     audio = msg.get("audio", {}) if isinstance(msg.get("audio"), dict) else {}
                     media_id_str = audio.get("id", "")
                     media_mime = audio.get("mime_type", "")
-                    if media_id_str:
+                    if media_id_str and not skip_media:
                         media_result = await download_media(media_id_str, "audio")
                         if media_result:
                             media_path = media_result["path"]
@@ -1136,7 +1166,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     media_id_str = video.get("id", "")
                     media_mime = video.get("mime_type", "")
                     content = video.get("caption", "")
-                    if media_id_str:
+                    if media_id_str and not skip_media:
                         media_result = await download_media(media_id_str, "video")
                         if media_result:
                             media_path = media_result["path"]
@@ -1148,7 +1178,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     media_mime = doc.get("mime_type", "")
                     filename = doc.get("filename", "")
                     content = doc.get("caption", "")
-                    if media_id_str:
+                    if media_id_str and not skip_media:
                         media_result = await download_media(media_id_str, "document", filename)
                         if media_result:
                             media_path = media_result["path"]
@@ -1158,7 +1188,7 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     sticker = msg.get("sticker", {}) if isinstance(msg.get("sticker"), dict) else {}
                     media_id_str = sticker.get("id", "")
                     media_mime = sticker.get("mime_type", "image/webp")
-                    if media_id_str:
+                    if media_id_str and not skip_media:
                         media_result = await download_media(media_id_str, "sticker")
                         if media_result:
                             media_path = media_result["path"]
@@ -1229,6 +1259,13 @@ async def _process_history_media_assets(value, business_phone):
         timestamp = msg.get("timestamp", "")
         ts_iso = _parse_unix_timestamp(timestamp)
 
+        # Reentrega: se o placeholder ja foi preenchido com a midia real,
+        # nao re-baixar (evita 2 requisicoes Graph + escrita no storage).
+        skip_media = _media_already_downloaded(msg_id)
+        if skip_media:
+            logger.info("[HISTORY MEDIA] Ja baixada, ignorando reentrega | id=%s", msg_id[:20])
+            continue
+
         media_path = ""
         media_mime = ""
         media_id_str = ""
@@ -1240,7 +1277,7 @@ async def _process_history_media_assets(value, business_phone):
             media_id_str = image.get("id", "")
             media_mime = image.get("mime_type", "")
             content = image.get("caption", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "image")
                 if media_result:
                     media_path = media_result["path"]
@@ -1250,7 +1287,7 @@ async def _process_history_media_assets(value, business_phone):
             audio = msg.get("audio", {}) if isinstance(msg.get("audio"), dict) else {}
             media_id_str = audio.get("id", "")
             media_mime = audio.get("mime_type", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "audio")
                 if media_result:
                     media_path = media_result["path"]
@@ -1261,7 +1298,7 @@ async def _process_history_media_assets(value, business_phone):
             media_id_str = video.get("id", "")
             media_mime = video.get("mime_type", "")
             content = video.get("caption", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "video")
                 if media_result:
                     media_path = media_result["path"]
@@ -1273,7 +1310,7 @@ async def _process_history_media_assets(value, business_phone):
             media_mime = doc.get("mime_type", "")
             filename = doc.get("filename", "")
             content = doc.get("caption", "")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "document", filename)
                 if media_result:
                     media_path = media_result["path"]
@@ -1283,7 +1320,7 @@ async def _process_history_media_assets(value, business_phone):
             sticker = msg.get("sticker", {}) if isinstance(msg.get("sticker"), dict) else {}
             media_id_str = sticker.get("id", "")
             media_mime = sticker.get("mime_type", "image/webp")
-            if media_id_str:
+            if media_id_str and not skip_media:
                 media_result = await download_media(media_id_str, "sticker")
                 if media_result:
                     media_path = media_result["path"]

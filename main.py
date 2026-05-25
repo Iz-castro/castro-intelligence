@@ -54,7 +54,7 @@ from database import (
     get_department_by_id, update_department, deactivate_department,
     assign_wa_contact, assign_wa_conversation, get_transfer_history,
     return_contact_to_bot, get_contacts_by_assigned_user,
-    get_wa_contacts_scoped_for_user,
+    get_wa_contacts_scoped_for_user, get_wa_contacts_visible_to,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user, set_coex_authorization,
     upsert_firebase_user, get_user_by_email,
@@ -842,7 +842,14 @@ async def upload_alarm_sound(
 
 @app.get("/api/wa/contacts")
 async def wa_contacts(current_user: dict = Depends(get_current_user)):
-    contacts = get_all_wa_contacts()
+    # Escopado por operador (admin/supervisor veem tudo). Alinha o fallback
+    # de polling com as Firestore rules do snapshot: operador comum nao
+    # recebe a agenda inteira do tenant (custo de leitura + isolamento LGPD).
+    contacts = get_wa_contacts_visible_to(
+        current_user.get("id"),
+        current_user.get("department_id"),
+        current_user.get("role"),
+    )
     for c in contacts:
         c["unread"] = int(c.get("unread_count", 0))
     return {"contacts": contacts}
@@ -3552,9 +3559,12 @@ async def embedded_signup_exchange(
     sync_results: dict[str, dict] = {}
     if is_coexistence:
         smb_data_url = f"{GRAPH_API_BASE}/{phone_number_id}/smb_app_data"
-        for sync_type in ("smb_app_state_sync", "history"):
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+        # Um unico AsyncClient para os dois POSTs (reuso de conexao). O
+        # try/except continua por sync_type pra que falha em um nao aborte
+        # o outro.
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for sync_type in ("smb_app_state_sync", "history"):
+                try:
                     sync_resp = await client.post(
                         smb_data_url,
                         headers={
@@ -3563,33 +3573,33 @@ async def embedded_signup_exchange(
                         },
                         json={"messaging_product": "whatsapp", "sync_type": sync_type},
                     )
-                if sync_resp.status_code >= 400:
-                    detail = _meta_error_detail(sync_resp)
-                    logger.error(
-                        "Embedded Signup smb_app_data %s falhou: %s",
-                        sync_type, detail,
+                    if sync_resp.status_code >= 400:
+                        detail = _meta_error_detail(sync_resp)
+                        logger.error(
+                            "Embedded Signup smb_app_data %s falhou: %s",
+                            sync_type, detail,
+                        )
+                        sync_results[sync_type] = {"ok": False, "error": detail}
+                    else:
+                        body_json = sync_resp.json()
+                        sync_results[sync_type] = {
+                            "ok": True,
+                            "request_id": body_json.get("request_id", ""),
+                        }
+                        logger.info(
+                            "Embedded Signup smb_app_data %s OK | request_id=%s",
+                            sync_type, body_json.get("request_id", ""),
+                        )
+                except httpx.RequestError as exc:
+                    # Erro de rede nao aborta signup. Admin pode redisparar
+                    # via POST /api/admin/channels/{id}/trigger-coex-sync
+                    # dentro da janela de 24h.
+                    logger.warning(
+                        "Embedded Signup smb_app_data %s erro de rede (%s: %s) — "
+                        "canal segue criado, admin redispara via endpoint",
+                        sync_type, type(exc).__name__, exc,
                     )
-                    sync_results[sync_type] = {"ok": False, "error": detail}
-                else:
-                    body_json = sync_resp.json()
-                    sync_results[sync_type] = {
-                        "ok": True,
-                        "request_id": body_json.get("request_id", ""),
-                    }
-                    logger.info(
-                        "Embedded Signup smb_app_data %s OK | request_id=%s",
-                        sync_type, body_json.get("request_id", ""),
-                    )
-            except httpx.RequestError as exc:
-                # Erro de rede nao aborta signup. Admin pode redisparar
-                # via POST /api/admin/channels/{id}/trigger-coex-sync
-                # dentro da janela de 24h.
-                logger.warning(
-                    "Embedded Signup smb_app_data %s erro de rede (%s: %s) — "
-                    "canal segue criado, admin redispara via endpoint",
-                    sync_type, type(exc).__name__, exc,
-                )
-                sync_results[sync_type] = {"ok": False, "error": str(exc)}
+                    sync_results[sync_type] = {"ok": False, "error": str(exc)}
 
     log_audit(
         current_user["id"],
