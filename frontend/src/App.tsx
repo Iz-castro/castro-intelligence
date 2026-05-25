@@ -514,9 +514,15 @@ function ChatPanel() {
   const noInboundWindow = selectedContact && !selectedContact.last_inbound_at;
   const isManualContact = selectedContact?.created_source === "manual";
   // Takeover temporario (coexistence): lead de outro operador escreveu neste numero.
+  // O banner/prompt e uma acao do HANDLER (dono do numero onde o lead de outro
+  // operador escreveu). So aparece para ele — nunca para o proprio dono do lead,
+  // que senao veria "Este contato pertence a <ele mesmo>. Assuma..." ao abrir a
+  // thread do canal do handler (o mesmo wa_id aparece em mais de um canal coex).
   const takeoverStatus = selectedThread?.takeover_status;
-  const isTakeoverPending = takeoverStatus === "pending";
-  const isTakeoverActive = takeoverStatus === "active";
+  const isTakeoverHandler =
+    sessionUser?.id != null && selectedThread?.takeover_handler_user_id === sessionUser.id;
+  const isTakeoverPending = takeoverStatus === "pending" && isTakeoverHandler;
+  const isTakeoverActive = takeoverStatus === "active" && isTakeoverHandler;
   const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
   const clientGreetName = selectedContact?.declared_name || selectedContact?.whatsapp_profile_name || "";
   const greetSuggestion = `Ola${clientGreetName ? " " + clientGreetName : ""}! Aqui e ${sessionUser?.display_name || "o atendimento"}. Vi no nosso sistema que voce costuma falar com ${leadOwnerName}. Como voce me chamou por aqui, como posso te ajudar hoje?`;
