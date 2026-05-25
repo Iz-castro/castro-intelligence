@@ -89,7 +89,7 @@ REQUIRE_WEBHOOK_SIGNATURE = _as_bool(
     default=IS_CLOUD_RUN,
 )
 
-GRAPH_API_VERSION = "v22.0"
+GRAPH_API_VERSION = "v23.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 # -- Embedded Signup (Coexistence) --
