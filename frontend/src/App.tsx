@@ -524,6 +524,23 @@ function ChatPanel() {
   const isTakeoverPending = takeoverStatus === "pending" && isTakeoverHandler;
   const isTakeoverActive = takeoverStatus === "active" && isTakeoverHandler;
   const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
+  // Faixa de contexto (visivel para todos): de quem e o lead, em que numero
+  // a conversa vive, estado do takeover e qual o meu papel nesta thread.
+  // Ajuda a debugar o cenario do mesmo wa_id em varios canais coex.
+  const leadOwnerOp = operators.find((o) => o.id === selectedContact?.assigned_to);
+  const leadOwnerLabel = leadOwnerOp?.display_name
+    || (selectedContact?.assigned_to ? `#${selectedContact.assigned_to}` : "sem dono");
+  const threadHandlerOp = operators.find((o) => o.id === selectedThread?.takeover_handler_user_id);
+  const takeoverLabel = takeoverStatus === "pending"
+    ? `pendente (handler: ${threadHandlerOp?.display_name || "?"})`
+    : takeoverStatus === "active"
+      ? `ativo (handler: ${threadHandlerOp?.display_name || "?"})`
+      : "nenhum";
+  const myThreadRole = (selectedContact?.assigned_to != null && sessionUser?.id === selectedContact.assigned_to)
+    ? "dono do lead"
+    : (selectedThread?.takeover_handler_user_id != null && sessionUser?.id === selectedThread.takeover_handler_user_id)
+      ? "handler"
+      : "observador";
   const clientGreetName = selectedContact?.declared_name || selectedContact?.whatsapp_profile_name || "";
   const greetSuggestion = `Ola${clientGreetName ? " " + clientGreetName : ""}! Aqui e ${sessionUser?.display_name || "o atendimento"}. Vi no nosso sistema que voce costuma falar com ${leadOwnerName}. Como voce me chamou por aqui, como posso te ajudar hoje?`;
   const openTakeoverPrompt = () => { setGreetDraft(greetSuggestion); setShowTakeoverPrompt(true); };
@@ -664,6 +681,15 @@ function ChatPanel() {
             </div>
           </div>
         </div>
+
+        {selectedContact ? (
+          <div className="sub" style={{ display: "flex", flexWrap: "wrap", gap: "0.2rem 1rem", padding: "0.35rem 1rem", fontSize: "0.72rem", borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface-2, rgba(0,0,0,0.03))" }}>
+            <span>👤 Dono do lead: <strong>{leadOwnerLabel}</strong></span>
+            {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}</span> : null}
+            <span>🔄 Takeover: <strong>{takeoverLabel}</strong></span>
+            <span>Você: <strong>{myThreadRole}</strong></span>
+          </div>
+        ) : null}
 
         {(isTakeoverPending || isTakeoverActive) ? (
           <div className={`alert ${isTakeoverPending ? "danger" : "success"}`} style={{ alignItems: "center", gap: "0.6rem" }}>

@@ -1227,15 +1227,34 @@ def _resolve_send_target(
     return conv, ctc, ch
 
 
-def _check_conv_send_permission(conversation: dict, current_user: dict):
+def _check_conv_send_permission(conversation: dict, current_user: dict, contact: dict | None = None):
     """Permission check baseado na conversation (Fase 2C).
 
     Bloqueia envio se a thread esta atribuida a outro operador. Sem
     atribuicao, exige role admin/supervisor (mesma regra anterior, mas
     por thread em vez de por contato — admite que o mesmo cliente em
     canais diferentes seja atendido por gente diferente).
+
+    Excecao (Opcao A): o DONO DO LEAD (contact.assigned_to) sempre pode
+    responder em qualquer thread do proprio contato, mesmo que a thread
+    viva no numero de outro operador (canal coex diferente) e esteja em
+    takeover 'pending'/'active'. Cenario: lead transferido para o teste1,
+    mas a conversa real esta no numero do Izael. Ao responder, o dono
+    assume de fato -> zera o takeover (some o prompt 'assuma' do handler).
     """
-    # Takeover temporario: durante 'pending' o operador precisa assumir antes
+    lead_owner = (contact or {}).get("assigned_to")
+    if lead_owner is not None and lead_owner == current_user["id"]:
+        if conversation.get("takeover_status") in ("pending", "active"):
+            try:
+                clear_conversation_takeover(conversation["id"])
+            except Exception as exc:
+                logger.warning(
+                    "Falha ao limpar takeover da conversa %s: %s",
+                    conversation.get("id"), exc,
+                )
+        return
+
+    # Takeover temporario: durante 'pending' o handler precisa assumir antes
     # de responder (o frontend ja bloqueia o composer; isto fecha a brecha via API).
     if conversation.get("takeover_status") == "pending":
         raise HTTPException(status_code=403, detail="Assuma o atendimento temporario antes de responder")
@@ -1261,7 +1280,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user)
+    _check_conv_send_permission(conv, current_user, contact)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
@@ -1328,7 +1347,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user)
+    _check_conv_send_permission(conv, current_user, contact)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
@@ -1378,7 +1397,7 @@ async def wa_send_media(
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user)
+    _check_conv_send_permission(conv, current_user, contact)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], reply_to_message_id)
@@ -1441,7 +1460,7 @@ async def wa_send_audio(
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user)
+    _check_conv_send_permission(conv, current_user, contact)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], reply_to_message_id)
@@ -1592,7 +1611,7 @@ async def wa_send_template(
         effective_template_category = None
 
     conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
-    _check_conv_send_permission(conv, current_user)
+    _check_conv_send_permission(conv, current_user, contact)
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
