@@ -180,6 +180,23 @@ configurado".
 
 ## 4. Apresentação no frontend (absorve A e B)
 
+> **Status (2026-05-27):** entregue como **Fase 2a** (commit `957cef2`, prod) —
+> denormalização + faixa honesta + read-only de canal inativo. As **abas por
+> atendimento (Fase 2b) foram ADIADAS** por decisão do PO: a sidebar já lista
+> cada canal como linha distinta (`ContactList`, `renderItems` = 1 por
+> conversa), então a separação por canal já existe; as abas são refinamento de
+> navegação, não correção de bug. Quando reabrir, há dois sabores:
+> - **2b-light (baixo risco, só frontend):** barra de abas dentro da `ChatPanel`
+>   agrupando `conversations.filter(c => c.contact_id === selectedContact.id)`;
+>   clicar a aba só faz `setSelectedThreadId`. Não toca backend/filtros.
+> - **2b-full (médio risco):** sidebar passa a 1 linha por **contato** (colapsa
+>   as N conversas) + unread agregado + abas como navegação primária. Exige
+>   refatorar `renderItems` e os **filtros das views** (novos/meus/equipe/bot),
+>   que hoje operam por-conversa → mudam de semântica (ex.: "Equipe" com um
+>   contato tendo conversas de 2 operadores). É decisão de produto.
+>
+> Recomendação: se reabrir, começar pela **2b-light**.
+
 - **Ficha do Lead com abas/divisões por Atendimento** (canal):
   `📱 Coex (OpV1) [ativo]` · `🏢 Empresa 2121 (OpV3) [ativo]` · `📱 7195-7758 [canal removido]`.
   Mensagens **não** se mesclam entre canais; cada aba é um Atendimento.
@@ -209,9 +226,11 @@ configurado".
   Sob o wipe (decisão #7) **não há merge de órfãos** — deploy do rebind → export
   da Helenice → wipe → re-onboard limpo.
   *Risco: médio (toca onboarding + cache de canais + roteamento).*
-- **Fase 2 — Apresentação por Atendimento (§4).** Denormalização + abas por canal
-  + faixa honesta + read-only de canal inativo. *Risco: baixo (display + 1 campo
-  denormalizado + backfill).* **Aqui é onde A e B finalmente entram.**
+- **Fase 2 — Apresentação por Atendimento (§4).** **2a CONCLUÍDA (commit
+  `957cef2`, prod):** denormalização (incl. `channel_type`) + REST cai no denorm
+  p/ canal inativo + `normalizeConversation` mapeia `channel_active` + composer
+  read-only + backfill (`scripts/backfill_conversation_channel_denorm.py`, 98
+  convs). **2b (abas) ADIADA** — ver nota no §4. *Risco: baixo.*
 - **Fase 3 — Dono do Atendimento + Conflitos (§3.1, §3.2).** Transferência por
   thread; permissão coex vs standard; Painel de Conflitos. *Risco: médio
   (semântica de permissão — testar bem).*

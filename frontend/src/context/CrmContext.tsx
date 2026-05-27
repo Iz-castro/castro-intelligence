@@ -5,7 +5,7 @@ import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where 
 import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
-  ActiveView, Channel, ChatMessage, ClientConfig, Contact, Conversation, Department,
+  ActiveView, Channel, ChatMessage, ClientConfig, ConflictLead, Contact, Conversation, Department,
   MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings,
   TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
@@ -160,6 +160,7 @@ type CrmContextValue = {
   loadAllContacts: (q?: string) => Promise<{ contacts: Contact[]; total: number }>;
   refreshAllContacts: () => Promise<void>;
   openConversationForContact: (contact_id: number, channel_id?: number) => Promise<string | null>;
+  loadConflicts: () => Promise<ConflictLead[]>;
 
   // Message correction
   correctMessage: (messageId: number, newContent: string) => Promise<boolean>;
@@ -1705,6 +1706,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return { contacts: base, total: totalFromBackend };
   }
 
+  async function loadConflicts(): Promise<ConflictLead[]> {
+    if (!bundle) return [];
+    const r = await getJson<{ conflicts: ConflictLead[] }>(bundle.auth, "/api/admin/conflicts");
+    return r.conflicts || [];
+  }
+
   async function refreshAllContacts(): Promise<void> {
     // Forca reload do cache. Util apos criar contato manual ou
     // se admin sabe que houve sincronizacao nova.
@@ -1838,7 +1845,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
-    loadAllContacts, refreshAllContacts, openConversationForContact,
+    loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,

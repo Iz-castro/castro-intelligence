@@ -2173,6 +2173,78 @@ async def list_channels(current_user: dict = Depends(get_current_user)):
     return {"channels": safe}
 
 
+@app.get("/api/admin/conflicts")
+async def admin_conflicts(current_user: dict = Depends(get_current_user)):
+    """Painel de Conflitos (Fase 3A): Leads com >=2 atendimentos ATIVOS
+    atribuidos a operadores DISTINTOS. Read-only, admin/supervisor.
+
+    "Ativo" = conversation com assigned_to setado, channel_active != False e
+    last_message_at nos ultimos 30 dias (ainda nao ha attendance_status —
+    Fase 4). Conflito = >=2 assignees distintos no mesmo contato. O nome do
+    operador e resolvido no frontend (ja tem `operators` em memoria).
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    from firestore_common import collection as fs_coll
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+
+    def _to_dt(v):
+        if isinstance(v, datetime):
+            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+        if isinstance(v, str) and v:
+            try:
+                d = datetime.fromisoformat(v)
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    by_contact: dict = {}
+    for snap in fs_coll("wa_conversations").stream():
+        c = snap.to_dict() or {}
+        if c.get("assigned_to") is None or c.get("channel_active") is False:
+            continue
+        lm = _to_dt(c.get("last_message_at"))
+        if lm is None or lm < cutoff:
+            continue
+        cid = c.get("contact_id")
+        if cid is None:
+            continue
+        if "id" not in c:
+            c["id"] = snap.id
+        by_contact.setdefault(cid, []).append((c, lm))
+
+    contacts_by_id = {ct["id"]: ct for ct in get_all_wa_contacts()}
+    conflicts = []
+    for cid, items in by_contact.items():
+        if len({c.get("assigned_to") for c, _ in items}) < 2:
+            continue
+        contact = contacts_by_id.get(cid) or {}
+        items_sorted = sorted(items, key=lambda t: t[1], reverse=True)
+        conflicts.append({
+            "contact_id": cid,
+            "display_name": contact.get("display_name") or contact.get("wa_id") or f"#{cid}",
+            "phone_formatted": contact.get("phone_formatted") or "",
+            "lead_owner_user_id": contact.get("assigned_to"),
+            "conversations": [
+                {
+                    "conversation_id": c.get("id"),
+                    "channel_id": c.get("channel_id"),
+                    "channel_label": c.get("channel_label") or "",
+                    "channel_phone_number": c.get("channel_phone_number") or "",
+                    "channel_active": c.get("channel_active", True),
+                    "assigned_to": c.get("assigned_to"),
+                    "unread": int(c.get("unread_count", 0) or 0),
+                    "last_message_at": lm.isoformat(),
+                }
+                for c, lm in items_sorted
+            ],
+        })
+    conflicts.sort(key=lambda k: k["conversations"][0]["last_message_at"], reverse=True)
+    return {"conflicts": conflicts, "count": len(conflicts)}
+
+
 @app.post("/api/admin/channels")
 async def create_channel_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
     if current_user.get("role") not in ("admin", "supervisor"):

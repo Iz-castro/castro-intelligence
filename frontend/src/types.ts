@@ -161,6 +161,27 @@ export type Conversation = {
   takeover_handler_user_id?: number | null;
 };
 
+// Painel de Conflitos (Fase 3A): Lead com >=2 atendimentos ativos de
+// operadores distintos.
+export type ConflictConversation = {
+  conversation_id: string;
+  channel_id: number | null;
+  channel_label: string;
+  channel_phone_number: string;
+  channel_active: boolean;
+  assigned_to: number | null;
+  unread: number;
+  last_message_at: string;
+};
+
+export type ConflictLead = {
+  contact_id: number;
+  display_name: string;
+  phone_formatted: string;
+  lead_owner_user_id: number | null;
+  conversations: ConflictConversation[];
+};
+
 export type MessageReplyReference = {
   message_id: number;
   preview: string;

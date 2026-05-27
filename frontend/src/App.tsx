@@ -7,7 +7,7 @@ import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
-import type { Channel, ChatMessage, Contact, Conversation, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
 
@@ -308,6 +308,51 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function ConflictsPanel() {
+  // Fase 3A: Leads com >=2 atendimentos ativos de operadores distintos.
+  // Read-only; clicar num atendimento abre a thread correspondente.
+  const { loadConflicts, operators, setSelectedThreadId, setActiveView } = useCrm();
+  const [conflicts, setConflicts] = useState<ConflictLead[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadedOnce, setLoadedOnce] = useState(false);
+  const refresh = async () => {
+    setLoading(true);
+    try { setConflicts(await loadConflicts()); setLoadedOnce(true); }
+    catch { /* erro nao-fatal: mantem lista atual / vazia */ }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { void refresh(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const opName = (id: number | null) => operators.find((o) => o.id === id)?.display_name || (id ? `#${id}` : "—");
+  const jump = (conversationId: string) => { setActiveView("equipe"); setSelectedThreadId(conversationId); };
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.4rem" }}>
+        <span className="sub">{loading ? "Carregando..." : `${conflicts.length} lead(s) em conflito`}</span>
+        <button type="button" className="ghost" style={{ padding: "0.2rem 0.5rem", fontSize: "0.72rem" }} onClick={() => void refresh()} disabled={loading}>Atualizar</button>
+      </div>
+      {!loading && loadedOnce && conflicts.length === 0 ? (
+        <div className="sub" style={{ opacity: 0.7 }}>Nenhum lead com 2+ atendimentos ativos de operadores distintos. ✓</div>
+      ) : null}
+      {conflicts.map((lead) => (
+        <div key={lead.contact_id} className="admin-user-row" style={{ flexDirection: "column", alignItems: "stretch", gap: "0.3rem", padding: "0.5rem 0.6rem" }}>
+          <div className="admin-user-info">
+            <strong>{lead.display_name}</strong>
+            <span className="sub">{lead.phone_formatted}{lead.phone_formatted ? " · " : ""}dono do lead: {opName(lead.lead_owner_user_id)}</span>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+            {lead.conversations.map((cv) => (
+              <button key={cv.conversation_id} type="button" className="ghost" style={{ display: "flex", justifyContent: "space-between", gap: "0.4rem", padding: "0.3rem 0.45rem", fontSize: "0.72rem", textAlign: "left" }} onClick={() => jump(cv.conversation_id)} title="Abrir este atendimento">
+                <span>👤 {opName(cv.assigned_to)}</span>
+                <span className="sub" style={{ whiteSpace: "nowrap" }}>{cv.channel_phone_number || cv.channel_label || "—"}{cv.channel_active === false ? " ⚠" : ""}{cv.unread ? ` · ${cv.unread} nao lida(s)` : ""}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1156,6 +1201,12 @@ function DetailPanel() {
             <button className="primary" onClick={() => void transferContact()} disabled={!toUserId || !transferSummary.trim() || busyTransfer}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
           </CollapsibleCard>
         </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
+
+        {isManagerRole ? (
+          <CollapsibleCard title="Conflitos de atendimento" defaultOpen={false}>
+            <ConflictsPanel />
+          </CollapsibleCard>
+        ) : null}
 
         {isManagerRole ? (
           <CollapsibleCard title={sessionUser?.role === "admin" ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
