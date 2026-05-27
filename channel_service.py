@@ -403,6 +403,147 @@ def get_channel_by_id_from_db(channel_id: int) -> dict | None:
     return normalize_record(data)
 
 
+def get_channel_by_phone_id_from_db(phone_number_id: str) -> dict | None:
+    """Leitura direta do Firestore por phone_number_id, INCLUINDO inativos.
+
+    Diferente de get_channel_by_phone_id (que usa o cache so-ativos —
+    refresh_channels filtra is_active=True), este le o Firestore direto.
+    E o que o rebind do Embedded Signup precisa: detectar um canal que foi
+    desativado num onboarding anterior do MESMO numero e reativa-lo, em vez
+    de criar uma duplicata.
+
+    Quando ha mais de um canal com o mesmo phone_number_id (estado legado de
+    prod antes do rebind, ex.: canais 1/4/5 do mesmo numero), escolhe o
+    melhor candidato: prioriza is_active=True, depois updated_at mais
+    recente. Loga warning na ambiguidade.
+    """
+    pid = str(phone_number_id or "").strip()
+    if not pid:
+        return None
+    rows: list[dict] = []
+    for snap in collection("channels").where("phone_number_id", "==", pid).stream():
+        data = snap.to_dict() or {}
+        if "id" not in data:
+            try:
+                data["id"] = int(snap.id)
+            except ValueError:
+                data["id"] = snap.id
+        rows.append(data)
+    if not rows:
+        return None
+    if len(rows) > 1:
+        logger.warning(
+            "get_channel_by_phone_id_from_db: %d canais com phone_id=%s (ids=%s) "
+            "— escolhendo ativo/mais recente para rebind",
+            len(rows), pid, sorted(str(r.get("id")) for r in rows),
+        )
+    rows.sort(
+        key=lambda r: (bool(r.get("is_active")), str(r.get("updated_at") or "")),
+        reverse=True,
+    )
+    return normalize_record(rows[0])
+
+
+def rebind_channel(
+    channel_id: int,
+    *,
+    waba_id: str,
+    phone_number_id: str,
+    display_phone_number: str,
+    access_token: str,
+    token_expires_at: str | None = None,
+    owner_user_id: int | None = None,
+    owner_firebase_uid: str | None = None,
+    webhook_subscribed: bool | None = None,
+    platform_type: str = "",
+    is_official_business_account: bool | None = None,
+    code_verification_status: str = "",
+    messaging_limit_tier: str = "",
+    verified_name: str = "",
+    quality_rating: str = "",
+    tenant_id: str | None = None,
+) -> int:
+    """Reaproveita um canal existente num re-onboarding do mesmo numero.
+
+    Em vez de create_channel (que geraria channel_id novo -> threads
+    duplicadas + canal antigo orfao), atualiza o canal existente: token/waba/
+    metadata novos, REATIVA (is_active=True) e reaponta o phone_routing.
+    Preserva config do operador (is_bot_enabled, label, default_department_id)
+    — so mexe em identidade/credenciais/status.
+
+    Mantem o channel_id, entao as threads {channel_id}__{wa_id} e as
+    wa_conversations/wa_messages sobrevivem sem migracao. Retorna o
+    channel_id reaproveitado.
+    """
+    pid = str(phone_number_id or "").strip()
+
+    fields: dict[str, Any] = {
+        "waba_id": str(waba_id).strip(),
+        "phone_number_id": pid,
+        "display_phone_number": display_phone_number,
+        "access_token": access_token,
+        "token_expires_at": token_expires_at,
+        "is_active": True,
+        "platform_type": platform_type,
+        "is_official_business_account": is_official_business_account,
+        "code_verification_status": code_verification_status,
+        "messaging_limit_tier": messaging_limit_tier,
+        "verified_name": verified_name,
+        "quality_rating": quality_rating,
+    }
+    # owner/webhook so sobrescrevem quando o caller fornece (None = preserva).
+    if owner_user_id is not None:
+        fields["owner_user_id"] = owner_user_id
+    if owner_firebase_uid is not None:
+        fields["owner_firebase_uid"] = owner_firebase_uid
+    if webhook_subscribed is not None:
+        fields["webhook_subscribed"] = webhook_subscribed
+
+    update_channel(channel_id, **fields)  # ja faz refresh_channels()
+
+    # Reaponta phone_routing -> este canal. deactivate_channel anterior pode
+    # ter REMOVIDO a entrada; um create cego antigo pode te-la apontado p/
+    # outro channel_id. upsert garante O(1) routing correto no webhook.
+    if pid:
+        try:
+            from firestore_common import get_tenant_context
+            from tenant_service import upsert_phone_routing
+            tid = tenant_id or get_tenant_context() or "hubloc"
+            upsert_phone_routing(pid, str(tid), channel_id)
+        except Exception as exc:
+            logger.warning(
+                "rebind_channel: falha ao reapontar phone_routing | channel=%s phone=%s err=%s",
+                channel_id, pid, exc,
+            )
+
+    # Unicidade no cache (so-ativos): desativa irmaos com o mesmo
+    # phone_number_id (estado legado pre-rebind). Usa update_channel e NAO
+    # deactivate_channel de proposito — deactivate removeria o phone_routing
+    # que acabamos de apontar (mesma chave phone_id).
+    if pid:
+        for snap in collection("channels").where("phone_number_id", "==", pid).stream():
+            other = snap.to_dict() or {}
+            other_id = other.get("id")
+            if other_id is None:
+                try:
+                    other_id = int(snap.id)
+                except ValueError:
+                    continue
+            if other_id != channel_id and other.get("is_active"):
+                update_channel(other_id, is_active=False)
+                logger.info(
+                    "rebind_channel: canal irmao %s (phone=%s) desativado p/ unicidade",
+                    other_id, pid,
+                )
+
+    refresh_channels()
+    logger.info(
+        "Channel rebound: id=%s phone=%s waba=%s (reativado + credenciais novas)",
+        channel_id, pid, str(waba_id).strip(),
+    )
+    return channel_id
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap: cria canal default a partir das env vars legadas
 # ---------------------------------------------------------------------------

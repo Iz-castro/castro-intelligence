@@ -127,10 +127,14 @@ configurado".
   ([webhook.py](../webhook.py)) evita re-baixar mídia. Ou seja, re-sync não
   duplica mensagem — só o `channel_id` novo é que duplicava **thread**. Rebind
   resolve.
-- **Atenção:** o `phone_number_id` pode mudar no re-onboarding; como
-  `conversation_id` usa `channel_id` (não `phone_number_id`), as threads
-  sobrevivem ao rebind. Atualizar `get_channel_by_phone_id`/cache e
-  `phone_routing`.
+- **Confirmado (decisão #1):** o `phone_number_id` **NÃO muda** no
+  re-onboarding do mesmo número, então a **chave de detecção/dedup é o
+  `phone_number_id`** e o `phone_routing` não troca de chave — só é reapontado
+  para o `channel_id` reaproveitado. Como `conversation_id` usa `channel_id`, as
+  threads sobrevivem ao rebind. ⚠️ A detecção tem que ler o Firestore **direto**:
+  `get_channel_by_phone_id`/cache carrega **só canais ativos**
+  ([channel_service.py:70](../channel_service.py)) e não enxerga o canal
+  desativado que o rebind precisa reativar.
 - **Migração dos órfãos atuais** (canais 1, 4 inativos + conv `4__…`): script de
   rebind/merge para o canal ativo correspondente, ou arquivamento explícito.
 
@@ -196,11 +200,14 @@ configurado".
 ## 5. Plano de ação faseado (ordem por dependência/risco)
 
 > Premissa do PLANO existente: o Firestore **pode ser zerado** antes de produção
-> real multi-cliente. Isso simplifica migrações/backfills. Confirmar se ainda vale.
+> real multi-cliente. Isso simplifica migrações/backfills. **Confirmado
+> (decisão #7 — ver §6): pode zerar** (com export da Helenice antes do wipe).
 
 - **Fase 1 — Re-login = rebind de canal (§3.3).** Maior dor + destrava o resto.
-  Detectar canal existente por (owner + número), rebindar token/waba/phone_id +
-  `phone_routing`. Script de merge dos órfãos atuais (canais 1/4, conv `4__…`).
+  Detectar canal existente por **`phone_number_id`** (decisão #1) e dar UPDATE
+  (reativar + novo token + reapontar `phone_routing`), em vez de `create_channel`.
+  Sob o wipe (decisão #7) **não há merge de órfãos** — deploy do rebind → export
+  da Helenice → wipe → re-onboard limpo.
   *Risco: médio (toca onboarding + cache de canais + roteamento).*
 - **Fase 2 — Apresentação por Atendimento (§4).** Denormalização + abas por canal
   + faixa honesta + read-only de canal inativo. *Risco: baixo (display + 1 campo
@@ -219,27 +226,25 @@ Cada fase: staging→prod no mesmo gate usado hoje
 
 ---
 
-## 6. Decisões em aberto (responder antes de executar)
+## 6. Decisões
 
-1. ~~**Re-login:** o `phone_number_id` muda no re-onboarding do mesmo número?~~
-   **RESPONDIDA (2026-05-27):** NÃO muda. Canais 1/4/5 (mesmo número 7195-7758,
-   incluindo antigo+novo pós re-signup do teste1) têm `phone_number_id` e
-   `waba_id` **idênticos** (`1055982807598158` / `680503338460083`). Logo:
-   `phone_routing` **não muda** no rebind; a **chave de dedup é o
-   `phone_number_id`** (estável). Os canais duplicados existem só porque o
-   Embedded Signup sempre faz `create_channel` — o fix é **detectar canal
-   por `phone_number_id` e dar UPDATE** (reativar + novo token), não criar novo.
-   (A linha "Atenção: phone_number_id pode mudar" da §3.3 está obsoleta.)
-2. ~~**Órfãos atuais:** rebindar/mesclar ou arquivar?~~ **RESPONDIDA
-   (2026-05-27) — híbrido por dono:** consolidar (merge das conversas no canal
-   ativo) APENAS quando o órfão tem **mesmo `owner_user_id` + mesmo
-   `phone_number_id`** do canal ativo (ex.: canal 4 → 5, ambos teste1).
-   Órfão com **dono diferente** (ex.: canal 1, owner Izael, mesmo número) é
-   **arquivado**, NÃO mesclado — mesclar corromperia a autoria. Merge =
-   repontuar `conversation_id`+`channel_id` das `wa_messages` da thread órfã
-   para `{canal_ativo}__{wa_id}`, somar unread/last_message_at, deletar a
-   conversa órfã (idempotente; PITR ligado como rede). A própria Fase 1
-   (rebind por `phone_number_id`) impede a criação de novos órfãos.
+### Resolvidas (2026-05-27) — destravam a Fase 1
+- **#1 — Re-login / chave de dedup:** `phone_number_id` **NÃO muda** no
+  re-onboarding do mesmo número (canais 1/4/5 do 7195-7758:
+  `phone_id=1055982807598158` / `waba=680503338460083` idênticos). ⇒ detecção e
+  dedup por **`phone_number_id`**; rebind = **UPDATE** (reativar + novo token),
+  não `create_channel`. Acionado em §3.3 e na Fase 1 (§5).
+- **#2 — Órfãos atuais:** híbrido por dono — merge só com mesmo `owner_user_id`
+  + mesmo `phone_number_id`; dono diferente = **arquivar** (não mesclar, preserva
+  autoria). **Moot sob o wipe (#7):** a Fase 1 pula o merge; o rebind impede
+  novos órfãos.
+- **#7 — Reset do Firestore:** **PODE ZERAR.** Offboarding no celular +
+  re-signup re-libera o sync coex (contatos + histórico ≤6m). Ressalva: dados
+  só-do-CRM (`declared_name`, notas, qualificação, protocolo, avaliação) **não**
+  voltam — exportar antes (ver checklist da Helenice). Caminho: deploy do
+  rebind → export → wipe → re-onboard limpo.
+
+### Em aberto (responder antes das fases seguintes)
 3. **Agenda (§3.8):** por-operador (subcoleção `wa_contacts/{id}/notes/{uid}`) ou
    compartilhada do Lead? (impacto LGPD).
 4. **Sticky routing TTL:** N dias (sugestão 30)? Como detectar dono
@@ -247,15 +252,6 @@ Cada fase: staging→prod no mesmo gate usado hoje
 5. **`attendance_status`:** novo campo no `wa_conversations`? Fechar zera takeover
    também?
 6. **Tipificação:** catálogo fixo ou configurável por tenant? Onde editar?
-7. ~~**Reset do Firestore** antes do refator ainda é aceitável?~~ **RESPONDIDA
-   (2026-05-27): PODE ZERAR.** Confirmado que sair da plataforma comercial
-   (offboarding real no celular) + re-signup **re-libera** o sync coex
-   (contatos + histórico ≤6m voltam). Procedimento para a Helenice (único uso
-   real): instruir offboarding → re-signup → conferir retorno dos contatos.
-   **Ressalva:** dados só-do-CRM (notas, qualificações, protocolos, avaliações)
-   NÃO voltam pelo re-sync — se a Helenice tiver desses e importarem, exportar
-   antes. Como pode zerar: **a Fase 1 ignora a #2 (merge de órfãos) e os
-   backfills** — deploy do código novo + wipe + re-onboard limpo.
 
 ---
 

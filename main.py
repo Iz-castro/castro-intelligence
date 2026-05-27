@@ -78,7 +78,7 @@ from database import (
 from channel_service import (
     get_all_active_channels, get_channels_for_user,
     create_channel, update_channel, deactivate_channel,
-    get_channel_by_id_from_db,
+    get_channel_by_id_from_db, get_channel_by_phone_id_from_db, rebind_channel,
     CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
 from auth import authenticate_firebase_token
@@ -3541,7 +3541,13 @@ async def embedded_signup_exchange(
             webhook_subscribed, ",".join(subscribed_fields),
         )
 
-    # 6. Criar canal no registry
+    # 6. Criar OU rebindar canal no registry.
+    #    Re-onboarding do MESMO numero NAO cria canal novo (decisao #1 do
+    #    docs/PLANO_LEAD_ATENDIMENTO_E_REGRAS): detecta canal existente por
+    #    phone_number_id lendo o Firestore DIRETO (o cache so-ativos nao
+    #    enxerga canal desativado) e da UPDATE — reativa + token novo +
+    #    reaponta phone_routing. Mantendo o channel_id, as threads
+    #    {channel_id}__{wa_id} sobrevivem (sem duplicar conversa).
     owner_user = get_user_by_id(owner_id) if owner_id else None
     channel_label = body.label or (
         f"{(owner_user or {}).get('display_name', 'Operador')} - {display_phone}"
@@ -3549,26 +3555,72 @@ async def embedded_signup_exchange(
         else f"Canal {display_phone}"
     )
 
-    new_channel_id = create_channel(
-        channel_type=channel_type,
-        label=channel_label,
-        waba_id=waba_id,
-        phone_number_id=phone_number_id,
-        display_phone_number=display_phone,
-        access_token=access_token,
-        token_expires_at=token_expires_at_iso,
-        owner_user_id=owner_id,
-        owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
-        default_department_id=body.default_department_id,
-        is_bot_enabled=not is_coexistence,
-        platform_type=platform_type,
-        is_official_business_account=is_official,
-        code_verification_status=code_verification_status,
-        messaging_limit_tier=messaging_limit_tier,
-        verified_name=verified_name,
-        quality_rating=quality_rating,
-        webhook_subscribed=webhook_subscribed,
-    )
+    existing_channel = get_channel_by_phone_id_from_db(phone_number_id)
+    rebound = False
+    if existing_channel:
+        existing_owner = existing_channel.get("owner_user_id")
+        # Guard de autoria: um operador nao pode "roubar" via re-signup o
+        # canal de OUTRO operador. Admin/supervisor pode reatribuir (audit).
+        if (
+            owner_id is not None
+            and existing_owner is not None
+            and existing_owner != owner_id
+            and not is_privileged
+        ):
+            logger.warning(
+                "Embedded Signup: rebind bloqueado | channel=%s owner_existente=%s tentando=%s",
+                existing_channel.get("id"), existing_owner, owner_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Este numero ja esta vinculado a outro operador. "
+                    "Peca a um admin para transferir o canal."
+                ),
+            )
+        new_channel_id = rebind_channel(
+            existing_channel["id"],
+            waba_id=waba_id,
+            phone_number_id=phone_number_id,
+            display_phone_number=display_phone,
+            access_token=access_token,
+            token_expires_at=token_expires_at_iso,
+            owner_user_id=owner_id,
+            owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
+            webhook_subscribed=webhook_subscribed,
+            platform_type=platform_type,
+            is_official_business_account=is_official,
+            code_verification_status=code_verification_status,
+            messaging_limit_tier=messaging_limit_tier,
+            verified_name=verified_name,
+            quality_rating=quality_rating,
+        )
+        rebound = True
+        logger.info(
+            "Embedded Signup: REBIND canal existente id=%s phone=%s owner=%s privileged=%s",
+            new_channel_id, phone_number_id, owner_id, is_privileged,
+        )
+    else:
+        new_channel_id = create_channel(
+            channel_type=channel_type,
+            label=channel_label,
+            waba_id=waba_id,
+            phone_number_id=phone_number_id,
+            display_phone_number=display_phone,
+            access_token=access_token,
+            token_expires_at=token_expires_at_iso,
+            owner_user_id=owner_id,
+            owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
+            default_department_id=body.default_department_id,
+            is_bot_enabled=not is_coexistence,
+            platform_type=platform_type,
+            is_official_business_account=is_official,
+            code_verification_status=code_verification_status,
+            messaging_limit_tier=messaging_limit_tier,
+            verified_name=verified_name,
+            quality_rating=quality_rating,
+            webhook_subscribed=webhook_subscribed,
+        )
 
     # 7. Disparar sync de contatos + history (coexistence apenas).
     # Doc Meta: POST /{phone_id}/smb_app_data e necessario pra Meta
@@ -3623,13 +3675,14 @@ async def embedded_signup_exchange(
 
     log_audit(
         current_user["id"],
-        "EMBEDDED_SIGNUP",
-        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} syncs={list(sync_results.keys())}",
+        "EMBEDDED_SIGNUP_REBIND" if rebound else "EMBEDDED_SIGNUP",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} rebound={rebound} syncs={list(sync_results.keys())}",
     )
 
     return {
         "status": "ok",
         "channel_id": new_channel_id,
+        "rebound": rebound,
         "channel_type": channel_type,
         "access_token": access_token,
         "token_expires_at": token_expires_at_iso,

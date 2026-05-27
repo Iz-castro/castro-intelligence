@@ -19,6 +19,9 @@ service-account*.json
 *.sqlite3
 data/
 
+# Exports de migracao (PII — LGPD: nunca versionar; retencao curta)
+scripts/_exports/
+
 # Logs
 logs/
 *.log
