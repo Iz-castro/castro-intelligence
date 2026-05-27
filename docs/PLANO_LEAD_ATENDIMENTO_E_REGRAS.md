@@ -111,6 +111,18 @@ configurado".
 - **Painel de Conflitos (supervisor):** lista Leads com ≥2 Atendimentos **ativos**
   com operadores distintos. Query sobre `wa_conversations` agrupada por
   `contact_id`. Novo endpoint admin + aba no frontend.
+- **Intervenção do supervisor — 3 modos (decisão do PO, 2026-05-27):** substitui
+  o "bypass admin" cego por modos com intenção/auditoria claras:
+  1. **Sussurro (nota interna):** `direction="internal"` em `wa_messages`, NÃO vai
+     pra Meta; orienta o operador, cliente não vê. ✅ FEITO (`/api/wa/internal-note`,
+     toggle 🔒 no composer, bolha amarela).
+  2. **Co-pilotagem (intervenção assinada):** admin/sup envia ao lead **sem assumir**;
+     backend faz prepend `[Supervisão - {nome}]:` + grava `sender_user_id=supervisor`
+     (thread owner intacto). ⏳ PENDENTE (Modo 2; é aqui que entra a permissão
+     coex×standard explícita + bypass admin/sup).
+  3. **Assunção (takeover do supervisor):** botão muda o **Dono do Atendimento**
+     (thread) p/ o supervisor + msg automática ao lead (texto se ≤24h, senão
+     template) + operador read-only. ⏳ PENDENTE (Modo 3) — reusa o desacople 3B.
 
 ### 3.3 Re-login coexistence = **merge/rebind**, não canal novo (substitui o C)
 - **Hoje:** Embedded Signup ([main.py](../main.py), handler `embedded_signup`)
@@ -231,9 +243,12 @@ configurado".
   p/ canal inativo + `normalizeConversation` mapeia `channel_active` + composer
   read-only + backfill (`scripts/backfill_conversation_channel_denorm.py`, 98
   convs). **2b (abas) ADIADA** — ver nota no §4. *Risco: baixo.*
-- **Fase 3 — Dono do Atendimento + Conflitos (§3.1, §3.2).** Transferência por
-  thread; permissão coex vs standard; Painel de Conflitos. *Risco: médio
-  (semântica de permissão — testar bem).*
+- **Fase 3 — Dono do Atendimento + Conflitos (§3.1, §3.2).** **CONCLUÍDOS em prod:**
+  3A Painel de Conflitos (`5b121e2`); 3B desacople Dono-Atendimento×Lead
+  (`assign_wa_conversation` sem espelho + `/api/admin/reassign-lead`); Modo 1
+  Sussurro (nota interna `/api/wa/internal-note`). **Pendentes:** Modo 2
+  (co-pilotagem assinada + permissão coex×standard) e Modo 3 (takeover supervisor).
+  *Risco: médio (semântica de permissão — testar bem).*
 - **Fase 4 — Ciclo de vida (§3.4, §3.5).** `attendance_status`, auto-close
   estendendo o cron existente, finalização manual. *Risco: baixo-médio.*
 - **Fase 5 — Protocolo + Auditoria/IA (§3.6, §3.7).** Protocolo por dia/thread,

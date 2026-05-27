@@ -728,10 +728,15 @@ def get_conversations_by_contact(contact_id):
     return _normalize_many(rows)
 
 
-def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transferred_by, reason="", summary=""):
-    """Transfere uma conversation (thread). Atualiza apenas a conversation
-    e contact (assigned_to compartilhado por enquanto). Loga transferencia
-    com referencia a conversation_id E contact_id.
+def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transferred_by, reason="", summary="", also_lead=False):
+    """Transfere uma conversation (thread). Atualiza a conversation; o
+    contato (Dono do Lead) so e movido junto quando also_lead=True.
+
+    Fase 3B: por padrao NAO espelha no contato — Dono do Atendimento
+    (conversation.assigned_to) e Dono do Lead (contact.assigned_to) sao
+    distintos. Transferir uma thread nao muda o Lead inteiro. O espelho
+    legado virou opt-in (also_lead) e a reatribuicao explicita do Lead usa
+    assign_wa_contact (endpoint /api/admin/reassign-lead).
 
     Retorna {from_user_id, to_user_id, contact_id} ou None se nao achar.
     """
@@ -748,8 +753,8 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
         "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
         "department_id": to_department_id,
     }, merge=True)
-    # Espelho no contato pra views legadas que ainda leem dali
-    if contact_id is not None:
+    # Espelho no contato (Dono do Lead) — opt-in pos-Fase 3B.
+    if also_lead and contact_id is not None:
         document("wa_contacts", contact_id).set({
             "assigned_to": to_user_id,
             "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
@@ -1431,6 +1436,26 @@ def insert_transfer_system_message(contact_id, content, operator_id=None,
         timestamp_wa=utcnow().isoformat(),
         operator_id=operator_id,
         sender_user_id=operator_id,
+        conversation_id=conversation_id,
+        channel_id=channel_id,
+    )
+
+
+def insert_internal_note(contact_id, content, sender_user_id, conversation_id=None, channel_id=None):
+    """Modo 1 (Sussurro): nota interna na thread. Salva como
+    direction='internal' — aparece pro operador/managers no chat, NUNCA vai
+    pra Meta (o save nao envia) nem conta janela 24h / unread do cliente.
+    id sintetico (sem wa_message_id da Meta)."""
+    return save_wa_message(
+        wa_message_id=f"int_{utcnow().isoformat()}_{contact_id}",
+        contact_id=contact_id,
+        direction="internal",
+        msg_type="internal",
+        content=content,
+        status="delivered",
+        timestamp_wa=utcnow().isoformat(),
+        operator_id=sender_user_id,
+        sender_user_id=sender_user_id,
         conversation_id=conversation_id,
         channel_id=channel_id,
     )

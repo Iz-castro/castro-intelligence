@@ -59,7 +59,7 @@ from database import (
     update_user, deactivate_user, set_coex_authorization,
     upsert_firebase_user, get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
-    update_contact_avatar, insert_transfer_system_message, set_attendance_protocol,
+    update_contact_avatar, insert_transfer_system_message, insert_internal_note, set_attendance_protocol,
     get_wa_message_by_id, update_wa_message_transcription,
     create_manual_wa_contact, update_wa_contact_declared_name,
     mark_message_corrected,
@@ -2884,6 +2884,67 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
         },
     })
     return {"status": "transferred", "to_user": to_name}
+
+
+@app.post("/api/admin/reassign-lead")
+async def admin_reassign_lead(request: Request, current_user: dict = Depends(get_current_user)):
+    """Fase 3B: reatribui o DONO DO LEAD (contact.assigned_to) SEM mover os
+    atendimentos — as threads mantem seus donos (Dono do Atendimento). Acao
+    explicita e separada da transferencia de thread. Apenas admin/supervisor.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    body = await request.json()
+    contact_id = body.get("contact_id")
+    to_user_id = body.get("to_user_id")
+    to_department_id = body.get("to_department_id")
+    reason = body.get("reason", "")
+    summary = body.get("summary", "")
+    if not contact_id:
+        raise HTTPException(status_code=400, detail="contact_id obrigatorio")
+    if not to_user_id:
+        raise HTTPException(status_code=400, detail="Selecione o operador destino")
+    result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    to_user = get_user_by_id(to_user_id) if to_user_id else None
+    to_name = to_user["display_name"] if to_user else "Nenhum"
+    insert_transfer_system_message(
+        contact_id,
+        f"Lead reatribuido para {to_name} por {current_user['display_name']}"
+        + (f" | Motivo: {reason}" if reason else ""),
+        current_user["id"],
+    )
+    log_audit(current_user["id"], "WA_REASSIGN_LEAD", f"Contato {contact_id} -> {to_name}: {reason}")
+    await broadcast_to_operators({
+        "event": "wa_contact_reassigned",
+        "data": {"contact_id": contact_id, "assigned_to": to_user_id, "assigned_name": to_name},
+    })
+    return {"status": "reassigned", "to_user": to_name}
+
+
+@app.post("/api/wa/internal-note")
+async def wa_internal_note(request: Request, current_user: dict = Depends(get_current_user)):
+    """Modo 1 (Sussurro): nota interna na thread — orienta o operador em
+    tempo real; o cliente NAO recebe (nada vai pra Meta). Apenas
+    admin/supervisor escrevem; operador da thread + managers leem.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    body = await request.json()
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Nota vazia")
+    conv, contact, channel = _resolve_send_target(body.get("conversation_id"), body.get("contact_id"))
+    insert_internal_note(
+        contact_id=contact["id"],
+        content=content,
+        sender_user_id=current_user["id"],
+        conversation_id=conv["id"] if conv else None,
+        channel_id=(channel["id"] if channel else (conv.get("channel_id") if conv else contact.get("channel_id"))),
+    )
+    log_audit(current_user["id"], "WA_INTERNAL_NOTE", f"Conv {conv['id'] if conv else contact['id']}")
+    return {"status": "ok"}
 
 
 @app.post("/api/wa/assume/{contact_id}")

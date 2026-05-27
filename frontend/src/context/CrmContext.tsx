@@ -111,6 +111,11 @@ type CrmContextValue = {
   applyQuickMessage: (qm: { shortcut: string; message: string }) => void;
   handlePrimaryAction: () => void;
   handleImageSelected: (e: ChangeEvent<HTMLInputElement>) => void;
+  // Modo 1 (Sussurro): nota interna — nao vai pra Meta.
+  internalMode: boolean;
+  setInternalMode: (v: boolean) => void;
+  // Fase 3B: reatribui so o Dono do Lead (nao mexe nos atendimentos).
+  reassignLead: (toUserId: number, toDeptId: number | null, reason: string, summary: string) => Promise<void>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
   imageInputRef: React.MutableRefObject<HTMLInputElement | null>;
   videoInputRef: React.MutableRefObject<HTMLInputElement | null>;
@@ -1327,8 +1332,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return {};
   }
 
+  const [internalMode, setInternalMode] = useState(false);
   async function sendTextMessage() {
     if (!bundle || !selectedContact || !draft.trim()) return;
+    if (internalMode) { await sendInternalNote(); return; }
     try {
       setBusySend(true); setError(""); setNotice("");
       let content = draft.trim();
@@ -1337,6 +1344,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       }
       await sendJson(bundle.auth, "/api/wa/send", { ...buildSendTarget(), content, ...buildReplyPayload() });
       setDraft(""); setReplyTarget(null); setNotice("Mensagem enviada.");
+      if (!snapshotMode) await refreshPollingViews();
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusySend(false); }
+  }
+
+  // Modo 1 (Sussurro): grava nota interna na thread; NAO chama a Meta.
+  async function sendInternalNote() {
+    if (!bundle || !selectedContact || !draft.trim()) return;
+    try {
+      setBusySend(true); setError(""); setNotice("");
+      await sendJson(bundle.auth, "/api/wa/internal-note", { ...buildSendTarget(), content: draft.trim() });
+      setDraft(""); setNotice("Nota interna adicionada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusySend(false); }
@@ -1482,6 +1501,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function handlePrimaryAction() {
     if (busyComposerAction) return;
+    // Modo interno e texto-only: nunca grava audio (que iria pra Meta).
+    if (internalMode) { if (hasDraft) void sendTextMessage(); return; }
     if (recording) { void sendRecordedAudio(); return; }
     if (hasDraft) { void sendTextMessage(); return; }
     void startRecording();
@@ -1790,6 +1811,20 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyTransfer(false); }
   }
 
+  // Fase 3B: reatribui SO o Dono do Lead (contact.assigned_to). Os
+  // atendimentos (threads) mantem seus donos — a conversa aberta nao sai
+  // da tela. Admin/supervisor.
+  async function reassignLead(toUserId: number, toDeptId: number | null, reason: string, summary: string) {
+    if (!bundle || !selectedContact || !toUserId) return;
+    try {
+      setBusyTransfer(true); setError(""); setNotice("");
+      await sendJson(bundle.auth, "/api/admin/reassign-lead", { contact_id: selectedContact.id, to_user_id: toUserId, to_department_id: toDeptId, reason, summary });
+      setNotice("Lead reatribuido (atendimentos mantidos).");
+      if (!snapshotMode) await refreshPollingViews();
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusyTransfer(false); }
+  }
+
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
   async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "dashboard") {
@@ -1837,6 +1872,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     draft, setDraft, busySend, busyUpload, busyAudio, quickSuggestions, setQuickSuggestions,
     sendTextMessage, submitText, submitMedia, submitFile, sendLocation,
     handleDraftKeyDown, handleDraftChange, applyQuickMessage, handlePrimaryAction, handleImageSelected,
+    internalMode, setInternalMode,
     composerInputRef, imageInputRef, videoInputRef, documentInputRef,
     showAttachMenu, setShowAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, attachMenuRef,
     recording, recordingSeconds, startRecording, sendRecordedAudio, discardRecording,
@@ -1848,7 +1884,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
-    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact,
+    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,

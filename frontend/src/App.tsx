@@ -312,6 +312,21 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+function ReassignLeadCard() {
+  // Fase 3B: reatribui SO o Dono do Lead; os atendimentos mantem seus donos.
+  const { operators, sessionUser, reassignLead, busyTransfer } = useCrm();
+  const [uid, setUid] = useState<number | "">("");
+  const [reason, setReason] = useState("");
+  return (
+    <CollapsibleCard title="Reatribuir Lead (dono)" defaultOpen={false}>
+      <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Muda so o dono do Lead — os atendimentos abertos mantem seus donos.</span>
+      <select value={uid} onChange={(e) => setUid(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione o operador</option>{operators.filter((o) => o.id !== sessionUser?.id).map((o) => <option key={o.id} value={o.id}>{o.display_name}</option>)}</select>
+      <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo (opcional)" />
+      <button className="primary" onClick={() => { if (uid) { void reassignLead(Number(uid), null, reason, ""); setReason(""); setUid(""); } }} disabled={!uid || busyTransfer}>{busyTransfer ? "..." : "Reatribuir Lead"}</button>
+    </CollapsibleCard>
+  );
+}
+
 function ConflictsPanel() {
   // Fase 3A: Leads com >=2 atendimentos ativos de operadores distintos.
   // Read-only; clicar num atendimento abre a thread correspondente.
@@ -541,7 +556,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
@@ -774,12 +789,13 @@ function ChatPanel() {
           ) : null}
           {loadingMore && <div className="sub" style={{ textAlign: "center", padding: "0.5rem" }}>Carregando mensagens anteriores...</div>}
           {(visibleMessagesFiltered ?? visibleMessages).map((message) => {
-            const canInteract = message.direction !== "system";
+            const isInternal = message.direction === "internal";
+            const canInteract = message.direction !== "system" && !isInternal;
             const isMenuOpen = openMessageMenuId === message.id;
             const bubbleOperator = activeView === "equipe" && message.direction === "outbound" ? findMessageOperator(message, operators, selectedContact) : null;
             const bubbleColor = bubbleOperator ? operatorColor(bubbleOperator.id) : null;
             return (
-              <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""}`} style={operatorAccentStyle(bubbleColor)}>
+              <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""}`} style={isInternal ? { background: "#fef9c3", borderColor: "#facc15", color: "#713f12" } : operatorAccentStyle(bubbleColor)}>
                 {canInteract ? (
                   <div className="bubble-menu-anchor" ref={isMenuOpen ? activeMessageMenuRef : null}>
                     <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Acoes da mensagem" aria-expanded={isMenuOpen}>v</button>
@@ -794,7 +810,7 @@ function ChatPanel() {
                     ) : null}
                   </div>
                 ) : null}
-                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message)}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
+                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
                 {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
                 <MessageMedia message={message} />
@@ -860,6 +876,9 @@ function ChatPanel() {
           <div className={`composer-shell ${recording ? "is-recording" : ""}`}>
             <div className="composer-menu" ref={attachMenuRef}>
               <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busyUpload || busyAudio} aria-label="Abrir menu de anexos"><PlusIcon /></button>
+              {(sessionUser?.role === "admin" || sessionUser?.role === "supervisor") ? (
+                <button type="button" className="composer-icon" onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15", color: "#713f12" } : undefined}>🔒</button>
+              ) : null}
               {showAttachMenu ? (
                 <div className="attach-menu">
                   <button type="button" className="attach-option" onClick={openImagePicker}><PhotoIcon /><span>Foto</span></button>
@@ -873,7 +892,7 @@ function ChatPanel() {
               <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden />
             </div>
             <div className="composer-field">
-              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder="Digite uma mensagem" disabled={busySend || busyAudio} />}
+              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
             </div>
             <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={!selectedContact || busyUpload || busyComposerAction} aria-label={recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"}>
               {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : recording || hasDraft ? <SendIcon /> : <MicIcon />}
@@ -1193,13 +1212,15 @@ function DetailPanel() {
               <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={busyReturnBot} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
             ) : null}
           </CollapsibleCard>
-          <CollapsibleCard title="Transferencia" defaultOpen={false}>
+          <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
+            <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move so este atendimento (thread). O Dono do Lead nao muda.</span>
             <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
             <select value={toDepartmentId} onChange={(e) => setToDepartmentId(e.target.value ? Number(e.target.value) : "")}><option value="">Manter departamento atual</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
             <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferencia" />
             <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatorio" />
             <button className="primary" onClick={() => void transferContact()} disabled={!toUserId || !transferSummary.trim() || busyTransfer}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
           </CollapsibleCard>
+          {isManagerRole ? <ReassignLeadCard /> : null}
         </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
 
         {isManagerRole ? (
