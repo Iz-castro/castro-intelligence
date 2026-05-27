@@ -642,6 +642,7 @@ def upsert_wa_conversation(
             _ch_fields = {
                 "channel_phone_number": _ch.get("display_phone_number", ""),
                 "channel_label": _ch.get("label", ""),
+                "channel_type": _ch.get("channel_type", ""),
                 "channel_active": True,
             }
         elif channel_id is not None:

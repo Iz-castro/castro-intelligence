@@ -769,7 +769,11 @@ function ChatPanel() {
           ))}</div>
         )}
 
-        {isTakeoverPending ? (
+        {channelInactive ? (
+          <div className="composer" style={{ padding: "0.8rem 1rem" }}>
+            <div className="sub" style={{ textAlign: "center", width: "100%" }}>⚠ Canal removido/antigo — somente leitura. Nao e possivel enviar por este atendimento.</div>
+          </div>
+        ) : isTakeoverPending ? (
           <div className="composer" style={{ padding: "0.8rem 1rem", flexDirection: "column", gap: "0.5rem" }}>
             {showTakeoverPrompt ? (
               <>

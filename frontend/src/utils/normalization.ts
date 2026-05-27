@@ -93,6 +93,7 @@ export function normalizeConversation(record: Record<string, unknown>, docId: st
     channel_label: String(record.channel_label || ""),
     channel_type: String(record.channel_type || ""),
     channel_phone_number: String(record.channel_phone_number || ""),
+    channel_active: record.channel_active == null ? undefined : Boolean(record.channel_active),
     source_channel_type: String(record.source_channel_type || ""),
     phone_number_id: String(record.phone_number_id || ""),
     assigned_to: record.assigned_to == null ? null : num(record.assigned_to),

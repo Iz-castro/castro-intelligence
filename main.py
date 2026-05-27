@@ -1010,9 +1010,12 @@ async def wa_conversations(current_user: dict = Depends(get_current_user)):
             "contact_avatar_path": contact.get("contact_avatar_path"),
             "attendance_protocol": contact.get("attendance_protocol"),
             "attendance_started_at": contact.get("attendance_started_at"),
-            "channel_label": channel.get("label", "") if channel else "",
-            "channel_type": channel.get("channel_type", "") if channel else "",
-            "channel_phone_number": channel.get("display_phone_number", "") if channel else "",
+            # Canal inativo/removido (fora do cache so-ativos) => cai no valor
+            # denormalizado na propria conversation (Fase 2: apresentacao
+            # honesta), senao a thread perde o numero/label na UI em polling.
+            "channel_label": (channel.get("label", "") if channel else conv.get("channel_label", "")),
+            "channel_type": (channel.get("channel_type", "") if channel else (conv.get("channel_type") or conv.get("source_channel_type") or "")),
+            "channel_phone_number": (channel.get("display_phone_number", "") if channel else conv.get("channel_phone_number", "")),
             "channel_active": bool(channel),
             "unread": int(conv.get("unread_count", 0)),
         }
