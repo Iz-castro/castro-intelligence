@@ -130,6 +130,7 @@ export type Conversation = {
   channel_label?: string;
   channel_type?: "standard" | "coexistence" | string;
   channel_phone_number?: string;
+  channel_active?: boolean;
   source_channel_type?: "standard" | "coexistence" | string;
   phone_number_id?: string;
   assigned_to?: number | null;

@@ -536,11 +536,16 @@ function ChatPanel() {
     : takeoverStatus === "active"
       ? `ativo (handler: ${threadHandlerOp?.display_name || "?"})`
       : "nenhum";
-  const myThreadRole = (selectedContact?.assigned_to != null && sessionUser?.id === selectedContact.assigned_to)
-    ? "dono do lead"
-    : (selectedThread?.takeover_handler_user_id != null && sessionUser?.id === selectedThread.takeover_handler_user_id)
-      ? "handler"
-      : "observador";
+  const iOwnLead = selectedContact?.assigned_to != null && sessionUser?.id === selectedContact.assigned_to;
+  const iOwnThread = selectedThread?.assigned_to != null && sessionUser?.id === selectedThread.assigned_to;
+  const iAmActiveHandler = selectedThread?.takeover_status === "active"
+    && selectedThread?.takeover_handler_user_id != null
+    && sessionUser?.id === selectedThread.takeover_handler_user_id;
+  const myThreadRole = iOwnLead ? "dono do lead"
+    : iOwnThread ? "dono do atendimento"
+    : iAmActiveHandler ? "handler (assumido)"
+    : "observador";
+  const channelInactive = selectedThread?.channel_active === false;
   const clientGreetName = selectedContact?.declared_name || selectedContact?.whatsapp_profile_name || "";
   const greetSuggestion = `Ola${clientGreetName ? " " + clientGreetName : ""}! Aqui e ${sessionUser?.display_name || "o atendimento"}. Vi no nosso sistema que voce costuma falar com ${leadOwnerName}. Como voce me chamou por aqui, como posso te ajudar hoje?`;
   const openTakeoverPrompt = () => { setGreetDraft(greetSuggestion); setShowTakeoverPrompt(true); };
@@ -685,7 +690,7 @@ function ChatPanel() {
         {selectedContact ? (
           <div className="sub" style={{ display: "flex", flexWrap: "wrap", gap: "0.2rem 1rem", padding: "0.35rem 1rem", fontSize: "0.72rem", borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface-2, rgba(0,0,0,0.03))" }}>
             <span>👤 Dono do lead: <strong>{leadOwnerLabel}</strong></span>
-            {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}</span> : null}
+            {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}{channelInactive ? <strong style={{ color: "var(--danger, #c0392b)" }}> · ⚠ canal removido/antigo</strong> : null}</span> : null}
             <span>🔄 Takeover: <strong>{takeoverLabel}</strong></span>
             <span>Você: <strong>{myThreadRole}</strong></span>
           </div>

@@ -628,6 +628,27 @@ def upsert_wa_conversation(
     wa_id = normalize_br_phone(wa_id)
     conversation_id = _make_conversation_id(channel_id, wa_id)
     now = utcnow()
+
+    # Denormaliza dados do canal no doc do Atendimento para a UI. No modo
+    # snapshot o frontend nao faz join com o canal (e operador comum nem
+    # recebe /api/admin/channels), entao sem isto a faixa de contexto mostra
+    # "Conversa no numero: —". Canal fora do cache = inativo/removido — mesma
+    # semantica do envio (get_send_credentials falha quando get_channel e None).
+    _ch_fields: dict = {}
+    try:
+        from channel_service import get_channel as _get_channel
+        _ch = _get_channel(channel_id) if channel_id is not None else None
+        if _ch:
+            _ch_fields = {
+                "channel_phone_number": _ch.get("display_phone_number", ""),
+                "channel_label": _ch.get("label", ""),
+                "channel_active": True,
+            }
+        elif channel_id is not None:
+            _ch_fields = {"channel_active": False}
+    except Exception:
+        _ch_fields = {}
+
     ref = document("wa_conversations", conversation_id)
     snap = ref.get()
     existing = snap.to_dict() if snap.exists else None
@@ -635,6 +656,7 @@ def upsert_wa_conversation(
     if existing:
         updates = {
             "last_message_at": now,
+            **_ch_fields,
         }
         if direction_for_unread == "inbound":
             updates["last_inbound_at"] = now
@@ -669,6 +691,7 @@ def upsert_wa_conversation(
         "last_message_at": now,
         "last_inbound_at": now if direction_for_unread == "inbound" else None,
         "last_outbound_at": now if direction_for_unread == "outbound" else None,
+        **_ch_fields,
     }
     if auto_assign_user_id:
         user = _get_doc("users", auto_assign_user_id)

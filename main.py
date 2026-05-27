@@ -1013,6 +1013,7 @@ async def wa_conversations(current_user: dict = Depends(get_current_user)):
             "channel_label": channel.get("label", "") if channel else "",
             "channel_type": channel.get("channel_type", "") if channel else "",
             "channel_phone_number": channel.get("display_phone_number", "") if channel else "",
+            "channel_active": bool(channel),
             "unread": int(conv.get("unread_count", 0)),
         }
         enriched.append(item)
