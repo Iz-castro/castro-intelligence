@@ -1258,15 +1258,24 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
                 )
         return
 
-    # Takeover temporario: durante 'pending' o handler precisa assumir antes
-    # de responder (o frontend ja bloqueia o composer; isto fecha a brecha via API).
+    # Modo 2 (co-pilotagem): admin/supervisor pode enviar em QUALQUER thread.
+    # Quando nao e o dono do atendimento, e intervencao de supervisao -> retorna
+    # "intervention" e o caller assina o texto ([Supervisao - nome]:).
+    is_manager = current_user.get("role") in ("admin", "supervisor")
+    assigned = conversation.get("assigned_to")
+    if is_manager:
+        if assigned and assigned != current_user["id"]:
+            return "intervention"
+        return None
+    # --- operadores comuns: regras estritas ---
+    # Takeover 'pending' (coex): o handler precisa assumir antes de responder.
     if conversation.get("takeover_status") == "pending":
         raise HTTPException(status_code=403, detail="Assuma o atendimento temporario antes de responder")
-    assigned = conversation.get("assigned_to")
     if assigned and assigned != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
-    if not assigned and current_user.get("role") not in ("admin", "supervisor"):
+    if not assigned:
         raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
+    return None
 
 
 def _resolve_channel_creds(contact: dict) -> tuple[str, str, str]:
@@ -1351,15 +1360,21 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user, contact)
+    send_mode = _check_conv_send_permission(conv, current_user, contact)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
+    # Modo 2 (co-pilotagem): intervencao de supervisao -> assina o texto.
+    content = body.content
+    if send_mode == "intervention":
+        _sup_name = (current_user.get("display_name") or "Supervisao").split()[0]
+        content = f"[Supervisao - {_sup_name}]: {content}"
+
     wa_id = _wa_target(contact["wa_id"])
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": body.content}, **reply_context}
+    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": content}, **reply_context}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
@@ -1369,7 +1384,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
         wa_msg_id = result.get("messages", [{}])[0].get("id", "")
         save_wa_message(
             wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
-            msg_type="text", content=body.content, status="sent",
+            msg_type="text", content=content, status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
             channel_id=channel["id"] if channel else conv.get("channel_id"),
             conversation_id=conv["id"],
@@ -1378,7 +1393,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
             **reply_fields,
         )
         _maybe_credit_assume_counter(contact, current_user["id"])
-        log_audit(current_user["id"], "WA_SEND", f"Para {wa_id}: {body.content[:80]}")
+        log_audit(current_user["id"], "WA_SEND", f"Para {wa_id}: {content[:80]}")
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
         error_msg = result.get("error", {}).get("message", "Erro desconhecido")
@@ -2959,6 +2974,75 @@ async def wa_internal_note(request: Request, current_user: dict = Depends(get_cu
     )
     log_audit(current_user["id"], "WA_INTERNAL_NOTE", f"Conv {conv['id'] if conv else contact['id']}")
     return {"status": "ok"}
+
+
+@app.post("/api/wa/conversation/{conversation_id}/supervisor-takeover")
+async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Modo 3: supervisor ASSUME o atendimento (thread) — vira Dono do
+    Atendimento (nao muda o Dono do Lead). Avisa o lead com texto livre se
+    dentro da janela de 24h; fora, assume sem mensagem. Apenas admin/supervisor.
+    """
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    conv, contact, channel = _resolve_send_target(conversation_id, None)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Atendimento nao encontrado")
+    # Assume a thread (thread-only — nao mexe no Dono do Lead, Fase 3B).
+    assign_wa_conversation(
+        conv["id"], current_user["id"], conv.get("department_id"), current_user["id"],
+        reason="Assumido pela supervisao", summary="Supervisor assumiu o atendimento",
+    )
+    # Aviso ao lead: texto livre so dentro da janela de 24h (fora, sem msg).
+    within_24h = False
+    li = contact.get("last_inbound_at")
+    if li:
+        try:
+            li_dt = li if isinstance(li, datetime) else datetime.fromisoformat(str(li))
+            if li_dt.tzinfo is None:
+                li_dt = li_dt.replace(tzinfo=timezone.utc)
+            within_24h = (datetime.now(timezone.utc) - li_dt) <= timedelta(hours=24)
+        except Exception:
+            within_24h = False
+    announced = False
+    if within_24h:
+        try:
+            token, phone_id, api_base = _resolve_channel_creds_by_id(channel["id"] if channel else conv.get("channel_id"))
+            msg = (
+                f"Ola, aqui e {current_user.get('display_name', 'a supervisao')}. "
+                "Estou assumindo seu atendimento a partir de agora para agilizar sua solicitacao."
+            )
+            wa_id = _wa_target(contact["wa_id"])
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{api_base}/{phone_id}/messages",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": msg}},
+                )
+            if resp.status_code == 200:
+                wa_msg_id = (resp.json().get("messages", [{}])[0].get("id", ""))
+                save_wa_message(
+                    wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
+                    msg_type="text", content=msg, status="sent",
+                    timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
+                    channel_id=channel["id"] if channel else conv.get("channel_id"),
+                    conversation_id=conv["id"], sender_user_id=current_user["id"],
+                    channel_owner_user_id=(channel or {}).get("owner_user_id"),
+                )
+                announced = True
+        except Exception as exc:
+            logger.warning("supervisor-takeover: falha ao avisar lead conv=%s: %s", conv["id"], exc)
+    insert_transfer_system_message(
+        contact["id"],
+        f"Atendimento assumido pela supervisao ({current_user['display_name']}).",
+        current_user["id"], conversation_id=conv["id"],
+        channel_id=channel["id"] if channel else conv.get("channel_id"),
+    )
+    log_audit(current_user["id"], "WA_SUPERVISOR_TAKEOVER", f"Conv {conv['id']} (aviso={announced})")
+    await broadcast_to_operators({
+        "event": "wa_contact_reassigned",
+        "data": {"conversation_id": conv["id"], "contact_id": contact["id"], "assigned_to": current_user["id"], "assigned_name": current_user["display_name"]},
+    })
+    return {"status": "taken_over", "announced": announced}
 
 
 @app.post("/api/wa/assume/{contact_id}")

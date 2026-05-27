@@ -116,13 +116,18 @@ configurado".
   1. **Sussurro (nota interna):** `direction="internal"` em `wa_messages`, NÃO vai
      pra Meta; orienta o operador, cliente não vê. ✅ FEITO (`/api/wa/internal-note`,
      toggle 🔒 no composer, bolha amarela).
-  2. **Co-pilotagem (intervenção assinada):** admin/sup envia ao lead **sem assumir**;
-     backend faz prepend `[Supervisão - {nome}]:` + grava `sender_user_id=supervisor`
-     (thread owner intacto). ⏳ PENDENTE (Modo 2; é aqui que entra a permissão
-     coex×standard explícita + bypass admin/sup).
-  3. **Assunção (takeover do supervisor):** botão muda o **Dono do Atendimento**
-     (thread) p/ o supervisor + msg automática ao lead (texto se ≤24h, senão
-     template) + operador read-only. ⏳ PENDENTE (Modo 3) — reusa o desacople 3B.
+  2. **Co-pilotagem (intervenção assinada):** admin/sup envia ao lead **sem assumir**.
+     ✅ FEITO — `_check_conv_send_permission` retorna `"intervention"` p/ admin/sup
+     não-dono (bypass) e `/api/wa/send` faz prepend `[Supervisao - {1º nome}]:` +
+     grava `sender_user_id=supervisor` (thread owner intacto); faixa de aviso no
+     frontend. A permissão coex×standard p/ operador comum já era emergente (takeover
+     é coex-only) e `create_manual_wa_contact` (manual = standard) já bloqueia certo.
+  3. **Assunção (takeover do supervisor):** ✅ FEITO —
+     `POST /api/wa/conversation/{id}/supervisor-takeover` (admin/sup) assume a thread
+     via 3B (muda só o Dono do Atendimento) + avisa o lead com texto se ≤24h, senão
+     assume sem msg. Botão "Assumir como supervisor" na faixa de intervenção.
+     **Pendente (v2):** operador antigo ver a thread em read-only (hoje ela só sai
+     da view dele, como numa transferência).
 
 ### 3.3 Re-login coexistence = **merge/rebind**, não canal novo (substitui o C)
 - **Hoje:** Embedded Signup ([main.py](../main.py), handler `embedded_signup`)
@@ -231,6 +236,10 @@ configurado".
 > Premissa do PLANO existente: o Firestore **pode ser zerado** antes de produção
 > real multi-cliente. Isso simplifica migrações/backfills. **Confirmado
 > (decisão #7 — ver §6): pode zerar** (com export da Helenice antes do wipe).
+> **Atualização (2026-05-27): o wipe deixou de ser PRÉ-REQUISITO** — as fases
+> foram entregues evoluindo a base viva (backfills/scripts, sem zerar). Continua
+> válido como **higiene opcional** antes do 1º cliente real pago (limpar canais
+> duplicados 1/4 + contatos/dados de teste).
 
 - **Fase 1 — Re-login = rebind de canal (§3.3).** Maior dor + destrava o resto.
   Detectar canal existente por **`phone_number_id`** (decisão #1) e dar UPDATE
@@ -243,12 +252,10 @@ configurado".
   p/ canal inativo + `normalizeConversation` mapeia `channel_active` + composer
   read-only + backfill (`scripts/backfill_conversation_channel_denorm.py`, 98
   convs). **2b (abas) ADIADA** — ver nota no §4. *Risco: baixo.*
-- **Fase 3 — Dono do Atendimento + Conflitos (§3.1, §3.2).** **CONCLUÍDOS em prod:**
-  3A Painel de Conflitos (`5b121e2`); 3B desacople Dono-Atendimento×Lead
-  (`assign_wa_conversation` sem espelho + `/api/admin/reassign-lead`); Modo 1
-  Sussurro (nota interna `/api/wa/internal-note`). **Pendentes:** Modo 2
-  (co-pilotagem assinada + permissão coex×standard) e Modo 3 (takeover supervisor).
-  *Risco: médio (semântica de permissão — testar bem).*
+- **Fase 3 — Dono do Atendimento + Conflitos (§3.1, §3.2). CONCLUÍDA em prod:**
+  3A Conflitos (`5b121e2`); 3B desacople Dono-Atendimento×Lead; e os 3 modos do
+  supervisor — Modo 1 Sussurro, Modo 2 Co-pilotagem assinada, Modo 3 Takeover.
+  Pendente só o nice-to-have de read-only pro operador antigo após takeover (v2).
 - **Fase 4 — Ciclo de vida (§3.4, §3.5).** `attendance_status`, auto-close
   estendendo o cron existente, finalização manual. *Risco: baixo-médio.*
 - **Fase 5 — Protocolo + Auditoria/IA (§3.6, §3.7).** Protocolo por dia/thread,

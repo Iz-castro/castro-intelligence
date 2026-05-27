@@ -556,7 +556,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
@@ -591,6 +591,10 @@ function ChatPanel() {
   const iAmLeadOwner = selectedContact?.assigned_to != null && sessionUser?.id === selectedContact.assigned_to;
   const isTakeoverPending = takeoverStatus === "pending" && isTakeoverHandler && !iAmLeadOwner;
   const isTakeoverActive = takeoverStatus === "active" && isTakeoverHandler && !iAmLeadOwner;
+  const isManager = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
+  // Modo 2/3: admin/sup vendo thread que nao e dele (nem do lead dele) ->
+  // intervindo como supervisao (envio assinado) e pode assumir.
+  const iAmIntervening = isManager && selectedThread?.assigned_to != null && selectedThread.assigned_to !== sessionUser?.id && !iAmLeadOwner;
   const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
   // Faixa de contexto (visivel para todos): de quem e o lead, em que numero
   // a conversa vive, estado do takeover e qual o meu papel nesta thread.
@@ -761,6 +765,13 @@ function ChatPanel() {
             {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}{channelInactive ? <strong style={{ color: "var(--danger, #c0392b)" }}> · ⚠ canal removido/antigo</strong> : null}</span> : null}
             <span>🔄 Takeover: <strong>{takeoverLabel}</strong></span>
             <span>Você: <strong>{myThreadRole}</strong></span>
+          </div>
+        ) : null}
+
+        {iAmIntervening ? (
+          <div className="sub" style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem 0.8rem", alignItems: "center", padding: "0.3rem 1rem", fontSize: "0.72rem", background: "rgba(250,204,21,0.12)", borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
+            <span>👁️ Intervindo como supervisão — suas mensagens vão assinadas <strong>[Supervisão - {(sessionUser?.display_name || "").split(" ")[0]}]</strong>.</span>
+            <button type="button" className="ghost" style={{ padding: "0.2rem 0.5rem", fontSize: "0.7rem", whiteSpace: "nowrap" }} disabled={busySend} onClick={() => { if (selectedThreadId) void supervisorTakeover(selectedThreadId); }}>Assumir como supervisor</button>
           </div>
         ) : null}
 

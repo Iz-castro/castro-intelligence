@@ -116,6 +116,8 @@ type CrmContextValue = {
   setInternalMode: (v: boolean) => void;
   // Fase 3B: reatribui so o Dono do Lead (nao mexe nos atendimentos).
   reassignLead: (toUserId: number, toDeptId: number | null, reason: string, summary: string) => Promise<void>;
+  // Modo 3: supervisor assume a thread (vira Dono do Atendimento).
+  supervisorTakeover: (conversationId: string) => Promise<void>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
   imageInputRef: React.MutableRefObject<HTMLInputElement | null>;
   videoInputRef: React.MutableRefObject<HTMLInputElement | null>;
@@ -1825,6 +1827,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyTransfer(false); }
   }
 
+  // Modo 3: supervisor assume a thread (vira Dono do Atendimento; o Lead nao
+  // muda). Backend avisa o lead se dentro de 24h.
+  async function supervisorTakeover(conversationId: string) {
+    if (!bundle) return;
+    try {
+      setBusyTransfer(true); setError(""); setNotice("");
+      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/supervisor-takeover`, {});
+      setNotice("Atendimento assumido pela supervisao.");
+      if (!snapshotMode) await refreshPollingViews();
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusyTransfer(false); }
+  }
+
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
   async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "dashboard") {
@@ -1884,7 +1899,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
-    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead,
+    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
