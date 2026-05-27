@@ -52,7 +52,7 @@ from database import (
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
     get_department_by_id, update_department, deactivate_department,
-    assign_wa_contact, assign_wa_conversation, get_transfer_history,
+    assign_wa_contact, assign_wa_conversation, get_conversations_by_contact, get_transfer_history,
     return_contact_to_bot, get_contacts_by_assigned_user,
     get_wa_contacts_scoped_for_user, get_wa_contacts_visible_to,
     update_user_avatar, get_user_avatar,
@@ -2907,6 +2907,20 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
     result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # Reatribuir o Lead reconcilia o takeover das threads: se o novo dono ja e o
+    # handler (dono do numero), o conflito acabou -> limpa o takeover stale (senao
+    # o PROPRIO dono do Lead veria "Assumir atendimento"). Threads que seguem em
+    # conflito so tem o lead_owner_user_id atualizado p/ o banner ficar correto.
+    try:
+        for cv in get_conversations_by_contact(contact_id):
+            if cv.get("takeover_status") not in ("pending", "active"):
+                continue
+            if cv.get("takeover_handler_user_id") == to_user_id:
+                clear_conversation_takeover(cv["id"])
+            elif cv.get("lead_owner_user_id") != to_user_id:
+                fs_document("wa_conversations", cv["id"]).set({"lead_owner_user_id": to_user_id}, merge=True)
+    except Exception as exc:
+        logger.warning("reassign-lead: falha ao reconciliar takeover do contato %s: %s", contact_id, exc)
     to_user = get_user_by_id(to_user_id) if to_user_id else None
     to_name = to_user["display_name"] if to_user else "Nenhum"
     insert_transfer_system_message(

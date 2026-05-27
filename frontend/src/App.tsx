@@ -585,8 +585,12 @@ function ChatPanel() {
   const takeoverStatus = selectedThread?.takeover_status;
   const isTakeoverHandler =
     sessionUser?.id != null && selectedThread?.takeover_handler_user_id === sessionUser.id;
-  const isTakeoverPending = takeoverStatus === "pending" && isTakeoverHandler;
-  const isTakeoverActive = takeoverStatus === "active" && isTakeoverHandler;
+  // O dono do Lead nunca precisa "assumir" o proprio lead. Se eu sou dono do
+  // Lead (mesmo sendo handler/dono do numero), o conflito acabou — evita o
+  // banner/prompt de takeover stale apos reatribuir o Lead pra mim.
+  const iAmLeadOwner = selectedContact?.assigned_to != null && sessionUser?.id === selectedContact.assigned_to;
+  const isTakeoverPending = takeoverStatus === "pending" && isTakeoverHandler && !iAmLeadOwner;
+  const isTakeoverActive = takeoverStatus === "active" && isTakeoverHandler && !iAmLeadOwner;
   const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
   // Faixa de contexto (visivel para todos): de quem e o lead, em que numero
   // a conversa vive, estado do takeover e qual o meu papel nesta thread.
