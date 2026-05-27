@@ -221,8 +221,15 @@ Cada fase: staging→prod no mesmo gate usado hoje
 
 ## 6. Decisões em aberto (responder antes de executar)
 
-1. **Re-login:** o `phone_number_id` muda no re-onboarding do mesmo número?
-   (valida o passo de atualizar `phone_routing`). Confirmar com 1 re-signup real.
+1. ~~**Re-login:** o `phone_number_id` muda no re-onboarding do mesmo número?~~
+   **RESPONDIDA (2026-05-27):** NÃO muda. Canais 1/4/5 (mesmo número 7195-7758,
+   incluindo antigo+novo pós re-signup do teste1) têm `phone_number_id` e
+   `waba_id` **idênticos** (`1055982807598158` / `680503338460083`). Logo:
+   `phone_routing` **não muda** no rebind; a **chave de dedup é o
+   `phone_number_id`** (estável). Os canais duplicados existem só porque o
+   Embedded Signup sempre faz `create_channel` — o fix é **detectar canal
+   por `phone_number_id` e dar UPDATE** (reativar + novo token), não criar novo.
+   (A linha "Atenção: phone_number_id pode mudar" da §3.3 está obsoleta.)
 2. **Órfãos atuais:** rebindar/mesclar (canais 1/4 → canal ativo) **ou** apenas
    arquivar as conversas órfãs? (Fase 1 precisa disso definido.)
 3. **Agenda (§3.8):** por-operador (subcoleção `wa_contacts/{id}/notes/{uid}`) ou
