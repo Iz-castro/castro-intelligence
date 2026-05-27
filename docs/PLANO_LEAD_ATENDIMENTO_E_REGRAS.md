@@ -230,8 +230,16 @@ Cada fase: staging→prod no mesmo gate usado hoje
    Embedded Signup sempre faz `create_channel` — o fix é **detectar canal
    por `phone_number_id` e dar UPDATE** (reativar + novo token), não criar novo.
    (A linha "Atenção: phone_number_id pode mudar" da §3.3 está obsoleta.)
-2. **Órfãos atuais:** rebindar/mesclar (canais 1/4 → canal ativo) **ou** apenas
-   arquivar as conversas órfãs? (Fase 1 precisa disso definido.)
+2. ~~**Órfãos atuais:** rebindar/mesclar ou arquivar?~~ **RESPONDIDA
+   (2026-05-27) — híbrido por dono:** consolidar (merge das conversas no canal
+   ativo) APENAS quando o órfão tem **mesmo `owner_user_id` + mesmo
+   `phone_number_id`** do canal ativo (ex.: canal 4 → 5, ambos teste1).
+   Órfão com **dono diferente** (ex.: canal 1, owner Izael, mesmo número) é
+   **arquivado**, NÃO mesclado — mesclar corromperia a autoria. Merge =
+   repontuar `conversation_id`+`channel_id` das `wa_messages` da thread órfã
+   para `{canal_ativo}__{wa_id}`, somar unread/last_message_at, deletar a
+   conversa órfã (idempotente; PITR ligado como rede). A própria Fase 1
+   (rebind por `phone_number_id`) impede a criação de novos órfãos.
 3. **Agenda (§3.8):** por-operador (subcoleção `wa_contacts/{id}/notes/{uid}`) ou
    compartilhada do Lead? (impacto LGPD).
 4. **Sticky routing TTL:** N dias (sugestão 30)? Como detectar dono
