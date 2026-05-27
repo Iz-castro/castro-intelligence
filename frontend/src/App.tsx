@@ -434,15 +434,19 @@ function ContactList() {
                 <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
                 <div className="row">
                   <span className="chip">{contact.qualification || "novo"}</span>
-                  {channelLabel ? (
-                    <span className="chip" style={{ fontSize: "0.65rem", background: channelType === "coexistence" ? "#dbeafe" : "#dcfce7", color: channelType === "coexistence" ? "#1e40af" : "#166534" }} title={channelType === "coexistence" ? "Canal Coexistence (numero pessoal)" : "Canal Standard (Cloud API)"}>
-                      {channelLabel}
-                    </span>
-                  ) : channelType === "coexistence" ? (
-                    <span className="chip" style={{ fontSize: "0.65rem", opacity: 0.7 }}>coex</span>
-                  ) : null}
                   {unreadCount ? <b className="badge">{unreadCount}</b> : null}
                 </div>
+                {channelLabel ? (
+                  <div style={{ marginTop: "0.2rem", maxWidth: "100%" }}>
+                    <span className="chip" style={{ display: "inline-block", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", verticalAlign: "bottom", fontSize: "0.65rem", background: channelType === "coexistence" ? "#dbeafe" : "#dcfce7", color: channelType === "coexistence" ? "#1e40af" : "#166534" }} title={`${channelLabel}${channelType === "coexistence" ? " (Coexistence)" : " (Cloud API)"}`}>
+                      {channelLabel}
+                    </span>
+                  </div>
+                ) : channelType === "coexistence" ? (
+                  <div style={{ marginTop: "0.2rem" }}>
+                    <span className="chip" style={{ fontSize: "0.65rem", opacity: 0.7 }}>coex</span>
+                  </div>
+                ) : null}
               </div>
             </button>
           );
