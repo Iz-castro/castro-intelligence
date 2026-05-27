@@ -247,8 +247,15 @@ Cada fase: staging→prod no mesmo gate usado hoje
 5. **`attendance_status`:** novo campo no `wa_conversations`? Fechar zera takeover
    também?
 6. **Tipificação:** catálogo fixo ou configurável por tenant? Onde editar?
-7. **Reset do Firestore** antes do refator ainda é aceitável? (muda estratégia de
-   migração/backfill).
+7. ~~**Reset do Firestore** antes do refator ainda é aceitável?~~ **RESPONDIDA
+   (2026-05-27): PODE ZERAR.** Confirmado que sair da plataforma comercial
+   (offboarding real no celular) + re-signup **re-libera** o sync coex
+   (contatos + histórico ≤6m voltam). Procedimento para a Helenice (único uso
+   real): instruir offboarding → re-signup → conferir retorno dos contatos.
+   **Ressalva:** dados só-do-CRM (notas, qualificações, protocolos, avaliações)
+   NÃO voltam pelo re-sync — se a Helenice tiver desses e importarem, exportar
+   antes. Como pode zerar: **a Fase 1 ignora a #2 (merge de órfãos) e os
+   backfills** — deploy do código novo + wipe + re-onboard limpo.
 
 ---
 
