@@ -139,6 +139,7 @@ export type Conversation = {
   unread_count?: number;
   unread?: number;
   status?: "open" | "archived" | string;
+  attendance_status?: "aberto" | "fechado_inatividade" | "fechado_manual" | string;
   last_message_at?: string;
   last_inbound_at?: string;
   last_outbound_at?: string;

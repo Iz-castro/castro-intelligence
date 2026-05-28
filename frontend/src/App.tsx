@@ -8,6 +8,7 @@ import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
 
@@ -556,7 +557,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
@@ -595,6 +596,9 @@ function ChatPanel() {
   // Modo 2/3: admin/sup vendo thread que nao e dele (nem do lead dele) ->
   // intervindo como supervisao (envio assinado) e pode assumir.
   const iAmIntervening = isManager && selectedThread?.assigned_to != null && selectedThread.assigned_to !== sessionUser?.id && !iAmLeadOwner;
+  // Fase 4 (ciclo de vida): ausente = aberto.
+  const attendanceStatus = selectedThread?.attendance_status || "aberto";
+  const attendanceClosed = attendanceStatus !== "aberto";
   const leadOwnerName = operators.find((o) => o.id === selectedThread?.lead_owner_user_id)?.display_name || "outro operador";
   // Faixa de contexto (visivel para todos): de quem e o lead, em que numero
   // a conversa vive, estado do takeover e qual o meu papel nesta thread.
@@ -751,6 +755,7 @@ function ChatPanel() {
                     <button type="button" className="attach-option" onClick={() => { setShowTemplatePicker(true); closeDotsMenu(); }}><span>📋</span><span>Enviar template</span></button>
                     <div style={{ height: 1, background: "var(--border)", margin: "0.3rem 0.5rem" }} />
                     <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }}><span>✏️</span><span>Editar apelido</span></button>
+                    {selectedThreadId ? <button type="button" className="attach-option" onClick={() => { void setAttendance(selectedThreadId, attendanceClosed ? "aberto" : "fechado_manual"); closeDotsMenu(); }}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
                     {selectedContact.attendance_protocol ? <button type="button" className="attach-option" onClick={() => { navigator.clipboard.writeText(selectedContact.attendance_protocol!).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button> : null}
                   </div>
                 ) : null}
@@ -764,6 +769,7 @@ function ChatPanel() {
             <span>👤 Dono do lead: <strong>{leadOwnerLabel}</strong></span>
             {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}{channelInactive ? <strong style={{ color: "var(--danger, #c0392b)" }}> · ⚠ canal removido/antigo</strong> : null}</span> : null}
             <span>🔄 Takeover: <strong>{takeoverLabel}</strong></span>
+            {attendanceClosed ? <span style={{ color: "var(--danger, #c0392b)" }}>🔒 <strong>{attendanceStatus === "fechado_inatividade" ? "fechado (inatividade)" : "fechado"}</strong></span> : null}
             <span>Você: <strong>{myThreadRole}</strong></span>
           </div>
         ) : null}
@@ -892,7 +898,7 @@ function ChatPanel() {
             <div className="composer-menu" ref={attachMenuRef}>
               <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busyUpload || busyAudio} aria-label="Abrir menu de anexos"><PlusIcon /></button>
               {(sessionUser?.role === "admin" || sessionUser?.role === "supervisor") ? (
-                <button type="button" className="composer-icon" onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15", color: "#713f12" } : undefined}>🔒</button>
+                <button type="button" className="composer-icon" onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
               ) : null}
               {showAttachMenu ? (
                 <div className="attach-menu">

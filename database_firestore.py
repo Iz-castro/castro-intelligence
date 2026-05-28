@@ -664,6 +664,9 @@ def upsert_wa_conversation(
             updates["unread_count"] = int(existing.get("unread_count", 0)) + 1
         elif direction_for_unread == "outbound":
             updates["last_outbound_at"] = now
+        if direction_for_unread in ("inbound", "outbound"):
+            # Atividade reabre um atendimento fechado (Fase 4 — ciclo de vida).
+            updates["attendance_status"] = "aberto"
         # Auto-assign se nao atribuido (coexistence)
         if auto_assign_user_id and not existing.get("assigned_to"):
             user = _get_doc("users", auto_assign_user_id)
@@ -688,6 +691,7 @@ def upsert_wa_conversation(
         "department_id": None,
         "unread_count": 1 if direction_for_unread == "inbound" else 0,
         "status": "open",
+        "attendance_status": "aberto",
         "created_at": now,
         "last_message_at": now,
         "last_inbound_at": now if direction_for_unread == "inbound" else None,
@@ -863,6 +867,59 @@ def expire_stale_takeovers(max_idle_hours):
             "lead_owner_user_id": conv.get("lead_owner_user_id"),
         })
     return expired
+
+
+def close_stale_attendances(max_idle_hours):
+    """Fecha (attendance_status='fechado_inatividade') atendimentos ATRIBUIDOS
+    ociosos ha mais de max_idle_hours (sem mensagem). Reabre sozinho na proxima
+    mensagem (upsert_wa_conversation). Opera no tenant_context atual. Retorna
+    lista de {conversation_id, contact_id, assigned_to}. (Fase 4.)"""
+    from datetime import timedelta
+    cutoff = utcnow() - timedelta(hours=max_idle_hours)
+    closed = []
+    for snap in collection("wa_conversations").stream():
+        conv = snap.to_dict() or {}
+        if not conv.get("assigned_to"):
+            continue  # so atendimentos atribuidos (fila/bot nao fecham)
+        if conv.get("attendance_status") not in (None, "", "aberto"):
+            continue  # ja fechado
+        last = conv.get("last_message_at")
+        if isinstance(last, str):
+            try:
+                last = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            except ValueError:
+                last = None
+        try:
+            stale = last is not None and last < cutoff
+        except TypeError:
+            stale = False  # naive vs aware — nao arrisca fechar indevido
+        if not stale:
+            continue
+        cid = snap.id
+        document("wa_conversations", cid).set(
+            {"attendance_status": "fechado_inatividade"}, merge=True,
+        )
+        closed.append({
+            "conversation_id": cid,
+            "contact_id": conv.get("contact_id"),
+            "assigned_to": conv.get("assigned_to"),
+        })
+    return closed
+
+
+def set_attendance_status(conversation_id, status, clear_takeover=False):
+    """Define o attendance_status manualmente (Fase 4 — fechar/reabrir).
+    status: 'aberto' | 'fechado_manual'. clear_takeover encerra a sessao
+    temporaria de takeover junto. Retorna a conversation atualizada ou None."""
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        return None
+    updates = {"attendance_status": status}
+    if clear_takeover:
+        updates["takeover_status"] = "none"
+        updates["takeover_started_at"] = None
+    document("wa_conversations", conversation_id).set(updates, merge=True)
+    return get_wa_conversation_by_id(conversation_id)
 
 
 def mark_wa_conversation_read_by_id(conversation_id):

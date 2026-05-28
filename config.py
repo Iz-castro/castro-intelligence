@@ -148,6 +148,12 @@ ROLE_OPTIONS = [
 # devolver automaticamente uma sessao de takeover 'active' ao dono do lead.
 TAKEOVER_TIMEOUT_HOURS = int(os.environ.get("TAKEOVER_TIMEOUT_HOURS", "3"))
 
+# -- Ciclo de vida do Atendimento (Fase 4) --
+# Horas sem mensagem antes de FECHAR automaticamente um atendimento ATRIBUIDO
+# por inatividade (attendance_status -> fechado_inatividade). Reabre sozinho na
+# proxima mensagem.
+ATTENDANCE_AUTOCLOSE_HOURS = int(os.environ.get("ATTENDANCE_AUTOCLOSE_HOURS", "24"))
+
 # -- Bootstrap inicial --
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 BOOTSTRAP_ADMIN_DISPLAY_NAME = os.getenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Administrador")

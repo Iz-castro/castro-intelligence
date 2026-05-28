@@ -256,8 +256,16 @@ configurado".
   3A Conflitos (`5b121e2`); 3B desacople Dono-Atendimento×Lead; e os 3 modos do
   supervisor — Modo 1 Sussurro, Modo 2 Co-pilotagem assinada, Modo 3 Takeover.
   Pendente só o nice-to-have de read-only pro operador antigo após takeover (v2).
-- **Fase 4 — Ciclo de vida (§3.4, §3.5).** `attendance_status`, auto-close
-  estendendo o cron existente, finalização manual. *Risco: baixo-médio.*
+- **Fase 4 — Ciclo de vida (§3.5). CONCLUÍDA em prod:** campo
+  `attendance_status` (`aberto`/`fechado_inatividade`/`fechado_manual`);
+  reabre em qualquer mensagem (inbound ou outbound); `close_stale_attendances`
+  plugado no **cron `*/30` existente** (auto-close de atendimentos
+  ATRIBUÍDOS ociosos > `ATTENDANCE_AUTOCLOSE_HOURS`, **6h em prod** — encaixa
+  no fechamento operacional 17h da Hubloc); endpoint
+  `POST /api/wa/conversation/{id}/set-attendance` p/ fechar/reabrir manual
+  (zera takeover no fechar). UI: badge "fechado" na faixa + item
+  "Fechar/Reabrir atendimento" no menu ⋮. **Pendente:** sticky routing TTL
+  (§3.4) e operador read-only pós-takeover supervisor (v2).
 - **Fase 5 — Protocolo + Auditoria/IA (§3.6, §3.7).** Protocolo por dia/thread,
   busca por protocolo, tipificação obrigatória, resumo Vertex em background,
   relatórios. *Risco: baixo no protocolo; IA exige update de compliance.*

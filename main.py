@@ -32,7 +32,7 @@ from config import (
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
-    QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS,
+    QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS, ATTENDANCE_AUTOCLOSE_HOURS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
@@ -65,6 +65,7 @@ from database import (
     mark_message_corrected,
     get_wa_conversation_by_id, upsert_wa_conversation,
     set_conversation_takeover_active, clear_conversation_takeover, expire_stale_takeovers,
+    close_stale_attendances, set_attendance_status,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -2828,6 +2829,20 @@ async def cron_expire_takeovers(request: Request):
             if expired:
                 summary.append({"tenant_id": tid, "expired": len(expired)})
             total += len(expired)
+            # Fase 4: fecha atendimentos ATRIBUIDOS ociosos por inatividade.
+            closed = close_stale_attendances(ATTENDANCE_AUTOCLOSE_HOURS)
+            for c in closed:
+                cc_id = c.get("contact_id")
+                if cc_id is not None:
+                    insert_transfer_system_message(
+                        cc_id,
+                        "Atendimento fechado automaticamente por inatividade.",
+                        None, conversation_id=c.get("conversation_id"),
+                    )
+                log_audit(None, "ATTENDANCE_AUTO_CLOSE", f"conv={c.get('conversation_id')} assigned={c.get('assigned_to')}")
+            if closed:
+                summary.append({"tenant_id": tid, "closed": len(closed)})
+            total += len(closed)
         except Exception as exc:
             logger.error("expire-takeovers tenant %s falhou: %s", tid, exc)
             summary.append({"tenant_id": tid, "error": str(exc)})
@@ -3043,6 +3058,33 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
         "data": {"conversation_id": conv["id"], "contact_id": contact["id"], "assigned_to": current_user["id"], "assigned_name": current_user["display_name"]},
     })
     return {"status": "taken_over", "announced": announced}
+
+
+@app.post("/api/wa/conversation/{conversation_id}/set-attendance")
+async def wa_set_attendance(conversation_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Fase 4 (ciclo de vida): fecha/reabre um atendimento manualmente.
+    body: {status: 'fechado_manual' | 'aberto'}. Dono do atendimento ou
+    admin/supervisor. Fechar manual zera o takeover."""
+    body = await request.json()
+    status = (body.get("status") or "").strip()
+    if status not in ("fechado_manual", "aberto"):
+        raise HTTPException(status_code=400, detail="status invalido (use fechado_manual ou aberto)")
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Atendimento nao encontrado")
+    is_manager = current_user.get("role") in ("admin", "supervisor")
+    if not is_manager and conv.get("assigned_to") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Apenas o dono do atendimento ou admin/supervisor")
+    set_attendance_status(conversation_id, status, clear_takeover=(status == "fechado_manual"))
+    contact_id = conv.get("contact_id")
+    if contact_id is not None:
+        verb = "fechado" if status == "fechado_manual" else "reaberto"
+        insert_transfer_system_message(
+            contact_id, f"Atendimento {verb} por {current_user['display_name']}.",
+            current_user["id"], conversation_id=conversation_id, channel_id=conv.get("channel_id"),
+        )
+    log_audit(current_user["id"], "ATTENDANCE_SET_STATUS", f"conv={conversation_id} -> {status}")
+    return {"status": "ok", "attendance_status": status}
 
 
 @app.post("/api/wa/assume/{contact_id}")

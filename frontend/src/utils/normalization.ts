@@ -102,6 +102,7 @@ export function normalizeConversation(record: Record<string, unknown>, docId: st
     unread_count: num(record.unread_count ?? record.unread ?? 0),
     unread: num(record.unread ?? record.unread_count ?? 0),
     status: String(record.status || "open"),
+    attendance_status: String(record.attendance_status || "aberto"),
     last_message_at: iso(record.last_message_at),
     last_inbound_at: iso(record.last_inbound_at),
     last_outbound_at: iso(record.last_outbound_at),

@@ -118,6 +118,8 @@ type CrmContextValue = {
   reassignLead: (toUserId: number, toDeptId: number | null, reason: string, summary: string) => Promise<void>;
   // Modo 3: supervisor assume a thread (vira Dono do Atendimento).
   supervisorTakeover: (conversationId: string) => Promise<void>;
+  // Fase 4: fecha/reabre um atendimento manualmente.
+  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto") => Promise<void>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
   imageInputRef: React.MutableRefObject<HTMLInputElement | null>;
   videoInputRef: React.MutableRefObject<HTMLInputElement | null>;
@@ -1840,6 +1842,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyTransfer(false); }
   }
 
+  // Fase 4: fecha (fechado_manual) ou reabre (aberto) um atendimento.
+  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto") {
+    if (!bundle) return;
+    try {
+      setBusyTransfer(true); setError(""); setNotice("");
+      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/set-attendance`, { status });
+      setNotice(status === "fechado_manual" ? "Atendimento fechado." : "Atendimento reaberto.");
+      if (!snapshotMode) await refreshPollingViews();
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusyTransfer(false); }
+  }
+
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
   async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "dashboard") {
@@ -1899,7 +1913,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
-    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover,
+    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
