@@ -3,7 +3,7 @@
 import logging
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from google.api_core import exceptions as gcloud_exceptions
 from google.cloud import firestore
@@ -903,6 +903,7 @@ def close_stale_attendances(max_idle_hours):
             "conversation_id": cid,
             "contact_id": conv.get("contact_id"),
             "assigned_to": conv.get("assigned_to"),
+            "channel_id": conv.get("channel_id"),
         })
     return closed
 
@@ -1359,6 +1360,138 @@ def set_attendance_protocol(contact_id, protocol, started_at):
     }, merge=True)
 
 
+# ---------------------------------------------------------------------------
+# Fase 5A — Protocolo de Atendimento (1 dia = 1 por Lead). Spec do PO:
+# gerado silenciosamente no 1o inbound do dia; enviado ao cliente SO no
+# fechamento do atendimento como "recibo"; flag protocolo_informado impede
+# reenvio em retorno-zumbi no mesmo dia. Colecao tenant-scoped
+# attendances_daily/{YYYYMMDD-{contact_id}-{SETOR}}. Espelha o id em
+# wa_contacts.attendance_protocol p/ back-compat com o "Copiar protocolo".
+# ---------------------------------------------------------------------------
+
+_BR_TZ = timezone(timedelta(hours=-3))  # BR sem DST desde 2019; fixo -3.
+
+
+def _today_br_str():
+    """YYYYMMDD no horario do Brasil (granularidade do protocolo = dia BR)."""
+    return datetime.now(_BR_TZ).strftime("%Y%m%d")
+
+
+def _setor_code(department_id):
+    """3 letras maiusculas ASCII do nome do departamento; fallback GERAL."""
+    if not department_id:
+        return "GERAL"
+    dept = _get_doc("departments", department_id)
+    if not dept:
+        return "GERAL"
+    name = (dept.get("name") or "").strip()
+    if not name:
+        return "GERAL"
+    import unicodedata
+    ascii_name = "".join(
+        c for c in unicodedata.normalize("NFKD", name)
+        if not unicodedata.combining(c)
+    )
+    letters = "".join(c for c in ascii_name if c.isalpha())[:3].upper()
+    return letters or "GERAL"
+
+
+def ensure_daily_attendance(contact_id, setor=None):
+    """Get-or-create do Atendimento diario. Trigger: 1o inbound do dia (chamado
+    de save_wa_message). Reabre se estava fechado PRESERVANDO
+    protocolo_informado (regra do retorno-zumbi). Espelha o id em
+    wa_contacts.attendance_protocol. Retorna o protocol_id ou None."""
+    contact = _get_doc("wa_contacts", contact_id)
+    if not contact:
+        return None
+    date_str = _today_br_str()
+    if setor is None:
+        setor = _setor_code(contact.get("department_id"))
+    pid = f"{date_str}-{contact_id}-{setor}"
+    now = utcnow()
+    ref = document("attendances_daily", pid)
+    snap = ref.get()
+    if snap.exists:
+        existing = snap.to_dict() or {}
+        updates = {"ultima_interacao": now}
+        if existing.get("status") != "aberto":
+            # Retorno-zumbi: reabre status, NAO mexe em protocolo_informado.
+            updates["status"] = "aberto"
+            updates["fechado_em"] = None
+            updates["fechado_por_user_id"] = None
+        ref.set(updates, merge=True)
+    else:
+        ref.set({
+            "id": pid,
+            "contact_id": contact_id,
+            "date": date_str,
+            "setor": setor,
+            "criado_em": now,
+            "ultima_interacao": now,
+            "status": "aberto",
+            "protocolo_informado": False,
+            "fechado_em": None,
+            "fechado_por_user_id": None,
+        })
+    # Espelho no contato (back-compat com "Copiar protocolo" do menu).
+    document("wa_contacts", contact_id).set(
+        {"attendance_protocol": pid, "attendance_started_at": now}, merge=True,
+    )
+    return pid
+
+
+def get_daily_attendance(protocol_id):
+    """Le o Atendimento diario pelo id ou None."""
+    snap = document("attendances_daily", protocol_id).get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+    if "id" not in data:
+        data["id"] = protocol_id
+    return data
+
+
+def close_daily_attendance(protocol_id, status, closed_by_user_id=None):
+    """status: 'fechado_manual' ou 'fechado_inatividade'. Idempotente."""
+    document("attendances_daily", protocol_id).set({
+        "status": status,
+        "fechado_em": utcnow(),
+        "fechado_por_user_id": closed_by_user_id,
+    }, merge=True)
+
+
+def mark_protocol_informed(protocol_id):
+    """Sinaliza que o protocolo ja foi enviado ao cliente (semaforo do
+    retorno-zumbi). Idempotente."""
+    document("attendances_daily", protocol_id).set(
+        {"protocolo_informado": True}, merge=True,
+    )
+
+
+def get_current_protocol_id(contact_id):
+    """Retorna o protocol_id de hoje do contato SE existe (sem criar) —
+    usado p/ denorm de protocol_id em mensagens outbound/internal/system."""
+    contact = _get_doc("wa_contacts", contact_id)
+    if not contact:
+        return None
+    pid = contact.get("attendance_protocol") or ""
+    today = _today_br_str()
+    if pid and pid.startswith(today + "-"):
+        return pid
+    return None
+
+
+def get_messages_by_protocol(protocol_id):
+    """Mensagens denormalizadas pelo protocol_id (Fase 5A: busca admin/sup).
+    Ordena por timestamp_wa ascendente."""
+    rows = []
+    for snap in collection("wa_messages").where("protocol_id", "==", protocol_id).stream():
+        data = snap.to_dict() or {}
+        rows.append(data)
+    rows.sort(key=lambda r: str(r.get("timestamp_wa") or r.get("created_at") or ""))
+    return _normalize_many(rows)
+
+
 def archive_wa_contact(contact_id):
     document("wa_contacts", contact_id).set({"is_archived": 1}, merge=True)
 
@@ -1620,6 +1753,21 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                 )
                 raise
             eff_conversation_id = None
+    # Fase 5A: denorm do protocol_id (1 dia = 1 por Lead). Inbound dispara o
+    # ensure (cria/reabre o Atendimento diario); outras direcoes leem o
+    # atual sem criar.
+    protocol_id = None
+    if contact_id is not None:
+        if direction == "inbound":
+            try:
+                protocol_id = ensure_daily_attendance(contact_id)
+            except Exception as exc:
+                logger.warning("ensure_daily_attendance falhou contact=%s: %s", contact_id, exc)
+        else:
+            try:
+                protocol_id = get_current_protocol_id(contact_id)
+            except Exception:
+                protocol_id = None
     document("wa_messages", message_id).set({
         "id": message_id,
         "wa_message_id": effective_wa_message_id,
@@ -1644,6 +1792,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "department_id": (contact or {}).get("department_id"),
         "channel_id": eff_channel_id,
         "phone_number_id": eff_phone_number_id,
+        "protocol_id": protocol_id,
         "is_rating_message": is_rating_message,
         "visibility": visibility,
         "timestamp_wa": _coerce_timestamp(timestamp_wa),

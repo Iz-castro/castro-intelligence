@@ -183,6 +183,27 @@ export type ConflictLead = {
   conversations: ConflictConversation[];
 };
 
+// Fase 5A: Protocolo de Atendimento (1 dia = 1 por Lead).
+export type ProtocolAtendimento = {
+  id: string;
+  contact_id: number;
+  date: string;
+  setor: string;
+  criado_em?: string | null;
+  ultima_interacao?: string | null;
+  status: "aberto" | "fechado_inatividade" | "fechado_manual" | string;
+  protocolo_informado: boolean;
+  fechado_em?: string | null;
+  fechado_por_user_id?: number | null;
+};
+
+export type ProtocolSearchResult = {
+  atendimento: ProtocolAtendimento;
+  contact: { id: number; display_name: string; phone_formatted: string; wa_id: string } | null;
+  messages: ChatMessage[];
+  count: number;
+};
+
 export type MessageReplyReference = {
   message_id: number;
   preview: string;

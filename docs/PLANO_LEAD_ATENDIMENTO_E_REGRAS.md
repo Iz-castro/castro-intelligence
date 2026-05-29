@@ -170,12 +170,27 @@ configurado".
   `aberto` | `fechado_inatividade` | `fechado_manual`). Fechar quando última
   mensagem > 24h. Fechar deixa pendente a **tipificação** (3.7).
 
-### 3.6 Protocolo por dia/thread
-- **Hoje:** `attendance_protocol`/`attendance_started_at` no contato
-  (`set_attendance_protocol`), por-contato, não por-dia-por-thread.
-- **Alvo:** padrão `YYYYMMDD-{LEAD_ID}-{SETOR}` (ex.: `20260527-1870-VEN`),
-  gerado por dia, vinculado ao Atendimento. Busca por protocolo (admin/sup) →
-  renderiza as mensagens daquela thread/dia. Novo endpoint de busca.
+### 3.6 Protocolo por dia/thread — ✅ FEITO (Fase 5A, 2026-05-28)
+- **Spec do PO:** 1 Dia = 1 Protocolo por Lead; geração silenciosa no 1º inbound;
+  envio ao cliente SÓ no fechamento como "recibo"; semáforo `protocolo_informado`
+  bloqueia reenvio no retorno-zumbi do mesmo dia.
+- **Implementação:** nova coleção tenant-scoped `attendances_daily/{YYYYMMDD-{contact_id}-{SETOR}}`
+  (timezone Brasil -3h fixo; SETOR = 3 letras ASCII do dept ou `GERAL`). Campos:
+  status, protocolo_informado, criado_em, ultima_interacao, fechado_em/por.
+- **Trigger inbound:** `save_wa_message` chama `ensure_daily_attendance` em
+  inbound → cria/reabre o Atendimento + denormaliza `protocol_id` na mensagem.
+  Reabertura preserva `protocolo_informado=true` (regra do retorno-zumbi).
+- **Envio no fechamento:** `_close_daily_and_send_protocol` no
+  `set-attendance` manual E no cron de auto-close — envia texto livre se
+  ≤24h; fora, fecha sem enviar (sem template aprovado). Idempotente entre
+  threads do mesmo Lead/dia via o semáforo.
+- **Busca:** `GET /api/admin/protocol/{protocol_id}` (admin/sup) retorna
+  Atendimento + timeline; card "Buscar protocolo" no detail-panel.
+- **Assume não gera mais protocolo** (mudança de comportamento): só webhook
+  na 1ª inbound do dia. Espelho `wa_contacts.attendance_protocol` mantido p/
+  back-compat com o "Copiar protocolo" do menu ⋮.
+- **Faltam (5B/5C):** tipificação obrigatória no fechamento e resumo IA
+  Vertex em background (esta exige update RoPA/RIPD por LGPD).
 
 ### 3.7 Auditoria: tipificação obrigatória + resumo por IA
 - **Tipificação no fechamento:** Categoria / Sub-categoria / Status
@@ -266,9 +281,14 @@ configurado".
   (zera takeover no fechar). UI: badge "fechado" na faixa + item
   "Fechar/Reabrir atendimento" no menu ⋮. **Pendente:** sticky routing TTL
   (§3.4) e operador read-only pós-takeover supervisor (v2).
-- **Fase 5 — Protocolo + Auditoria/IA (§3.6, §3.7).** Protocolo por dia/thread,
-  busca por protocolo, tipificação obrigatória, resumo Vertex em background,
-  relatórios. *Risco: baixo no protocolo; IA exige update de compliance.*
+- **Fase 5 — Protocolo + Auditoria/IA (§3.6, §3.7). 5A CONCLUÍDA em prod
+  (2026-05-28):** coleção `attendances_daily/{YYYYMMDD-{contact_id}-{SETOR}}`,
+  geração silenciosa no inbound, envio do protocolo ao cliente como recibo no
+  fechamento (manual + cron), retorno-zumbi tratado via flag
+  `protocolo_informado`, busca admin `GET /api/admin/protocol/{id}` + card no
+  frontend. **Pendentes:** **5B** tipificação obrigatória no fechamento (catálogo
+  configurável por tenant) e **5C** resumo IA Vertex em background (exige update
+  RoPA/RIPD por LGPD).
 
 Cada fase: staging→prod no mesmo gate usado hoje
 (`gcloud run deploy castro-crm-staging … && … castro-crm …`), com health check.

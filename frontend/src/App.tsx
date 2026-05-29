@@ -7,7 +7,7 @@ import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
-import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -310,6 +310,57 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
         </div>
       </div>
     </div>
+  );
+}
+
+function ProtocolSearchCard() {
+  // Fase 5A: busca por protocolo (admin/sup). Mostra Atendimento + timeline
+  // do dia (todas as mensagens com aquele protocol_id).
+  const { loadProtocol, operators } = useCrm();
+  const [pid, setPid] = useState("");
+  const [result, setResult] = useState<ProtocolSearchResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const handleSearch = async () => {
+    const trimmed = pid.trim();
+    if (!trimmed) return;
+    setLoading(true);
+    setSearched(true);
+    try { setResult(await loadProtocol(trimmed)); }
+    finally { setLoading(false); }
+  };
+  const opName = (id?: number | null) => id != null ? (operators.find((o) => o.id === id)?.display_name || `#${id}`) : "—";
+  return (
+    <CollapsibleCard title="Buscar protocolo" defaultOpen={false}>
+      <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Formato: YYYYMMDD-{`{contact_id}`}-SETOR (ex.: 20260528-1870-VEN)</span>
+      <div style={{ display: "flex", gap: "0.3rem" }}>
+        <input value={pid} onChange={(e) => setPid(e.target.value)} placeholder="20260528-1870-VEN" style={{ flex: 1 }} />
+        <button type="button" className="primary" onClick={() => void handleSearch()} disabled={loading || !pid.trim()}>{loading ? "..." : "Buscar"}</button>
+      </div>
+      {!loading && searched && !result ? (
+        <div className="sub" style={{ opacity: 0.7, marginTop: "0.4rem" }}>Protocolo não encontrado.</div>
+      ) : null}
+      {result ? (
+        <div style={{ marginTop: "0.5rem", fontSize: "0.75rem" }}>
+          <div><strong>Lead:</strong> {result.contact?.display_name || `#${result.atendimento.contact_id}`} ({result.contact?.phone_formatted || result.contact?.wa_id || "—"})</div>
+          <div><strong>Status:</strong> {result.atendimento.status}{result.atendimento.protocolo_informado ? " · ✓ protocolo informado" : " · ⚠ não informado"}</div>
+          <div><strong>Setor:</strong> {result.atendimento.setor} · <strong>Dia:</strong> {result.atendimento.date}</div>
+          {result.atendimento.fechado_por_user_id ? <div><strong>Fechado por:</strong> {opName(result.atendimento.fechado_por_user_id)}</div> : null}
+          <div style={{ marginTop: "0.4rem" }}><strong>{result.count} mensagem(s)</strong></div>
+          <div style={{ maxHeight: 260, overflowY: "auto", marginTop: "0.3rem", display: "flex", flexDirection: "column", gap: "0.2rem" }}>
+            {result.messages.map((m) => {
+              const accent = m.direction === "inbound" ? "#0ea5e9" : m.direction === "outbound" ? "#22c55e" : m.direction === "internal" ? "#facc15" : "#94a3b8";
+              return (
+                <div key={m.id} style={{ padding: "0.2rem 0.4rem", borderLeft: `3px solid ${accent}`, opacity: 0.95 }}>
+                  <div className="sub" style={{ fontSize: "0.65rem", opacity: 0.7 }}>{when(m.timestamp_wa || m.created_at)} · {m.direction}</div>
+                  <div style={{ fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>{(m.content || `[${m.msg_type}]`).slice(0, 200)}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </CollapsibleCard>
   );
 }
 
@@ -770,6 +821,7 @@ function ChatPanel() {
             {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}{channelInactive ? <strong style={{ color: "var(--danger, #c0392b)" }}> · ⚠ canal removido/antigo</strong> : null}</span> : null}
             <span>🔄 Takeover: <strong>{takeoverLabel}</strong></span>
             {attendanceClosed ? <span style={{ color: "var(--danger, #c0392b)" }}>🔒 <strong>{attendanceStatus === "fechado_inatividade" ? "fechado (inatividade)" : "fechado"}</strong></span> : null}
+            {selectedContact.attendance_protocol ? <span>📄 <strong>{selectedContact.attendance_protocol}</strong></span> : null}
             <span>Você: <strong>{myThreadRole}</strong></span>
           </div>
         ) : null}
@@ -1249,6 +1301,8 @@ function DetailPanel() {
             <ConflictsPanel />
           </CollapsibleCard>
         ) : null}
+
+        {isManagerRole ? <ProtocolSearchCard /> : null}
 
         {isManagerRole ? (
           <CollapsibleCard title={sessionUser?.role === "admin" ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>

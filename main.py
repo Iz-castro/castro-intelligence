@@ -60,6 +60,8 @@ from database import (
     upsert_firebase_user, get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message, insert_internal_note, set_attendance_protocol,
+    get_daily_attendance, close_daily_attendance, mark_protocol_informed,
+    get_current_protocol_id, get_messages_by_protocol,
     get_wa_message_by_id, update_wa_message_transcription,
     create_manual_wa_contact, update_wa_contact_declared_name,
     mark_message_corrected,
@@ -2261,6 +2263,34 @@ async def admin_conflicts(current_user: dict = Depends(get_current_user)):
     return {"conflicts": conflicts, "count": len(conflicts)}
 
 
+@app.get("/api/admin/protocol/{protocol_id}")
+async def admin_get_protocol(protocol_id: str, current_user: dict = Depends(get_current_user)):
+    """Fase 5A: busca por protocolo (admin/supervisor) — retorna o Atendimento
+    diario + timeline de mensagens daquele dia pra aquele Lead (todas as
+    threads/canais, pois protocolo e 1 por Lead/dia)."""
+    if current_user.get("role") not in ("admin", "supervisor"):
+        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    atendimento = get_daily_attendance(protocol_id)
+    if not atendimento:
+        raise HTTPException(status_code=404, detail="Protocolo nao encontrado")
+    messages = get_messages_by_protocol(protocol_id)
+    contact = get_wa_contact(atendimento.get("contact_id"))
+    contact_brief = None
+    if contact:
+        contact_brief = {
+            "id": contact.get("id"),
+            "display_name": contact.get("display_name"),
+            "phone_formatted": contact.get("phone_formatted"),
+            "wa_id": contact.get("wa_id"),
+        }
+    return {
+        "atendimento": atendimento,
+        "contact": contact_brief,
+        "messages": messages,
+        "count": len(messages),
+    }
+
+
 @app.post("/api/admin/channels")
 async def create_channel_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
     if current_user.get("role") not in ("admin", "supervisor"):
@@ -2839,6 +2869,27 @@ async def cron_expire_takeovers(request: Request):
                         "Atendimento fechado automaticamente por inatividade.",
                         None, conversation_id=c.get("conversation_id"),
                     )
+                    # Fase 5A: envia o protocolo ao lead (recibo) se ainda nao
+                    # informado e dentro de 24h. Idempotente entre threads do
+                    # mesmo dia (a flag protocolo_informado bloqueia duplicata).
+                    try:
+                        contact_c = get_wa_contact(cc_id)
+                        if contact_c:
+                            from channel_service import get_channel as _get_channel
+                            channel_c = _get_channel(c.get("channel_id")) if c.get("channel_id") else None
+                            conv_stub = {
+                                "id": c.get("conversation_id"),
+                                "contact_id": cc_id,
+                                "channel_id": c.get("channel_id"),
+                            }
+                            await _close_daily_and_send_protocol(
+                                contact_c, conv_stub, channel_c, None, "fechado_inatividade",
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "cron protocol send conv=%s falhou: %s",
+                            c.get("conversation_id"), exc,
+                        )
                 log_audit(None, "ATTENDANCE_AUTO_CLOSE", f"conv={c.get('conversation_id')} assigned={c.get('assigned_to')}")
             if closed:
                 summary.append({"tenant_id": tid, "closed": len(closed)})
@@ -3060,6 +3111,67 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
     return {"status": "taken_over", "announced": announced}
 
 
+async def _close_daily_and_send_protocol(contact, conv, channel, current_user, close_status):
+    """Fase 5A: no fechamento de uma thread, fecha o Atendimento DIARIO do
+    contato e (se ainda nao informado) envia o protocolo ao lead como
+    "recibo". Texto livre se <=24h; fora da janela, fecha sem enviar (sem
+    template aprovado, mesma regra do Modo 3). Idempotente — a flag
+    protocolo_informado bloqueia reenvio no retorno-zumbi.
+
+    close_status: 'fechado_manual' | 'fechado_inatividade'.
+    """
+    pid = (contact or {}).get("attendance_protocol")
+    if not pid:
+        return False  # lead sem inbound hoje -> sem Atendimento diario
+    # Garante que o pid eh de hoje BR (caso contato tenha mirror antigo)
+    today_br = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y%m%d")
+    if not pid.startswith(today_br + "-"):
+        return False
+    atendimento = get_daily_attendance(pid)
+    if not atendimento:
+        return False
+    sender_uid = (current_user or {}).get("id")
+    if not atendimento.get("protocolo_informado"):
+        within_24h = False
+        li = contact.get("last_inbound_at")
+        if li:
+            try:
+                li_dt = li if isinstance(li, datetime) else datetime.fromisoformat(str(li))
+                if li_dt.tzinfo is None:
+                    li_dt = li_dt.replace(tzinfo=timezone.utc)
+                within_24h = (datetime.now(timezone.utc) - li_dt) <= timedelta(hours=24)
+            except Exception:
+                within_24h = False
+        if within_24h and channel:
+            try:
+                token, phone_id, api_base = _resolve_channel_creds_by_id(channel["id"])
+                wa_id = _wa_target(contact["wa_id"])
+                msg = f"Seu protocolo de hoje é {pid}. Agradecemos pela confiança em nossa empresa."
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        f"{api_base}/{phone_id}/messages",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json={"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": msg}},
+                    )
+                if resp.status_code == 200:
+                    wa_msg_id = (resp.json().get("messages", [{}])[0].get("id", ""))
+                    save_wa_message(
+                        wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
+                        msg_type="text", content=msg, status="sent",
+                        timestamp_wa=datetime.now(timezone.utc).isoformat(),
+                        operator_id=sender_uid,
+                        channel_id=channel["id"],
+                        conversation_id=conv["id"] if conv else None,
+                        sender_user_id=sender_uid,
+                        channel_owner_user_id=channel.get("owner_user_id"),
+                    )
+                    mark_protocol_informed(pid)
+            except Exception as exc:
+                logger.warning("close_daily_protocol: falha ao enviar pid=%s: %s", pid, exc)
+    close_daily_attendance(pid, close_status, sender_uid)
+    return True
+
+
 @app.post("/api/wa/conversation/{conversation_id}/set-attendance")
 async def wa_set_attendance(conversation_id: str, request: Request, current_user: dict = Depends(get_current_user)):
     """Fase 4 (ciclo de vida): fecha/reabre um atendimento manualmente.
@@ -3083,6 +3195,27 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
             contact_id, f"Atendimento {verb} por {current_user['display_name']}.",
             current_user["id"], conversation_id=conversation_id, channel_id=conv.get("channel_id"),
         )
+    # Fase 5A: ao fechar a thread, fecha o Atendimento DIARIO + envia o
+    # protocolo ao lead (recibo). Idempotente: a flag protocolo_informado
+    # bloqueia reenvio se outra thread do mesmo dia ja fechou antes.
+    if contact_id is not None and status == "fechado_manual":
+        contact = get_wa_contact(contact_id)
+        from channel_service import get_channel as _get_channel
+        channel = _get_channel(conv.get("channel_id")) if conv.get("channel_id") else None
+        if contact:
+            await _close_daily_and_send_protocol(contact, conv, channel, current_user, "fechado_manual")
+    elif contact_id is not None and status == "aberto":
+        # Reopen manual: volta o Atendimento diario p/ 'aberto' mantendo
+        # protocolo_informado (consistencia com o que ensure_daily_attendance
+        # faz no proximo inbound).
+        pid = get_current_protocol_id(contact_id)
+        if pid:
+            try:
+                fs_document("attendances_daily", pid).set(
+                    {"status": "aberto", "fechado_em": None, "fechado_por_user_id": None}, merge=True,
+                )
+            except Exception as exc:
+                logger.warning("reopen daily attendance pid=%s falhou: %s", pid, exc)
     log_audit(current_user["id"], "ATTENDANCE_SET_STATUS", f"conv={conversation_id} -> {status}")
     return {"status": "ok", "attendance_status": status}
 
@@ -3118,17 +3251,17 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     if not contact.get("original_operator_id"):
 
         fs_document("wa_contacts", contact_id).set({"original_operator_id": current_user["id"]}, merge=True)
-    now = datetime.now(timezone.utc)
-    protocol = f"ATD-{now.strftime('%Y%m%d%H%M%S')}-{contact_id:05d}"
-    set_attendance_protocol(contact_id, protocol, now.isoformat())
-    sys_content = f"Atendimento assumido por {current_user['display_name']} | Protocolo: {protocol}"
+    # Fase 5A: protocolo NAO e mais gerado no assume (so no 1o inbound do dia
+    # via webhook -> ensure_daily_attendance). Reusa o atual se ja existe.
+    protocol = get_current_protocol_id(contact_id) or ""
+    sys_content = f"Atendimento assumido por {current_user['display_name']}" + (f" | Protocolo: {protocol}" if protocol else "")
     insert_transfer_system_message(contact_id, sys_content, current_user["id"])
-    log_audit(current_user["id"], "WA_ASSUME", f"Contato {contact_id} | Protocolo {protocol}")
+    log_audit(current_user["id"], "WA_ASSUME", f"Contato {contact_id}" + (f" | Protocolo {protocol}" if protocol else ""))
     await broadcast_to_operators({
         "event": "wa_contact_reassigned",
         "data": {"contact_id": contact_id, "assigned_to": current_user["id"], "assigned_name": current_user["display_name"]},
     })
-    return {"status": "assumed", "assigned_to": current_user["id"], "assigned_name": current_user["display_name"], "protocol": protocol}
+    return {"status": "assumed", "assigned_to": current_user["id"], "assigned_name": current_user["display_name"], "protocol": protocol or None}
 
 
 @app.post("/api/admin/operator/{user_id}/reset-assume-counter")

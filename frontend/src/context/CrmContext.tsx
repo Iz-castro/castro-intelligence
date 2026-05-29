@@ -6,7 +6,7 @@ import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
   ActiveView, Channel, ChatMessage, ClientConfig, ConflictLead, Contact, Conversation, Department,
-  MessageReplyReference, Operator, SessionUser, SettingsPage, SystemSettings,
+  MessageReplyReference, Operator, ProtocolSearchResult, SessionUser, SettingsPage, SystemSettings,
   TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
 import { errorText } from "../utils/errors";
@@ -120,6 +120,8 @@ type CrmContextValue = {
   supervisorTakeover: (conversationId: string) => Promise<void>;
   // Fase 4: fecha/reabre um atendimento manualmente.
   setAttendance: (conversationId: string, status: "fechado_manual" | "aberto") => Promise<void>;
+  // Fase 5A: busca por protocolo (admin/sup).
+  loadProtocol: (protocolId: string) => Promise<ProtocolSearchResult | null>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
   imageInputRef: React.MutableRefObject<HTMLInputElement | null>;
   videoInputRef: React.MutableRefObject<HTMLInputElement | null>;
@@ -1854,6 +1856,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyTransfer(false); }
   }
 
+  // Fase 5A: busca por protocolo (admin/sup). Retorna null se nao achou.
+  async function loadProtocol(protocolId: string): Promise<ProtocolSearchResult | null> {
+    if (!bundle || !protocolId.trim()) return null;
+    try {
+      return await getJson<ProtocolSearchResult>(bundle.auth, `/api/admin/protocol/${encodeURIComponent(protocolId.trim())}`);
+    } catch {
+      return null;
+    }
+  }
+
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
   async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "dashboard") {
@@ -1913,7 +1925,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
-    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance,
+    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
