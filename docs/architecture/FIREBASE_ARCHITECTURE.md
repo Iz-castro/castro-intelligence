@@ -1,6 +1,6 @@
 # Firebase Architecture
 
-Atualizado em: 2026-04-02
+Atualizado em: 2026-05-28
 
 ## Modelo atual
 
@@ -64,14 +64,22 @@ Responsabilidades:
 Capacidades ativas no frontend:
 
 - login com Google
-- listagem de contatos WhatsApp
-- views `novos`, `meus`, `nao_qualificados` e `equipe`
+- listagem de contatos via `wa_conversations` (1 linha por canal-thread)
+- views `bot`, `novos`, `meus`, `nao_qualificados` e `equipe`
 - leitura de mensagens por snapshot ou polling
 - envio de texto, imagem, video, documento, audio e localizacao
-- reply com contexto
+- reply com contexto, copia e correcao de mensagens proprias
 - transcricao manual de audio
 - qualificacao, notas e assumir atendimento
 - transferencia entre operadores e departamentos
+- transferencia POR ATENDIMENTO (thread) vs "Reatribuir Lead" (Dono do Lead — admin)
+- intervencao do supervisor — 3 modos:
+  - **Sussurro** (nota interna, toggle no composer, cliente nao recebe)
+  - **Co-pilotagem** (texto assinado `[Supervisao - nome]:` sem assumir; faixa de aviso)
+  - **Takeover** (botao "Assumir como supervisor" muda Dono do Atendimento + avisa o lead)
+- ciclo de vida do Atendimento: badge `🔒 fechado` na faixa + item "Fechar/Reabrir atendimento" no menu ⋮; reabre em qualquer nova mensagem
+- protocolo do dia visivel na faixa (`📄 YYYYMMDD-{contact_id}-SETOR`); admin tem card "Buscar protocolo" no detail-panel (timeline do dia)
+- Painel de Conflitos (admin/sup): Leads com >=2 atendimentos ativos de operadores distintos
 - edicao basica de role e departamento por admin
 - configuracoes de prefixo de mensagem
 - mensagens rapidas por usuario e globais
@@ -111,32 +119,39 @@ Persistencia efetiva do repo:
 - `Firestore` para entidades de CRM
 - `Cloud Storage` ou `Firestore` para blobs
 
-Colecoes backend principais:
+### Tenant-scoped (`tenants/{tid}/...`)
 
-- `users`
-- `departments`
-- `operator_profiles`
-- `wa_contacts`
-- `wa_messages`
-- `wa_transfer_log`
-- `wa_message_status`
-- `audit_log`
-- `system_settings`
-- `user_settings`
-- `gc_conversations`
-- `gc_messages`
-- `media_assets`
-- `_meta`
+Subcolecoes do tenant — sao isoladas pelas Firestore rules (path-based).
 
-Entidades que mais importam no dia a dia:
+- `users` — cadastro interno do operador
+- `operator_profiles` — espelho seguro do operador autenticado
+- `departments` — setores configurados
+- `wa_contacts` — Lead/contato unico por `wa_id` (dedup atomico via index abaixo)
+- `wa_conversations` — Atendimento por (canal + wa_id); id deterministico `{channel_id}__{wa_id}`. Campos relevantes: `assigned_to`, `attendance_status` (`aberto`/`fechado_inatividade`/`fechado_manual`), `takeover_status` + `takeover_handler_user_id` + `lead_owner_user_id`, denormalizacao de canal (`channel_phone_number`, `channel_label`, `channel_active`, `channel_type`).
+- `wa_messages` — historico cronologico (por `timestamp_wa`). Campos novos: `conversation_id` (denorm), `protocol_id` (denorm — Fase 5A), `sender_user_id` vs `channel_owner_user_id` (auditoria coex), `direction` aceita `inbound`/`outbound`/`system`/`internal`.
+- `wa_contact_index` — doc-id = `wa_id` canonico. Claim atomico via `.create()` que previne duplicatas em rajada (Fase 2 do incidente de dedup).
+- `wa_transfer_log` — historico de transferencias por thread e por Lead.
+- `attendances_daily` — **Fase 5A**: id `{YYYYMMDD-{contact_id}-{SETOR}}` (TZ Brasil -3 fixo). 1 Atendimento por Lead/dia; concentra `status`, `protocolo_informado`, `criado_em`, `ultima_interacao`, `fechado_em`/`fechado_por_user_id`.
+- `audit_log` — toda mutacao cross-user (transferencia, takeover, reassign, fechar atendimento, enviar/receber, intervencao de supervisor).
+- `audit_metrics` — agregados de auditoria.
+- `audit_metrics/usage_{YYYY-MM}` — Fase 2.10.4: contadores de uso mensal (`inbound_received`, `free_form_sent`, `templates_sent.{cat}`, `media_uploaded_bytes`).
+- `health_status/current` — Fase 2.10.3: snapshot do estado de billing/canal escrito pelo cron diario.
+- `system_settings`, `user_settings` — configuracoes globais e por-usuario.
+- `gc_conversations`, `gc_messages` — Google Chat (`space_id`, mensagens, anexos).
 
-- `users`: cadastro interno do operador
-- `operator_profiles`: espelho seguro do operador autenticado
-- `wa_contacts`: resumo do atendimento por contato
-- `wa_messages`: historico completo de mensagens WhatsApp
-- `wa_transfer_log`: historico de handoff
-- `gc_conversations`: conversas do Google Chat com preview e nao lidas
-- `gc_messages`: mensagens e anexos do Google Chat
+### Flat / global (fora de `tenants/`)
+
+- `channels` — registry de canais WhatsApp (standard + coexistence). Compartilhado entre tenants enquanto o sistema for single-tenant operacional.
+- `phone_routing/{phone_number_id}` — indice global que mapeia `phone_number_id` da Meta para `{tenant_id, channel_id}`. Webhook resolve tenant em O(1) sem varrer canais.
+- `pending_webhook_events` — fila de webhooks da Meta nao processados imediatamente (canal nao indexado durante onboarding, exception). Garante zero perda.
+- `tenants` — lista flat de tenants (root).
+- `media_assets` — metadados/referencias de blob.
+- `_meta` — counters cross-tenant.
+
+### Indices e contadores
+
+- `firestore.indexes.json` foi reduzido a indices COLLECTION_GROUP ativos para `wa_conversations`, `wa_messages`, `wa_contacts`, `wa_transfer_log`.
+- `_meta/counters` (sequencias atomicas) **NAO** e mais usado no caminho quente de auditoria — `log_audit` usa doc-id auto-gerado desde a remediacao do hotspot (2026-05-25). Reservado para entidades que precisam mesmo de id int sequencial.
 
 ## Colecoes lidas pelo React
 
@@ -147,15 +162,19 @@ Colecoes expostas ao cliente:
 - `departments`
 - `operator_profiles`
 - `wa_contacts`
+- `wa_conversations`
 - `wa_messages`
 - `wa_transfer_log`
+- `attendances_daily` (admin/sup via REST; nao via snapshot direto)
+- `health_status` (manager — leitura do snapshot do estado de billing)
 - `gc_conversations`
 - `gc_messages`
 
 Observacao importante:
 
 - os nomes finais passam por `FIRESTORE_COLLECTION_PREFIX`
-- as rules atuais continuam hardcoded para o prefixo `castro_crm_*`
+- as rules atuais sao estritas e escopadas por path `tenants/{tid}/...` (Fase 2 da remediacao de isolamento por operador, 2026-05-19; reconfirmadas 2026-05-22)
+- claim `tenant_id` no JWT do Firebase Auth gateia leitura por tenant
 - mudar o prefixo sem alinhar `firestore.rules` quebra snapshots no frontend
 
 ## Fluxo de autenticacao
@@ -208,9 +227,13 @@ Operacoes de atendimento mais importantes:
 
 - qualificar contato
 - assumir atendimento
-- transferir atendimento
-- marcar conversa como lida
+- transferir atendimento (POR THREAD; Reatribuir Lead e separado e admin-only)
+- fechar / reabrir atendimento manual (`set-attendance`)
+- intervir como supervisor — Sussurro (nota interna), Co-pilotagem (texto assinado), Takeover (assume thread + avisa o lead)
+- marcar conversa como lida (por thread ou por contato — legacy)
 - arquivar e restaurar contato
+- auto-close por inatividade (cron `*/30` — threshold via env `ATTENDANCE_AUTOCLOSE_HOURS`)
+- envio automatico do protocolo do dia ao cliente no fechamento (Fase 5A)
 
 ### Midia
 
@@ -276,16 +299,19 @@ Arquivos centrais:
 - `firestore.rules`
 - `storage.rules`
 
-Estado atual das rules:
+Estado atual das rules (2026-05-28):
 
-- ainda sao regras amplas para desenvolvimento/demo controlada
-- usam emails autorizados e prefixos hardcoded
-- ainda nao implementam isolamento fino por operador ou departamento
+- rules **estritas** em prod desde a Fase 2 da remediacao de isolamento por operador (2026-05-19; reconfirmadas 2026-05-22)
+- escopadas por path `tenants/{tid}/...` (isolamento estrutural, nao apenas filtro logico)
+- claim `tenant_id` + `role` no JWT (custom claims do Firebase Auth) sao a fonte de autorizacao
+- backend valida `tenant_id` e role em todo endpoint mutador (cross-check com rules)
+- snapshots Firestore para o operador comum: escopados a `assigned_to == self`, sem dono, ou mesmo `department_id`
 
 Conclusao:
 
-- o maior risco arquitetural restante nao e mais o legado
-- o ponto que mais pede maturidade agora e seguranca das rules e o desenho futuro do chat interno
+- o ciclo de seguranca de rules + claims esta fechado em prod
+- isolamento e auditoria sao defensaveis (vide `docs/compliance/LGPD_RoPA_RIPD_INTERNO.md`)
+- pendencia menor: ainda nao ha multi-tenant operacional (a `castro_crm_tenants` so contem `hubloc`); quando o cliente #2 fechar, validar isolamento end-to-end com 2+ tenants em paralelo
 
 ## Rotas de referencia
 
@@ -295,10 +321,12 @@ Autenticacao:
 - `GET /api/client-config`
 - `POST /api/login` apenas para responder `410 Gone`
 
-WhatsApp:
+WhatsApp — contatos e mensagens:
 
 - `GET /api/wa/contacts`
-- `GET /api/wa/messages/{contact_id}`
+- `GET /api/wa/contacts/all` (modal "Selecionar contato" — agenda)
+- `GET /api/wa/conversations` (sub-threads enriquecidas com canal e contato)
+- `GET /api/wa/messages/{contact_id}?conversation_id=...`
 - `POST /api/wa/send`
 - `POST /api/wa/send-media`
 - `POST /api/wa/send-audio`
@@ -307,9 +335,50 @@ WhatsApp:
 - `POST /api/wa/messages/{message_id}/transcribe`
 - `PUT /api/wa/contact/{contact_id}/qualify`
 - `POST /api/wa/contact/{contact_id}/read`
-- `POST /api/wa/transfer`
+- `POST /api/wa/conversation/{conversation_id}/read` (Fase 2C — por thread)
+
+WhatsApp — atribuicao e ciclo de vida:
+
+- `POST /api/wa/transfer` (transferir thread; aceita `conversation_id`)
 - `POST /api/wa/assume/{contact_id}`
+- `POST /api/wa/contact/{contact_id}/return-to-bot`
 - `GET /api/wa/transfer-history/{contact_id}`
+- `POST /api/wa/conversation/{id}/takeover` (coex: lead-owner takeover temporario)
+- `POST /api/wa/conversation/{id}/return` (devolve takeover ao dono do lead)
+- `POST /api/wa/conversation/{id}/supervisor-takeover` (Modo 3: admin/sup assume thread + avisa lead)
+- `POST /api/wa/conversation/{id}/set-attendance` (Fase 4: fechar/reabrir manual)
+- `POST /api/wa/internal-note` (Modo 1: nota interna; nao vai pra Meta)
+- `POST /api/wa/conversation/open` (materializa thread ao clicar contato da agenda)
+
+Embedded Signup (coex):
+
+- `GET /api/embedded-signup/config`
+- `POST /api/embedded-signup/exchange` (Fase 1: rebind por `phone_number_id` em vez de criar duplicata)
+- `POST /api/admin/channels/{id}/trigger-coex-sync` (re-disparo manual de `smb_app_data`)
+
+Admin:
+
+- `GET /api/admin/channels`, `POST /api/admin/channels`, `PUT /api/admin/channels/{id}`
+- `GET /api/admin/conflicts` (Fase 3A: Leads com >=2 atendimentos ativos de operadores distintos)
+- `GET /api/admin/protocol/{protocol_id}` (Fase 5A: timeline do dia por protocolo)
+- `POST /api/admin/reassign-lead` (Fase 3B: muda Dono do Lead sem mover atendimentos)
+- `POST /api/admin/bulk-reassign`
+- `GET /api/admin/pending-webhook-events?status=pending`
+- `POST /api/admin/pending-webhook-events/{id}/retry|dismiss`
+- `DELETE /api/admin/pending-webhook-events/{id}`
+- `POST /api/admin/operator/{user_id}/reset-assume-counter`
+
+Cron / interno (auth via OIDC do Cloud Scheduler):
+
+- `POST /api/internal/cron/health-check` (Fase 2.10.3: status billing por canal/tenant — escreve `health_status/current`)
+- `POST /api/internal/cron/expire-takeovers` — schedule `*/30`. Roda: (1) expira takeover coex inativo > `TAKEOVER_TIMEOUT_HOURS`; (2) auto-close de atendimentos atribuidos ociosos > `ATTENDANCE_AUTOCLOSE_HOURS`; (3) envia protocolo ao lead no fechamento (Fase 5A) se nao informado e <=24h
+
+Usage / billing:
+
+- `GET /api/wa/usage/current-month`
+- `GET /api/wa/usage/history?months=N`
+- `GET /api/wa/usage/{YYYY-MM}`
+- `GET /api/wa/channel/{id}/billing-status`
 
 Usuarios e configuracoes:
 

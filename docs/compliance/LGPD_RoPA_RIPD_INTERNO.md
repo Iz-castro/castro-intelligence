@@ -7,11 +7,17 @@
 
 - **Produto:** Castro Intelligence CRM (SaaS multi-tenant de atendimento via WhatsApp Business Platform)
 - **Papel da Castro neste documento:** **Operador (processador)** — art. 5º VII da LGPD
-- **Versão:** 1.0 — diagnóstico inicial
-- **Data:** 2026-05-15
+- **Versão:** 1.1 — adendo do refactor Lead/Atendimento (Fases 1-5A)
+- **Data:** 2026-05-28 (atualização) · 2026-05-15 (diagnóstico inicial)
 - **Autores:** Rafa + Claude (análise técnica)
 - **Base legal do produto:** Lei nº 13.709/2018 (LGPD)
-- **Relacionado:** [CLAUDE.md §2](../../CLAUDE.md), [ADR 0001](../decisions/0001-prevenir-coex-signup-duplicado.md), [ADR 0002](../decisions/0002-lgpd-canal-coex-compartilhado.md)
+- **Relacionado:** [CLAUDE.md §2](../../CLAUDE.md), [ADR 0001](../decisions/0001-prevenir-coex-signup-duplicado.md), [ADR 0002](../decisions/0002-lgpd-canal-coex-compartilhado.md), [ADR 0003](../decisions/0003-refactor-lead-atendimento.md)
+
+> **Adendo 2026-05-28:** o refactor `PLANO_LEAD_ATENDIMENTO_E_REGRAS`
+> (Fases 1-5A — ver ADR 0003 + dailies em `docs/internal/`) introduziu
+> novos campos e operações de tratamento. Os pontos em §1.3 e as operações
+> 11-14 em §1.4 abaixo refletem o estado atualizado. Não houve nova
+> categoria de **titular** nem novo **suboperador**.
 
 ---
 
@@ -98,8 +104,10 @@ por gravidade × esforço.
 | Dados comportamentais do operador | `users.last_login`, `audit_log.ip_address`, contadores de tentativas | Não |
 | Credenciais de canal | `channels.access_token`, `token_expires_at` (não é dado pessoal de titular, mas segredo crítico) | Credencial |
 | Dados sensíveis (art. 11) | Saúde, em tenants de clínica — texto livre de mensagens / `notes` | **Sim** |
-
-## 1.4 Registro de operações de tratamento
+| Estado e ciclo de vida do atendimento *(Fase 4)* | `wa_conversations.attendance_status` (`aberto`/`fechado_inatividade`/`fechado_manual`), `assigned_to`, `takeover_status`, `takeover_handler_user_id`, `lead_owner_user_id` | Não (metadado operacional) |
+| Protocolo de atendimento diário *(Fase 5A)* | `attendances_daily/{id}` (`id=YYYYMMDD-{contact_id}-{SETOR}`, `status`, `protocolo_informado`, `criado_em`, `ultima_interacao`, `fechado_em`, `fechado_por_user_id`) + `wa_messages.protocol_id` (denorm) | Não (metadado; é o "carimbo" do dia que o cliente recebe ao fechar) |
+| Conteúdo de comunicação interna *(Modo 1 — Sussurro)* | `wa_messages` com `direction="internal"` e `msg_type="internal"` — anotação operador→operador/supervisor; **não vai pra Meta** | Pode conter sensível indireto (orientação sobre o caso/cliente) |
+| Atribuição dupla supervisor *(Modo 2 — Co-pilotagem)* | `wa_messages` outbound com `sender_user_id` ≠ `channel_owner_user_id` + prepend `[Supervisao - nome]:` no texto | Não (rastreabilidade de autoria) |
 
 Legenda de base legal: **7º-V** = execução de contrato/procedimentos
 preliminares; **7º-IX** = legítimo interesse (com teste de proporcionalidade);
@@ -120,6 +128,10 @@ indicações abaixo são as aplicáveis ao desenho técnico.
 | 8 | **Auditoria** | Registrar quem fez o quê (responsabilização — art. 6º X) | 7º-II / 7º-IX | Operador | `user_id`, `action`, `detail`, `ip_address` | Google Firestore | Não (Brasil) | Indefinida (acúmulo ilimitado) | `log_audit()` em mutações cross-user (`database_firestore.py`) |
 | 9 | **Roteamento multi-tenant** | Resolver o tenant correto a partir do `phone_number_id` do webhook | 7º-V | — (índice técnico) | `phone_number_id` → `tenant_id`, `channel_id` | Google Firestore | Não (Brasil) | Indefinida | Índice global `phone_routing`, contexto por contextvar |
 | 10 | **Comunicação interna (condicional)** | Comunicação operacional entre operadores | 7º-IX | Operador | E-mail, nome, conteúdo de mensagem interna | Google (Chat) | **Sim** — Google (US), se habilitado | Indefinida | Somente leitura via Firestore rules; só se `FEATURE_GOOGLE_CHAT` |
+| 11 | **Ciclo de vida do atendimento (auto-close)** *(Fase 4)* | Sinalizar "atendimento concluído" sem dependência exclusiva da ação humana — higiene operacional e gatilho do recibo do dia | 7º-IX (legítimo interesse do controlador) | Cliente final / Operador | `wa_conversations.attendance_status`, `last_message_at`, `assigned_to` | Google Firestore (Brasil) | Não | Indefinida; reabre em qualquer nova mensagem | Cron `castro-crm-expire-takeovers` (*/30) com OIDC, threshold via env `ATTENDANCE_AUTOCLOSE_HOURS` (prod=6h), `audit_log` `ATTENDANCE_AUTO_CLOSE` |
+| 12 | **Protocolo do dia + envio automático ao cliente** *(Fase 5A)* | Gerar identificador único por (Lead, dia) e enviar ao cliente como "recibo" no fechamento (manual ou auto-close) | 7º-V (execução do atendimento) | Cliente final | `attendances_daily/*` + `wa_messages.protocol_id` (denorm) + mensagem outbound `"Seu protocolo de hoje é {id}..."` | Meta (entrega ao cliente quando ≤24h), Google Firestore (armazenamento) | **Sim** — Meta (EUA) somente na entrega da frase | Indefinida (Atendimento + protocolo histórico) | Semáforo `protocolo_informado` previne duplicata em retorno-zumbi; helper só envia se pid no formato novo (`YYYYMMDD-...`); fora de 24h, fecha sem enviar; `audit_log` `ATTENDANCE_AUTO_CLOSE` + outbound em `wa_messages` |
+| 13 | **Intervenção do supervisor (3 modos)** *(Fase 3)* | Permitir orientar (Sussurro), responder ao lead sem assumir (Co-pilotagem assinada) e assumir thread (Takeover) com auditoria explícita | 7º-IX | Cliente final / Operador / Supervisor | (Sussurro) `wa_messages` `direction="internal"` — sem ir pra Meta; (Co-pilotagem) `wa_messages` outbound com `sender_user_id`=supervisor + texto com prepend `[Supervisao - nome]:`; (Takeover) mudança de `wa_conversations.assigned_to` + mensagem automática ao lead se ≤24h | Meta (modos 2 e 3 quando há entrega ao lead) | **Sim** — Meta (EUA) nos modos 2 e 3 | Indefinida | `audit_log` específico por modo (`WA_INTERNAL_NOTE`, `WA_SEND`, `WA_SUPERVISOR_TAKEOVER`); permissão verifica `role in {admin, supervisor}`; assinatura textual + atribuição (`sender_user_id`) garantem rastreabilidade |
+| 14 | **Painel de Conflitos (admin/supervisor)** *(Fase 3A)* | Dar ao supervisor visão dos Leads tocados por ≥2 operadores em paralelo (gestão de equipe + LGPD: detectar acesso cross-operador inadvertido) | 7º-IX | Cliente final / Operador | Agregação read-only sobre `wa_conversations` (`assigned_to`, `channel_active`, `last_message_at`) + join com contato | Google Firestore (Brasil) | Não | — (cálculo on-demand) | Endpoint `GET /api/admin/conflicts` gated em role admin/supervisor; sem persistência nova; resolve nome do operador no frontend (não vaza id ao não-manager) |
 
 ---
 

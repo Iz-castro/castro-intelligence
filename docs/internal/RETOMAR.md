@@ -1,4 +1,94 @@
-# Contexto pra retomar — Coexistence completo + contact picker com agenda do telefone
+# Contexto pra retomar — refactor Lead/Atendimento concluido (Fases 1-5A em prod)
+
+> **Estado atual (2026-05-28).** Revisao prod ativa: `castro-crm-00124-298`.
+> Branch `develop` sincronizada (ultimo commit `15b4c7a`).
+>
+> O refactor `PLANO_LEAD_ATENDIMENTO_E_REGRAS.md` esta em prod em ~todos os
+> pilares principais. Detalhe cronologico em [2026-05-28.md](2026-05-28.md)
+> (Fase 4 ciclo de vida + Fase 5A protocolo + icone do Sussurro + esta
+> atualizacao de doc) e [2026-05-27.md](2026-05-27.md) (Fases 1 rebind,
+> 2a apresentacao, 3 inteira — Conflitos + desacople + 3 modos do
+> supervisor — e fix do takeover preso).
+>
+> **Fases concluidas em prod:**
+> - **Fase 1** rebind de canal coex no re-signup (commit `0a13d62`) —
+>   `embedded_signup_exchange` detecta canal por `phone_number_id` e da
+>   UPDATE, em vez de criar duplicata.
+> - **Fase 2a** apresentacao honesta por atendimento (commit `957cef2`) —
+>   denorm de canal + REST cai no denorm p/ canal inativo + composer
+>   read-only + backfill de 98 convs.
+> - **Fase 3** completa (commits `5b121e2`, `0409857`, `8c1ff70`, `9d609de`):
+>   - **3A** Painel de Conflitos (`GET /api/admin/conflicts` + card admin).
+>   - **3B** desacople Dono Atendimento × Lead (`assign_wa_conversation`
+>     sem espelho + `POST /api/admin/reassign-lead`).
+>   - **3 modos do supervisor** (substitui o "bypass admin" cego):
+>     **Sussurro** (Modo 1, nota interna `direction="internal"`, toggle
+>     no composer), **Co-pilotagem** (Modo 2, supervisor envia ao lead
+>     com prepend `[Supervisao - nome]:` sem assumir), **Takeover do
+>     supervisor** (Modo 3, `POST /api/wa/conversation/{id}/supervisor-takeover`).
+> - **Fase 4** ciclo de vida do Atendimento (commit `ea2cbbc`) — campo
+>   `attendance_status` em `wa_conversations`, auto-close por inatividade
+>   plugado no cron `*/30` existente (threshold em prod: **6h** via env
+>   `ATTENDANCE_AUTOCLOSE_HOURS`), endpoint
+>   `POST /api/wa/conversation/{id}/set-attendance` p/ fechar/reabrir
+>   manual, badge + item no menu ⋮.
+> - **Fase 5A** protocolo 1 dia=1 por Lead (commit `15b4c7a`) — nova
+>   colecao tenant-scoped `attendances_daily/{YYYYMMDD-{contact_id}-{SETOR}}`,
+>   geracao silenciosa no 1o inbound do dia (webhook), envio ao cliente
+>   SO no fechamento como recibo, semaforo `protocolo_informado` bloqueia
+>   reenvio em retorno-zumbi, busca admin `GET /api/admin/protocol/{id}`
+>   + card "Buscar protocolo" no detail-panel.
+>
+> **Mudancas de infra/UX desta onda:**
+> - Cron `castro-crm-expire-takeovers` (*/30) agora roda takeover-expire
+>   + auto-close de atendimentos + envio do protocolo no fechamento.
+> - Env nova em prod: `ATTENDANCE_AUTOCLOSE_HOURS=6`.
+> - Novo asset frontend `frontend/src/assets/sussurro-icon.png` (128×128,
+>   26 KB; substitui o emoji 🔒 no toggle do Sussurro pra eliminar a
+>   colisao visual com o 🔒/🔓 do menu Fechar/Reabrir atendimento).
+> - **`/api/wa/assume/{contact_id}` NAO gera mais protocolo** — agora so
+>   o webhook na 1a inbound do dia gera (alinhado a spec do PO).
+>   `wa_contacts.attendance_protocol` mantido como espelho do
+>   `attendances_daily.id` atual (back-compat com "Copiar protocolo"
+>   do menu ⋮).
+>
+> **Pendentes (em ordem sugerida):**
+> 1. **Fase 5B — Tipificacao obrigatoria no fechamento** (catalogo
+>    configuravel por tenant; modal de Categoria/Sub/Status).
+> 2. **Fase 5C — Resumo IA Vertex em background ao fechar** (exige
+>    update RoPA/RIPD por LGPD).
+> 3. **Read-only do operador antigo pos-takeover do supervisor** (v2 do
+>    Modo 3).
+> 4. **Fase 2b — Abas por canal na ChatPanel** (adiada por Rafa; reabre
+>    se a navegacao por pessoa virar dor concreta).
+> 5. **Sticky routing TTL (§3.4 do plano)** — lead convertido retorna
+>    apos N dias → cai pro bot/fila em vez de forcar dono. Requer
+>    `last_seen`/flag de ausencia.
+> 6. **Decisoes em aberto do plano:** #3 (agenda por-operador), #4 (TTL
+>    do sticky), #6 (catalogo de tipificacao).
+>
+> **Quick start (proxima sessao):**
+>
+> ```powershell
+> # Confirmar branch e env
+> cd c:\Projetos\Hubloc\castro-intelligence
+> git status --short
+> gcloud config get-value account  # deve retornar rafaluisc@outlook.com
+>
+> # Estado da revisao ativa em prod
+> gcloud run services describe castro-crm --region=southamerica-east1 `
+>   --project=project-26fb9c99-8ee9-4179-aef `
+>   --format="value(status.latestReadyRevisionName)"
+>
+> # Conferir env ATTENDANCE_AUTOCLOSE_HOURS
+> gcloud run services describe castro-crm --region=southamerica-east1 `
+>   --project=project-26fb9c99-8ee9-4179-aef `
+>   --format="value(spec.template.spec.containers[0].env)"
+> ```
+
+---
+
+## Historico (preservado abaixo)
 
 > **Adendo 2026-05-24:** onda de features pós-validação dos gates de
 > onboarding coex. Detalhe completo em [2026-05-24.md](2026-05-24.md).

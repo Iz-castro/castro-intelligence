@@ -33,7 +33,11 @@ Assuma estas premissas ao ler ou alterar o sistema:
 ## Arquivos auxiliares importantes
 
 - `firebase_admin_client.py`: validacao de ID token do Firebase
-- `firestore_common.py`: cliente Firestore, prefixos de colecao e sequencias
+- `firestore_common.py`: cliente Firestore, prefixos de colecao, sequencias, tenant context
+- `tenant_service.py`: cache de tenants e roteamento `phone_routing/{phone_number_id}` global
+- `channel_service.py`: registry de canais WhatsApp (lookup por id/phone_id; cache so-ativos), `create_channel` / `update_channel` / `rebind_channel` (Fase 1) e `deactivate_channel`
+- `pending_events.py`: fila `pending_webhook_events` (zero perda de webhook da Meta quando canal nao indexado ou exception no processamento)
+- `pii_redaction.py`: utilitarios `redact_phone` / `redact_name` para logs (LGPD)
 - `bootstrap_data.py`: departamentos padrao
 - `init_db.py`: bootstrap do Firestore e provisionamento inicial do admin
 - `seed_gchat.py`: seed manual de Google Chat para teste
@@ -63,12 +67,20 @@ Arquivos principais:
 - `webhook.py`
 - `media.py`
 - `database_firestore.py`
+- `channel_service.py`
 
 O que esperar:
 
-- webhook da Meta
+- webhook da Meta (com `phone_routing` global → tenant + canal em O(1))
 - envio de texto, midia, audio, localizacao e template
-- atribuicao, handoff, nao lidas e historico de mensagens
+- modelo `Contato`/`Atendimento`/`Mensagem` = `wa_contacts` / `wa_conversations` / `wa_messages` (sub-thread por canal; `conversation_id = {channel_id}__{wa_id}`)
+- atribuicao e transferencia POR THREAD (`assign_wa_conversation`); Dono do Lead separado (`assign_wa_contact`, endpoint `/api/admin/reassign-lead`)
+- coexistence: Embedded Signup com rebind de canal (Fase 1 — `rebind_channel`), takeover temporario do lead-owner (`flag_conversation_takeover`, cron `castro-crm-expire-takeovers` */30)
+- intervencao do supervisor — 3 modos: Sussurro (`/api/wa/internal-note`, `direction="internal"`), Co-pilotagem (texto assinado `[Supervisao - nome]:` em `/api/wa/send`), Takeover (`/api/wa/conversation/{id}/supervisor-takeover`)
+- ciclo de vida do atendimento (`attendance_status` em `wa_conversations`): auto-close por inatividade plugado no mesmo cron */30, fechar/reabrir manual (`/api/wa/conversation/{id}/set-attendance`), reabre em qualquer nova mensagem
+- protocolo 1 dia=1 por Lead (`attendances_daily/{YYYYMMDD-{contact_id}-{SETOR}}`): geracao silenciosa no 1o inbound (via `save_wa_message` → `ensure_daily_attendance`), envio ao cliente no fechamento como recibo, busca admin `GET /api/admin/protocol/{id}`
+- painel de conflitos (`GET /api/admin/conflicts`): Leads com >=2 atendimentos ativos atribuidos a operadores distintos
+- nao lidas, historico cronologico por `timestamp_wa`, idempotencia por `wa_message_id`
 
 ### Google Chat
 

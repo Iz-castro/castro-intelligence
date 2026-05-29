@@ -32,14 +32,25 @@ A leitura recomendada agora e:
 
 ## Documentos atuais
 
+### Arquitetura e operacao
 - [Arquitetura Firebase](architecture/FIREBASE_ARCHITECTURE.md)
 - [Guia do Codebase](architecture/CODEBASE_GUIDE.md)
 - [Produto](product/README.md)
+- [Politica de Numeros WhatsApp](product/POLITICA_NUMEROS_WHATSAPP.md)
 - [Deploy e Operacao](deploy/README.md)
-- [Task - Novo contato manual em Meus Atendimentos](TASK_FEATURE_NOVO_CONTATO_MANUAL_MEUS_ATENDIMENTOS.md)
-- [Task - Fix scroll vertical na coluna de contatos](TASK_FIX_SCROLL_VERTICAL_COLUNA_CONTATOS.md)
-- [Task - Prod Hubloc + Coexistence](TASK_PROD_HUBLOC_COEXISTENCE.md)
-- [Task - Edicao de Mensagens WhatsApp no CRM](TASK_FEATURE_EDICAO_MENSAGENS_WHATSAPP_CRM.md)
-- [Task - Spike API Edicao de Mensagens WhatsApp](TASK_SPIKE_API_EDICAO_MENSAGENS_WHATSAPP.md)
-- [LGPD - RoPA/RIPD versao cliente](compliance/LGPD_RoPA_RIPD_CLIENTE.md)
-- [LGPD - RoPA/RIPD versao interna](compliance/LGPD_RoPA_RIPD_INTERNO.md) (CONFIDENCIAL - uso interno, nao compartilhar com cliente)
+- [Runbook de Cutover Prod](deploy/RUNBOOK_CUTOVER_PROD.md)
+
+### Planos e refactors
+- [Plano Coexistence — refactor](PLANO_COEXISTENCE_REFATORACAO.md) (Fases 1-4 concluidas)
+- [Plano Lead/Atendimento/Mensagem + regras coex hibrido](PLANO_LEAD_ATENDIMENTO_E_REGRAS.md) (Fases 1, 2a, 3, 4 e 5A em prod; 2b, 5B, 5C pendentes)
+
+### Decisoes
+- [ADRs](decisions/README.md)
+
+### Compliance LGPD
+- [RoPA/RIPD versao cliente](compliance/LGPD_RoPA_RIPD_CLIENTE.md)
+- [RoPA/RIPD versao interna](compliance/LGPD_RoPA_RIPD_INTERNO.md) (CONFIDENCIAL — uso interno, nao compartilhar com cliente)
+
+### Outros
+- [Screencast App Review](APP_REVIEW_SCREENCAST_SCRIPT.md)
+- [Referencia WhatsApp Business Platform (Meta API)](Whatsapp%20Business%20Platform/)
