@@ -37,16 +37,6 @@ service cloud.firestore {
         (myProfile().data.role == 'admin' || myProfile().data.role == 'supervisor');
     }
 
-    function canSeeConversation(assignedUid, departmentId) {
-      return operatorActive() && (
-        isPrivileged() ||
-        assignedUid == request.auth.uid ||
-        assignedUid == '' ||
-        departmentId == null ||
-        departmentId == myProfile().data.department_id
-      );
-    }
-
     // ====================================================================
     // Fase 2 — helpers tenant-scoped estritos (PLANO_COEXISTENCE §2.9).
     // Isolamento por tenant+operador via custom claims tenant_id/role no
