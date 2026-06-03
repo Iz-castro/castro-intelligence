@@ -1131,14 +1131,14 @@ function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: num
             <div>
               {selected ? (
                 <>
-                  <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "0.8rem", background: "var(--bg-muted, #f9fafb)", marginBottom: "1rem" }}>
-                    <div className="sub" style={{ fontSize: "0.7rem", marginBottom: "0.3rem" }}>Preview</div>
-                    {preview?.header ? <div style={{ fontWeight: 600, marginBottom: "0.3rem" }}>{preview.header}</div> : null}
-                    {preview?.body ? <div style={{ whiteSpace: "pre-wrap", fontSize: "0.9rem" }}>{preview.body}</div> : null}
-                    {preview?.footer ? <div className="sub" style={{ fontSize: "0.75rem", marginTop: "0.3rem" }}>{preview.footer}</div> : null}
+                  <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "0.8rem", background: "#f9fafb", color: "#111", marginBottom: "1rem" }}>
+                    <div style={{ fontSize: "0.7rem", marginBottom: "0.3rem", color: "#374151", fontWeight: 600 }}>Preview</div>
+                    {preview?.header ? <div style={{ fontWeight: 600, marginBottom: "0.3rem", color: "#111" }}>{preview.header}</div> : null}
+                    {preview?.body ? <div style={{ whiteSpace: "pre-wrap", fontSize: "0.9rem", color: "#111" }}>{preview.body}</div> : null}
+                    {preview?.footer ? <div style={{ fontSize: "0.75rem", marginTop: "0.3rem", color: "#374151" }}>{preview.footer}</div> : null}
                     {preview?.buttons && preview.buttons.length > 0 ? (
                       <div style={{ display: "flex", gap: "0.3rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
-                        {preview.buttons.map((b, i) => <span key={i} className="chip" style={{ fontSize: "0.72rem" }}>{b}</span>)}
+                        {preview.buttons.map((b, i) => <span key={i} className="chip" style={{ fontSize: "0.72rem", color: "#7a3f17" }}>{b}</span>)}
                       </div>
                     ) : null}
                   </div>
