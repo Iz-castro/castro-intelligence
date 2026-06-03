@@ -44,9 +44,10 @@ describe ...` pra acompanhar). Se algo der errado, restore via
 git status --short  # deve estar limpo
 git log --oneline -5
 
-# Deploy
+# Deploy — use o CAMINHO ABSOLUTO da raiz como --source. NAO use '.': se o shell
+# estiver em frontend/ (ex.: apos npm run build) o gcloud cai em Buildpacks e falha.
 gcloud run deploy castro-crm `
-  --source . `
+  --source C:\Rafael\castro-intelligence `
   --region southamerica-east1 `
   --project project-26fb9c99-8ee9-4179-aef `
   --quiet

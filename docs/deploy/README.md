@@ -45,9 +45,14 @@ Transcricao:
 - `STT_LANGUAGE_CODE`
 - `STT_TIMEOUT_SECONDS`
 - `STT_FALLBACK_TEXT`
-- `WHISPER_MODEL_SIZE`
+- `WHISPER_MODEL_SIZE` — tamanho do modelo (ex.: `base`). O modelo e **embutido na imagem Docker em build-time** (`HF_HOME=/opt/hf-cache`); **mudar este valor exige rebuild**.
 - `WHISPER_DEVICE`
 - `WHISPER_COMPUTE_TYPE`
+
+> **Nota (2026-06-03):** `FEATURE_AUDIO_TRANSCRIPTION` e apenas uma flag — NAO ha
+> download do modelo em runtime. O modelo Whisper vem pre-carregado na imagem
+> (`HF_HUB_OFFLINE=1`). Ligar a flag SEM o modelo embutido trava o cold-start
+> (incidente 2026-06-03). Ver [../internal/2026-06-03.md](../internal/2026-06-03.md).
 
 WhatsApp (canal default / standard):
 

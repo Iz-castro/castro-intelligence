@@ -1,6 +1,33 @@
 # Contexto pra retomar — refactor Lead/Atendimento concluido (Fases 1-5A em prod)
 
-> **Estado atual (2026-05-28).** Revisao prod ativa: `castro-crm-00124-298`.
+> **Estado atual (2026-06-03).** Revisao prod ativa: **`castro-crm-00137-v7t`**.
+> Dia denso — detalhe completo em [2026-06-03.md](2026-06-03.md). Resumo:
+> - **Incidente Whisper resolvido:** `FEATURE_AUDIO_TRANSCRIPTION=true` baixava o
+>   modelo do HF em cold-start e derrubava prod; agora o modelo esta **embutido na
+>   imagem** (Dockerfile, `HF_HUB_OFFLINE=1`). Flag religada (commit `1b71ef0`).
+> - **Reabertura automatica:** template `atualizao_de_solicitao` com `{{1}}`/`{{2}}`
+>   auto-preenchidos (`POST /api/wa/conversation/{id}/reopen`); webhook trata
+>   resposta de botao (Encerrar->`fechado_cliente`+protocolo+`client_requested_close`;
+>   Retomar->reabre). Commits `09fb23d`, `2d64ff2`.
+> - **Isolamento LGPD (departamento):** removida a visibilidade por `department_id`
+>   (vazava agenda coex de um operador p/ colegas do mesmo depto) em 3 camadas
+>   (backend/frontend/rules). Operador comum ve so o proprio + pool. Verificado.
+>   Commits `ddcfb69`, `e2cecf8`; rules publicadas no console.
+> - **Gate REST de dono:** `_require_contact_access` em 11 endpoints REST (commit
+>   `cebd367`, rev 00135) — operador comum recebe 403 em recurso de outro.
+> - **Capacidade:** incidente de 429; ajustada p/ `max=40/min=0`.
+> - **Backfill:** 361 conversas coex orfas (canal removido) herdaram o dono do
+>   contato e sairam da fila global "Novos".
+>
+> **PENDENTE (proxima sessao):** round unico de Firestore rules — `wa_messages`
+> (denorm de `assigned_to_uid` + backfill, pois o app le via Web SDK), negar
+> colecoes legadas, Google Chat por participante, e fix do **write-path** do
+> history sync (conversa herdar dono do contato). Decisao: novos numeros vao de
+> **API padrao** (nao coexistence). Commits do dia ainda **sem push**.
+>
+> ---
+>
+> **Estado anterior (2026-05-28).** Revisao prod ativa: `castro-crm-00124-298`.
 > Branch `develop` sincronizada (ultimo commit `15b4c7a`).
 >
 > O refactor `PLANO_LEAD_ATENDIMENTO_E_REGRAS.md` esta em prod em ~todos os

@@ -8,6 +8,13 @@
   `_check_conv_send_permission` em [main.py:1136](../../main.py#L1136),
   modelo `channel_owner_user_id` vs `sender_user_id` em `wa_messages`.
 
+> **Atualizacao 2026-06-03:** a visibilidade por `department_id` foi **removida**
+> do isolamento (commit `ddcfb69`). O operador comum agora ve **apenas** contatos/
+> conversas atribuidos a si ou em pool/fila — nunca por departamento. O
+> compartilhamento de canal coex segue via **transferencia de thread**
+> (`assigned_to`), nao por departamento. O "modelo operacional ativo" descrito
+> abaixo reflete o estado de 2026-05-11. Ver [docs/internal/2026-06-03.md](../internal/2026-06-03.md).
+
 ## Contexto
 
 O sistema suporta dois tipos de canal:

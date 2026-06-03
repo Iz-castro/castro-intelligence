@@ -1,6 +1,6 @@
 # Firebase Architecture
 
-Atualizado em: 2026-05-28
+Atualizado em: 2026-06-03
 
 ## Modelo atual
 
@@ -203,6 +203,7 @@ Entrada:
 - persiste mensagens e atualiza nao lidas
 - baixa midia quando necessario
 - pode transcrever audio inbound conforme feature flag
+- trata resposta de botao quick-reply do template de reabertura (`type=button`): **Encerrar chamado** → `attendance_status='fechado_cliente'` + recibo de protocolo + flag `client_requested_close`; **Retomar solicitacao** → reabre o atendimento (2026-06-03; antes era no-op)
 
 Tipos tratados no inbound:
 
@@ -216,6 +217,7 @@ Tipos tratados no inbound:
 - `location`
 - `contacts`
 - `reaction`
+- `button` (resposta de botao quick-reply — template de reabertura)
 - `unsupported`
 
 Saida:
@@ -248,10 +250,11 @@ Pipeline atual:
 
 Status atual:
 
-- usa `faster-whisper`
+- usa `faster-whisper` com o modelo **embutido na imagem Docker em build-time** (`HF_HOME=/opt/hf-cache`, `RUN` baixa o modelo no build; `HF_HUB_OFFLINE=1` em runtime) — NUNCA acessa o HuggingFace em runtime. Isso evita o cold-start que travava o bind na porta 8080 e causava cascata de 500/503/429 (incidente 2026-06-03, commit `1b71ef0`).
 - converte audio com `ffmpeg`
 - suporta transcricao inbound e rota manual por mensagem
 - a rota manual em `main.py` ja usa as configs corretas `STT_LANGUAGE_CODE` e `STT_TIMEOUT_SECONDS`
+- mudar `WHISPER_MODEL_SIZE` exige **rebuild da imagem** (o modelo daquele tamanho precisa estar embutido)
 
 ### Google Chat
 
@@ -305,7 +308,7 @@ Estado atual das rules (2026-05-28):
 - escopadas por path `tenants/{tid}/...` (isolamento estrutural, nao apenas filtro logico)
 - claim `tenant_id` + `role` no JWT (custom claims do Firebase Auth) sao a fonte de autorizacao
 - backend valida `tenant_id` e role em todo endpoint mutador (cross-check com rules)
-- snapshots Firestore para o operador comum: escopados a `assigned_to == self`, sem dono, ou mesmo `department_id`
+- snapshots Firestore para o operador comum: escopados a `assigned_to == self` ou sem dono (pool/fila). A visibilidade por `department_id` foi **removida em 2026-06-03** (isolamento LGPD, commit `ddcfb69`) — vazava a agenda coex de um operador para os colegas do mesmo departamento. admin/supervisor seguem vendo tudo.
 
 Conclusao:
 
@@ -323,26 +326,34 @@ Autenticacao:
 
 WhatsApp — contatos e mensagens:
 
+> **Gate de dono (2026-06-03, `_require_contact_access`):** nos endpoints por
+> `contact_id`/`message_id`, o operador comum recebe **403** em recurso de outro
+> operador (so acessa o proprio ou o pool sem dono); admin/supervisor passam.
+
 - `GET /api/wa/contacts`
 - `GET /api/wa/contacts/all` (modal "Selecionar contato" — agenda)
-- `GET /api/wa/conversations` (sub-threads enriquecidas com canal e contato)
-- `GET /api/wa/messages/{contact_id}?conversation_id=...`
+- `GET /api/wa/conversations` (sub-threads enriquecidas; operador comum so ve as proprias + pool)
+- `GET /api/wa/contact/{contact_id}` (detalhe; gate de dono)
+- `GET /api/wa/messages/{contact_id}?conversation_id=...` (gate de dono)
 - `POST /api/wa/send`
 - `POST /api/wa/send-media`
 - `POST /api/wa/send-audio`
 - `POST /api/wa/send-location`
 - `POST /api/wa/send-template`
-- `POST /api/wa/messages/{message_id}/transcribe`
-- `PUT /api/wa/contact/{contact_id}/qualify`
-- `POST /api/wa/contact/{contact_id}/read`
+- `POST /api/wa/conversation/{id}/reopen` (reabertura por inatividade: template `atualizao_de_solicitao` com `{{1}}`=primeiro nome do cliente e `{{2}}`=data da ultima conversa, preenchidos server-side)
+- `POST /api/wa/messages/{message_id}/transcribe` (gate de dono)
+- `PUT /api/wa/contact/{contact_id}/qualify` (gate de dono)
+- `PUT /api/wa/contact/{contact_id}/declared-name` (gate de dono)
+- `POST /api/wa/contact/{contact_id}/read` (gate de dono)
 - `POST /api/wa/conversation/{conversation_id}/read` (Fase 2C — por thread)
+- `DELETE /api/wa/contact/{contact_id}` + `POST /api/wa/contact/{contact_id}/restore` (gate de dono)
 
 WhatsApp — atribuicao e ciclo de vida:
 
 - `POST /api/wa/transfer` (transferir thread; aceita `conversation_id`)
 - `POST /api/wa/assume/{contact_id}`
 - `POST /api/wa/contact/{contact_id}/return-to-bot`
-- `GET /api/wa/transfer-history/{contact_id}`
+- `GET /api/wa/transfer-history/{contact_id}` (gate de dono)
 - `POST /api/wa/conversation/{id}/takeover` (coex: lead-owner takeover temporario)
 - `POST /api/wa/conversation/{id}/return` (devolve takeover ao dono do lead)
 - `POST /api/wa/conversation/{id}/supervisor-takeover` (Modo 3: admin/sup assume thread + avisa lead)

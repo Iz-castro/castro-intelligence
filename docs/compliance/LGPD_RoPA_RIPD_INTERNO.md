@@ -120,7 +120,7 @@ indicações abaixo são as aplicáveis ao desenho técnico.
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | **Recepção de mensagens inbound** | Receber e registrar a comunicação iniciada pelo titular para atendimento | 7º-V; 11 se clínica | Cliente final | Telefone, nome de perfil, conteúdo, mídia, localização | Meta (origem), Google Firestore (armazenamento) | **Sim** — Meta (EUA) | **Indefinida** — sem TTL/expurgo | HMAC-SHA256 (`webhook.py`), roteamento por `phone_routing`, contexto de tenant |
 | 2 | **Envio de mensagens outbound** | Responder o titular dentro do atendimento | 7º-V | Cliente final | Telefone, conteúdo, mídia | Meta (entrega) | **Sim** — Meta (EUA) | Indefinida | Janela 24h (`_check_24h_window`), token por canal, `audit_log` `WA_SEND` |
-| 3 | **Gestão e qualificação de contatos (CRM)** | Organizar, qualificar e atribuir o lead ao operador/departamento | 7º-IX (legítimo interesse do controlador) | Cliente final | Nome declarado, `notes`, `qualification`, `rating`, atribuição | Google Firestore | Não (dados no Brasil) | Indefinida; soft-delete = `is_archived=1` (não apaga) | RBAC Firestore rules, `audit_log` de transferências |
+| 3 | **Gestão e qualificação de contatos (CRM)** | Organizar, qualificar e atribuir o lead ao operador | 7º-IX (legítimo interesse do controlador) | Cliente final | Nome declarado, `notes`, `qualification`, `rating`, atribuição | Google Firestore | Não (dados no Brasil) | Indefinida; soft-delete = `is_archived=1` (não apaga) | RBAC Firestore rules, `audit_log` de transferências |
 | 4 | **Mídia e localização** | Armazenar anexos e localização trocados na conversa | 7º-V | Cliente final | Imagem/áudio/vídeo/documento, lat/long | Google Cloud Storage **ou** Firestore (config `MEDIA_STORAGE_BACKEND`) | **A verificar** (região do bucket GCS) | Indefinida; sem expurgo de mídia | Validação MIME/tamanho, download autenticado (`media.py`) |
 | 5 | **Transcrição de áudio** | Converter áudio recebido em texto para o operador | 7º-V | Cliente final | Conteúdo de áudio → `transcription` | **Nenhum terceiro** — faster-whisper roda **localmente no Cloud Run** | Não | Indefinida (mesmo ciclo da mensagem) | Processamento in-house; condicional `FEATURE_AUDIO_TRANSCRIPTION` |
 | 6 | **Onboarding de canal (Embedded Signup)** | Vincular o número WhatsApp do controlador/operador ao CRM | 7º-V | Operador (owner do canal) | `owner_user_id`, `owner_firebase_uid`, `display_phone_number`, token | Meta (OAuth/Graph) | **Sim** — Meta (EUA) | Token renovado; sem expurgo de canal inativo | Troca de token via `fb_exchange_token`, `channel_service.py` |
@@ -298,7 +298,7 @@ Firestore (BR): save_wa_message (sender_user_id, channel_owner_user_id)
 ```
 Operador A ──/api/wa/transfer──▶ Cloud Run (BR)
    │ valida autorização (admin/supervisor/assigned)
-   │ atualiza conversation.assigned_to(_uid) + department_id
+   │ atualiza conversation.assigned_to(_uid)
    │ cria wa_transfer_log + mensagem de sistema
    │ log_audit(TRANSFER)
    ▼
@@ -320,7 +320,8 @@ upload p/ Meta /media (EUA) → media_id → envia mensagem
 
 ```
 Áudio inbound ──▶ download ──▶ ffmpeg (ogg/opus) ──▶ faster-whisper
-   (modelo local no Cloud Run, BR; condicional FEATURE_AUDIO_TRANSCRIPTION)
+   (modelo pre-embarcado na imagem Docker em build-time, HF_HUB_OFFLINE=1;
+    roda localmente no Cloud Run, BR; condicional FEATURE_AUDIO_TRANSCRIPTION)
    ──▶ wa_messages.transcription   ── nenhum dado sai para terceiro
 ```
 

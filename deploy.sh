@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
+# ============================================================================
+# AVISO (2026-06-03): NAO use este script para deploy de PROD sem revisar.
+# Usa --env-vars-file/--set-secrets/scaling hardcoded -> CLOBBERA a config de
+# prod (perde META_APP_SECRET, FEATURE_GOOGLE_CHAT, CRON_OIDC_*, reduz scaling).
+# Deploy seguro: gcloud run deploy castro-crm --source <RAIZ ABSOLUTA>
+# --region southamerica-east1. Ver docs/deploy/RUNBOOK_CUTOVER_PROD.md.
+# ============================================================================
 
 set -euo pipefail
 

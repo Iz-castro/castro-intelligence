@@ -1,3 +1,14 @@
+# ============================================================================
+# AVISO (2026-06-03): NAO use este script para deploy de PROD sem revisar.
+# Ele usa --env-vars-file (substitui TODAS as env vars) + --set-secrets
+# (substitui os secrets) + scaling hardcoded (--max-instances 3 --concurrency 1)
+# -> rodar em prod CLOBBERA a config (perde META_APP_SECRET, FEATURE_GOOGLE_CHAT,
+# CRON_OIDC_*, EMBEDDED_SIGNUP_CONFIG_ID, etc. e reduz o scaling tuneado).
+# Deploy SEGURO de prod: gcloud run deploy castro-crm --source <CAMINHO ABSOLUTO
+# DA RAIZ> --region southamerica-east1 (preserva env/secrets/scaling).
+# Ver docs/deploy/RUNBOOK_CUTOVER_PROD.md e docs/internal/2026-06-03.md.
+# ============================================================================
+
 $ErrorActionPreference = "Stop"
 
 function Import-DotEnv {

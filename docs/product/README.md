@@ -71,5 +71,5 @@ O frontend React cobre hoje:
 
 ## Pontos em aberto
 
-- evoluir `firestore.rules` para um modelo mais fino por operador e departamento
+- ✅ (CONCLUIDO em 2026-06-03) `firestore.rules` evoluiu para modelo restritivo por operador: usuario comum ve APENAS contatos/conversas atribuidos a si OU sem dono (pool/fila); visibilidade por `department_id` removida; admin/supervisor veem tudo
 - definir a estrategia futura do chat interno, caso Google Chat deixe de ser o caminho principal
