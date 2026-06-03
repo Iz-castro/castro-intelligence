@@ -1014,10 +1014,18 @@ function renderTemplatePreview(components: TemplateComponent[], vars: Record<str
   return { header, body, footer, buttons };
 }
 
-// Template de reabertura por inatividade. {{1}} (nome do cliente) e {{2}}
-// (data da ultima conversa) sao preenchidos automaticamente no backend via
-// POST /api/wa/conversation/{id}/reopen — sem caixa manual.
-const REOPEN_TEMPLATE_NAME = "atualizacao_solicitacao";
+// Detecta o template de reabertura por inatividade pelos botoes quick-reply
+// (Retomar / Encerrar), robusto a variacoes do nome — a Meta gera o nome sem
+// acentos (ex.: "atualizao_de_solicitao"). {{1}}/{{2}} sao preenchidos
+// automaticamente; a resposta do cliente e' tratada no webhook.
+function isReopenTemplate(t?: WhatsAppTemplate | null): boolean {
+  if (!t) return false;
+  const norm = (s: string) => s.toLowerCase();
+  const buttonTexts = (t.components || [])
+    .filter((c) => String(c.type).toUpperCase() === "BUTTONS")
+    .flatMap((c) => (c.buttons || []).map((b) => norm(b.text || "")));
+  return buttonTexts.some((x) => x.includes("retomar")) && buttonTexts.some((x) => x.includes("encerrar"));
+}
 
 function formatDateBR(raw?: string | null): string {
   if (!raw) return "";
@@ -1058,7 +1066,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
   const filtered = categoryFilter === "ALL" ? templates : templates.filter((t) => String(t.category).toUpperCase() === categoryFilter);
   const preview = selected ? renderTemplatePreview(selected.components || [], vars) : null;
   const conversationId = conversation?.id ?? null;
-  const isReopen = !!selected && selected.name === REOPEN_TEMPLATE_NAME;
+  const isReopen = isReopenTemplate(selected);
   const reopenName = reopenFirstName(contact);
   const reopenDate = formatDateBR(conversation?.last_message_at);
 
@@ -1071,7 +1079,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
   function pickTemplate(idx: number) {
     setSelectedIdx(idx);
     const t = templates[idx];
-    if (t && t.name === REOPEN_TEMPLATE_NAME) {
+    if (isReopenTemplate(t)) {
       // Reabertura: vars sao so para o preview; o backend recalcula e e a
       // fonte da verdade ao enviar via reopenConversation.
       setVars({ body_1: reopenFirstName(contact), body_2: formatDateBR(conversation?.last_message_at) });
@@ -1085,7 +1093,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
     if (isReopen) {
       // {{1}}/{{2}} resolvidos no backend; nao envia components manuais.
       if (!conversationId) return;
-      const ok = await reopenConversation(conversationId);
+      const ok = await reopenConversation(conversationId, selected.name, selected.language);
       if (ok) onClose();
       return;
     }

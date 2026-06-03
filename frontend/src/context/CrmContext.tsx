@@ -190,7 +190,8 @@ type CrmContextValue = {
   }) => Promise<boolean>;
   // Reabertura: envia o template de inatividade com {{1}} (nome) e {{2}}
   // (data da ultima conversa) preenchidos no backend. Sem caixa manual.
-  reopenConversation: (conversationId: string) => Promise<boolean>;
+  // templateName/language vem do template escolhido no picker.
+  reopenConversation: (conversationId: string, templateName?: string, language?: string) => Promise<boolean>;
   busyTemplate: boolean;
 
   // Detail panel
@@ -1654,11 +1655,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Reabre o atendimento via template de inatividade. {{1}}/{{2}} sao
   // resolvidos server-side (nome do cliente + data da ultima conversa) —
   // o operador nao digita nada.
-  async function reopenConversation(conversationId: string): Promise<boolean> {
+  async function reopenConversation(conversationId: string, templateName?: string, language?: string): Promise<boolean> {
     if (!bundle) return false;
     try {
       setBusyTemplate(true); setError(""); setNotice("");
-      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/reopen`, {});
+      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/reopen`, {
+        ...(templateName ? { template_name: templateName } : {}),
+        ...(language ? { language } : {}),
+      });
       setNotice("Template de reabertura enviado.");
       if (!snapshotMode) await refreshPollingViews();
       return true;

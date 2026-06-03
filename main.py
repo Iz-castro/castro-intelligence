@@ -1767,8 +1767,16 @@ async def wa_send_template(
 # template utility atual). {{1}} = primeiro nome do cliente, {{2}} = data da
 # ultima conversa. A resposta do cliente (Retomar/Encerrar) e tratada em
 # webhook._handle_reopen_button.
-REOPEN_TEMPLATE_NAME = os.getenv("REOPEN_TEMPLATE_NAME", "atualizacao_solicitacao")
+REOPEN_TEMPLATE_NAME = os.getenv("REOPEN_TEMPLATE_NAME", "atualizao_de_solicitao")
 REOPEN_TEMPLATE_LANG = os.getenv("REOPEN_TEMPLATE_LANG", "pt_BR")
+
+
+class WaReopenRequest(BaseModel):
+    # Nome/idioma do template enviado pelo frontend (que ja sabe qual o
+    # operador escolheu). Ausentes -> usa os defaults de env. Evita acoplar
+    # o nome exato (que a Meta gera sem acentos, ex.: atualizao_de_solicitao).
+    template_name: str | None = None
+    language: str | None = None
 
 
 def _reopen_first_name(contact: dict) -> str:
@@ -1805,12 +1813,20 @@ def _reopen_last_conv_date(conv: dict, contact: dict) -> str:
 
 
 @app.post("/api/wa/conversation/{conversation_id}/reopen")
-async def wa_reopen_conversation(conversation_id: str, current_user: dict = Depends(get_current_user)):
+async def wa_reopen_conversation(
+    conversation_id: str,
+    body: WaReopenRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+):
     """Reabre um atendimento enviando o template de reabertura com {{1}} e
     {{2}} preenchidos automaticamente (primeiro nome do cliente + data da
-    ultima conversa). Reusa /send-template (guard WABA + billing + persist)."""
+    ultima conversa). Reusa /send-template (guard WABA + billing + persist).
+    Nome/idioma do template vem do frontend (ou env default)."""
     conv, contact, channel = _resolve_send_target(conversation_id, None)
     _check_conv_send_permission(conv, current_user, contact)
+
+    template_name = (body.template_name if body else None) or REOPEN_TEMPLATE_NAME
+    language = (body.language if body else None) or REOPEN_TEMPLATE_LANG
 
     nome = _reopen_first_name(contact)
     data = _reopen_last_conv_date(conv, contact)
@@ -1821,15 +1837,15 @@ async def wa_reopen_conversation(conversation_id: str, current_user: dict = Depe
             {"type": "text", "text": data},
         ],
     }]
-    body = WaSendTemplateRequest(
+    send_body = WaSendTemplateRequest(
         conversation_id=conversation_id,
-        template_name=REOPEN_TEMPLATE_NAME,
-        language=REOPEN_TEMPLATE_LANG,
+        template_name=template_name,
+        language=language,
         components=components,
         template_category="utility",
     )
-    result = await wa_send_template(body=body, current_user=current_user)
-    log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} nome={nome} data={data}")
+    result = await wa_send_template(body=send_body, current_user=current_user)
+    log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} template={template_name} nome={nome} data={data}")
     out = result if isinstance(result, dict) else {"status": "sent"}
     return {**out, "rendered": {"nome": nome, "data": data}}
 
