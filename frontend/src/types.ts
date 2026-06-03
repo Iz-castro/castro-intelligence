@@ -139,7 +139,11 @@ export type Conversation = {
   unread_count?: number;
   unread?: number;
   status?: "open" | "archived" | string;
-  attendance_status?: "aberto" | "fechado_inatividade" | "fechado_manual" | string;
+  attendance_status?: "aberto" | "fechado_inatividade" | "fechado_manual" | "fechado_cliente" | string;
+  // Resposta do cliente ao template de reabertura (webhook button reply).
+  reopen_response?: "retomar" | "encerrar" | string;
+  reopen_response_at?: string;
+  client_requested_close?: boolean;
   last_message_at?: string;
   last_inbound_at?: string;
   last_outbound_at?: string;
@@ -191,7 +195,7 @@ export type ProtocolAtendimento = {
   setor: string;
   criado_em?: string | null;
   ultima_interacao?: string | null;
-  status: "aberto" | "fechado_inatividade" | "fechado_manual" | string;
+  status: "aberto" | "fechado_inatividade" | "fechado_manual" | "fechado_cliente" | string;
   protocolo_informado: boolean;
   fechado_em?: string | null;
   fechado_por_user_id?: number | null;

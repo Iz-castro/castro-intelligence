@@ -188,6 +188,9 @@ type CrmContextValue = {
     language: string;
     components?: TemplateSendComponent[];
   }) => Promise<boolean>;
+  // Reabertura: envia o template de inatividade com {{1}} (nome) e {{2}}
+  // (data da ultima conversa) preenchidos no backend. Sem caixa manual.
+  reopenConversation: (conversationId: string) => Promise<boolean>;
   busyTemplate: boolean;
 
   // Detail panel
@@ -1648,6 +1651,25 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // Reabre o atendimento via template de inatividade. {{1}}/{{2}} sao
+  // resolvidos server-side (nome do cliente + data da ultima conversa) —
+  // o operador nao digita nada.
+  async function reopenConversation(conversationId: string): Promise<boolean> {
+    if (!bundle) return false;
+    try {
+      setBusyTemplate(true); setError(""); setNotice("");
+      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/reopen`, {});
+      setNotice("Template de reabertura enviado.");
+      if (!snapshotMode) await refreshPollingViews();
+      return true;
+    } catch (e) {
+      setError(errorText(e));
+      return false;
+    } finally {
+      setBusyTemplate(false);
+    }
+  }
+
   async function createManualContact(declared_name: string, phone: string, channel_id?: number): Promise<Contact | null> {
     if (!bundle) return null;
     try {
@@ -1924,7 +1946,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     createManualContact, updateDeclaredName, busyCreateContact,
     loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
-    fetchTemplates, sendTemplate, busyTemplate, fetchBillingStatus,
+    fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
     editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,

@@ -24,11 +24,13 @@ from database import (
     get_user_by_id, get_wa_message_by_wa_message_id, get_wa_contact,
     assign_wa_contact, update_wa_contact_qualification,
     normalize_br_phone,
+    get_wa_conversation_by_id, set_attendance_status,
+    insert_transfer_system_message, get_current_protocol_id,
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
 from bot_service import process_bot_message
-from firestore_common import set_tenant_context, reset_tenant_context
+from firestore_common import set_tenant_context, reset_tenant_context, document, utcnow
 from tenant_service import lookup_phone_routing
 from pii_redaction import redact_phone, redact_name
 from pending_events import enqueue_pending_event
@@ -232,6 +234,116 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             logger.warning("[BOT] Falha ao enviar resposta | status=%s | erro=%s", resp.status_code, result)
     except Exception as e:
         logger.error("[BOT] Erro ao enviar resposta: %s", e, exc_info=True)
+
+
+def _normalize_reopen_choice(text):
+    """Normaliza texto/payload do botao (sem acento, minusculo) p/ matching
+    robusto contra acentuacao e pequenas edicoes no texto do botao."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
+    return s.lower().strip()
+
+
+async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
+                                db_id, content, ts_iso, reply_fields, ws_notify_callback=None):
+    """Processa a resposta de um botao quick-reply do template de reabertura.
+
+    Resolve a conversation alvo via context.id (mensagem-template original),
+    com fallback no id deterministico {channel_id}__{wa_id}. Registra a
+    escolha (reopen_response) + mensagem de sistema visivel ao operador.
+
+    - 'Encerrar': fecha o atendimento (fechado_cliente), marca
+      client_requested_close (trava p/ reabertura em lote futura) e envia o
+      recibo de protocolo (mesma logica do fechamento manual).
+    - 'Retomar': reabre o atendimento (aberto) e o Atendimento diario.
+    """
+    channel_id = channel.get("id") if channel else None
+
+    # Resolve a conversation alvo a partir da mensagem-template citada.
+    conversation_id = None
+    ctx = context if isinstance(context, dict) else {}
+    ctx_id = str(ctx.get("id") or "").strip()
+    if ctx_id:
+        original = get_wa_message_by_wa_message_id(ctx_id)
+        if original:
+            conversation_id = original.get("conversation_id")
+    if not conversation_id and channel_id and wa_id:
+        conversation_id = f"{channel_id}__{wa_id}"
+
+    choice = _normalize_reopen_choice(button.get("payload") or button.get("text"))
+    if "encerr" in choice:
+        action = "encerrar"
+    elif "retom" in choice:
+        action = "retomar"
+    else:
+        action = None
+        logger.info("[REOPEN BTN] resposta nao reconhecida | conv=%s txt=%s", conversation_id, choice[:40])
+
+    # Emite a mensagem de botao p/ clientes conectados (paridade com o emit
+    # padrao de inbound; em snapshot mode o Firestore tambem propaga).
+    if ws_notify_callback:
+        await ws_notify_callback({
+            "event": "wa_new_message",
+            "data": {
+                "id": db_id, "contact_id": contact_id, "wa_id": wa_id,
+                "msg_type": "button", "content": content, "timestamp": ts_iso,
+                **(reply_fields or {}),
+            },
+        })
+
+    if action is None or not conversation_id:
+        return
+
+    conv = get_wa_conversation_by_id(conversation_id)
+    contact = get_wa_contact(contact_id)
+
+    # Registra a escolha na conversation (auditavel + trava de reabertura
+    # em lote: nao reabrir quem ja pediu encerramento).
+    response_fields = {
+        "reopen_response": action,
+        "reopen_response_at": utcnow().isoformat(),
+    }
+    if action == "encerrar":
+        response_fields["client_requested_close"] = True
+    try:
+        document("wa_conversations", conversation_id).set(response_fields, merge=True)
+    except Exception as exc:
+        logger.warning("[REOPEN BTN] falha ao gravar reopen_response conv=%s: %s", conversation_id, exc)
+
+    if action == "encerrar":
+        set_attendance_status(conversation_id, "fechado_cliente", clear_takeover=True)
+        insert_transfer_system_message(
+            contact_id,
+            "Cliente encerrou o chamado pelo botao de reabertura.",
+            None, conversation_id=conversation_id, channel_id=channel_id,
+        )
+        # Fecha o Atendimento diario + envia recibo de protocolo (mesma
+        # logica do fechamento manual). Import tardio evita ciclo com main.
+        try:
+            from main import _close_daily_and_send_protocol
+            await _close_daily_and_send_protocol(contact, conv, channel, None, "fechado_cliente")
+        except Exception as exc:
+            logger.warning("[REOPEN BTN] close_daily/protocolo falhou conv=%s: %s", conversation_id, exc)
+        log_audit(None, "WA_REOPEN_RESPONSE", f"conv={conversation_id} -> encerrar (cliente)")
+        logger.info("[REOPEN BTN] Cliente encerrou | conv=%s", conversation_id)
+    else:  # retomar
+        set_attendance_status(conversation_id, "aberto")
+        # Reabre o Atendimento diario se existir (espelha set-attendance).
+        pid = get_current_protocol_id(contact_id)
+        if pid:
+            try:
+                document("attendances_daily", pid).set(
+                    {"status": "aberto", "fechado_em": None, "fechado_por_user_id": None}, merge=True,
+                )
+            except Exception as exc:
+                logger.warning("[REOPEN BTN] reabrir daily pid=%s falhou: %s", pid, exc)
+        insert_transfer_system_message(
+            contact_id,
+            "Cliente optou por retomar a solicitacao.",
+            None, conversation_id=conversation_id, channel_id=channel_id,
+        )
+        log_audit(None, "WA_REOPEN_RESPONSE", f"conv={conversation_id} -> retomar (cliente)")
+        logger.info("[REOPEN BTN] Cliente retomou | conv=%s", conversation_id)
 
 
 # Fields que dependem de canal resolvido para escrever mensagem/contato.
@@ -515,6 +627,13 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             reaction = msg.get("reaction", {})
             content = reaction.get("emoji", "")
 
+        elif msg_type == "button":
+            # Resposta a botao quick-reply de template (ex.: template de
+            # reabertura 'atualizacao_solicitacao'). Meta entrega o texto do
+            # botao em button.text e o payload (se enviado) em button.payload.
+            button_obj = msg.get("button", {}) if isinstance(msg.get("button"), dict) else {}
+            content = str(button_obj.get("text") or "").strip() or "[button]"
+
         elif msg_type == "unsupported":
             errors = msg.get("errors", []) if isinstance(msg.get("errors"), list) else []
             error_code = ""
@@ -560,6 +679,25 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             "[WA IN] %s (%s) | tipo=%s | id=%s",
             redact_name(contact_name), redact_phone(wa_id), effective_msg_type, msg_id[:20]
         )
+
+        # -- Resposta de botao quick-reply (template de reabertura) --
+        # Registra a escolha do cliente (Retomar/Encerrar), atualiza o
+        # atendimento e curto-circuita: NAO roda bot/rating/takeover, que
+        # poderiam reatribuir lead ou disparar automacao indevida.
+        if effective_msg_type == "button":
+            await _handle_reopen_button(
+                contact_id=contact_id,
+                wa_id=wa_id,
+                channel=channel,
+                button=msg.get("button", {}) if isinstance(msg.get("button"), dict) else {},
+                context=msg.get("context"),
+                db_id=db_id,
+                content=content,
+                ts_iso=ts_iso,
+                reply_fields=reply_fields,
+                ws_notify_callback=ws_notify_callback,
+            )
+            continue
 
         # -- Takeover temporario (coexistence) --
         # A mensagem chegou no canal de channel_owner_id (dono do numero), mas o

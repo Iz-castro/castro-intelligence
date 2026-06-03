@@ -1759,6 +1759,81 @@ async def wa_send_template(
         raise HTTPException(status_code=502, detail=err_msg)
 
 
+# ---------------------------------------------------------------------------
+# Reabertura automatica (template de inatividade)
+# ---------------------------------------------------------------------------
+
+# Nome/idioma do template de reabertura, configuraveis por env (default = o
+# template utility atual). {{1}} = primeiro nome do cliente, {{2}} = data da
+# ultima conversa. A resposta do cliente (Retomar/Encerrar) e tratada em
+# webhook._handle_reopen_button.
+REOPEN_TEMPLATE_NAME = os.getenv("REOPEN_TEMPLATE_NAME", "atualizacao_solicitacao")
+REOPEN_TEMPLATE_LANG = os.getenv("REOPEN_TEMPLATE_LANG", "pt_BR")
+
+
+def _reopen_first_name(contact: dict) -> str:
+    """{{1}}: primeiro nome do cliente. Prioriza o profile name do WhatsApp,
+    cai em declared_name/display_name e, por fim, 'cliente'."""
+    name = (
+        str((contact or {}).get("whatsapp_profile_name") or "").strip()
+        or str((contact or {}).get("declared_name") or "").strip()
+        or str((contact or {}).get("display_name") or "").strip()
+    )
+    return name.split()[0] if name else "cliente"
+
+
+def _reopen_last_conv_date(conv: dict, contact: dict) -> str:
+    """{{2}}: data da ultima conversa em DD/MM/AAAA (BRT). Usa o
+    last_message_at da thread aberta (ja em maos, sem query extra) com
+    fallback no contato. So formata data — nenhum search/protocolo."""
+    raw = (
+        (conv or {}).get("last_message_at")
+        or (contact or {}).get("last_message_at")
+        or (contact or {}).get("last_inbound_at")
+    )
+    dt = None
+    if raw:
+        try:
+            dt = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+        except (ValueError, TypeError):
+            dt = None
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
+
+
+@app.post("/api/wa/conversation/{conversation_id}/reopen")
+async def wa_reopen_conversation(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Reabre um atendimento enviando o template de reabertura com {{1}} e
+    {{2}} preenchidos automaticamente (primeiro nome do cliente + data da
+    ultima conversa). Reusa /send-template (guard WABA + billing + persist)."""
+    conv, contact, channel = _resolve_send_target(conversation_id, None)
+    _check_conv_send_permission(conv, current_user, contact)
+
+    nome = _reopen_first_name(contact)
+    data = _reopen_last_conv_date(conv, contact)
+    components = [{
+        "type": "body",
+        "parameters": [
+            {"type": "text", "text": nome},
+            {"type": "text", "text": data},
+        ],
+    }]
+    body = WaSendTemplateRequest(
+        conversation_id=conversation_id,
+        template_name=REOPEN_TEMPLATE_NAME,
+        language=REOPEN_TEMPLATE_LANG,
+        components=components,
+        template_category="utility",
+    )
+    result = await wa_send_template(body=body, current_user=current_user)
+    log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} nome={nome} data={data}")
+    out = result if isinstance(result, dict) else {"status": "sent"}
+    return {**out, "rendered": {"nome": nome, "data": data}}
+
+
 @app.get("/api/wa/templates")
 async def wa_list_templates(
     channel_id: int | None = None,

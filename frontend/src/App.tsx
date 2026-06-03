@@ -820,7 +820,7 @@ function ChatPanel() {
             <span>👤 Dono do lead: <strong>{leadOwnerLabel}</strong></span>
             {selectedThread ? <span>📱 Conversa no número: <strong>{selectedThread.channel_phone_number || "—"}</strong>{selectedThread.channel_label ? ` (${selectedThread.channel_label})` : ""}{channelInactive ? <strong style={{ color: "var(--danger, #c0392b)" }}> · ⚠ canal removido/antigo</strong> : null}</span> : null}
             <span>🔄 Takeover: <strong>{takeoverLabel}</strong></span>
-            {attendanceClosed ? <span style={{ color: "var(--danger, #c0392b)" }}>🔒 <strong>{attendanceStatus === "fechado_inatividade" ? "fechado (inatividade)" : "fechado"}</strong></span> : null}
+            {attendanceClosed ? <span style={{ color: "var(--danger, #c0392b)" }}>🔒 <strong>{attendanceStatus === "fechado_inatividade" ? "fechado (inatividade)" : attendanceStatus === "fechado_cliente" ? "fechado (cliente)" : "fechado"}</strong></span> : null}
             {selectedContact.attendance_protocol ? <span>📄 <strong>{selectedContact.attendance_protocol}</strong></span> : null}
             <span>Você: <strong>{myThreadRole}</strong></span>
           </div>
@@ -978,6 +978,8 @@ function ChatPanel() {
         <TemplatePickerModal
           contactId={selectedContact.id}
           channelId={sendChannelId}
+          conversation={selectedThread ?? null}
+          contact={selectedContact}
           onClose={() => setShowTemplatePicker(false)}
         />
       ) : null}
@@ -1012,8 +1014,25 @@ function renderTemplatePreview(components: TemplateComponent[], vars: Record<str
   return { header, body, footer, buttons };
 }
 
-function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: number; channelId: number | null; onClose: () => void }) {
-  const { fetchTemplates, sendTemplate, busyTemplate } = useCrm();
+// Template de reabertura por inatividade. {{1}} (nome do cliente) e {{2}}
+// (data da ultima conversa) sao preenchidos automaticamente no backend via
+// POST /api/wa/conversation/{id}/reopen — sem caixa manual.
+const REOPEN_TEMPLATE_NAME = "atualizacao_solicitacao";
+
+function formatDateBR(raw?: string | null): string {
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+function reopenFirstName(contact?: Contact | null): string {
+  const name = (contact?.whatsapp_profile_name || contact?.declared_name || contact?.display_name || "").trim();
+  return name ? name.split(/\s+/)[0] : "cliente";
+}
+
+function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
+  const { fetchTemplates, sendTemplate, reopenConversation, busyTemplate } = useCrm();
   const [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
@@ -1038,6 +1057,10 @@ function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: num
   const selected = selectedIdx !== null ? templates[selectedIdx] : null;
   const filtered = categoryFilter === "ALL" ? templates : templates.filter((t) => String(t.category).toUpperCase() === categoryFilter);
   const preview = selected ? renderTemplatePreview(selected.components || [], vars) : null;
+  const conversationId = conversation?.id ?? null;
+  const isReopen = !!selected && selected.name === REOPEN_TEMPLATE_NAME;
+  const reopenName = reopenFirstName(contact);
+  const reopenDate = formatDateBR(conversation?.last_message_at);
 
   // Discover placeholders once template selected
   const bodyComp = selected?.components?.find((c) => String(c.type).toUpperCase() === "BODY");
@@ -1047,11 +1070,25 @@ function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: num
 
   function pickTemplate(idx: number) {
     setSelectedIdx(idx);
-    setVars({});
+    const t = templates[idx];
+    if (t && t.name === REOPEN_TEMPLATE_NAME) {
+      // Reabertura: vars sao so para o preview; o backend recalcula e e a
+      // fonte da verdade ao enviar via reopenConversation.
+      setVars({ body_1: reopenFirstName(contact), body_2: formatDateBR(conversation?.last_message_at) });
+    } else {
+      setVars({});
+    }
   }
 
   async function submit() {
     if (!selected) return;
+    if (isReopen) {
+      // {{1}}/{{2}} resolvidos no backend; nao envia components manuais.
+      if (!conversationId) return;
+      const ok = await reopenConversation(conversationId);
+      if (ok) onClose();
+      return;
+    }
     const components: TemplateSendComponent[] = [];
     if (headerPlaceholders > 0) {
       const parameters = [];
@@ -1076,9 +1113,12 @@ function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: num
     if (ok) onClose();
   }
 
-  const canSubmit = selected && !busyTemplate
-    && Array.from({ length: bodyPlaceholders }, (_, i) => `body_${i + 1}`).every((k) => (vars[k] || "").trim())
-    && Array.from({ length: headerPlaceholders }, (_, i) => `header_${i + 1}`).every((k) => (vars[k] || "").trim());
+  const canSubmit = selected && !busyTemplate && (
+    isReopen
+      ? !!conversationId
+      : Array.from({ length: bodyPlaceholders }, (_, i) => `body_${i + 1}`).every((k) => (vars[k] || "").trim())
+        && Array.from({ length: headerPlaceholders }, (_, i) => `header_${i + 1}`).every((k) => (vars[k] || "").trim())
+  );
 
   return (
     <div className="lightbox" role="dialog" aria-modal="true" aria-label="Enviar template" onClick={onClose}>
@@ -1143,7 +1183,14 @@ function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: num
                     ) : null}
                   </div>
 
-                  {(headerPlaceholders > 0 || bodyPlaceholders > 0) ? (
+                  {isReopen ? (
+                    <div style={{ marginBottom: "1rem", background: "#ecfdf5", border: "1px solid #6ee7b7", borderRadius: 8, padding: "0.7rem 0.8rem", color: "#065f46", fontSize: "0.8rem" }}>
+                      <div style={{ fontWeight: 600, marginBottom: "0.3rem" }}>Preenchido automaticamente</div>
+                      <div><strong>{`{{1}}`}</strong> nome do cliente — <strong>{reopenName}</strong></div>
+                      <div><strong>{`{{2}}`}</strong> data da última conversa — <strong>{reopenDate || "—"}</strong></div>
+                      {!conversationId ? <div style={{ color: "#b91c1c", marginTop: "0.4rem" }}>Abra a conversa do cliente para reabrir.</div> : null}
+                    </div>
+                  ) : (headerPlaceholders > 0 || bodyPlaceholders > 0) ? (
                     <div style={{ marginBottom: "1rem" }}>
                       <div className="sub" style={{ marginBottom: "0.4rem", fontWeight: 600 }}>Variáveis</div>
                       {Array.from({ length: headerPlaceholders }, (_, i) => i + 1).map((n) => (
@@ -1172,7 +1219,7 @@ function TemplatePickerModal({ contactId, channelId, onClose }: { contactId: num
                   <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
                     <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
                     <button type="button" className="primary" onClick={() => void submit()} disabled={!canSubmit}>
-                      {busyTemplate ? "Enviando..." : "Enviar template"}
+                      {busyTemplate ? "Enviando..." : isReopen ? "Enviar reabertura" : "Enviar template"}
                     </button>
                   </div>
                 </>
