@@ -702,7 +702,23 @@ def _process_statuses(value):
                 pass
 
         update_wa_message_status(msg_id, state, ts_iso)
-        logger.info("[WA STATUS] %s -> %s", msg_id[:20], state)
+        if state == "failed":
+            # Meta preenche errors[] apenas em status failed, com
+            # code/title/error_data.details. Logamos o motivo para
+            # diagnostico (ex.: billing 131009, undeliverable 131026,
+            # quality 131049, account-not-registered 133010). Sem PII:
+            # code/title/details sao descricoes de erro, nao conteudo.
+            errors = status.get("errors") or []
+            err = errors[0] if errors and isinstance(errors[0], dict) else {}
+            logger.error(
+                "[WA STATUS] %s -> failed | code=%s title=%s details=%s",
+                msg_id[:20],
+                err.get("code"),
+                err.get("title"),
+                (err.get("error_data") or {}).get("details"),
+            )
+        else:
+            logger.info("[WA STATUS] %s -> %s", msg_id[:20], state)
 
 
 # ---------------------------------------------------------------------------
