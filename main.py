@@ -970,6 +970,20 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
     return {"conversation_id": conversation_id, "contact_id": int(contact_id), "channel_id": int(channel_id)}
 
 
+def _require_contact_access(contact: dict, current_user: dict):
+    """Isolamento LGPD: operador comum so acessa contato proprio (assigned_to
+    == ele) ou do pool/fila (sem dono). admin/supervisor acessam tudo.
+    Espelha get_wa_contacts_scoped_for_user (DB) e canSeeContactScoped (rules).
+    Levanta 403 caso contrario. contact pode ser {} (trata como sem acesso)."""
+    if current_user.get("role") in ("admin", "supervisor"):
+        return
+    if contact and contact.get("assigned_to") == current_user.get("id"):
+        return
+    if contact and not contact.get("assigned_to_uid"):  # pool: '' ou None
+        return
+    raise HTTPException(status_code=403, detail="Acesso negado: contato de outro operador")
+
+
 @app.get("/api/wa/conversations")
 async def wa_conversations(current_user: dict = Depends(get_current_user)):
     """Retorna lista de conversations enriquecidas (Fase 3 multi-canal).
@@ -989,9 +1003,16 @@ async def wa_conversations(current_user: dict = Depends(get_current_user)):
             data["id"] = snap.id
         convs_raw.append(data)
 
-    # Cache de contatos por id (evita N queries)
+    # Cache de contatos por id (evita N queries). Operador comum: SO contatos
+    # visiveis a ele (proprios + pool sem dono); conversas cujo contato nao e
+    # visivel sao descartadas pelo `if not contact: continue` abaixo
+    # (isolamento LGPD, espelha o snapshot). admin/supervisor: todos.
+    _convs_privileged = current_user.get("role") in ("admin", "supervisor")
     contacts_by_id = {}
-    for c in get_all_wa_contacts():
+    _contacts_src = get_all_wa_contacts() if _convs_privileged else get_wa_contacts_visible_to(
+        current_user.get("id"), current_user.get("department_id"), current_user.get("role"),
+    )
+    for c in _contacts_src:
         contacts_by_id[c["id"]] = c
 
     enriched = []
@@ -1048,6 +1069,10 @@ async def wa_messages(
     - Se conversation_id e fornecido: filtra por aquela thread (canal+wa_id).
     - Se nao: retorna timeline cross-channel do contato (legado).
     """
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     messages = get_wa_conversation(contact_id, limit=limit, conversation_id=conversation_id)
     return {"messages": messages}
 
@@ -1068,6 +1093,8 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
     msg = get_wa_message_by_id(message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Mensagem nao encontrada")
+    # LGPD: so o dono do contato (ou pool/admin) pode transcrever o audio.
+    _require_contact_access(get_wa_contact(msg.get("contact_id")) or {}, current_user)
     if msg.get("msg_type") != "audio":
         raise HTTPException(status_code=400, detail="Mensagem nao e do tipo audio")
 
@@ -2035,6 +2062,7 @@ async def update_declared_name(contact_id: int, body: DeclaredNameRequest, curre
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     update_wa_contact_declared_name(contact_id, body.declared_name)
     log_audit(current_user["id"], "CONTACT_DECLARED_NAME", f"Contato {contact_id}: {body.declared_name}")
     updated = get_wa_contact(contact_id)
@@ -2053,6 +2081,7 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     update_wa_contact_qualification(contact_id, qualification, notes)
     log_audit(current_user["id"], "CONTACT_QUALIFY", f"Contato {contact_id}: {qualification}")
 
@@ -2123,6 +2152,7 @@ async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_cu
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     if int(contact.get("unread_count", 0) or 0) <= 0:
         return {"status": "ok", "updated_count": 0}
     updated_count = mark_wa_conversation_read(contact_id)
@@ -2187,6 +2217,7 @@ async def delete_contact(contact_id: int, current_user: dict = Depends(get_curre
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     archive_wa_contact(contact_id)
     log_audit(current_user["id"], "CONTACT_ARCHIVE", f"Contato {contact_id}")
     return {"status": "ok"}
@@ -2194,6 +2225,10 @@ async def delete_contact(contact_id: int, current_user: dict = Depends(get_curre
 
 @app.post("/api/wa/contact/{contact_id}/restore")
 async def restore_contact(contact_id: int, current_user: dict = Depends(get_current_user)):
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     restore_wa_contact(contact_id)
     log_audit(current_user["id"], "CONTACT_RESTORE", f"Contato {contact_id}")
     return {"status": "ok"}
@@ -2999,6 +3034,7 @@ async def wa_contact_detail(contact_id: int, current_user: dict = Depends(get_cu
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     return {"contact": contact}
 
 
@@ -3370,6 +3406,10 @@ async def admin_reset_assume_counter(user_id: int, current_user: dict = Depends(
 
 @app.get("/api/wa/transfer-history/{contact_id}")
 async def wa_transfer_hist(contact_id: int, current_user: dict = Depends(get_current_user)):
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     return {"history": get_transfer_history(contact_id)}
 
 
