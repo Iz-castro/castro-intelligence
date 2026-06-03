@@ -1334,10 +1334,10 @@ def get_wa_contacts_visible_to(user_id, department_id=None, role=None, include_a
     get_all_wa_contacts.
 
     Admin/supervisor enxergam todos. Operador comum ve apenas o proprio escopo
-    (atribuidos a si, sem dono, ou do mesmo departamento) — espelha as
-    Firestore rules do caminho de snapshot e evita varrer/expor a agenda
-    inteira do tenant (milhares de contatos da agenda coex) no fallback de
-    polling do frontend. Isolamento LGPD + corte de leitura.
+    (atribuidos a si ou sem dono/pool) — espelha as Firestore rules do caminho
+    de snapshot e evita varrer/expor a agenda inteira do tenant (milhares de
+    contatos da agenda coex) no fallback de polling do frontend. NAO inclui
+    contatos de colegas do mesmo departamento (isolamento LGPD).
     """
     if role in ("admin", "supervisor"):
         rows = _all_docs("wa_contacts")
@@ -1585,12 +1585,17 @@ def get_contacts_by_assigned_user(user_id):
 def get_wa_contacts_scoped_for_user(user_id, department_id=None):
     """Contatos visiveis a um operador comum — espelha canSeeContactScoped
     (firestore.rules) e buildContactSnapshotTargets (frontend): atribuidos
-    a si, sem atribuicao, ou do mesmo departamento.
+    a si OU sem atribuicao (pool/fila).
+
+    NAO inclui mais o departamento. A query por department_id vazava a agenda
+    pessoal (coexistence) de um operador para todos os colegas do mesmo
+    departamento — quebra de isolamento LGPD (ex.: agenda da aline visivel
+    p/ danielle). `department_id` mantido na assinatura por compat com os
+    callers, mas ignorado de proposito.
 
     Usa queries de igualdade (sem orderBy) — nao exige indice composto e
-    evita varrer a colecao inteira do tenant (corte de leitura + isolamento
-    LGPD). Dedup por doc id. Retorna dicts crus normalizados; o caller
-    aplica filtro is_archived / busca / ordenacao.
+    evita varrer a colecao inteira do tenant. Dedup por doc id. Retorna dicts
+    crus normalizados; o caller aplica filtro is_archived / busca / ordenacao.
     """
     col = collection("wa_contacts")
     seen = {}
@@ -1605,11 +1610,10 @@ def get_wa_contacts_scoped_for_user(user_id, department_id=None):
 
     if user_id is not None:
         _collect(col.where("assigned_to", "==", user_id))
-    # Sem atribuicao (campo "" ou None) — pool visivel a qualquer operador.
+    # Sem atribuicao (campo "" ou None) — pool/fila visivel a qualquer operador.
     _collect(col.where("assigned_to_uid", "==", ""))
     _collect(col.where("assigned_to_uid", "==", None))
-    if department_id is not None:
-        _collect(col.where("department_id", "==", department_id))
+    # department_id intencionalmente NAO consultado (isolamento LGPD acima).
 
     return [normalize_record(dict(row)) for row in seen.values()]
 

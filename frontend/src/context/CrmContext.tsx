@@ -705,12 +705,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       });
     }
 
-    if (sessionUser.department_id != null) {
-      targets.push({
-        key: `department:${sessionUser.department_id}`,
-        ref: query(waContacts, where("department_id", "==", sessionUser.department_id), ...baseConstraints),
-      });
-    }
+    // Isolamento LGPD: operador comum NAO ve a agenda de colegas do mesmo
+    // departamento. O target por department_id vazava os contatos pessoais
+    // (coexistence) de um operador para os demais do departamento. So
+    // proprios + pool sem dono; admin/supervisor (acima) seguem vendo tudo.
 
     return targets;
   }
@@ -754,12 +752,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       });
     }
 
-    if (sessionUser.department_id != null) {
-      targets.push({
-        key: `department:${sessionUser.department_id}`,
-        ref: query(waConversations, where("department_id", "==", sessionUser.department_id)),
-      });
-    }
+    // Isolamento LGPD: operador comum NAO ve conversas de colegas do mesmo
+    // departamento (mesma regra dos contatos). So proprias + pool sem dono;
+    // admin/supervisor (acima) seguem vendo todas.
 
     return targets;
   }

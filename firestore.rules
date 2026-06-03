@@ -85,15 +85,15 @@ service cloud.firestore {
     }
 
     function canSeeContactScoped(tid) {
-      // Privilegiado le todos do tenant; operador so atribuidos a si,
-      // sem atribuicao, ou do mesmo departamento. Short-circuit em
-      // isPrivilegedInTenant evita get() de profile no caso admin.
+      // Privilegiado le todos do tenant; operador comum SO atribuidos a si
+      // ou sem atribuicao (pool/fila). NAO inclui departamento: a regra por
+      // department_id vazava a agenda pessoal (coexistence) de um operador
+      // para todos os colegas do mesmo departamento (isolamento LGPD).
       return ownsTenant(tid) && (
         isPrivilegedInTenant(tid) ||
         resource.data.assigned_to_uid == request.auth.uid ||
         resource.data.assigned_to_uid == '' ||
-        resource.data.assigned_to_uid == null ||
-        resource.data.department_id == tenantOperatorProfile(tid).data.department_id
+        resource.data.assigned_to_uid == null
       );
     }
 
@@ -108,14 +108,14 @@ service cloud.firestore {
     }
 
     match /castro_crm_wa_contacts/{contactId} {
-      // Privilegiados (admin/supervisor) veem todos.
-      // Operadores veem: atribuidos a si, sem atribuicao, ou do mesmo departamento.
+      // Privilegiados (admin/supervisor) veem todos. Operadores: SO
+      // atribuidos a si ou sem atribuicao (pool). Sem departamento
+      // (isolamento LGPD — ver canSeeContactScoped). Colecao flat legada.
       allow read: if operatorActive() && (
         isPrivileged() ||
         resource.data.assigned_to_uid == request.auth.uid ||
         resource.data.assigned_to_uid == '' ||
-        resource.data.assigned_to_uid == null ||
-        resource.data.department_id == myProfile().data.department_id
+        resource.data.assigned_to_uid == null
       );
       allow write: if false;
     }
