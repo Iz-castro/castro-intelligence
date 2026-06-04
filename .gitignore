@@ -21,6 +21,10 @@ data/
 
 # Exports de migracao (PII — LGPD: nunca versionar; retencao curta)
 scripts/_exports/
+# Backups/exports de conversas WhatsApp (PII pesada — LGPD: NUNCA versionar)
+backup*/
+*backup*/
+scripts/_backfill_undo_*.json
 
 # Logs
 logs/
