@@ -1824,6 +1824,13 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     source_channel_type=(contact or {}).get("source_channel_type", ""),
                     phone_number_id=eff_phone_number_id,
                     direction_for_unread="inbound" if direction == "inbound" and status == "received" else ("outbound" if direction == "outbound" else None),
+                    # Conversa herda o Dono do Lead (contact.assigned_to). O guard
+                    # de orfa em upsert_wa_conversation (so atribui se a thread NAO
+                    # tem dono) garante que isto nunca pisa em transferencia de
+                    # thread nem em takeover ativo. [LGPD: thread orfa e legivel
+                    # por qualquer operador via canSeeContactScoped; herdar o dono
+                    # fecha esse vetor].
+                    auto_assign_user_id=(contact or {}).get("assigned_to"),
                 )
             except Exception as exc:
                 logger.warning("Falha ao upsert conversation para msg %s: %s", message_id, exc)
