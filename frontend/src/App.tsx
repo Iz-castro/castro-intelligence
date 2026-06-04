@@ -116,6 +116,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
               {(sessionUser.role === "admin" || sessionUser.role === "supervisor" || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
+              {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp-standard")}><span>☁️</span><span>Conectar numero (Cloud API)</span></button>}
               {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
@@ -1436,8 +1437,9 @@ declare global {
   }
 }
 
-function WhatsAppSignupModal() {
+function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "coexistence" | "standard" }) {
   const { bundle, setShowSettings } = useCrm();
+  const isStandard = channelType === "standard";
   const [step, setStep] = useState<"loading" | "ready" | "signing" | "exchanging" | "done" | "error">("loading");
   const [signupConfig, setSignupConfig] = useState<{ app_id: string; config_id: string; graph_api_version: string } | null>(null);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
@@ -1446,13 +1448,13 @@ function WhatsAppSignupModal() {
 
   useEffect(() => {
     if (!bundle) return;
-    getJson<{ app_id: string; config_id: string; graph_api_version: string }>(bundle.auth, "/api/admin/embedded-signup/config")
+    getJson<{ app_id: string; config_id: string; graph_api_version: string }>(bundle.auth, `/api/admin/embedded-signup/config?type=${channelType}`)
       .then((cfg) => {
         setSignupConfig(cfg);
         loadFacebookSDK(cfg.app_id, cfg.graph_api_version);
       })
       .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
-  }, [bundle]);
+  }, [bundle, channelType]);
 
   function loadFacebookSDK(appId: string, version: string) {
     if (fbLoaded.current || window.FB) {
@@ -1485,7 +1487,7 @@ function WhatsAppSignupModal() {
           return;
         }
         setStep("exchanging");
-        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code, channel_type: "coexistence" })
+        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code, channel_type: channelType })
           .then((data) => { setResult(data); setStep("done"); })
           .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
       },
@@ -1493,20 +1495,18 @@ function WhatsAppSignupModal() {
         config_id: signupConfig.config_id,
         response_type: "code",
         override_default_response_type: true,
-        extras: {
-          setup: {},
-          featureType: "whatsapp_business_app_onboarding",
-          sessionInfoVersion: "3",
-        },
+        extras: isStandard
+          ? { setup: {}, sessionInfoVersion: "3" }
+          : { setup: {}, featureType: "whatsapp_business_app_onboarding", sessionInfoVersion: "3" },
       },
     );
-  }, [signupConfig, bundle]);
+  }, [signupConfig, bundle, channelType, isStandard]);
 
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="WhatsApp Coexistence" onClick={() => setShowSettings(false)}>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label={isStandard ? "Conectar numero (Cloud API)" : "WhatsApp Coexistence"} onClick={() => setShowSettings(false)}>
       <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 600 }}>
-        <h2 style={{ margin: "0 0 1.2rem" }}>WhatsApp Coexistence</h2>
+        <h2 style={{ margin: "0 0 1.2rem" }}>{isStandard ? "Conectar numero oficial (Cloud API)" : "WhatsApp Coexistence"}</h2>
 
         {step === "loading" && <p>Carregando configuracao...</p>}
 
@@ -1521,21 +1521,41 @@ function WhatsAppSignupModal() {
 
         {step === "ready" && (
           <div className="settings-section">
-            <p style={{ marginBottom: "1rem", lineHeight: 1.6 }}>
-              Conecte um numero do WhatsApp Business App ao CRM via Coexistence.
-              O administrador do portfolio <strong>cliente</strong> deve fazer login no popup do Facebook.
-            </p>
-            <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginBottom: "1rem", fontSize: "0.9rem" }}>
-              <strong>Requisitos:</strong>
-              <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
-                <li>Numero ativo no WhatsApp Business App (Android/iOS)</li>
-                <li>App versao 2.24.17 ou superior</li>
-                <li>Portfolio do cliente verificado no Meta Business Manager</li>
-                <li>Camera do celular pronta para escanear QR Code</li>
-              </ul>
-            </div>
+            {isStandard ? (
+              <>
+                <p style={{ marginBottom: "1rem", lineHeight: 1.6 }}>
+                  Conecte (ou migre) o numero oficial da empresa para a <strong>Cloud API</strong> como canal padrao.
+                  O numero <strong>sai do app do WhatsApp Business</strong> e passa a ser gerenciado 100% pelo CRM.
+                  Faca login no popup com a conta que administra a WABA.
+                </p>
+                <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginBottom: "1rem", fontSize: "0.9rem" }}>
+                  <strong>Requisitos:</strong>
+                  <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
+                    <li>Forma de pagamento ativa na WABA (linha de credito ou cartao)</li>
+                    <li>Voce define o PIN de 6 digitos no popup (verificacao em 2 etapas)</li>
+                    <li>O app do WhatsApp Business desconecta deste numero</li>
+                  </ul>
+                </div>
+              </>
+            ) : (
+              <>
+                <p style={{ marginBottom: "1rem", lineHeight: 1.6 }}>
+                  Conecte um numero do WhatsApp Business App ao CRM via Coexistence.
+                  O administrador do portfolio <strong>cliente</strong> deve fazer login no popup do Facebook.
+                </p>
+                <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginBottom: "1rem", fontSize: "0.9rem" }}>
+                  <strong>Requisitos:</strong>
+                  <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
+                    <li>Numero ativo no WhatsApp Business App (Android/iOS)</li>
+                    <li>App versao 2.24.17 ou superior</li>
+                    <li>Portfolio do cliente verificado no Meta Business Manager</li>
+                    <li>Camera do celular pronta para escanear QR Code</li>
+                  </ul>
+                </div>
+              </>
+            )}
             <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup}>
-              Iniciar Embedded Signup
+              {isStandard ? "Conectar numero (Cloud API)" : "Iniciar Embedded Signup"}
             </button>
           </div>
         )}
@@ -1577,14 +1597,21 @@ function WhatsAppSignupModal() {
                 ))}
               </tbody>
             </table>
-            <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginTop: "1rem", fontSize: "0.85rem" }}>
-              <strong>Proximo passo:</strong> Atualize o <code>.env</code> do servidor com os novos valores:
-              <pre style={{ margin: "0.5rem 0 0", whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
+            {isStandard ? (
+              <div style={{ background: "#eff6ff", border: "1px solid #93c5fd", borderRadius: 8, padding: "1rem", marginTop: "1rem", fontSize: "0.85rem" }}>
+                <strong>Pronto.</strong> Canal standard criado. O envio usa o <strong>token do proprio canal</strong>.
+                <br />NAO defina <code>WHATSAPP_TOKEN</code>/<code>WHATSAPP_PHONE_NUMBER_ID</code> no Cloud Run — deixe vazios para suportar mais de uma empresa (multi-tenant).
+              </div>
+            ) : (
+              <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginTop: "1rem", fontSize: "0.85rem" }}>
+                <strong>Proximo passo:</strong> Atualize o <code>.env</code> do servidor com os novos valores:
+                <pre style={{ margin: "0.5rem 0 0", whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
 {`WHATSAPP_TOKEN=${result.access_token || "???"}
 WHATSAPP_PHONE_NUMBER_ID=${result.phone_number_id || "???"}
 WHATSAPP_WABA_ID=${result.waba_id || "???"}`}
-              </pre>
-            </div>
+                </pre>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1642,6 +1669,7 @@ function SettingsModals() {
       ) : null}
 
       {showSettings === "whatsapp" ? <WhatsAppSignupModal /> : null}
+      {showSettings === "whatsapp-standard" ? <WhatsAppSignupModal channelType="standard" /> : null}
 
       {showSettings === "admin" && sessionUser.role === "admin" ? <AdminSettingsModal /> : null}
 

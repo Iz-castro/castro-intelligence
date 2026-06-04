@@ -43,6 +43,7 @@ from config import (
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
     STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS,
     META_APP_ID, META_APP_SECRET, EMBEDDED_SIGNUP_CONFIG_ID,
+    EMBEDDED_SIGNUP_CONFIG_ID_STANDARD,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
@@ -3804,17 +3805,27 @@ async def export_data(
 
 
 @app.get("/api/admin/embedded-signup/config")
-async def embedded_signup_config(current_user: dict = Depends(get_current_user)):
-    """Retorna configuracao necessaria para o frontend iniciar o Embedded Signup."""
-    if current_user.get("role") not in ("admin", "supervisor") and not current_user.get("coex_authorized"):
-        raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
+async def embedded_signup_config(type: str = "coexistence", current_user: dict = Depends(get_current_user)):
+    """Retorna configuracao para o frontend iniciar o Embedded Signup.
+
+    type=coexistence (default): canal coex do operador (admin/sup ou coex_authorized).
+    type=standard: canal Cloud API padrao — APENAS admin/supervisor, config_id proprio.
+    """
+    is_standard = type == "standard"
+    if is_standard:
+        if current_user.get("role") not in ("admin", "supervisor"):
+            raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem conectar canal standard (Cloud API).")
+    else:
+        if current_user.get("role") not in ("admin", "supervisor") and not current_user.get("coex_authorized"):
+            raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     missing: list[str] = []
     if not META_APP_ID:
         missing.append("META_APP_ID")
     if not META_APP_SECRET:
         missing.append("META_APP_SECRET")
-    if not EMBEDDED_SIGNUP_CONFIG_ID:
-        missing.append("EMBEDDED_SIGNUP_CONFIG_ID")
+    cfg_id = EMBEDDED_SIGNUP_CONFIG_ID_STANDARD if is_standard else EMBEDDED_SIGNUP_CONFIG_ID
+    if not cfg_id:
+        missing.append("EMBEDDED_SIGNUP_CONFIG_ID_STANDARD" if is_standard else "EMBEDDED_SIGNUP_CONFIG_ID")
     if missing:
         raise HTTPException(
             status_code=503,
@@ -3822,7 +3833,7 @@ async def embedded_signup_config(current_user: dict = Depends(get_current_user))
         )
     return {
         "app_id": META_APP_ID,
-        "config_id": EMBEDDED_SIGNUP_CONFIG_ID,
+        "config_id": cfg_id,
         "graph_api_version": GRAPH_API_VERSION,
     }
 

@@ -244,7 +244,7 @@ type CrmContextValue = {
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
   toggleSettingsMenu: () => void;
-  openSettingsPage: (page: "chat" | "quick" | "admin" | "whatsapp" | "dashboard") => Promise<void>;
+  openSettingsPage: (page: "chat" | "quick" | "admin" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
   settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -1893,9 +1893,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
-  async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "dashboard") {
+  async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "whatsapp-standard" | "dashboard") {
     if (!bundle) return;
-    if (page === "whatsapp") {
+    if (page === "whatsapp" || page === "whatsapp-standard") {
       setShowSettings(page);
       return;
     }

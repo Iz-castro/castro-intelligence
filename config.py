@@ -96,6 +96,10 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 META_APP_ID = os.getenv("META_APP_ID", "").strip()
 META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 EMBEDDED_SIGNUP_CONFIG_ID = os.getenv("EMBEDDED_SIGNUP_CONFIG_ID", "").strip()
+# Config de Embedded Signup STANDARD (Cloud API). Config separada na Meta —
+# a de coexistence usa featureType=whatsapp_business_app_onboarding; a standard
+# nao. Sem isso, o botao "Conectar numero (Cloud API)" retorna 503.
+EMBEDDED_SIGNUP_CONFIG_ID_STANDARD = os.getenv("EMBEDDED_SIGNUP_CONFIG_ID_STANDARD", "").strip()
 
 # -- Media --
 DEFAULT_MEDIA_DIR = Path("/tmp/castro_crm_media") if IS_CLOUD_RUN else BASE_DIR / "media"
