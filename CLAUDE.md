@@ -19,10 +19,14 @@ clínicas médicas, locadoras de equipamentos e similares.
   Brasil).
 - **Stack:** FastAPI + Firestore + Firebase Auth + React/TypeScript/Vite,
   hospedado no Cloud Run em `southamerica-east1`.
-- **Modelo financeiro:** passthrough — Castro Intelligence cobra
-  mensalidade SaaS do cliente; Meta cobra direto do cliente pelo uso
-  (cliente é dono da WABA, configura método de pagamento no Business
-  Manager dele); Castro Intelligence só paga GCP/Firebase.
+- **Modelo financeiro:** managed billing (não passthrough). Castro
+  Intelligence cobra a mensalidade SaaS do cliente e **fronta a Meta** —
+  paga o uso de conversas e re-fatura o cliente. As WABAs ficam no
+  portfólio **Castro Operações**, onde a Castro configura o método de
+  pagamento e **consolida o billing** (junto dos números coexistence dos
+  operadores). A Castro paga GCP/Firebase + uso da Meta.
+  (Histórico: antes documentado como passthrough puro — cliente dono da
+  WABA pagando a Meta direto. O modelo real adotado é o managed billing.)
 
 Roadmap arquitetural completo em [docs/PLANO_COEXISTENCE_REFATORACAO.md](docs/PLANO_COEXISTENCE_REFATORACAO.md).
 
