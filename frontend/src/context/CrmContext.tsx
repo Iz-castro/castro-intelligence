@@ -517,13 +517,17 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       return c.qualification !== "nao_qualificado" && !c.bot_completed;
     });
   }, [botEnabled, conversations, contactsById]);
-  // Novos: sem atribuicao. Com bot ativo, so threads que ja completaram bot.
+  // Novos: pool sem dono. Exige thread SEM dono (conv.assigned_to) E lead SEM
+  // dono (contact.assigned_to) — senao threads orfas de leads ja atribuidos
+  // (ex.: reassign-lead muda so o contato, nao a thread) vazariam pra ca.
+  // Com bot ativo, so threads que ja completaram bot.
   // Operador comum so ve threads do seu departamento (ou sem); admin/supervisor veem todas.
   const novosConversations = useMemo(() => {
     return conversations.filter((conv) => {
       if (conv.assigned_to) return false;
       const c = contactsById.get(conv.contact_id);
       if (!c) return false;
+      if (c.assigned_to) return false;
       if (c.qualification === "nao_qualificado") return false;
       if (botEnabled && !c.bot_completed) return false;
       if (!isManagerRole && conv.department_id != null && conv.department_id !== sessionUser?.department_id) return false;
