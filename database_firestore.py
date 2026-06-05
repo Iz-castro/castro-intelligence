@@ -636,8 +636,16 @@ def upsert_wa_conversation(
     # semantica do envio (get_send_credentials falha quando get_channel e None).
     _ch_fields: dict = {}
     try:
-        from channel_service import get_channel as _get_channel
+        from channel_service import get_channel as _get_channel, refresh_channels as _refresh_channels
         _ch = _get_channel(channel_id) if channel_id is not None else None
+        if _ch is None and channel_id is not None:
+            # Cache de canais defasado (canal recem-criado, cold start de
+            # instancia, ou cross-instance no Cloud Run com TTL de 60s) faria a
+            # conversa nascer "canal removido" (channel_active=False) mesmo o
+            # canal estando ativo. Forca um refresh e tenta de novo antes de
+            # marcar inativo — so marca False se o canal sumiu de fato.
+            _refresh_channels()
+            _ch = _get_channel(channel_id)
         if _ch:
             _ch_fields = {
                 "channel_phone_number": _ch.get("display_phone_number", ""),
