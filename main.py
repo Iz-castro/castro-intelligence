@@ -68,7 +68,7 @@ from database import (
     mark_message_corrected,
     get_wa_conversation_by_id, upsert_wa_conversation,
     set_conversation_takeover_active, clear_conversation_takeover, expire_stale_takeovers,
-    close_stale_attendances, set_attendance_status,
+    close_stale_attendances, set_attendance_status, set_sale_owner,
     get_system_settings, save_system_settings,
     get_user_settings, save_user_settings,
     get_all_gc_conversations, get_gc_messages, save_gc_message,
@@ -3123,6 +3123,9 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
     result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # Admin/supervisor trocando o Dono do Lead -> a dona de origem (sale_owner)
+    # ACOMPANHA: futuros fechamentos revertem p/ o novo dono.
+    set_sale_owner(contact_id, to_user_id)
     # Reatribuir o Lead reconcilia o takeover das threads: se o novo dono ja e o
     # handler (dono do numero), o conflito acabou -> limpa o takeover stale (senao
     # o PROPRIO dono do Lead veria "Assumir atendimento"). Threads que seguem em
@@ -3386,6 +3389,10 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     if not contact.get("original_operator_id"):
 
         fs_document("wa_contacts", contact_id).set({"original_operator_id": current_user["id"]}, merge=True)
+    # Dona de origem (sale_owner): grava na 1a assuncao. Handoff entre operadores
+    # NAO altera (so admin via reassign-lead). Restaurada no fechamento da conversa.
+    if not contact.get("sale_owner_user_id"):
+        set_sale_owner(contact_id, current_user["id"])
     # Fase 5A: protocolo NAO e mais gerado no assume (so no 1o inbound do dia
     # via webhook -> ensure_daily_attendance). Reusa o atual se ja existe.
     protocol = get_current_protocol_id(contact_id) or ""

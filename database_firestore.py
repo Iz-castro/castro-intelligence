@@ -899,6 +899,8 @@ def close_stale_attendances(max_idle_hours):
         document("wa_conversations", cid).set(
             {"attendance_status": "fechado_inatividade"}, merge=True,
         )
+        # Mesma regra do fechamento manual: lead volta p/ a dona de origem.
+        revert_lead_to_sale_owner(conv.get("contact_id"))
         closed.append({
             "conversation_id": cid,
             "contact_id": conv.get("contact_id"),
@@ -919,6 +921,10 @@ def set_attendance_status(conversation_id, status, clear_takeover=False):
     if clear_takeover:
         updates["takeover_status"] = "none"
         updates["takeover_started_at"] = None
+    # Fechamento -> o Dono do Lead volta p/ a dona de origem (sale_owner), pra
+    # que o proximo inbound 'herda dono' p/ ela (vendedora ganha prioridade).
+    if str(status).startswith("fechado"):
+        revert_lead_to_sale_owner(conv.get("contact_id"))
     document("wa_conversations", conversation_id).set(updates, merge=True)
     return get_wa_conversation_by_id(conversation_id)
 
@@ -1004,6 +1010,8 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "phone_number_id": phone_number_id,
         "source_channel_type": source_channel_type,
         "original_operator_id": None,
+        "sale_owner_user_id": None,
+        "sale_owner_uid": "",
         "converted_by_user_id": None,
         "rating": None,
         "rating_requested_at": None,
@@ -1237,6 +1245,8 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         "phone_number_id": "",
         "source_channel_type": "standard",
         "original_operator_id": None,
+        "sale_owner_user_id": None,
+        "sale_owner_uid": "",
         "converted_by_user_id": None,
         "rating": None,
         "rating_requested_at": None,
@@ -1535,6 +1545,50 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
         "created_at": utcnow(),
     })
     return {"from_user_id": from_user, "to_user_id": to_user_id}
+
+
+def set_sale_owner(contact_id, user_id):
+    """Define/atualiza a 'dona de origem' (sale_owner) do lead — a vendedora a
+    quem o lead 'gruda'. Gravada na 1a assuncao; handoff entre operadores NAO
+    altera (so o assume inicial e o reassign-lead do admin/supervisor gravam).
+    E metadado de roteamento: NAO participa do isolamento/escopo (so
+    assigned_to_uid faz). Grava o uid denormalizado p/ o revert no fechamento.
+    """
+    to_user = _get_doc("users", user_id) if user_id else None
+    document("wa_contacts", contact_id).set({
+        "sale_owner_user_id": user_id,
+        "sale_owner_uid": (to_user or {}).get("firebase_uid", ""),
+    }, merge=True)
+    return to_user
+
+
+def revert_lead_to_sale_owner(contact_id):
+    """No fechamento do atendimento, o Dono do Lead (contact.assigned_to/_uid)
+    volta p/ a dona de origem (sale_owner) — assim o proximo inbound 'herda
+    dono' p/ ela (save_wa_message) e a vendedora ganha prioridade.
+
+    Salvaguardas: se NAO houver sale_owner (lead nunca assumido) ou ela estiver
+    inativa/deletada, NAO faz nada — nunca inventa dono nem gruda lead em conta
+    morta (ficaria orfa invisivel). Idempotente. Retorna o user_id ou None.
+    """
+    if contact_id is None:
+        return None
+    contact = _get_doc("wa_contacts", contact_id)
+    if not contact:
+        return None
+    owner_id = contact.get("sale_owner_user_id")
+    if not owner_id:
+        return None  # sem dona de origem -> mantem como esta (pool fica pool)
+    owner = _get_doc("users", owner_id)
+    if not owner or not owner.get("is_active", 1):
+        return None  # dona inativa/deletada -> nao restaura
+    if contact.get("assigned_to") == owner_id:
+        return owner_id  # ja e a dona — nada a fazer
+    document("wa_contacts", contact_id).set({
+        "assigned_to": owner_id,
+        "assigned_to_uid": owner.get("firebase_uid", ""),
+    }, merge=True)
+    return owner_id
 
 
 def return_contact_to_bot(contact_id, returned_by_user_id):

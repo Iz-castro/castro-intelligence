@@ -105,6 +105,8 @@ export type Contact = {
   source_channel_type?: "standard" | "coexistence" | string;
   original_operator_id?: number | null;
   converted_by_user_id?: number | null;
+  sale_owner_user_id?: number | null;
+  sale_owner_uid?: string;
   rating?: number | null;
   unread_count?: number;
   unread?: number;
