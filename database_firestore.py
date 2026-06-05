@@ -904,11 +904,13 @@ def close_stale_attendances(max_idle_hours):
         if not stale:
             continue
         cid = snap.id
-        document("wa_conversations", cid).set(
-            {"attendance_status": "fechado_inatividade"}, merge=True,
-        )
-        # Mesma regra do fechamento manual: lead volta p/ a dona de origem.
-        revert_lead_to_sale_owner(conv.get("contact_id"))
+        # Mesma regra do fechamento manual: lead (contato) E atendimento (esta
+        # conversa) voltam p/ a dona de origem (sale_owner).
+        _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
+        _conv_updates = {"attendance_status": "fechado_inatividade"}
+        if _owner_fields:
+            _conv_updates.update(_owner_fields)
+        document("wa_conversations", cid).set(_conv_updates, merge=True)
         closed.append({
             "conversation_id": cid,
             "contact_id": conv.get("contact_id"),
@@ -929,10 +931,13 @@ def set_attendance_status(conversation_id, status, clear_takeover=False):
     if clear_takeover:
         updates["takeover_status"] = "none"
         updates["takeover_started_at"] = None
-    # Fechamento -> o Dono do Lead volta p/ a dona de origem (sale_owner), pra
-    # que o proximo inbound 'herda dono' p/ ela (vendedora ganha prioridade).
+    # Fechamento -> o Dono do Lead (contato) E o Dono do Atendimento (esta
+    # conversa) voltam p/ a dona de origem (sale_owner). Assim, ao reabrir no
+    # proximo contato, a conversa ja e da vendedora que assumiu (prioridade).
     if str(status).startswith("fechado"):
-        revert_lead_to_sale_owner(conv.get("contact_id"))
+        _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
+        if _owner_fields:
+            updates.update(_owner_fields)
     document("wa_conversations", conversation_id).set(updates, merge=True)
     return get_wa_conversation_by_id(conversation_id)
 
@@ -1571,13 +1576,15 @@ def set_sale_owner(contact_id, user_id):
 
 
 def revert_lead_to_sale_owner(contact_id):
-    """No fechamento do atendimento, o Dono do Lead (contact.assigned_to/_uid)
-    volta p/ a dona de origem (sale_owner) — assim o proximo inbound 'herda
-    dono' p/ ela (save_wa_message) e a vendedora ganha prioridade.
+    """No fechamento do atendimento, o Dono do Lead (contato) volta p/ a dona de
+    origem (sale_owner). Reverte o CONTATO aqui e RETORNA {assigned_to,
+    assigned_to_uid} p/ o caller reverter tambem o Dono do Atendimento (a
+    conversa fechada) — assim, ao reabrir no proximo contato, a conversa ja e da
+    vendedora que assumiu (prioridade da venda).
 
     Salvaguardas: se NAO houver sale_owner (lead nunca assumido) ou ela estiver
-    inativa/deletada, NAO faz nada — nunca inventa dono nem gruda lead em conta
-    morta (ficaria orfa invisivel). Idempotente. Retorna o user_id ou None.
+    inativa/deletada, retorna None e NAO mexe — nunca inventa dono nem gruda
+    lead/atendimento em conta morta (ficaria orfa invisivel). Idempotente.
     """
     if contact_id is None:
         return None
@@ -1590,13 +1597,10 @@ def revert_lead_to_sale_owner(contact_id):
     owner = _get_doc("users", owner_id)
     if not owner or not owner.get("is_active", 1):
         return None  # dona inativa/deletada -> nao restaura
-    if contact.get("assigned_to") == owner_id:
-        return owner_id  # ja e a dona — nada a fazer
-    document("wa_contacts", contact_id).set({
-        "assigned_to": owner_id,
-        "assigned_to_uid": owner.get("firebase_uid", ""),
-    }, merge=True)
-    return owner_id
+    fields = {"assigned_to": owner_id, "assigned_to_uid": owner.get("firebase_uid", "")}
+    if contact.get("assigned_to") != owner_id:
+        document("wa_contacts", contact_id).set(fields, merge=True)  # Dono do Lead
+    return fields
 
 
 def return_contact_to_bot(contact_id, returned_by_user_id):
