@@ -175,18 +175,16 @@ def _resolve_webhook_channel(value):
             "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado.",
             phone_number_id,
         )
-        default = get_default_channel()
-        if default:
-            return default, "no_channel_for_phone"
+        # NAO cair no canal default: um phone_number_id que nao bate com nenhum
+        # canal (ex.: numero coex desconectado) deve ir pra pending_webhook_events,
+        # nao ser processado sob o canal standard/default — senao o coex de um
+        # operador vaza pra dentro do canal standard. (Bug 2026-06-05.)
         return None, "no_channel_for_phone"
 
     logger.warning(
         "Webhook: metadata sem phone_number_id. Payload metadata=%s",
         metadata,
     )
-    default = get_default_channel()
-    if default:
-        return default, "no_phone_number_id"
     return None, "no_phone_number_id"
 
 
