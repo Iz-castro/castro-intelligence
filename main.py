@@ -3062,7 +3062,14 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
     # — mas no fluxo novo so transferimos a thread aberta, deixando outras
     # threads coexistence intactas.
     if conversation_id:
-        result = assign_wa_conversation(conv["id"], to_user_id, to_department_id, current_user["id"], reason, summary)
+        # Canal standard compartilhado: transferir a thread move o Lead junto
+        # (also_lead) — o operador destino vira dono do contato E da conversa.
+        # Sem isso ele recebe a conversa mas, em snapshot mode, nao consegue
+        # ler o contato (rules canSeeContactScoped) nem renderiza-lo, e a
+        # conversa fica "fantasma" no Meus dele. Coex mantem Fase 3B
+        # (also_lead=False): o mesmo contato pode viver em varios numeros.
+        also_lead = bool(channel and str(channel.get("channel_type", "")) == CHANNEL_TYPE_STANDARD)
+        result = assign_wa_conversation(conv["id"], to_user_id, to_department_id, current_user["id"], reason, summary, also_lead=also_lead)
     else:
         result = assign_wa_contact(contact["id"], to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
