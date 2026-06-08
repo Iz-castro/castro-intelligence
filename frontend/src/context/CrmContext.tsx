@@ -64,11 +64,13 @@ type CrmContextValue = {
   nqConversations: Conversation[];
   equipeConversations: Conversation[];
   botConversations: Conversation[];
+  backupConversations: Conversation[];
   novosUnread: number;
   meusUnread: number;
   nqUnread: number;
   equipeUnread: number;
   botUnread: number;
+  backupUnread: number;
   equipeOperatorFilter: string;
   setEquipeOperatorFilter: (v: string) => void;
   equipeFiltered: Conversation[];
@@ -511,6 +513,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const botConversations = useMemo(() => {
     if (!botEnabled) return [] as Conversation[];
     return conversations.filter((conv) => {
+      if (conv.is_backup) return false;
       if (conv.assigned_to) return false;
       const c = contactsById.get(conv.contact_id);
       if (!c) return false;
@@ -524,6 +527,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Operador comum so ve threads do seu departamento (ou sem); admin/supervisor veem todas.
   const novosConversations = useMemo(() => {
     return conversations.filter((conv) => {
+      if (conv.is_backup) return false;
       if (conv.assigned_to) return false;
       const c = contactsById.get(conv.contact_id);
       if (!c) return false;
@@ -536,12 +540,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }, [conversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
   // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas)
   const meusConversations = useMemo(
-    () => conversations.filter((conv) => conv.assigned_to === sessionUser?.id),
+    () => conversations.filter((conv) => conv.assigned_to === sessionUser?.id && !conv.is_backup),
     [conversations, sessionUser?.id],
   );
   // Nao qualificadas: qualification do contato e "nao_qualificado"
   const nqConversations = useMemo(() => {
     return conversations.filter((conv) => {
+      if (conv.is_backup) return false;
       const c = contactsById.get(conv.contact_id);
       return c?.qualification === "nao_qualificado";
     });
@@ -550,11 +555,22 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // coexistence de outros; admin/supervisor veem tudo.
   const equipeConversations = useMemo(() => {
     return conversations.filter((conv) => {
+      if (conv.is_backup) return false;
       if (!conv.assigned_to || conv.assigned_to === sessionUser?.id) return false;
       if (!isManagerRole && conv.source_channel_type === "coexistence") return false;
       return true;
     });
   }, [conversations, isManagerRole, sessionUser?.id]);
+
+  // Backup: conversas historicas importadas (is_backup). So privilegiado ve;
+  // ordenadas por mais recente — a que recebe msg nova sobe pro topo (triagem).
+  const backupConversations = useMemo(() => {
+    if (!isManagerRole) return [] as Conversation[];
+    return conversations
+      .filter((conv) => conv.is_backup === true)
+      .slice()
+      .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
+  }, [conversations, isManagerRole]);
 
   // Fase 3.D: unread agregado e a soma das conversations daquela view.
   // Single source of truth — coerente com mark-read otimista por thread.
@@ -565,6 +581,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const meusUnread = sumUnread(meusConversations);
   const nqUnread = sumUnread(nqConversations);
   const equipeUnread = sumUnread(equipeConversations);
+  const backupUnread = sumUnread(backupConversations);
   const equipeFiltered = equipeOperatorFilter
     ? equipeConversations.filter((conv) => String(conv.assigned_to) === equipeOperatorFilter)
     : equipeConversations;
@@ -573,6 +590,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     : activeView === "novos" ? novosConversations
     : activeView === "meus" ? meusConversations
     : activeView === "equipe" ? equipeFiltered
+    : activeView === "backup" ? backupConversations
     : nqConversations;
   // Search e qualification filter operam no contato (denormalizado pra UX).
   const filteredConversations = viewConversations.filter((conv) => {
@@ -1931,7 +1949,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loginWithGoogle, loginWithEmail, logout,
     contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
-    activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
+    activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
     replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,

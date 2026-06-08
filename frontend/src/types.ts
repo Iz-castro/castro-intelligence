@@ -142,6 +142,8 @@ export type Conversation = {
   unread?: number;
   status?: "open" | "archived" | string;
   attendance_status?: "aberto" | "fechado_inatividade" | "fechado_manual" | "fechado_cliente" | string;
+  // Backup: conversa historica importada — visivel so a admin/supervisor (aba Backup).
+  is_backup?: boolean;
   // Resposta do cliente ao template de reabertura (webhook button reply).
   reopen_response?: "retomar" | "encerrar" | string;
   reopen_response_at?: string;
@@ -320,7 +322,7 @@ export type UserSettings = {
   quick_messages: { shortcut: string; message: string }[];
 };
 
-export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot";
+export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
 export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "whatsapp" | "whatsapp-standard" | "dashboard";
 

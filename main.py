@@ -1018,6 +1018,11 @@ async def wa_conversations(current_user: dict = Depends(get_current_user)):
 
     enriched = []
     for conv in convs_raw:
+        # Backup: nunca exposto a operador comum (defesa-em-profundidade; o
+        # sentinela "__backup__" ja barra via contato nao-visivel). Privilegiado
+        # recebe — a aba Backup do frontend filtra is_backup.
+        if conv.get("is_backup") and not _convs_privileged:
+            continue
         contact = contacts_by_id.get(conv.get("contact_id"))
         if not contact:
             continue

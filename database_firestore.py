@@ -759,11 +759,13 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
     from_user = conv.get("assigned_to")
     from_dept = conv.get("department_id")
     to_user = _get_doc("users", to_user_id) if to_user_id else None
+    was_backup = bool(conv.get("is_backup"))
 
     document("wa_conversations", conversation_id).set({
         "assigned_to": to_user_id,
         "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
         "department_id": to_department_id,
+        "is_backup": False,  # atribuir GRADUA a conversa: sai da caixa Backup
     }, merge=True)
     # Espelho no contato (Dono do Lead) — opt-in pos-Fase 3B.
     if also_lead and contact_id is not None:
@@ -771,7 +773,12 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
             "assigned_to": to_user_id,
             "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
             "department_id": to_department_id,
+            "is_backup": False,
         }, merge=True)
+    # Graduacao de backup: a 1a atribuicao define a dona de origem (sale_owner),
+    # igual a um assume. Handoff normal (nao-backup) NAO mexe no sale_owner.
+    if was_backup and to_user_id and contact_id is not None:
+        set_sale_owner(contact_id, to_user_id)
 
     transfer_id = next_sequence("wa_transfer_log")
     document("wa_transfer_log", transfer_id).set({
@@ -1539,6 +1546,7 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
         "assigned_to": to_user_id,
         "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
         "department_id": to_department_id,
+        "is_backup": False,  # reatribuir o Lead gradua o contato (sai do Backup)
     }, merge=True)
 
     transfer_id = next_sequence("wa_transfer_log")
@@ -1669,7 +1677,9 @@ def get_wa_contacts_scoped_for_user(user_id, department_id=None):
     def _collect(query):
         for snapshot in query.stream():
             data = snapshot.to_dict() or {}
-            if not data:
+            # Backup nunca visivel a operador comum (defesa; o sentinela
+            # "__backup__" ja impede que caia nas queries de pool/proprios).
+            if not data or data.get("is_backup"):
                 continue
             data.setdefault("id", snapshot.id)
             seen[snapshot.id] = data
@@ -2311,6 +2321,149 @@ def _find_contact_by_wa_id_any_variant(wa_id):
         if found:
             return found
     return None
+
+
+# ---------------------------------------------------------------------------
+# Importacao de backup (caixa "Backup" — historico de conversas)
+# ---------------------------------------------------------------------------
+# Sentinela do dono: mantem conversas/contatos de backup FORA do pool do
+# operador (snapshot target == '' e rule canSeeContactScoped), visiveis so a
+# admin/supervisor (via aba Backup). NUNCA usar como uid real de um usuario.
+BACKUP_ASSIGNED_UID = "__backup__"
+
+
+def create_backup_contact(wa_id, display_name, channel_id, first_seen_at, last_ts=None):
+    """Cria um contato HISTORICO (backup). NAO usa upsert_wa_contact (que dispara
+    timestamps/conversation ao vivo). Se ja existir contato (vivo) p/ o wa_id,
+    reusa SEM rebaixar p/ backup. Retorna contact_id."""
+    wa_id = normalize_br_phone(wa_id)
+    existing = _find_contact_by_wa_id_any_variant(wa_id)
+    if existing:
+        return existing["id"]  # contato vivo/ja importado — nao mexe
+    phone_formatted = format_phone_br(wa_id)
+    contact_id = next_sequence("wa_contacts")
+    new_contact = {
+        "id": contact_id,
+        "wa_id": wa_id,
+        "display_name": _resolve_display_name("", display_name, phone_formatted),
+        "declared_name": "",
+        "whatsapp_profile_name": display_name or "",
+        "created_source": "backup_import",
+        "created_by_user_id": None,
+        "phone_formatted": phone_formatted,
+        "profile_picture_url": "",
+        "contact_avatar_path": "",
+        "qualification": "novo",
+        "notes": "",
+        "assigned_to": None,
+        "assigned_to_uid": BACKUP_ASSIGNED_UID,
+        "department_id": None,
+        "channel_id": channel_id,
+        "phone_number_id": "",
+        "source_channel_type": "standard",
+        "original_operator_id": None,
+        "sale_owner_user_id": None,
+        "sale_owner_uid": "",
+        "converted_by_user_id": None,
+        "rating": None,
+        "rating_requested_at": None,
+        "is_archived": 0,
+        "unread_count": 0,
+        "is_backup": True,
+        "first_seen_at": first_seen_at,
+        "last_message_at": last_ts,
+        "last_inbound_at": None,
+    }
+    idx_ref = document("wa_contact_index", wa_id)
+    try:
+        idx_ref.create({"contact_id": contact_id, "created_at": utcnow()})
+    except gcloud_exceptions.AlreadyExists:
+        return (idx_ref.get().to_dict() or {}).get("contact_id")
+    document("wa_contacts", contact_id).set(new_contact)
+    return contact_id
+
+
+def upsert_backup_conversation(conversation_id, contact_id, wa_id, channel_id,
+                               first_ts, last_ts, last_in, last_out, channel_label=""):
+    """Cria a conversa HISTORICA (backup): is_backup + sentinela, NUNCA 'aberto',
+    read-only (channel_active=False). Se a conversa ja existe e NAO e backup
+    (thread viva), NAO rebaixa. Idempotente."""
+    wa_id = normalize_br_phone(wa_id)
+    ref = document("wa_conversations", conversation_id)
+    snap = ref.get()
+    if snap.exists:
+        return conversation_id  # ja existe (backup ou viva) — nao mexe
+    ref.set({
+        "id": conversation_id,
+        "contact_id": contact_id,
+        "wa_id": wa_id,
+        "channel_id": channel_id,
+        "phone_number_id": "",
+        "source_channel_type": "standard",
+        "assigned_to": None,
+        "assigned_to_uid": BACKUP_ASSIGNED_UID,
+        "department_id": None,
+        "unread_count": 0,
+        "status": "open",
+        "attendance_status": "fechado_inatividade",  # NUNCA 'aberto' (sem auto-close/protocolo)
+        "is_backup": True,
+        "channel_label": channel_label or "Backup (historico)",
+        "channel_active": False,  # read-only ate o cliente voltar / ser atribuido
+        "created_at": first_ts,
+        "last_message_at": last_ts,
+        "last_inbound_at": last_in,
+        "last_outbound_at": last_out,
+    })
+    return conversation_id
+
+
+def write_backup_message(wa_message_id, contact_id, conversation_id, direction,
+                         msg_type, content, timestamp_wa, channel_id,
+                         media_path="", media_mime="", filename="", status="read"):
+    """Grava mensagem HISTORICA (backup). NAO dispara protocolo, metricas, unread
+    nem reabre atendimento. Denormaliza is_backup + sentinela na propria msg p/
+    fechar o Vetor B (rule de wa_messages). Idempotente por wa_message_id."""
+    if wa_message_id:
+        existing = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
+        if existing:
+            return existing["id"]
+    message_id = next_sequence("wa_messages")
+    ts = _coerce_timestamp(timestamp_wa)
+    document("wa_messages", message_id).set({
+        "id": message_id,
+        "wa_message_id": wa_message_id or f"local_{message_id}",
+        "contact_id": contact_id,
+        "contact_doc_id": str(contact_id),
+        "conversation_id": conversation_id,
+        "direction": direction,
+        "msg_type": msg_type,
+        "content": content or "",
+        "media_path": media_path or "",
+        "media_mime": media_mime or "",
+        "media_id": "",
+        "latitude": None,
+        "longitude": None,
+        "filename": filename or "",
+        "status": status,
+        "operator_id": None,
+        "sender_user_id": None,
+        "channel_owner_user_id": None,
+        "assigned_to": None,
+        "assigned_to_uid": BACKUP_ASSIGNED_UID,
+        "department_id": None,
+        "channel_id": channel_id,
+        "phone_number_id": "",
+        "protocol_id": None,
+        "is_rating_message": False,
+        "visibility": "all",
+        "is_backup": True,
+        "timestamp_wa": ts,
+        "created_at": ts or utcnow(),
+        "reply_to_message_id": None,
+        "reply_to_preview": "",
+        "reply_to_sender_name": "",
+    })
+    return message_id
 
 
 # ---------------------------------------------------------------------------

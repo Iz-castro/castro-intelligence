@@ -129,7 +129,7 @@ function TopBar() {
 }
 
 function NavBar() {
-  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, isManagerRole, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, systemSettings } = useCrm();
+  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, isManagerRole, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, systemSettings } = useCrm();
   return (
     <nav className="crm-nav">
       {isManagerRole && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); }} title="Contatos no bot">
@@ -156,6 +156,11 @@ function NavBar() {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span className="nav-label">Equipe</span>
         {equipeUnread > 0 && <span className="nav-badge">{equipeUnread > 99 ? "99+" : equipeUnread}</span>}
+      </button>}
+      {isManagerRole && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); }} title="Conversas em backup (historico importado)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/></svg>
+        <span className="nav-label">Backup</span>
+        {backupUnread > 0 && <span className="nav-badge">{backupUnread > 99 ? "99+" : backupUnread}</span>}
       </button>}
     </nav>
   );
@@ -438,7 +443,7 @@ function ContactList() {
     });
     return () => { disposed = true; };
   }, [loadAllContacts]);
-  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : "Nao Qualificados";
+  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
 
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
@@ -564,7 +569,7 @@ function ContactList() {
             </button>
           );
         })}
-        {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : "Nenhum contato nao qualificado."}</div> : null}
+        {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
       </div>
       {showNewContact && <NewContactModal onClose={() => setShowNewContact(false)} />}
     </aside>
@@ -906,7 +911,9 @@ function ChatPanel() {
 
         {channelInactive ? (
           <div className="composer" style={{ padding: "0.8rem 1rem" }}>
-            <div className="sub" style={{ textAlign: "center", width: "100%" }}>⚠ Canal removido/antigo — somente leitura. Nao e possivel enviar por este atendimento.</div>
+            <div className="sub" style={{ textAlign: "center", width: "100%" }}>{selectedThread?.is_backup
+              ? "📦 Conversa de backup (historico) — somente leitura. Transfira para um operador para atender quando o cliente voltar."
+              : "⚠ Canal removido/antigo — somente leitura. Nao e possivel enviar por este atendimento."}</div>
           </div>
         ) : isTakeoverPending ? (
           <div className="composer" style={{ padding: "0.8rem 1rem", flexDirection: "column", gap: "0.5rem" }}>

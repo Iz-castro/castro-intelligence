@@ -79,11 +79,15 @@ service cloud.firestore {
       // ou sem atribuicao (pool/fila). NAO inclui departamento: a regra por
       // department_id vazava a agenda pessoal (coexistence) de um operador
       // para todos os colegas do mesmo departamento (isolamento LGPD).
+      // Backup (is_backup): historico importado, visivel SO a privilegiado
+      // (aba Backup). Operador comum nunca le — nem por pool/atribuicao.
       return ownsTenant(tid) && (
         isPrivilegedInTenant(tid) ||
-        resource.data.assigned_to_uid == request.auth.uid ||
-        resource.data.assigned_to_uid == '' ||
-        resource.data.assigned_to_uid == null
+        (resource.data.get('is_backup', false) != true && (
+          resource.data.assigned_to_uid == request.auth.uid ||
+          resource.data.assigned_to_uid == '' ||
+          resource.data.assigned_to_uid == null
+        ))
       );
     }
 
@@ -200,7 +204,10 @@ service cloud.firestore {
       }
 
       match /wa_messages/{messageId} {
-        allow read: if ownsTenant(tenantId);
+        // Backup: mensagens historicas (is_backup denormalizado) so p/
+        // privilegiado. Fecha o recorte backup do Vetor B (read amplo de msgs).
+        allow read: if ownsTenant(tenantId) &&
+          (isPrivilegedInTenant(tenantId) || resource.data.get('is_backup', false) != true);
         allow write: if false;
       }
 
