@@ -1810,6 +1810,31 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     message_id = next_sequence("wa_messages")
     created_at = utcnow()
     effective_wa_message_id = wa_message_id or f"local_{message_id}"
+
+    # Anti-duplicata ATOMICO (rajada/concorrencia/reentrega): claim do wamid num
+    # doc-indice (doc id = wamid sanitizado). document().create() falha se ja
+    # existe — primitiva atomica, imune ao lag de query que deixava 2 entregas
+    # concorrentes do mesmo wamid passarem ambas pelo query-miss acima e criarem
+    # 2 docs. Espelha wa_contact_index. So p/ wamid real (local_/system tem id
+    # unico via next_sequence, sem corrida).
+    if wa_message_id:
+        _idx_key = str(wa_message_id).replace("/", "_").replace("\\", "_")
+        _idx_ref = document("wa_message_index", _idx_key)
+        try:
+            _idx_ref.create({"message_id": message_id, "created_at": created_at})
+        except gcloud_exceptions.AlreadyExists:
+            # Entrega concorrente ja reivindicou este wamid -> retorna o vencedor
+            # (get por id e fortemente consistente; retry curto p/ a janela ms
+            # entre claim e gravacao do doc). NAO recria nem re-roda protocolo/
+            # metricas/conversation.
+            _winner_mid = (_idx_ref.get().to_dict() or {}).get("message_id")
+            for _ in range(5):
+                if _winner_mid is not None and _get_doc("wa_messages", _winner_mid):
+                    return _winner_mid
+                time.sleep(0.1)
+            # Vencedor ainda nao visivel (lag extremo) — segue criando com o
+            # message_id ja alocado; a query-dedup do proximo evento reconcilia.
+
     contact = _get_doc("wa_contacts", contact_id)
     # Resolve channel/wa_id efetivos pra calcular conversation_id
     eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
