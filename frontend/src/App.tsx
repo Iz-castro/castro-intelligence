@@ -889,7 +889,7 @@ function ChatPanel() {
                     ) : null}
                   </div>
                 ) : null}
-                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.created_at || message.timestamp_wa)}</span></header>
+                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.timestamp_wa || message.created_at)}</span></header>
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
                 {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
                 <MessageMedia message={message} />
