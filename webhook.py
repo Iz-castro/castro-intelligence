@@ -1405,11 +1405,25 @@ async def _process_history_media_assets(value, business_phone):
     Estes sao enviados separadamente dos threads, com 'messages' contendo
     a midia real de mensagens que eram media_placeholder.
     """
+    need_retry = False
     for msg in value.get("messages", []):
         msg_id = msg.get("id", "")
         msg_type = msg.get("type", "unknown")
         timestamp = msg.get("timestamp", "")
         ts_iso = _parse_unix_timestamp(timestamp)
+
+        # Corrida (mais provavel com varias instancias): o asset de midia pode
+        # chegar ANTES do placeholder (thread do history) ser salvo. Checa ANTES
+        # de baixar — se a mensagem ainda nao existe, NAO baixa (a midia ficaria
+        # orfa e o retry com skip_media nao preencheria) e enfileira p/ retry.
+        # Zero perda: o retry reprocessa quando o placeholder ja existir.
+        if not get_wa_message_by_wa_message_id(msg_id):
+            need_retry = True
+            logger.warning(
+                "[HISTORY MEDIA] placeholder ausente (asset fora de ordem) — "
+                "enfileirando retry | id=%s", msg_id[:20],
+            )
+            continue
 
         # Reentrega: se o placeholder ja foi preenchido com a midia real,
         # nao re-baixar (evita 2 requisicoes Graph + escrita no storage).
@@ -1500,10 +1514,27 @@ async def _process_history_media_assets(value, business_phone):
             }, merge=True)
             logger.info("[HISTORY MEDIA] Placeholder atualizado | id=%s type=%s", msg_id[:20], msg_type)
         else:
+            # Nao deveria ocorrer (checado no topo do loop), mas por seguranca
+            # tambem marca retry em vez de descartar a midia.
+            need_retry = True
             logger.warning(
                 "[HISTORY MEDIA] Mensagem original nao encontrada para media | wa_msg_id=%s",
                 msg_id[:20],
             )
+
+    # Algum asset chegou sem o placeholder (corrida) -> reprocessa o lote depois,
+    # quando o thread do history ja tiver criado as mensagens. Idempotente.
+    if need_retry:
+        try:
+            enqueue_pending_event(
+                payload={"entry": [{"changes": [{"field": "history", "value": value}]}]},
+                change_field="history",
+                phone_number_id=str((value.get("metadata") or {}).get("phone_number_id") or "").strip(),
+                reason="history_media_no_placeholder",
+            )
+            logger.info("[HISTORY MEDIA] retry do lote de midia enfileirado")
+        except Exception as exc:
+            logger.warning("[HISTORY MEDIA] falha ao enfileirar retry da midia: %s", exc)
 
 
 # ---------------------------------------------------------------------------
