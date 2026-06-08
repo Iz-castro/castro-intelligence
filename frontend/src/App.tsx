@@ -2248,6 +2248,12 @@ function BillingHealthBanner() {
 
   if (!isPrivileged || !standardChannel || !status || dismissed) return null;
   if (status.ok && status.has_payment_method) return null;
+  // [Temporario] Castro Intelligence e Tech Provider (nao BSP), entao a consulta
+  // de billing da Meta retorna #10 ("no permission") — erro COSMETICO: o envio
+  // funciona via managed billing (Castro Operacoes). Suprime o banner de "nao
+  // foi possivel verificar o billing". Mantem o alerta REAL (sem metodo de
+  // pagamento). Reativar a verificacao se/quando virar BSP.
+  if (!status.ok) return null;
 
   const isError = !status.ok;
   const message = isError
