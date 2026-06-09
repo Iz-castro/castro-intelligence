@@ -1,0 +1,8 @@
+- [Hubloc/Centralloc context](project_hubloc_context.md) — Client rebranded to Hubloc but workspace domain is still @centralloc.com.br
+- [Google Chat integration](project_gchat_integration.md) — Internal chat panel in CRM bridging to Google Chat API for operator-supervisor comms
+- [gcloud Python quirk](project_gcloud_python.md) — gcloud deploys need CLOUDSDK_PYTHON pointing to Python312 (else picks unsupported 3.8)
+- [Whisper cold-start outage](project_whisper_cold_start_outage.md) — FEATURE_AUDIO_TRANSCRIPTION=true derruba prod via cold-start (modelo Whisper baixado do HF estoura startup probe); resolvido embutindo o modelo na imagem
+- [Deploy script desatualizado](project_deploy_script_desatualizado.md) — NÃO usar deploy.ps1/deploy.sh em prod (clobbera env/secrets/scaling); usar gcloud run deploy --source puro
+- [Isolamento operador (LGPD)](project_operator_isolation_lgpd.md) — operador comum vê só próprios + pool sem dono, NUNCA por departamento; 3 camadas (backend/frontend/rules) em sincronia
+- [Migração canal standard](project_standard_channel_migration.md) — Embedded Signup é coex-only; standard via POST manual; secret Cloud Run vazio (forward-compatible); plano multi-empresa pendente (ADR 0007 Fase 2 + Método B)
+- [Caixa Backup](project_backup_inbox_feature.md) — aba admin/supervisor com histórico importado dos JSONs; is_backup+sentinela; import via scripts/import_backup_hubloc.py (pós-embed + publicar rules)
