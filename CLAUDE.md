@@ -128,6 +128,14 @@ implementar e proponha um caminho alternativo conforme.
 
 ### Deploy
 
+> ⚠️ **Migração para Oregon em andamento (iniciada 2026-06-10).** Infra nova
+> validada em `project-4a851bf9-f475-418c-800` / `us-west1`
+> (URL `https://castro-crm-28179318848.us-west1.run.app`). Ver
+> [docs/deploy/MIGRACAO_GCP_OREGON_CHECKLIST.md](docs/deploy/MIGRACAO_GCP_OREGON_CHECKLIST.md)
+> e [docs/internal/2026-06-10-migracao-oregon.md](docs/internal/2026-06-10-migracao-oregon.md).
+> Os valores abaixo são do projeto **ANTIGO**, mantido durante a transição;
+> atualizar quando o cutover completar.
+
 - Produção: Cloud Run service `castro-crm` (região `southamerica-east1`,
   projeto `project-26fb9c99-8ee9-4179-aef`).
 - Staging: Cloud Run service `castro-crm-staging` (mesmo projeto, com
