@@ -43,7 +43,7 @@ from config import (
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
     STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS,
     META_APP_ID, META_APP_SECRET, EMBEDDED_SIGNUP_CONFIG_ID,
-    EMBEDDED_SIGNUP_CONFIG_ID_STANDARD,
+    EMBEDDED_SIGNUP_CONFIG_ID_STANDARD, WHATSAPP_SYSTEM_USER_TOKEN,
 )
 from database import (
     init_database, get_user_by_id, get_all_users,
@@ -3863,6 +3863,10 @@ class EmbeddedSignupExchange(BaseModel):
     owner_user_id: int | None = None
     label: str = ""
     default_department_id: int | None = None
+    # session-info do popup (Embedded Signup v4 entrega a WABA/numero AQUI,
+    # nao mais nos granular_scopes do token). O frontend captura via postMessage.
+    phone_number_id: str = ""
+    waba_id: str = ""
 
 
 def _meta_error_detail(resp: httpx.Response) -> str:
@@ -3946,7 +3950,26 @@ async def embedded_signup_exchange(
         raise HTTPException(status_code=502, detail=f"Erro ao validar token: {detail}")
 
     debug_data = debug_resp.json()
-    granular_scopes = debug_data.get("data", {}).get("granular_scopes", [])
+    _dbg = debug_data.get("data", {}) or {}
+    granular_scopes = _dbg.get("granular_scopes", [])
+
+    # [DIAGNOSTICO TEMPORARIO] introspeccao crua do token p/ depurar granted=<vazio>.
+    # Nao loga o token nem PII; target_ids sao IDs de WABA (ativos de negocio).
+    # scopes (flat) revela se o token tem QUALQUER permissao mesmo com granular vazio:
+    #  - scopes vazio  -> login nao concedeu nada (acesso do app/modo, ou conta sem ativo)
+    #  - scopes tem whatsapp_business_management mas granular vazio -> problema de ativo/targeting
+    logger.info(
+        "Embedded Signup debug_token | channel_type=%s valid=%s app_id=%s type=%s scopes=[%s] granular=%s",
+        body.channel_type,
+        _dbg.get("is_valid"),
+        _dbg.get("app_id"),
+        _dbg.get("type"),
+        ",".join(_dbg.get("scopes") or []) or "<vazio>",
+        [
+            {"scope": s.get("scope"), "targets": s.get("target_ids")}
+            for s in (granular_scopes or [])
+        ],
+    )
 
     waba_ids: list[str] = []
     coexistence_scope_present = False
@@ -3961,9 +3984,15 @@ async def embedded_signup_exchange(
         if scope_name == "whatsapp_business_app_onboarding":
             coexistence_scope_present = True
 
-    if not waba_ids:
+    # WABA: o Embedded Signup v4 entrega waba_id/phone_number_id na MENSAGEM de
+    # session-info do popup (o frontend captura via postMessage e envia no body),
+    # NAO mais nos granular_scopes do token (que no v4 voltam so public_profile).
+    # Usa a session-info como fonte primaria; granular_scopes (v3) como fallback.
+    session_waba = (body.waba_id or "").strip()
+    waba_id = session_waba or (waba_ids[0] if waba_ids else "")
+    if not waba_id:
         logger.warning(
-            "Embedded Signup: nenhum WABA nos scopes (granted=%s)",
+            "Embedded Signup: nenhum WABA (granted=%s, session-info vazio)",
             ",".join(granted_scope_names) or "<vazio>",
         )
         raise HTTPException(
@@ -3982,10 +4011,15 @@ async def embedded_signup_exchange(
         # Nao bloqueia (Meta as vezes nao retorna esse scope no debug),
         # mas registra para diagnostico futuro.
 
-    waba_id = waba_ids[0]
+    # Token para LER/GERENCIAR a WABA: o token do popup (public_profile no v4)
+    # nao tem permissao. Usa o System User token global do portfolio Castro
+    # Operacoes (Secret Manager), que acessa todas as WABAs onboardadas no app.
+    wa_token = (WHATSAPP_SYSTEM_USER_TOKEN or "").strip() or access_token
     logger.info(
-        "Embedded Signup: WABA ID = %s (total descobertos: %d)",
-        waba_id, len(waba_ids),
+        "Embedded Signup: WABA ID = %s (fonte=%s, system_user_token=%s)",
+        waba_id,
+        "session-info" if session_waba else "granular_scopes",
+        bool((WHATSAPP_SYSTEM_USER_TOKEN or "").strip()),
     )
 
     # 3. Buscar todos os Phone Numbers do WABA, com paginacao
@@ -3997,7 +4031,7 @@ async def embedded_signup_exchange(
             phones_resp = await client.get(
                 next_url,
                 params=next_params,
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {wa_token}"},
             )
             if phones_resp.status_code >= 400:
                 detail = _meta_error_detail(phones_resp)
@@ -4082,7 +4116,7 @@ async def embedded_signup_exchange(
         async with httpx.AsyncClient(timeout=30.0) as client:
             sub_resp = await client.post(
                 subscribe_url,
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {wa_token}"},
                 json={"subscribed_fields": subscribed_fields},
             )
     except httpx.RequestError as exc:
@@ -4153,7 +4187,7 @@ async def embedded_signup_exchange(
             waba_id=waba_id,
             phone_number_id=phone_number_id,
             display_phone_number=display_phone,
-            access_token=access_token,
+            access_token=wa_token,
             token_expires_at=token_expires_at_iso,
             owner_user_id=owner_id,
             owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
@@ -4177,7 +4211,7 @@ async def embedded_signup_exchange(
             waba_id=waba_id,
             phone_number_id=phone_number_id,
             display_phone_number=display_phone,
-            access_token=access_token,
+            access_token=wa_token,
             token_expires_at=token_expires_at_iso,
             owner_user_id=owner_id,
             owner_firebase_uid=(owner_user or {}).get("firebase_uid", ""),
@@ -4210,7 +4244,7 @@ async def embedded_signup_exchange(
                     sync_resp = await client.post(
                         smb_data_url,
                         headers={
-                            "Authorization": f"Bearer {access_token}",
+                            "Authorization": f"Bearer {wa_token}",
                             "Content-Type": "application/json",
                         },
                         json={"messaging_product": "whatsapp", "sync_type": sync_type},

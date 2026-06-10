@@ -100,6 +100,11 @@ EMBEDDED_SIGNUP_CONFIG_ID = os.getenv("EMBEDDED_SIGNUP_CONFIG_ID", "").strip()
 # a de coexistence usa featureType=whatsapp_business_app_onboarding; a standard
 # nao. Sem isso, o botao "Conectar numero (Cloud API)" retorna 503.
 EMBEDDED_SIGNUP_CONFIG_ID_STANDARD = os.getenv("EMBEDDED_SIGNUP_CONFIG_ID_STANDARD", "").strip()
+# System User token (long-lived) do portfolio Castro Operacoes. Acessa TODAS as
+# WABAs onboardadas no app. Usado no Embedded Signup v4 (o token do popup volta
+# so com public_profile e NAO consegue ler/gerenciar a WABA) e como credencial
+# duravel dos canais coex — em vez do token por-signup que se perdia em wipe.
+WHATSAPP_SYSTEM_USER_TOKEN = os.getenv("WHATSAPP_SYSTEM_USER_TOKEN", "").strip()
 
 # -- Media --
 DEFAULT_MEDIA_DIR = Path("/tmp/castro_crm_media") if IS_CLOUD_RUN else BASE_DIR / "media"

@@ -1452,6 +1452,9 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
   const fbLoaded = useRef(false);
+  // Embedded Signup v4: a Meta entrega waba_id/phone_number_id na mensagem de
+  // session-info (postMessage), NAO mais nos scopes do token. Capturado abaixo.
+  const sessionInfoRef = useRef<{ phone_number_id?: string; waba_id?: string }>({});
 
   useEffect(() => {
     if (!bundle) return;
@@ -1462,6 +1465,23 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
       })
       .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
   }, [bundle, channelType]);
+
+  // Captura a session-info do Embedded Signup (postMessage da Meta) com o
+  // waba_id/phone_number_id do numero conectado. No v4 a WABA vem por aqui,
+  // nao mais nos granular_scopes do token (que voltam so com public_profile).
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (typeof event.origin === "string" && !event.origin.endsWith("facebook.com")) return;
+      let data: { type?: string; data?: { phone_number_id?: string; waba_id?: string } };
+      try { data = typeof event.data === "string" ? JSON.parse(event.data) : event.data; } catch { return; }
+      if (data && data.type === "WA_EMBEDDED_SIGNUP" && data.data) {
+        if (data.data.phone_number_id) sessionInfoRef.current.phone_number_id = String(data.data.phone_number_id);
+        if (data.data.waba_id) sessionInfoRef.current.waba_id = String(data.data.waba_id);
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
 
   function loadFacebookSDK(appId: string, version: string) {
     if (fbLoaded.current || window.FB) {
@@ -1494,7 +1514,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
           return;
         }
         setStep("exchanging");
-        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code, channel_type: channelType })
+        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code, channel_type: channelType, phone_number_id: sessionInfoRef.current.phone_number_id || "", waba_id: sessionInfoRef.current.waba_id || "" })
           .then((data) => { setResult(data); setStep("done"); })
           .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
       },
