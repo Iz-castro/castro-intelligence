@@ -365,7 +365,6 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         .filter((id): id is number => typeof id === "number" && !localIds.has(id) && !fetchedExtraRef.current.has(id)),
     ));
     if (missing.length === 0) return;
-    let disposed = false;
     missing.forEach((id) => fetchedExtraRef.current.add(id));
     void Promise.all(missing.map((id) =>
       getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
@@ -379,7 +378,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           return null;
         }),
     )).then((fetched) => {
-      if (disposed) return;
+      // SEM guard de dispose: o effect re-roda a cada publish do snapshot
+      // (conversations muda o tempo todo) e o cleanup descartava o batch
+      // inteiro — com os ids ja marcados em fetchedExtraRef, os contatos
+      // nunca chegavam ao estado (join preso nos 50 do snapshot). O provider
+      // vive a sessao inteira; armazenar apos re-run e seguro e correto.
       const valid = fetched.filter((c): c is Contact => !!c);
       if (!valid.length) return;
       setExtraContacts((prev) => {
@@ -388,7 +391,6 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         return next;
       });
     });
-    return () => { disposed = true; };
   }, [conversations, contacts, bundle]);
 
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
