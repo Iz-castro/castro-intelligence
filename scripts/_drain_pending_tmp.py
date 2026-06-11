@@ -27,6 +27,9 @@ import webhook  # noqa: E402
 _db.ensure_daily_attendance = lambda *a, **k: None
 
 _ORDER = {"no_channel_for_phone": 0, "history_media_no_placeholder": 1}
+# Agendas gigantes (milhares de contatos) estouram qualquer timeout local e os
+# contatos ja existem (sync ao vivo anterior) — tratadas num passe final dedicado.
+_SKIP_FIELDS = {"smb_app_state_sync"}
 
 
 def _fetch(limit, shard=None, workers=None):
@@ -34,6 +37,8 @@ def _fetch(limit, shard=None, workers=None):
     for s in global_collection(PENDING_COLLECTION).where("status", "==", STATUS_PENDING).stream():
         d = s.to_dict() or {}
         d["_id"] = d.get("id") or s.id
+        if str(d.get("change_field")) in _SKIP_FIELDS:
+            continue
         if shard is not None and workers:
             try:
                 if int(d["_id"]) % workers != shard:

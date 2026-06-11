@@ -474,7 +474,14 @@ function ContactList() {
   // = 2 entradas distintas, com badge proprio do canal.
   const renderItems: RenderItem[] = filteredConversations
     .slice()
-    .sort((a, b) => toMillis(b.last_message_at) - toMillis(a.last_message_at))
+    .sort((a, b) => {
+      // Canal oficial (standard) sempre acima dos coex; dentro de cada grupo,
+      // mais recente primeiro.
+      const pa = (a.channel_type || a.source_channel_type) === "standard" ? 0 : 1;
+      const pb = (b.channel_type || b.source_channel_type) === "standard" ? 0 : 1;
+      if (pa !== pb) return pa - pb;
+      return toMillis(b.last_message_at) - toMillis(a.last_message_at);
+    })
     .flatMap((conversation): RenderItem[] => {
       const contact = contactsById.get(conversation.contact_id);
       return contact ? [{ contact, conversation }] : [];
