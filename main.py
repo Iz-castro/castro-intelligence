@@ -986,7 +986,10 @@ def _require_contact_access(contact: dict, current_user: dict):
 
 
 @app.get("/api/wa/conversations")
-async def wa_conversations(current_user: dict = Depends(get_current_user)):
+async def wa_conversations(
+    limit: int = Query(default=500, ge=1, le=2000),
+    current_user: dict = Depends(get_current_user),
+):
     """Retorna lista de conversations enriquecidas (Fase 3 multi-canal).
 
     Cada conversation representa uma thread (channel_id + wa_id).
@@ -994,15 +997,30 @@ async def wa_conversations(current_user: dict = Depends(get_current_user)):
     cada uma com seu proprio assigned_to/unread/last_message_at.
     Dados do cliente (nome, telefone formatado, notas, qualificacao,
     rating) sao mesclados via join in-memory com wa_contacts.
+
+    Paginado server-side (mais recentes primeiro): a colecao cresceu (~3k+)
+    e o stream integral custava a colecao inteira por tick de polling.
+    Backup (last_message_at antigo) vem por query propria p/ privilegiado,
+    espelhando os snapshot targets do frontend.
     """
     from firestore_common import collection as fs_coll
     from channel_service import get_channel
+    from google.cloud.firestore_v1 import Query as FsQuery
     convs_raw = []
-    for snap in fs_coll("wa_conversations").stream():
-        data = snap.to_dict() or {}
-        if "id" not in data:
-            data["id"] = snap.id
-        convs_raw.append(data)
+    _seen_conv_ids = set()
+    _streams = [fs_coll("wa_conversations").order_by(
+        "last_message_at", direction=FsQuery.DESCENDING).limit(limit).stream()]
+    if current_user.get("role") in ("admin", "supervisor"):
+        _streams.append(fs_coll("wa_conversations").where("is_backup", "==", True).stream())
+    for _stream in _streams:
+        for snap in _stream:
+            data = snap.to_dict() or {}
+            if "id" not in data:
+                data["id"] = snap.id
+            if data["id"] in _seen_conv_ids:
+                continue
+            _seen_conv_ids.add(data["id"])
+            convs_raw.append(data)
 
     # Cache de contatos por id (evita N queries). Operador comum: SO contatos
     # visiveis a ele (proprios + pool sem dono); conversas cujo contato nao e

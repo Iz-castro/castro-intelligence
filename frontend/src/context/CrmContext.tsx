@@ -748,18 +748,27 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   // Escopo de conversations por operador — espelha buildContactSnapshotTargets.
-  // Admin/supervisor: todas as conversas do tenant (paridade com contatos).
-  // Operador comum: so atribuidas a si, sem dono, ou do seu departamento.
-  // Sem orderBy/limit de proposito: queries de igualdade simples nao exigem
-  // indice composto novo (Fase 1 nao mexe em indices/rules). Ordenacao e
-  // dedupe sao feitos client-side em mergeVisibleConversations.
+  // Admin/supervisor: 300 mais recentes + backup (ver comentario no branch).
+  // Operador comum: so atribuidas a si ou sem dono — sem orderBy/limit de
+  // proposito: igualdade simples nao exige indice composto (adicionar limit
+  // aqui exigiria indice assigned_to_uid+last_message_at; follow-up).
+  // Ordenacao e dedupe sao feitos client-side em mergeVisibleConversations.
   function buildConversationSnapshotTargets() {
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return [];
 
     const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
 
     if (sessionUser.role === "admin" || sessionUser.role === "supervisor") {
-      return [{ key: "all", ref: query(waConversations) }];
+      // Corte de leitura: a colecao cresceu (~3k conversas) e o snapshot sem
+      // limite custava ~3k reads por sessao e 1000+ itens em memoria/DOM.
+      // Admin ouve as 300 mais recentes (orderBy single-field = indice
+      // automatico) + um target dedicado pra caixa Backup (igualdade simples,
+      // sem indice composto), cujas conversas tem last_message_at antigo e
+      // cairiam fora do top-300.
+      return [
+        { key: "all", ref: query(waConversations, orderBy("last_message_at", "desc"), firestoreLimit(300)) },
+        { key: "backup", ref: query(waConversations, where("is_backup", "==", true)) },
+      ];
     }
 
     const targets: { key: string; ref: ReturnType<typeof query> }[] = [

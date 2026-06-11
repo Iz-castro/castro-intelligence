@@ -445,6 +445,13 @@ function ContactList() {
   }, [loadAllContacts]);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
 
+  // Render incremental: com ~3k conversas, montar 1000+ itens no DOM trava a
+  // coluna. Renderiza em paginas de 50 ("Carregar mais"); o contador do header
+  // segue sendo o total carregado. Reseta ao trocar de caixa/busca/filtro.
+  const SIDEBAR_PAGE = 50;
+  const [visibleLimit, setVisibleLimit] = useState(SIDEBAR_PAGE);
+  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, equipeOperatorFilter]);
+
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
   // direto). Converte ambos para epoch ms para ordenacao.
@@ -516,7 +523,7 @@ function ContactList() {
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
       </div>
       <div className="contact-list">
-        {renderItems.map(({ contact, conversation }) => {
+        {renderItems.slice(0, visibleLimit).map(({ contact, conversation }) => {
           // Fase 3.D: assigned/department vem da Conversation (cutover Fase 2C);
           // qualification/notes/avatar continuam no Contact.
           const assignedOperator = activeView === "equipe"
@@ -570,6 +577,11 @@ function ContactList() {
           );
         })}
         {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
+        {renderItems.length > visibleLimit ? (
+          <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} onClick={() => setVisibleLimit((v) => v + 100)}>
+            Carregar mais ({renderItems.length - visibleLimit} restantes)
+          </button>
+        ) : null}
       </div>
       {showNewContact && <NewContactModal onClose={() => setShowNewContact(false)} />}
     </aside>
