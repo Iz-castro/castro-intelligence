@@ -973,8 +973,13 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
 
 def _require_contact_access(contact: dict, current_user: dict):
     """Isolamento LGPD: operador comum so acessa contato proprio (assigned_to
-    == ele) ou do pool/fila (sem dono). admin/supervisor acessam tudo.
-    Espelha get_wa_contacts_scoped_for_user (DB) e canSeeContactScoped (rules).
+    == ele), do pool/fila (sem dono), OU de uma thread que ELE atende
+    (coex multi-canal: o mesmo cliente vive em varios numeros — o Dono do
+    Lead pode ser outra operadora enquanto a thread e dele; sem o nome do
+    contato a conversa dele vira fantasma na sidebar). admin/supervisor
+    acessam tudo. Espelha get_wa_contacts_scoped_for_user (DB) e
+    canSeeContactScoped (rules); o caso thread-propria nao e expressavel em
+    rules — coberto via REST (lazy-load extraContacts do frontend).
     Levanta 403 caso contrario. contact pode ser {} (trata como sem acesso)."""
     if current_user.get("role") in ("admin", "supervisor"):
         return
@@ -982,6 +987,21 @@ def _require_contact_access(contact: dict, current_user: dict):
         return
     if contact and not contact.get("assigned_to_uid"):  # pool: '' ou None
         return
+    if contact:
+        # Thread atribuida ao operador para este contato? (2 igualdades —
+        # zigzag merge, sem indice composto novo.)
+        try:
+            from firestore_common import collection as _fs_coll
+            _uid = str(current_user.get("firebase_uid") or "")
+            if _uid:
+                _q = (_fs_coll("wa_conversations")
+                      .where("contact_id", "==", contact.get("id"))
+                      .where("assigned_to_uid", "==", _uid)
+                      .limit(1))
+                if any(True for _ in _q.stream()):
+                    return
+        except Exception as exc:
+            logger.warning("_require_contact_access thread-check falhou: %s", exc)
     raise HTTPException(status_code=403, detail="Acesso negado: contato de outro operador")
 
 

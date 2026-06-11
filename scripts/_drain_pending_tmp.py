@@ -17,7 +17,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from firestore_common import global_collection  # noqa: E402
 from pending_events import mark_event_attempt, count_pending, PENDING_COLLECTION, STATUS_PENDING  # noqa: E402
+import database_firestore as _db  # noqa: E402
 import webhook  # noqa: E402
+
+# REPLAY != atendimento novo: sem este no-op, cada inbound antigo reabre
+# atendimento + cria protocolo do dia -> o cron de inatividade fecha e ENVIA
+# o recibo de protocolo pro cliente (131047 quando >24h; entrega real se <24h).
+# Incidente de 2026-06-11 ~10:00Z: 78 envios bloqueados + 2 entregues.
+_db.ensure_daily_attendance = lambda *a, **k: None
 
 _ORDER = {"no_channel_for_phone": 0, "history_media_no_placeholder": 1}
 

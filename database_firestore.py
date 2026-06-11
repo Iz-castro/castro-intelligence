@@ -609,6 +609,7 @@ def upsert_wa_conversation(
     phone_number_id="",
     auto_assign_user_id=None,
     direction_for_unread=None,
+    message_at=None,
 ):
     """Cria ou atualiza a conversation correspondente a (channel_id, wa_id).
 
@@ -619,6 +620,11 @@ def upsert_wa_conversation(
     direction_for_unread: 'inbound' incrementa unread_count, outras
     direcoes nao mexem. None nao mexe (uso pelo upsert_wa_contact).
 
+    message_at: data REAL da mensagem (timestamp_wa). Replay de history/
+    backup chega horas/meses depois — sem isto a conversa "sobe" pro topo
+    da sidebar com a data da gravacao. last_message_at e monotonico: so
+    avanca, nunca recua.
+
     Normaliza o nono digito BR antes de calcular o conversation_id —
     determinismo de id depende de wa_id canonico para nao criar
     threads duplicadas pra mesmo cliente.
@@ -628,6 +634,9 @@ def upsert_wa_conversation(
     wa_id = normalize_br_phone(wa_id)
     conversation_id = _make_conversation_id(channel_id, wa_id)
     now = utcnow()
+    msg_at = _coerce_timestamp(message_at)
+    if not isinstance(msg_at, datetime):
+        msg_at = now
 
     # Denormaliza dados do canal no doc do Atendimento para a UI. No modo
     # snapshot o frontend nao faz join com o canal (e operador comum nem
@@ -663,15 +672,19 @@ def upsert_wa_conversation(
     existing = snap.to_dict() if snap.exists else None
 
     if existing:
-        updates = {
-            "last_message_at": now,
-            **_ch_fields,
-        }
+        updates = {**_ch_fields}
+        _cur_lma = _coerce_timestamp(existing.get("last_message_at"))
+        try:
+            _advances = not isinstance(_cur_lma, datetime) or msg_at >= _cur_lma
+        except TypeError:
+            _advances = True
+        if _advances:
+            updates["last_message_at"] = msg_at
         if direction_for_unread == "inbound":
-            updates["last_inbound_at"] = now
+            updates["last_inbound_at"] = msg_at
             updates["unread_count"] = int(existing.get("unread_count", 0)) + 1
         elif direction_for_unread == "outbound":
-            updates["last_outbound_at"] = now
+            updates["last_outbound_at"] = msg_at
         if direction_for_unread in ("inbound", "outbound"):
             # Atividade reabre um atendimento fechado (Fase 4 — ciclo de vida).
             updates["attendance_status"] = "aberto"
@@ -701,9 +714,9 @@ def upsert_wa_conversation(
         "status": "open",
         "attendance_status": "aberto",
         "created_at": now,
-        "last_message_at": now,
-        "last_inbound_at": now if direction_for_unread == "inbound" else None,
-        "last_outbound_at": now if direction_for_unread == "outbound" else None,
+        "last_message_at": msg_at,
+        "last_inbound_at": msg_at if direction_for_unread == "inbound" else None,
+        "last_outbound_at": msg_at if direction_for_unread == "outbound" else None,
         **_ch_fields,
     }
     if auto_assign_user_id:
@@ -1908,10 +1921,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     })
 
     if contact:
-        updates = {"last_message_at": created_at}
+        # Data REAL da mensagem (timestamp_wa) — replay de history/backup nao
+        # pode "subir" o contato na sidebar com a data da gravacao. Monotonico:
+        # so avanca (mensagem ao vivo sempre avanca; replay antigo nao recua).
+        _eff_msg_at = _coerce_timestamp(timestamp_wa)
+        if not isinstance(_eff_msg_at, datetime):
+            _eff_msg_at = created_at
+        _cur_lma = _coerce_timestamp(contact.get("last_message_at"))
+        try:
+            _lma_advances = not isinstance(_cur_lma, datetime) or _eff_msg_at >= _cur_lma
+        except TypeError:
+            _lma_advances = True
+        updates = {"last_message_at": _eff_msg_at} if _lma_advances else {}
         if direction == "inbound" and status == "received":
             updates["unread_count"] = int(contact.get("unread_count", 0)) + 1
-        document("wa_contacts", contact_id).set(updates, merge=True)
+        if updates:
+            document("wa_contacts", contact_id).set(updates, merge=True)
 
         # Atualiza conversation correspondente (Fase 2 — sub-threads).
         # Se ainda nao existe (mensagem de contato legado pre-Fase 2),
@@ -1932,6 +1957,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     # por qualquer operador via canSeeContactScoped; herdar o dono
                     # fecha esse vetor].
                     auto_assign_user_id=(contact or {}).get("assigned_to"),
+                    message_at=_eff_msg_at,
                 )
             except Exception as exc:
                 logger.warning("Falha ao upsert conversation para msg %s: %s", message_id, exc)

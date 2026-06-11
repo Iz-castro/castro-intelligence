@@ -370,7 +370,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     void Promise.all(missing.map((id) =>
       getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
         .then((res) => normalizeContact(res.contact, String(res.contact.id)))
-        .catch(() => null),
+        // Falha TRANSITORIA (rede/5xx/deploy) libera o id pra retry no proximo
+        // run. 403/404 sao permanentes (LGPD/inexistente) — re-tentar viraria
+        // tempestade de requests a cada publish do snapshot.
+        .catch((e) => {
+          const st = Number((e as { status?: number })?.status ?? 0);
+          if (st !== 403 && st !== 404) fetchedExtraRef.current.delete(id);
+          return null;
+        }),
     )).then((fetched) => {
       if (disposed) return;
       const valid = fetched.filter((c): c is Contact => !!c);
