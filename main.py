@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -1639,12 +1640,20 @@ async def _load_approved_templates_for_channel(channel: dict) -> dict:
         next_url: str | None = url
         next_params: dict | None = params
         while next_url:
-            resp = await client.get(next_url, params=next_params, headers=headers)
-            if resp.status_code >= 400:
+            # Meta oscila com 500/erro transitorio neste endpoint (visto em
+            # 2026-06-12). Retry curto antes de desistir — sem ele a UI mostra
+            # "nenhum template" para uma WABA que TEM templates aprovados.
+            resp = None
+            for _attempt in range(3):
+                resp = await client.get(next_url, params=next_params, headers=headers)
+                if resp.status_code < 500:
+                    break
+                await asyncio.sleep(1.5 * (_attempt + 1))
+            if resp is None or resp.status_code >= 400:
                 try:
-                    err = resp.json().get("error", {}).get("message", resp.text[:300])
+                    err = resp.json().get("error", {}).get("message", resp.text[:300]) if resp is not None else "sem resposta"
                 except Exception:
-                    err = resp.text[:300]
+                    err = resp.text[:300] if resp is not None else "sem resposta"
                 raise HTTPException(status_code=502, detail=f"Meta retornou erro: {err}")
             data = resp.json()
             templates.extend(data.get("data", []) or [])
