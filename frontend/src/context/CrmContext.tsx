@@ -1645,7 +1645,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function fetchTemplates(channelId?: number | null): Promise<WhatsAppTemplate[]> {
+  // useCallback: o TemplatePickerModal depende da IDENTIDADE desta funcao no
+  // useEffect — sem memoizacao, cada publish do snapshot recriava a funcao,
+  // re-disparava o fetch e RESETAVA o modal (flicker continuo + GETs em loop
+  // + impossivel completar o envio).
+  const fetchTemplates = useCallback(async (channelId?: number | null): Promise<WhatsAppTemplate[]> => {
     if (!bundle) return [];
     const qs = channelId ? `?channel_id=${encodeURIComponent(String(channelId))}` : "";
     try {
@@ -1655,7 +1659,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setError(errorText(e));
       return [];
     }
-  }
+  }, [bundle]);
 
   async function sendTemplate(params: {
     contactId: number;
