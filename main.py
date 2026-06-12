@@ -1910,13 +1910,40 @@ async def wa_reopen_conversation(
 
     nome = _reopen_first_name(contact)
     data = _reopen_last_conv_date(conv, contact)
-    components = [{
-        "type": "body",
-        "parameters": [
+    # Introspecta o template REAL em vez de hardcodar 2 parametros: a versao
+    # aprovada no console pode ter so {{1}} (=data, caso atual) ou {{1}}/{{2}}
+    # (desenho original). Hardcodar causava #132000 (param count mismatch).
+    # Semantica por posicao decidida pelo EXEMPLO do template (data dd/mm/aaaa
+    # -> preenche a data; senao nome na 1a posicao, data nas demais).
+    import re as _re
+    params: list[dict] = []
+    tpl = None
+    if channel:
+        try:
+            tpl_data = await _load_approved_templates_for_channel(channel)
+            tpl = next((t for t in tpl_data.get("templates", [])
+                        if t.get("name") == template_name and t.get("language") == language), None)
+        except Exception as exc:
+            logger.warning("reopen: introspeccao de template falhou (%s); usando 2 params legados", exc)
+    if tpl:
+        body_comp = next((c for c in (tpl.get("components") or [])
+                          if str(c.get("type", "")).upper() == "BODY"), None) or {}
+        n_params = len(set(_re.findall(r"\{\{(\d+)\}\}", str(body_comp.get("text") or ""))))
+        _ex_rows = ((body_comp.get("example") or {}).get("body_text") or [])
+        examples = _ex_rows[0] if _ex_rows else []
+        _date_re = _re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+        for i in range(n_params):
+            ex = str(examples[i]).strip() if i < len(examples) else ""
+            if _date_re.match(ex):
+                params.append({"type": "text", "text": data})
+            else:
+                params.append({"type": "text", "text": nome if i == 0 else data})
+    else:
+        params = [
             {"type": "text", "text": nome},
             {"type": "text", "text": data},
-        ],
-    }]
+        ]
+    components = [{"type": "body", "parameters": params}] if params else None
     send_body = WaSendTemplateRequest(
         conversation_id=conversation_id,
         template_name=template_name,
