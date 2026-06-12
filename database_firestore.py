@@ -779,6 +779,11 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
         "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
         "department_id": to_department_id,
         "is_backup": False,  # atribuir GRADUA a conversa: sai da caixa Backup
+        # Transferencia explicita SUPERA takeover temporario: sem isto, um
+        # 'pending' herdado (lead de outrem escreveu no numero coex) bloqueia
+        # o envio do NOVO dono com 403 (incidente roberta 2026-06-12 13:02).
+        "takeover_status": None,
+        "takeover_user_id": None,
     }, merge=True)
     # Espelho no contato (Dono do Lead) — opt-in pos-Fase 3B.
     if also_lead and contact_id is not None:
