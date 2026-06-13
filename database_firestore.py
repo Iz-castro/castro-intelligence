@@ -753,6 +753,33 @@ def get_conversations_by_contact(contact_id):
     return _normalize_many(rows)
 
 
+def _graduate_backup_messages(conversation_id, owner_uid=""):
+    """Gradua as mensagens historicas (is_backup=True) de uma conversa que saiu
+    do Backup: vira is_backup=False + carimba o dono, para o novo dono conseguir
+    ler (a rule de wa_messages bloqueia is_backup p/ nao-privilegiado). Backup
+    NAO graduado (parado na caixa) fica is_backup=True -> segue admin-only.
+    Idempotente. Retorna a quantidade graduada."""
+    if not conversation_id:
+        return 0
+    batch = get_firestore_client().batch()
+    count = 0
+    total = 0
+    for snapshot in collection("wa_messages").where("conversation_id", "==", conversation_id).stream():
+        d = snapshot.to_dict() or {}
+        if not d.get("is_backup"):
+            continue
+        batch.set(snapshot.reference, {"is_backup": False, "assigned_to_uid": owner_uid or ""}, merge=True)
+        count += 1
+        total += 1
+        if count >= 400:
+            batch.commit()
+            batch = get_firestore_client().batch()
+            count = 0
+    if count > 0:
+        batch.commit()
+    return total
+
+
 def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transferred_by, reason="", summary="", also_lead=False):
     """Transfere uma conversation (thread). Atualiza a conversation; o
     contato (Dono do Lead) so e movido junto quando also_lead=True.
@@ -797,6 +824,11 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
     # igual a um assume. Handoff normal (nao-backup) NAO mexe no sale_owner.
     if was_backup and to_user_id and contact_id is not None:
         set_sale_owner(contact_id, to_user_id)
+    # Graduacao completa: as mensagens historicas (is_backup) da conversa tambem
+    # saem do gate admin-only, senao o novo dono abre a thread e ve zero
+    # historico (rule de wa_messages bloqueia is_backup p/ nao-privilegiado).
+    if was_backup:
+        _graduate_backup_messages(conversation_id, (to_user or {}).get("firebase_uid", ""))
 
     transfer_id = next_sequence("wa_transfer_log")
     document("wa_transfer_log", transfer_id).set({
@@ -1566,6 +1598,22 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
         "department_id": to_department_id,
         "is_backup": False,  # reatribuir o Lead gradua o contato (sai do Backup)
     }, merge=True)
+    # Backup graduado via reassign-lead: gradua tambem as conversas historicas
+    # do contato + suas mensagens (senao o novo dono ve o contato mas threads
+    # vazias). Escopo backup-only — nao mexe em contato vivo multi-canal (3B).
+    if current.get("is_backup"):
+        _owner_uid = (to_user or {}).get("firebase_uid", "")
+        for _snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+            _cd = _snap.to_dict() or {}
+            if not _cd.get("is_backup"):
+                continue
+            _snap.reference.set({
+                "is_backup": False,
+                "assigned_to": to_user_id,
+                "assigned_to_uid": _owner_uid,
+                "department_id": to_department_id,
+            }, merge=True)
+            _graduate_backup_messages(_snap.id, _owner_uid)
 
     transfer_id = next_sequence("wa_transfer_log")
     document("wa_transfer_log", transfer_id).set({
