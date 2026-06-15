@@ -2474,8 +2474,10 @@ def create_backup_contact(wa_id, display_name, channel_id, first_seen_at, last_t
         "is_archived": 0,
         "unread_count": 0,
         "is_backup": True,
-        "first_seen_at": first_seen_at,
-        "last_message_at": last_ts,
+        # Datas REAIS (datetime). String aqui ordena ACIMA de datetime no
+        # Firestore -> tomava o top-50 do snapshot de contatos do admin.
+        "first_seen_at": _coerce_timestamp(first_seen_at),
+        "last_message_at": _coerce_timestamp(last_ts),
         "last_inbound_at": None,
     }
     idx_ref = document("wa_contact_index", wa_id)
@@ -2489,21 +2491,30 @@ def create_backup_contact(wa_id, display_name, channel_id, first_seen_at, last_t
 
 def upsert_backup_conversation(conversation_id, contact_id, wa_id, channel_id,
                                first_ts, last_ts, last_in, last_out, channel_label=""):
-    """Cria a conversa HISTORICA (backup): is_backup + sentinela, NUNCA 'aberto',
-    read-only (channel_active=False). Se a conversa ja existe e NAO e backup
-    (thread viva), NAO rebaixa. Idempotente."""
+    """Cria a conversa HISTORICA (backup): is_backup + sentinela, NUNCA 'aberto'.
+    Reflete o canal REAL (nao finge removido). Se a conversa ja existe e NAO e
+    backup (thread viva), NAO rebaixa. Idempotente."""
     wa_id = normalize_br_phone(wa_id)
     ref = document("wa_conversations", conversation_id)
     snap = ref.get()
     if snap.exists:
         return conversation_id  # ja existe (backup ou viva) — nao mexe
+    # Reflete o canal REAL (vivo): backup do 3351-7604 NAO e "canal removido".
+    # O isolamento do backup vem de is_backup + aba Backup; fingir o canal
+    # inativo confundia a UI e quebrava a resposta apos a graduacao.
+    _ch = None
+    try:
+        from channel_service import get_channel as _get_channel
+        _ch = _get_channel(channel_id) if channel_id is not None else None
+    except Exception:
+        _ch = None
     ref.set({
         "id": conversation_id,
         "contact_id": contact_id,
         "wa_id": wa_id,
         "channel_id": channel_id,
-        "phone_number_id": "",
-        "source_channel_type": "standard",
+        "phone_number_id": (_ch.get("phone_number_id", "") if _ch else ""),
+        "source_channel_type": (_ch.get("channel_type", "standard") if _ch else "standard"),
         "assigned_to": None,
         "assigned_to_uid": BACKUP_ASSIGNED_UID,
         "department_id": None,
@@ -2511,12 +2522,15 @@ def upsert_backup_conversation(conversation_id, contact_id, wa_id, channel_id,
         "status": "open",
         "attendance_status": "fechado_inatividade",  # NUNCA 'aberto' (sem auto-close/protocolo)
         "is_backup": True,
-        "channel_label": channel_label or "Backup (historico)",
-        "channel_active": False,  # read-only ate o cliente voltar / ser atribuido
-        "created_at": first_ts,
-        "last_message_at": last_ts,
-        "last_inbound_at": last_in,
-        "last_outbound_at": last_out,
+        "channel_label": (_ch.get("label") if _ch else (channel_label or "Backup (historico)")),
+        "channel_phone_number": (_ch.get("display_phone_number", "") if _ch else ""),
+        "channel_active": bool(_ch),
+        # Datas REAIS (datetime). String aqui ordena ACIMA de datetime no
+        # Firestore e tomava o top-300 do snapshot, sumindo as conversas vivas.
+        "created_at": _coerce_timestamp(first_ts),
+        "last_message_at": _coerce_timestamp(last_ts),
+        "last_inbound_at": _coerce_timestamp(last_in),
+        "last_outbound_at": _coerce_timestamp(last_out),
     })
     return conversation_id
 
