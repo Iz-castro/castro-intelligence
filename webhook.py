@@ -30,6 +30,7 @@ from database import (
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
 from bot_service import process_bot_message
+from bot_transport import build_outbound_payload, extract_interactive_inbound
 from firestore_common import set_tenant_context, reset_tenant_context, document, utcnow
 from tenant_service import lookup_phone_routing
 from pii_redaction import redact_phone, redact_name
@@ -188,9 +189,13 @@ def _resolve_webhook_channel(value):
     return None, "no_phone_number_id"
 
 
-async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, phone_id: str,
+async def _send_bot_reply(wa_id: str, reply, contact_id: int, token: str, phone_id: str,
                           channel_id=None, channel_owner_user_id=None):
     """Envia resposta do bot via WhatsApp Cloud API e salva no banco.
+
+    `reply` pode ser str (texto) ou dict (type="interactive_buttons", ex.:
+    consentimento LGPD). A traducao para o payload da Meta e o texto a
+    persistir (corpo visivel, nunca o dict cru) vem de bot_transport.
 
     sender_user_id=None marca a mensagem como originada pelo bot
     automatico (nao por operador humano).
@@ -199,15 +204,9 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
     from config import GRAPH_API_BASE
     from database import save_wa_message
 
-    wa_target = "".join(ch for ch in str(wa_id) if ch.isdigit())
     url = f"{GRAPH_API_BASE}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload_msg = {
-        "messaging_product": "whatsapp",
-        "to": wa_target,
-        "type": "text",
-        "text": {"body": text},
-    }
+    payload_msg, store_content = build_outbound_payload(reply, wa_id)
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, json=payload_msg, headers=headers)
@@ -218,7 +217,7 @@ async def _send_bot_reply(wa_id: str, text: str, contact_id: int, token: str, ph
             contact_id=contact_id,
             direction="outbound",
             msg_type="text",
-            content=text,
+            content=store_content,
             status="sent" if resp.status_code == 200 else "failed",
             timestamp_wa=datetime.now(timezone.utc).isoformat(),
             operator_id=None,
@@ -645,6 +644,14 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 redact_phone(wa_id),
                 msg_id[:20],
             )
+
+        elif msg_type == "interactive":
+            # Resposta de botao/lista interativa (Cloud API): o cliente tocou
+            # num botao (ex.: consentimento LGPD). Extrai o id do botao e
+            # normaliza para 'text' para passar pelo gate do bot (~L721), que
+            # entao alimenta process_bot_message com o id ("lgpd_aceitar"...).
+            content = extract_interactive_inbound(msg)
+            effective_msg_type = "text"
 
         else:
             content = f"[{msg_type}]"
