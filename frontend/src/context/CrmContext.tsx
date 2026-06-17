@@ -1391,7 +1391,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setDraft(""); setReplyTarget(null); setNotice("Mensagem enviada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
-    finally { setBusySend(false); }
+    finally {
+      setBusySend(false);
+      // Mantem o foco na caixa apos enviar: a textarea fica disabled durante o
+      // envio (perde o foco); rAF refoca depois do re-render reabilitar.
+      requestAnimationFrame(() => composerInputRef.current?.focus());
+    }
   }
 
   // Modo 1 (Sussurro): grava nota interna na thread; NAO chama a Meta.
@@ -1403,7 +1408,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       setDraft(""); setNotice("Nota interna adicionada.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
-    finally { setBusySend(false); }
+    finally {
+      setBusySend(false);
+      requestAnimationFrame(() => composerInputRef.current?.focus());
+    }
   }
 
   async function submitText(event: FormEvent<HTMLFormElement>) { event.preventDefault(); await sendTextMessage(); }
