@@ -610,6 +610,7 @@ def upsert_wa_conversation(
     auto_assign_user_id=None,
     direction_for_unread=None,
     message_at=None,
+    advance_recency=True,
 ):
     """Cria ou atualiza a conversation correspondente a (channel_id, wa_id).
 
@@ -678,7 +679,7 @@ def upsert_wa_conversation(
             _advances = not isinstance(_cur_lma, datetime) or msg_at >= _cur_lma
         except TypeError:
             _advances = True
-        if _advances:
+        if _advances and advance_recency:
             updates["last_message_at"] = msg_at
         if direction_for_unread == "inbound":
             updates["last_inbound_at"] = msg_at
@@ -1769,7 +1770,8 @@ def get_wa_contacts_scoped_for_user(user_id, department_id=None):
 
 
 def insert_transfer_system_message(contact_id, content, operator_id=None,
-                                   conversation_id=None, channel_id=None):
+                                   conversation_id=None, channel_id=None,
+                                   advance_recency=True):
     return save_wa_message(
         wa_message_id=f"sys_{utcnow().isoformat()}_{contact_id}",
         contact_id=contact_id,
@@ -1782,6 +1784,7 @@ def insert_transfer_system_message(contact_id, content, operator_id=None,
         sender_user_id=operator_id,
         conversation_id=conversation_id,
         channel_id=channel_id,
+        advance_recency=advance_recency,
     )
 
 
@@ -1840,7 +1843,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     is_rating_message=False, visibility="all",
                     conversation_id=None,
                     channel_owner_user_id=None, sender_user_id=None,
-                    template_category=None, media_size_bytes=0):
+                    template_category=None, media_size_bytes=0,
+                    advance_recency=True):
     """Persiste mensagem WhatsApp.
 
     Auditoria coexistence (Fase 2C):
@@ -1993,7 +1997,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
             _lma_advances = not isinstance(_cur_lma, datetime) or _eff_msg_at >= _cur_lma
         except TypeError:
             _lma_advances = True
-        updates = {"last_message_at": _eff_msg_at} if _lma_advances else {}
+        updates = {"last_message_at": _eff_msg_at} if (_lma_advances and advance_recency) else {}
         if direction == "inbound" and status == "received":
             updates["unread_count"] = int(contact.get("unread_count", 0)) + 1
         if updates:
@@ -2019,6 +2023,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     # fecha esse vetor].
                     auto_assign_user_id=(contact or {}).get("assigned_to"),
                     message_at=_eff_msg_at,
+                    advance_recency=advance_recency,
                 )
             except Exception as exc:
                 logger.warning("Falha ao upsert conversation para msg %s: %s", message_id, exc)

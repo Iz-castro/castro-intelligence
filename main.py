@@ -3060,6 +3060,7 @@ async def cron_expire_takeovers(request: Request):
                         contact_id,
                         "Atendimento temporario devolvido automaticamente por inatividade.",
                         None,
+                        advance_recency=False,  # banner automatico nao infla recencia
                     )
                 log_audit(None, "TAKEOVER_AUTO_RETURN", f"conv={e.get('conversation_id')} lead_owner={e.get('lead_owner_user_id')}")
             if expired:
@@ -3074,6 +3075,7 @@ async def cron_expire_takeovers(request: Request):
                         cc_id,
                         "Atendimento fechado automaticamente por inatividade.",
                         None, conversation_id=c.get("conversation_id"),
+                        advance_recency=False,  # banner automatico nao infla recencia
                     )
                     # Fase 5A: envia o protocolo ao lead (recibo) se ainda nao
                     # informado e dentro de 24h. Idempotente entre threads do
