@@ -811,6 +811,11 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
         # o envio do NOVO dono com 403 (incidente roberta 2026-06-12 13:02).
         "takeover_status": None,
         "takeover_user_id": None,
+        # Badge de transferencia: bumpa o unread da thread p/ o novo dono ver
+        # que ha algo a tratar, mesmo sem msg nova do cliente. Acende os DOIS
+        # badges (a bolinha da conversa le unread_count; a aba "Meus" soma os
+        # unread_count das conversas dela). Limpa no mark-read ao abrir.
+        "unread_count": int(conv.get("unread_count", 0) or 0) + 1,
     }, merge=True)
     # Espelho no contato (Dono do Lead) — opt-in pos-Fase 3B.
     if also_lead and contact_id is not None:
@@ -1612,6 +1617,9 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
                 "assigned_to": to_user_id,
                 "assigned_to_uid": _owner_uid,
                 "department_id": to_department_id,
+                # Badge de transferencia (mesmo criterio do assign_wa_conversation):
+                # a thread graduada chega ao novo dono com unread > 0.
+                "unread_count": int(_cd.get("unread_count", 0) or 0) + 1,
             }, merge=True)
             _graduate_backup_messages(_snap.id, _owner_uid)
 
