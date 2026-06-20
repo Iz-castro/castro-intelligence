@@ -1640,7 +1640,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusySend(false); }
   }
 
-  async function fetchBillingStatus(channelId: number): Promise<{ ok: boolean; has_payment_method: boolean; error?: string } | null> {
+  // useCallback: o BillingHealthBanner depende da IDENTIDADE desta funcao no
+  // seu useEffect. Sem memoizacao, cada render do provider (todo publish de
+  // snapshot de contacts/conversations) recriava a funcao e re-disparava o
+  // GET /billing-status em loop (o spam visivel no log). Memoizada por
+  // [bundle], o efeito do banner roda so quando muda bundle/canal/role.
+  // Mesmo motivo do fetchTemplates abaixo.
+  const fetchBillingStatus = useCallback(async (channelId: number): Promise<{ ok: boolean; has_payment_method: boolean; error?: string } | null> => {
     if (!bundle) return null;
     try {
       const res = await getJson<{ ok: boolean; has_payment_method: boolean; error?: string }>(
@@ -1651,7 +1657,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       return { ok: false, has_payment_method: false, error: errorText(e) };
     }
-  }
+  }, [bundle]);
 
   // useCallback: o TemplatePickerModal depende da IDENTIDADE desta funcao no
   // useEffect — sem memoizacao, cada publish do snapshot recriava a funcao,
