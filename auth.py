@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from config import (
@@ -34,6 +36,44 @@ _DEFAULT_TENANT = "hubloc"
 # (contencao de transacao -> 409 -> 500). Registramos no maximo um LOGIN_SUCCESS
 # por janela de sessao por usuario.
 _LOGIN_AUDIT_WINDOW = timedelta(minutes=30)
+
+# Cache in-memory (por instancia Cloud Run) do usuario resolvido por
+# (tenant, firebase_uid), para evitar ~4 reads + 3 writes Firestore em TODA
+# request autenticada. O ID token CONTINUA sendo verificado a cada request
+# (seguranca) e o tenant_context continua sendo setado; so o lookup/sync do
+# usuario no Firestore e que e cacheado. TTL curto limita a janela de staleness
+# (usuario desativado, troca de role/departamento, novo last_login) — apos o TTL
+# a proxima request refaz o caminho completo. Chave inclui tenant por defesa
+# (firebase_uid ja e unico por projeto Firebase).
+_AUTH_CACHE_TTL = float(os.getenv("AUTH_USER_CACHE_TTL_SECONDS", "45") or 45)
+_auth_user_cache: dict = {}
+
+
+def _auth_cache_get(tenant, firebase_uid):
+    entry = _auth_user_cache.get((tenant, firebase_uid))
+    if not entry:
+        return None
+    expires_at, user = entry
+    if time.monotonic() >= expires_at:
+        _auth_user_cache.pop((tenant, firebase_uid), None)
+        return None
+    return user
+
+
+def _auth_cache_put(tenant, firebase_uid, user):
+    if _AUTH_CACHE_TTL <= 0:
+        return
+    _auth_user_cache[(tenant, firebase_uid)] = (time.monotonic() + _AUTH_CACHE_TTL, user)
+
+
+def invalidate_auth_cache(firebase_uid=None):
+    """Limpa o cache de auth. Sem arg -> limpa tudo. Chamar ao alterar
+    role/departamento/is_active de um usuario para refletir antes do TTL."""
+    if firebase_uid is None:
+        _auth_user_cache.clear()
+        return
+    for key in [k for k in _auth_user_cache if k[1] == firebase_uid]:
+        _auth_user_cache.pop(key, None)
 
 
 def _is_new_login_session(previous_login):
@@ -132,6 +172,13 @@ def authenticate_firebase_token(id_token, ip_address=""):
     claim_tenant = decoded.get("tenant_id") or _DEFAULT_TENANT
     set_tenant_context(claim_tenant)
 
+    # Cache hit: evita ~4 reads + 3 writes Firestore por request. O token ja foi
+    # verificado acima e o tenant_context ja foi setado — so reaproveitamos o
+    # perfil de usuario resolvido (com tenant_id anexado).
+    cached_user = _auth_cache_get(claim_tenant, firebase_uid)
+    if cached_user is not None:
+        return {"success": True, "decoded_token": decoded, "user": cached_user}
+
     user = get_user_by_firebase_uid(firebase_uid) or get_user_by_email(email)
     if user:
         sync_user_identity(
@@ -170,6 +217,7 @@ def authenticate_firebase_token(id_token, ip_address=""):
         user = dict(user)
         user["tenant_id"] = tenant_id
 
+    _auth_cache_put(claim_tenant, firebase_uid, user)
     return {
         "success": True,
         "decoded_token": decoded,

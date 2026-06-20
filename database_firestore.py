@@ -948,12 +948,21 @@ def close_stale_attendances(max_idle_hours):
     from datetime import timedelta
     cutoff = utcnow() - timedelta(hours=max_idle_hours)
     closed = []
-    for snap in collection("wa_conversations").stream():
+    # Filtro server-side attendance_status == "aberto": exclui backups
+    # (fechado_inatividade) e ja-fechados (fechado_*), cortando a leitura de
+    # ~toda a colecao (full scan que rodava a cada 30min no cron) para so os
+    # atendimentos abertos. Igualdade em campo string -> indice single-field
+    # automatico, sem indice composto. assigned_to e last_message_at continuam
+    # filtrados em Python: assigned_to pra evitar 2o campo no indice;
+    # last_message_at porque pode estar como str OU Timestamp em docs
+    # legados/backup, e um range server-side erraria por tipo.
+    # NOTA: docs abertos SEM o campo attendance_status (legado pre-Fase 4) nao
+    # entram mais aqui — recebem o campo (e voltam a ser elegiveis) na proxima
+    # mensagem via upsert_wa_conversation.
+    for snap in collection("wa_conversations").where("attendance_status", "==", "aberto").stream():
         conv = snap.to_dict() or {}
         if not conv.get("assigned_to"):
             continue  # so atendimentos atribuidos (fila/bot nao fecham)
-        if conv.get("attendance_status") not in (None, "", "aberto"):
-            continue  # ja fechado
         last = conv.get("last_message_at")
         if isinstance(last, str):
             try:
@@ -2180,42 +2189,46 @@ def _audit_metric_doc_id(date_str, user_id=None):
 
 
 def increment_audit_metrics(direction, operator_id=None, is_new_lead=False, is_assumed=False):
-    """Incrementa metricas diarias. Chamada a cada save_wa_message."""
+    """Incrementa metricas diarias. Chamada a cada save_wa_message.
+
+    Usa firestore.Increment (atomico, SEM read) nos contadores — elimina o
+    read-modify-write nao-atomico que perdia incrementos sob concorrencia (mesmo
+    padrao ja adotado em increment_usage_metrics). Cada chamada vira 1 write por
+    doc e ZERO reads.
+
+    last_activity_at e gravado a cada chamada (last-write-wins, correto e de
+    graca no merge). first_activity_at NAO e mais gravado: mante-lo exato exigiria
+    um read (ou um create() que, ao falhar com AlreadyExists, AINDA e cobrado como
+    write) — e o campo nao e exibido no frontend (a tabela por operador so mostra
+    inbound/outbound/leads_assumed). Docs legados que ja tinham o campo
+    permanecem; o consumidor (main.py) trata ausencia como None.
+    """
     now = utcnow()
     date_str = now.strftime("%Y-%m-%d")
     half_hour = f"{now.strftime('%H')}:{('00' if now.minute < 30 else '30')}"
 
     def _increment(doc_id):
-        ref = document("audit_metrics", doc_id)
-        snap = ref.get()
-        data = snap.to_dict() if snap.exists else {}
-
         updates = {
             "date": date_str,
             "updated_at": now,
+            "last_activity_at": now,
+            # Increment aninhado no mapa: incrementa so o slot do half-hour,
+            # preservando os irmaos (merge=True faz deep-merge do mapa) — mesmo
+            # padrao de templates_sent em increment_usage_metrics.
+            "messages_by_half_hour": {half_hour: firestore.Increment(1)},
         }
 
         if direction == "inbound":
-            updates["total_messages_inbound"] = int(data.get("total_messages_inbound", 0)) + 1
+            updates["total_messages_inbound"] = firestore.Increment(1)
         elif direction == "outbound":
-            updates["total_messages_outbound"] = int(data.get("total_messages_outbound", 0)) + 1
+            updates["total_messages_outbound"] = firestore.Increment(1)
 
         if is_new_lead:
-            updates["total_leads_received"] = int(data.get("total_leads_received", 0)) + 1
+            updates["total_leads_received"] = firestore.Increment(1)
         if is_assumed:
-            updates["total_leads_assumed"] = int(data.get("total_leads_assumed", 0)) + 1
+            updates["total_leads_assumed"] = firestore.Increment(1)
 
-        # Messages by half hour
-        by_half = data.get("messages_by_half_hour", {})
-        by_half[half_hour] = int(by_half.get(half_hour, 0)) + 1
-        updates["messages_by_half_hour"] = by_half
-
-        # Activity tracking
-        if not data.get("first_activity_at"):
-            updates["first_activity_at"] = now
-        updates["last_activity_at"] = now
-
-        ref.set(updates, merge=True)
+        document("audit_metrics", doc_id).set(updates, merge=True)
 
     try:
         # Global aggregate
