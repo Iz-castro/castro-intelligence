@@ -758,10 +758,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Escopo de conversations por operador — espelha buildContactSnapshotTargets.
   // Admin/supervisor: 300 mais recentes + backup (ver comentario no branch).
-  // Operador comum: so atribuidas a si ou sem dono — sem orderBy/limit de
-  // proposito: igualdade simples nao exige indice composto (adicionar limit
-  // aqui exigiria indice assigned_to_uid+last_message_at; follow-up).
-  // Ordenacao e dedupe sao feitos client-side em mergeVisibleConversations.
+  // Operador comum: so atribuidas a si ou sem dono, agora com
+  // orderBy("last_message_at","desc")+limit(50) por target (igual aos contatos)
+  // — antes baixava o pool inteiro a cada abertura do CRM. Exige o indice
+  // composto (assigned_to_uid ASC, last_message_at DESC) em firestore.indexes.json
+  // (publicado e construido ANTES deste deploy). Dedupe final e client-side em
+  // mergeVisibleConversations.
   function buildConversationSnapshotTargets() {
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return [];
 
@@ -780,15 +782,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       ];
     }
 
+    // Mesmo corte dos contatos: top-50 por recencia em cada target. Exige o
+    // indice composto (assigned_to_uid, last_message_at). mergeVisibleConversations
+    // junta/ordena os targets client-side.
+    const opConstraints = [orderBy("last_message_at", "desc"), firestoreLimit(50)] as const;
     const targets: { key: string; ref: ReturnType<typeof query> }[] = [
-      { key: "unassigned:blank", ref: query(waConversations, where("assigned_to_uid", "==", "")) },
-      { key: "unassigned:null", ref: query(waConversations, where("assigned_to_uid", "==", null)) },
+      { key: "unassigned:blank", ref: query(waConversations, where("assigned_to_uid", "==", ""), ...opConstraints) },
+      { key: "unassigned:null", ref: query(waConversations, where("assigned_to_uid", "==", null), ...opConstraints) },
     ];
 
     if (sessionUser.firebase_uid) {
       targets.push({
         key: `mine:${sessionUser.firebase_uid}`,
-        ref: query(waConversations, where("assigned_to_uid", "==", sessionUser.firebase_uid)),
+        ref: query(waConversations, where("assigned_to_uid", "==", sessionUser.firebase_uid), ...opConstraints),
       });
     }
 
