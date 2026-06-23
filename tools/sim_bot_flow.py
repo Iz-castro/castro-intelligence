@@ -81,10 +81,10 @@ _fc.get_firestore_client = lambda: None
 sys.modules["firestore_common"] = _fc
 
 _DEPARTMENTS = [
-    {"id": 1, "name": "Comercial", "bot_key": "comercial"},
-    {"id": 2, "name": "Financeiro", "bot_key": "financeiro"},
-    {"id": 3, "name": "Administrativo", "bot_key": "administrativo"},
-    {"id": 4, "name": "SAC", "bot_key": "sac"},
+    {"id": 1, "name": "Vendas", "bot_key": "comercial"},
+    {"id": 2, "name": "Suporte", "bot_key": "sac"},
+    {"id": 3, "name": "Financeiro", "bot_key": "financeiro"},
+    {"id": 4, "name": "Geral", "bot_key": None},
 ]
 
 _db = types.ModuleType("database")
@@ -198,7 +198,7 @@ def titulo(txt):
 # =========================================================================
 
 def cenario_fluxo_feliz_botoes():
-    titulo("CENARIO 1 — Fluxo feliz com BOTOES (LGPD -> nome -> equip -> setor)")
+    titulo("CENARIO 1 — Fluxo feliz com BOTOES (LGPD -> setor)")
     cid = 1
     _novo_contato(cid)
 
@@ -214,26 +214,21 @@ def cenario_fluxo_feliz_botoes():
           "body.text dentro do limite de 1024 chars")
     ids = [b["reply"]["id"] for b in payload["interactive"]["action"]["buttons"]]
     check(ids == ["lgpd_aceitar", "lgpd_recusar"], "botoes lgpd_aceitar/lgpd_recusar")
+    titles = [b["reply"]["title"] for b in payload["interactive"]["action"]["buttons"]]
+    check(titles == ["Sim", "Não"], "botoes rotulados Sim / Não")
     check(isinstance(store, str), "content persistido e STRING (nunca o dict cru)")
 
-    reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Aceitar")
+    reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
     contato = STORE["wa_contacts"]["1"]
     check(contato.get("lgpd_consent") is True, "consentimento gravado no contato")
     check(bool(contato.get("lgpd_consent_at")), "carimbo lgpd_consent_at gravado")
     check(bool(contato.get("lgpd_policy_version")), "versao da politica gravada")
     check(any(a["action"] == "LGPD_CONSENT_ACCEPTED" for a in AUDIT),
           "audit_log registrou LGPD_CONSENT_ACCEPTED")
-    check(isinstance(reply, str) and "nome" in reply.lower(), "apos aceite, pede o nome")
-
-    reply, _, _ = cliente_envia(cid, text="João Silva")
-    check(STORE["wa_contacts"]["1"].get("display_name") == "João Silva",
-          "nome formatado e gravado (João Silva)")
-    check("equipamento" in (reply or "").lower(), "apos nome, pergunta equipamento")
-
-    reply, _, _ = cliente_envia(cid, text="betoneira")
-    st = STORE["bot_states"]["1"]
-    check(st.get("equipamento") == "betoneira", "equipamento betoneira detectado")
-    check(st.get("step") == "ask_sector", "avancou para ask_sector")
+    check(isinstance(reply, str) and "comercial" in reply.lower(),
+          "apos aceite, ja apresenta o menu de setores (sem pedir nome)")
+    check(STORE["bot_states"]["1"].get("step") == "ask_sector",
+          "estado avancou direto para ask_sector")
 
     reply, _, _ = cliente_envia(cid, text="1")
     contato = STORE["wa_contacts"]["1"]
@@ -249,14 +244,14 @@ def cenario_recusa_reconsentimento():
     _novo_contato(cid)
 
     cliente_envia(cid, text="bom dia")
-    reply, _, _ = cliente_envia(cid, button_id="lgpd_recusar", button_title="Recusar")
+    reply, _, _ = cliente_envia(cid, button_id="lgpd_recusar", button_title="Não")
     check(STORE["bot_states"]["2"].get("lgpd_consent") is False,
           "recusa registrada no estado (lgpd_consent=False)")
     check(isinstance(reply, str) and "não podemos prosseguir" in reply.lower(),
           "mensagem de recusa enviada")
 
-    # Cliente muda de ideia e toca em Aceitar
-    reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Aceitar")
+    # Cliente muda de ideia e toca em Sim
+    reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
     check(STORE["wa_contacts"]["2"].get("lgpd_consent") is True,
           "re-consentimento grava consentimento no contato")
 
@@ -267,32 +262,37 @@ def cenario_fallback_texto():
     _novo_contato(cid)
 
     reply, payload, _ = cliente_envia(cid, text="oi")
-    check("responda sim" in payload["interactive"]["body"]["text"].lower(),
-          "aviso inclui instrucao textual de fallback (SIM/NAO)")
+    check("podemos continuar" in payload["interactive"]["body"]["text"].lower(),
+          "aviso LGPD apresentado no primeiro contato")
     reply, _, _ = cliente_envia(cid, text="sim")
     check(STORE["wa_contacts"]["3"].get("lgpd_consent") is True,
           "aceite por TEXTO ('sim') tambem funciona")
+    check(isinstance(reply, str) and "comercial" in reply.lower(),
+          "apos aceite textual, apresenta o menu de setores")
 
 
-def cenario_lixo_equipamento():
-    titulo("CENARIO 4 — ask_equipment rejeita LIXO (pontuacao, risada)")
+def cenario_selecao_setor():
+    titulo("CENARIO 4 — Selecao de setor: invalida + roteamento por palavra-chave")
     cid = 4
     _novo_contato(cid)
     cliente_envia(cid, text="oi")
-    cliente_envia(cid, button_id="lgpd_aceitar", button_title="Aceitar")
-    cliente_envia(cid, text="Maria")  # nome -> agora em ask_equipment
+    cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
 
-    for ruido in ("????", "kkkk", "!!!"):
-        reply, _, _ = cliente_envia(cid, text=ruido)
-        st = STORE["bot_states"]["4"]
-        check("não consegui identificar" in (reply or "").lower()
-              and st.get("step") == "ask_equipment"
-              and not st.get("equipamento"),
-              f"ruido {ruido!r} rejeitado (nao vira equipamento)")
+    # Entrada sem setor reconhecivel -> pede opcao valida, mantem o estado
+    reply, _, _ = cliente_envia(cid, text="asdf ????")
+    st = STORE["bot_states"]["4"]
+    check("inválida" in (reply or "").lower() and st.get("step") == "ask_sector",
+          "entrada sem setor reconhecivel -> 'opcao invalida', mantem ask_sector")
 
-    reply, _, _ = cliente_envia(cid, text="andaime")
-    check(STORE["bot_states"]["4"].get("equipamento") == "andaime",
-          "equipamento valido 'andaime' aceito")
+    # Palavra-chave de troca/defeito -> Assistencia Tecnica (setor 2 / bot_key sac)
+    reply, _, _ = cliente_envia(
+        cid, text="preciso trocar um equipamento com defeito"
+    )
+    contato = STORE["wa_contacts"]["4"]
+    check(reply is None, "palavra-chave de troca/defeito finaliza o bot")
+    check(contato.get("bot_setor") == 2, "classificado como setor 2 (Assistencia)")
+    check(contato.get("department_id") == 2,
+          "encaminhado ao Suporte/Assistencia (department_id=2, bot_key=sac)")
 
 
 def cenario_limites_payload():
@@ -329,7 +329,7 @@ def main():
     cenario_fluxo_feliz_botoes()
     cenario_recusa_reconsentimento()
     cenario_fallback_texto()
-    cenario_lixo_equipamento()
+    cenario_selecao_setor()
     cenario_limites_payload()
 
     print("\n" + "=" * 70)

@@ -87,8 +87,8 @@ def _eh_recusa(texto: str) -> bool:
 # Botoes interativos
 # =========================================================================
 
-_BTN_ACEITAR = {"id": "lgpd_aceitar", "title": "Aceitar"}
-_BTN_RECUSAR = {"id": "lgpd_recusar", "title": "Recusar"}
+_BTN_ACEITAR = {"id": "lgpd_aceitar", "title": "Sim"}
+_BTN_RECUSAR = {"id": "lgpd_recusar", "title": "Não"}
 
 
 def _resposta_botoes(
@@ -117,19 +117,16 @@ def _resposta_botoes(
 # Textos LGPD (com acentuacao correta)
 # =========================================================================
 
+_LINK_PRIVACIDADE = (
+    "https://www.centralloc.com.br/politica-de-privacidade-e-protecao-de-dados-pessoais-hub-loc-equipamentos-p-construcao-civil/"
+)
+
 _AVISO_LGPD = (
-    "Antes de prosseguirmos, informamos que esta conversa "
-    "poderá envolver a coleta de dados pessoais como nome "
-    "e telefone, utilizados exclusivamente para fins de "
-    "atendimento comercial, elaboração de orçamentos "
-    "e gestão de contratos de locação.\n\n"
-    "Seus dados são tratados com sigilo e em conformidade "
-    "com a Lei Geral de Proteção de Dados "
-    "(LGPD - Lei 13.709/2018).\n\n"
-    "Para conhecer nossa política de privacidade completa, acesse:\n"
-    "https://www.centralloc.com.br/politica-de-privacidade-e-protecao-de-dados-pessoais-hub-loc-equipamentos-p-construcao-civil/\n\n"
-    "Você concorda com o uso dos seus dados para fins de atendimento?\n"
-    "Toque em um dos botões abaixo ou responda SIM para aceitar ou NÃO para recusar."
+    "Olá! Que bom ter você na Hub Loc! 👷‍♂️🏗️\n\n"
+    "Para falar com nosso atendimento e gerar orçamentos, "
+    "precisamos do seu nome e telefone, protegidos pela LGPD.\n"
+    f"(Nossa Política de Privacidade: {_LINK_PRIVACIDADE})\n\n"
+    "Podemos continuar?"
 )
 
 _ACEITO_RESPOSTA = (
@@ -164,7 +161,6 @@ _NAO_ENTENDI_CORPO = (
 def handle_lgpd(
     state: dict,
     message_text: str,
-    saudacao: str = "",
 ) -> Optional[Union[str, dict]]:
     """
     Verifica e gerencia o consentimento LGPD.
@@ -173,7 +169,6 @@ def handle_lgpd(
         state: dict do bot_states (sera modificado in place).
         message_text: texto da mensagem recebida do cliente,
                       ou o button_reply.id quando vier de botao interativo.
-        saudacao: saudacao contextual (ex: "Bom dia") gerada pelo bot.
 
     Returns:
         None  -> consentimento ja existe (pass through para o bot).
@@ -224,14 +219,9 @@ def handle_lgpd(
     state["lgpd_status"] = "awaiting"
     state["user_first_input"] = message_text
 
-    prefixo = f"{saudacao}! " if saudacao else ""
-    corpo = (
-        f"{prefixo}Bem-vindo à Hub Loc, sua locadora de "
-        f"equipamentos para construção.\n\n{_AVISO_LGPD}"
-    )
     logger.info("[LGPD] Aviso enviado ao contato")
 
     return _resposta_botoes(
-        corpo=corpo,
+        corpo=_AVISO_LGPD,
         botoes=[_BTN_ACEITAR, _BTN_RECUSAR],
     )
