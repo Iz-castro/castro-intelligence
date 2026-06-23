@@ -70,21 +70,48 @@ class _DocRef:
         STORE.get(self.coll, {}).pop(self.doc_id, None)
 
 
+class _QSnap:
+    def __init__(self, coll, doc_id, data):
+        self.id = doc_id
+        self._data = data
+        self.reference = _DocRef(coll, doc_id)
+
+    def to_dict(self):
+        return dict(self._data) if self._data else None
+
+
+class _CollRef:
+    """Query minima: encadeia .where(campo, '==', valor) e itera .stream()."""
+    def __init__(self, coll):
+        self.coll = coll
+        self._filters = []
+
+    def where(self, field, op, value):
+        self._filters.append((field, op, value))
+        return self
+
+    def stream(self):
+        for doc_id, data in list(STORE.get(self.coll, {}).items()):
+            if all(op == "==" and data.get(f) == v for (f, op, v) in self._filters):
+                yield _QSnap(self.coll, doc_id, data)
+
+
 # =========================================================================
 # Stubs de firestore_common e database (injetados antes dos imports reais)
 # =========================================================================
 
 _fc = types.ModuleType("firestore_common")
 _fc.document = lambda name, doc_id: _DocRef(name, doc_id)
+_fc.collection = lambda name: _CollRef(name)
 _fc.utcnow = lambda: datetime.now(timezone.utc)
 _fc.get_firestore_client = lambda: None
 sys.modules["firestore_common"] = _fc
 
 _DEPARTMENTS = [
-    {"id": 1, "name": "Vendas", "bot_key": "comercial"},
+    {"id": 1, "name": "Comercial", "bot_key": "comercial"},
     {"id": 2, "name": "Suporte", "bot_key": "sac"},
     {"id": 3, "name": "Financeiro", "bot_key": "financeiro"},
-    {"id": 4, "name": "Geral", "bot_key": None},
+    {"id": 4, "name": "Administrativo", "bot_key": "administrativo"},
 ]
 
 _db = types.ModuleType("database")
@@ -272,9 +299,14 @@ def cenario_fallback_texto():
 
 
 def cenario_selecao_setor():
-    titulo("CENARIO 4 — Selecao de setor: invalida + roteamento por palavra-chave")
+    titulo("CENARIO 4 — Selecao de setor: invalida, roteamento e propagacao p/ thread")
     cid = 4
     _novo_contato(cid)
+    # Thread (conversation) do contato, como o webhook cria no inbound.
+    STORE.setdefault("wa_conversations", {})["conv4"] = {
+        "id": "conv4", "contact_id": cid,
+        "assigned_to": None, "assigned_to_uid": "", "department_id": None,
+    }
     cliente_envia(cid, text="oi")
     cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
 
@@ -292,11 +324,33 @@ def cenario_selecao_setor():
     check(reply is None, "palavra-chave de troca/defeito finaliza o bot")
     check(contato.get("bot_setor") == 2, "classificado como setor 2 (Assistencia)")
     check(contato.get("department_id") == 2,
-          "encaminhado ao Suporte/Assistencia (department_id=2, bot_key=sac)")
+          "contato encaminhado ao Suporte (department_id=2, bot_key=sac)")
+    check(STORE["wa_conversations"]["conv4"].get("department_id") == 2,
+          "thread tambem recebeu department_id=2 (pool segmenta por setor)")
+
+
+def cenario_outros_administrativo():
+    titulo("CENARIO 5 — Opcao 4 (Outros) roteia p/ Administrativo (bot_key administrativo)")
+    cid = 6
+    _novo_contato(cid)
+    STORE.setdefault("wa_conversations", {})["conv6"] = {
+        "id": "conv6", "contact_id": cid,
+        "assigned_to": None, "assigned_to_uid": "", "department_id": None,
+    }
+    cliente_envia(cid, text="oi")
+    cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
+    reply, _, _ = cliente_envia(cid, text="4")
+    contato = STORE["wa_contacts"]["6"]
+    check(reply is None, "opcao 4 finaliza o bot")
+    check(contato.get("bot_setor") == 4, "classificado como setor 4 (Outros/Administrativo)")
+    check(contato.get("department_id") == 4,
+          "encaminhado ao Administrativo (department_id=4, bot_key=administrativo)")
+    check(STORE["wa_conversations"]["conv6"].get("department_id") == 4,
+          "thread recebeu department_id=4 (pool segmenta por setor)")
 
 
 def cenario_limites_payload():
-    titulo("CENARIO 5 — bot_transport: limites da Graph API (defensivo)")
+    titulo("CENARIO 6 — bot_transport: limites da Graph API (defensivo)")
     grande = {
         "type": "interactive_buttons",
         "body": "x" * 2000,
@@ -330,6 +384,7 @@ def main():
     cenario_recusa_reconsentimento()
     cenario_fallback_texto()
     cenario_selecao_setor()
+    cenario_outros_administrativo()
     cenario_limites_payload()
 
     print("\n" + "=" * 70)

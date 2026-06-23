@@ -24,7 +24,7 @@ import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Union
 
-from firestore_common import document, utcnow
+from firestore_common import document, utcnow, collection
 from database import (
     get_wa_contact, get_system_settings, get_all_departments,
     save_wa_message, log_audit,
@@ -165,13 +165,14 @@ _SETOR_NOMES = {
     1: "Comercial",
     2: "Assistência Técnica",
     3: "Financeiro",
-    4: "Outros assuntos",
+    4: "Administrativo",
 }
 
-# Setor do bot -> bot_key do departamento no CRM. O setor 4 (Outros assuntos)
-# NAO mapeia para departamento: o lead cai no pool geral nao-atribuido, para
-# triagem da supervisao (mesmo comportamento do antigo "Administrativo").
-_BOT_KEY_BY_SETOR = {1: "comercial", 2: "sac", 3: "financeiro"}
+# Setor do bot -> bot_key do departamento no CRM. Todos os setores roteiam para
+# um departamento real (a pool do frontend segmenta por department_id da
+# conversation). A opcao 4 ("Outros assuntos" no menu) cai no Administrativo.
+# O roteamento e por bot_key, entao renomear o departamento na UI nao quebra.
+_BOT_KEY_BY_SETOR = {1: "comercial", 2: "sac", 3: "financeiro", 4: "administrativo"}
 
 _dept_cache = None
 
@@ -383,6 +384,18 @@ def _finalize_bot(contact_id: int, state: dict, setor: int):
         updates["department_id"] = dept_id
 
     document("wa_contacts", contact_id).set(updates, merge=True)
+
+    # Propaga o setor para as threads do contato: a pool ("novos") do frontend
+    # segmenta por department_id da CONVERSATION, nao do contato. Mantem
+    # assigned_to vazio — o lead segue sem dono, na pool do setor. Pula backup.
+    if dept_id:
+        for snap in collection("wa_conversations").where(
+            "contact_id", "==", contact_id
+        ).stream():
+            cd = snap.to_dict() or {}
+            if cd.get("is_backup"):
+                continue
+            snap.reference.set({"department_id": dept_id}, merge=True)
 
     sys_content = (
         f"Bot finalizado | {notes} | Encaminhado para {setor_nome}"

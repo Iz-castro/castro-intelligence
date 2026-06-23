@@ -1696,7 +1696,10 @@ def revert_lead_to_sale_owner(contact_id):
 
 
 def return_contact_to_bot(contact_id, returned_by_user_id):
-    """Devolve o contato para a fila do bot (remove atribuicao)."""
+    """Devolve o contato para a fila do bot (remove atribuicao do lead E das
+    threads). Sem limpar a conversation, ela continua "dona" do operador
+    anterior e o lead nunca entra na pool — o filtro 'novos' do frontend exige
+    conv.assigned_to vazio (espelha o que assign_wa_contact faz nas threads)."""
     current = _get_doc("wa_contacts", contact_id)
     if not current:
         return None
@@ -1705,11 +1708,23 @@ def return_contact_to_bot(contact_id, returned_by_user_id):
     document("wa_contacts", contact_id).set({
         "assigned_to": None,
         "assigned_to_uid": "",
+        "department_id": None,
         "qualification": "novo",
         "bot_completed": False,
         "attendance_protocol": "",
         "attendance_started_at": "",
     }, merge=True)
+    # Espelha a remocao de dono/setor nas threads (wa_conversations) do contato.
+    # Exceto backup (historico importado nao volta para o bot).
+    for _snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        _cd = _snap.to_dict() or {}
+        if _cd.get("is_backup"):
+            continue
+        _snap.reference.set({
+            "assigned_to": None,
+            "assigned_to_uid": "",
+            "department_id": None,
+        }, merge=True)
     # Log na transfer_log
     transfer_id = next_sequence("wa_transfer_log")
     document("wa_transfer_log", transfer_id).set({
