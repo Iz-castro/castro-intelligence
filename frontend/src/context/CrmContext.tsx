@@ -1,6 +1,6 @@
 import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
-import { collection, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
+import { collection, getDocs, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
 import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
@@ -266,6 +266,10 @@ type CrmContextValue = {
   notice: string;
   setNotice: (msg: string) => void;
 
+  loadMoreMyConversations: () => Promise<void>;
+  canLoadMoreMine: boolean;
+  loadingMoreConvs: boolean;
+
   refreshPollingViews: () => Promise<void>;
 };
 
@@ -328,6 +332,29 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // com o top-50), evitando que o painel do operador seja derrubado. Mapa
   // conversation_id -> Conversation. Zerado no logout/troca de conta.
   const [extraConversations, setExtraConversations] = useState<Map<string, Conversation>>(new Map());
+  // Camada ESTATICA de paginacao do "Meus" (operador comum): getDocs do `mine`
+  // com limite crescente. O listener AO VIVO continua em 50; estas sao paginas
+  // antigas carregadas sob demanda ("Carregar mais"), sem snapshot. Uma conversa
+  // daqui que recebe msg sobe pro top-50 ao vivo e o dedup (live ganha) corrige.
+  const [pagedConversations, setPagedConversations] = useState<Map<string, Conversation>>(new Map());
+  const [myConvPageLimit, setMyConvPageLimit] = useState(50);
+  const [myConvHasMore, setMyConvHasMore] = useState(true);
+  const [loadingMoreConvs, setLoadingMoreConvs] = useState(false);
+  // Remove uma conversa das camadas ESTATICAS (fixada + paginada) — ex.: apos
+  // transferir, a thread saiu das maos do operador e o ao vivo nao reentrega
+  // threads fora do escopo. No-op se nao estiver nas estaticas (conversa normal
+  // do top-50 e removida pelo proprio listener).
+  const removeExtraConversation = useCallback((conversationId: string | null) => {
+    if (!conversationId) return;
+    const drop = (prev: Map<string, Conversation>) => {
+      if (!prev.has(conversationId)) return prev;
+      const next = new Map(prev);
+      next.delete(conversationId);
+      return next;
+    };
+    setExtraConversations(drop);
+    setPagedConversations(drop);
+  }, []);
   // Cache em memoria de TODOS os contatos do tenant (inclui agenda
   // sincronizada via smb_app_state_sync que nao aparece na sidebar).
   // null = ainda nao carregado; array = carregado (mesmo se vazio).
@@ -357,13 +384,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // sobrescrevendo a estatica (o listener e mais fresco). Alimenta selecao,
   // lazy-fetch de contatos e todas as views.
   const allConversations = useMemo(() => {
-    if (extraConversations.size === 0) return conversations;
+    if (extraConversations.size === 0 && pagedConversations.size === 0) return conversations;
     const map = new Map<string, Conversation>();
-    extraConversations.forEach((c) => map.set(c.id, c));  // estaticas primeiro
-    conversations.forEach((c) => map.set(c.id, c));        // ao vivo sobrescreve
+    extraConversations.forEach((c) => map.set(c.id, c));  // fixadas (otimista do picker)
+    pagedConversations.forEach((c) => map.set(c.id, c));  // paginadas (getDocs, mais frescas)
+    conversations.forEach((c) => map.set(c.id, c));        // ao vivo sobrescreve tudo
     return Array.from(map.values())
       .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
-  }, [conversations, extraConversations]);
+  }, [conversations, extraConversations, pagedConversations]);
   const selectedConversation = useMemo(
     () => (selectedThreadId ? allConversations.find((c) => c.id === selectedThreadId) || null : null),
     [allConversations, selectedThreadId],
@@ -565,11 +593,32 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       return true;
     });
   }, [allConversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
-  // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas)
+  // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas).
+  // Aceita o id numerico OU o assigned_to_uid (string) — o listener ao vivo e a
+  // paginacao filtram por assigned_to_uid, entao casar so o numerico poderia
+  // esconder uma conversa paginada se houver drift de denormalizacao.
   const meusConversations = useMemo(
-    () => allConversations.filter((conv) => conv.assigned_to === sessionUser?.id && !conv.is_backup),
-    [allConversations, sessionUser?.id],
+    () => allConversations.filter((conv) => (conv.assigned_to === sessionUser?.id || (!!conv.assigned_to_uid && conv.assigned_to_uid === sessionUser?.firebase_uid)) && !conv.is_backup),
+    [allConversations, sessionUser?.id, sessionUser?.firebase_uid],
   );
+  // "Carregar mais" do "Meus" so faz sentido se o mine AO VIVO saturou os 50
+  // (senao nao ha pagina antiga e um getDocs seria leitura desperdicada). Conta
+  // a camada ao vivo (conversations), nao allConversations (que ja inclui paged).
+  const myLiveCount = useMemo(
+    () => conversations.filter((c) => c.assigned_to === sessionUser?.id || (!!c.assigned_to_uid && c.assigned_to_uid === sessionUser?.firebase_uid)).length,
+    [conversations, sessionUser?.id, sessionUser?.firebase_uid],
+  );
+  const canLoadMoreMine = !isManagerRole && activeView === "meus" && myConvHasMore && myLiveCount >= 50;
+  // Limpa a paginacao estatica do "Meus" ao SAIR da view — bound na janela de
+  // staleness (thread paginada reatribuida por terceiros nao fica fantasma) e
+  // re-habilita o "Carregar mais" (hasMore=true) ao voltar.
+  useEffect(() => {
+    if (activeView !== "meus") {
+      setPagedConversations(new Map());
+      setMyConvPageLimit(50);
+      setMyConvHasMore(true);
+    }
+  }, [activeView]);
   // Nao qualificadas: qualification do contato e "nao_qualificado"
   const nqConversations = useMemo(() => {
     return allConversations.filter((conv) => {
@@ -713,6 +762,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         setConversations((prev) => prev.map((conv) => (
           conv.id === conversationId ? { ...conv, unread: 0, unread_count: 0 } : conv
         )));
+        // Espelha o zeramento nas camadas ESTATICAS (paginada + fixada) — senao
+        // uma thread que vive SO em pagedConversations mantem unread velho e
+        // infla meusUnread (o listener ao vivo nao a reentrega pra corrigir).
+        const markRead = (prev: Map<string, Conversation>) => {
+          const c = prev.get(conversationId);
+          if (!c) return prev;
+          const next = new Map(prev);
+          next.set(conversationId, { ...c, unread: 0, unread_count: 0 });
+          return next;
+        };
+        setPagedConversations(markRead);
+        setExtraConversations(markRead);
       } else {
         setContacts((prev) => prev.map((contact) => (
           contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
@@ -864,6 +925,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
+    setPagedConversations(new Map());
+    setMyConvPageLimit(50);
+    setMyConvHasMore(true);
+    setLoadingMoreConvs(false);
     setExtraContacts(new Map());
     fetchedExtraRef.current.clear();
     setMessages([]);
@@ -1852,6 +1917,39 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setAllContactsCacheTotal(0);
   }
 
+  // "Carregar mais" do "Meus" (operador comum): pagina ESTATICA via getDocs do
+  // mine com limite crescente (50 -> 100 -> 150...). O listener ao vivo continua
+  // em 50; isto e leitura UNICA (sem snapshot). Usa o indice composto
+  // (assigned_to_uid, last_message_at). Admin/supervisor ja ouvem 300 ao vivo.
+  async function loadMoreMyConversations() {
+    if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser?.firebase_uid) return;
+    if (sessionUser.role === "admin" || sessionUser.role === "supervisor") return;
+    if (loadingMoreConvs) return;
+    const nextLimit = myConvPageLimit + 50;
+    setLoadingMoreConvs(true);
+    try {
+      const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
+      const q = query(
+        waConversations,
+        where("assigned_to_uid", "==", sessionUser.firebase_uid),
+        orderBy("last_message_at", "desc"),
+        firestoreLimit(nextLimit),
+      );
+      const snap = await getDocs(q);
+      const fetched = snap.docs.map((d) => normalizeConversation(d.data() as Record<string, unknown>, d.id));
+      const next = new Map<string, Conversation>();
+      fetched.forEach((c) => next.set(c.id, c));
+      setPagedConversations(next);
+      setMyConvPageLimit(nextLimit);
+      // Se voltou menos que o pedido, nao ha mais paginas.
+      setMyConvHasMore(snap.docs.length >= nextLimit);
+    } catch (e) {
+      setError(`Falha ao carregar mais conversas: ${errorText(e)}`);
+    } finally {
+      setLoadingMoreConvs(false);
+    }
+  }
+
   async function openConversationForContact(contact_id: number, channel_id?: number): Promise<string | null> {
     if (!bundle) return null;
     try {
@@ -1925,6 +2023,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // placeholder ("Selecione um contato..."). holdEmptySelectionRef
       // impede o auto-select de reabrir conversations[0].
       holdEmptySelectionRef.current = true;
+      // Se a conversa transferida estava FIXADA (aberta pelo picker, fora do
+      // top-50), tira da camada estatica — senao ficaria fantasma em "Meus" com
+      // dono defasado (o ao vivo nao reentrega thread fora do escopo).
+      removeExtraConversation(selectedThreadId);
       setSelectedThreadId(null);
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
@@ -2046,6 +2148,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
+    loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
     refreshPollingViews,
   };
 
