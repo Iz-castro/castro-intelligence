@@ -118,7 +118,7 @@ def _resposta_botoes(
 # =========================================================================
 
 _LINK_PRIVACIDADE = (
-    "https://www.centralloc.com.br/politica-de-privacidade-e-protecao-de-dados-pessoais-hub-loc-equipamentos-p-construcao-civil/"
+    "https://hubloc.com.br/politica-de-privacidade/"
 )
 
 _AVISO_LGPD = (
