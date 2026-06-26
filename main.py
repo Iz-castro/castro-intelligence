@@ -945,6 +945,12 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
     contact = get_wa_contact(int(contact_id))
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # Isolamento LGPD ENTRE operadores: operador comum so abre conversa de
+    # contato proprio, do pool sem dono, ou de thread que ja atende
+    # (admin/supervisor irrestrito). Espelha GET /api/wa/contact/{id} e fecha o
+    # IDOR horizontal — sem isto, qualquer operador abriria (e o upsert
+    # auto-atribuiria) o lead de outro operador por contact_id enumeravel.
+    _require_contact_access(contact, current_user)
     channel_id = body.get("channel_id") or contact.get("channel_id")
     if channel_id is None:
         raise HTTPException(
