@@ -633,12 +633,15 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, conversations, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
   // ou contato cross-canal.
-  const selectedThread = selectedThreadId ? conversations.find((c) => c.id === selectedThreadId) : null;
+  // Usa selectedConversation do contexto (resolve sobre allConversations =
+  // ao vivo + fixadas). Resolver via `conversations` cru aqui perdia a thread
+  // aberta pelo picker (fora do top-50) -> sendChannelId/takeover/banner cegos.
+  const selectedThread = selectedConversation;
   const sendChannelId = selectedThread?.channel_id ?? selectedContact?.channel_id ?? null;
   const hasDraft = Boolean(draft.trim());
   const [editingNickname, setEditingNickname] = useState(false);
@@ -1283,7 +1286,7 @@ function CollapsibleCard({ title, defaultOpen = true, children }: { title: strin
 }
 
 function DetailPanel() {
-  const { bundle, selectedContact, selectedThreadId, conversations, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
+  const { bundle, selectedContact, selectedThreadId, selectedConversation, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
   const [bulkFromUser, setBulkFromUser] = useState<number | "">("");
   const [bulkAction, setBulkAction] = useState<"return_to_bot" | "transfer">("return_to_bot");
@@ -1331,7 +1334,10 @@ function DetailPanel() {
   // V2 Fase 3: prioriza o canal da thread selecionada (selectedThreadId)
   // sobre o canal "primario" do contato. Se o usuario abriu a linha do
   // canal coexistence, o painel direito reflete esse canal.
-  const selectedThread = selectedThreadId ? conversations.find((c) => c.id === selectedThreadId) : null;
+  // Usa selectedConversation do contexto (resolve sobre allConversations =
+  // ao vivo + fixadas). Resolver via `conversations` cru aqui perdia a thread
+  // aberta pelo picker (fora do top-50) -> sendChannelId/takeover/banner cegos.
+  const selectedThread = selectedConversation;
   const threadChannelId = selectedThread?.channel_id ?? selectedContact?.channel_id ?? null;
   const contactChannel = threadChannelId ? channels.find((ch) => ch.id === threadChannelId) : null;
 

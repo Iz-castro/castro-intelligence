@@ -322,6 +322,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Fase 3: lista de conversations (sub-threads por canal). Mesmo wa_id em
   // dois canais aparece como duas entradas distintas.
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  // Conversas FIXADAS que escapam do top-50 ao vivo mas precisam permanecer na
+  // sessao: abertas explicitamente pelo picker/deep-link (openConversationForContact).
+  // Sobrevivem aos re-publishes do snapshot (que reconstroem `conversations` so
+  // com o top-50), evitando que o painel do operador seja derrubado. Mapa
+  // conversation_id -> Conversation. Zerado no logout/troca de conta.
+  const [extraConversations, setExtraConversations] = useState<Map<string, Conversation>>(new Map());
   // Cache em memoria de TODOS os contatos do tenant (inclui agenda
   // sincronizada via smb_app_state_sync que nao aparece na sidebar).
   // null = ainda nao carregado; array = carregado (mesmo se vazio).
@@ -346,9 +352,21 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // cross-channel como o legado).
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  // Fonte de verdade unificada das conversas: snapshot AO VIVO (top-50) +
+  // FIXADAS (extraConversations). Dedup por id com a versao ao vivo sempre
+  // sobrescrevendo a estatica (o listener e mais fresco). Alimenta selecao,
+  // lazy-fetch de contatos e todas as views.
+  const allConversations = useMemo(() => {
+    if (extraConversations.size === 0) return conversations;
+    const map = new Map<string, Conversation>();
+    extraConversations.forEach((c) => map.set(c.id, c));  // estaticas primeiro
+    conversations.forEach((c) => map.set(c.id, c));        // ao vivo sobrescreve
+    return Array.from(map.values())
+      .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
+  }, [conversations, extraConversations]);
   const selectedConversation = useMemo(
-    () => (selectedThreadId ? conversations.find((c) => c.id === selectedThreadId) || null : null),
-    [conversations, selectedThreadId],
+    () => (selectedThreadId ? allConversations.find((c) => c.id === selectedThreadId) || null : null),
+    [allConversations, selectedThreadId],
   );
   const selectedContactId = selectedConversation?.contact_id ?? null;
 
@@ -360,7 +378,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle) return;
     const localIds = new Set(contacts.map((c) => c.id));
     const missing = Array.from(new Set(
-      conversations
+      allConversations
         .map((c) => c.contact_id)
         .filter((id): id is number => typeof id === "number" && !localIds.has(id) && !fetchedExtraRef.current.has(id)),
     ));
@@ -391,7 +409,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         return next;
       });
     });
-  }, [conversations, contacts, bundle]);
+  }, [allConversations, contacts, bundle]);
 
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
@@ -521,21 +539,21 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Bot: sem atribuicao, no fluxo do bot (ainda nao completaram)
   const botConversations = useMemo(() => {
     if (!botEnabled) return [] as Conversation[];
-    return conversations.filter((conv) => {
+    return allConversations.filter((conv) => {
       if (conv.is_backup) return false;
       if (conv.assigned_to) return false;
       const c = contactsById.get(conv.contact_id);
       if (!c) return false;
       return c.qualification !== "nao_qualificado" && !c.bot_completed;
     });
-  }, [botEnabled, conversations, contactsById]);
+  }, [botEnabled, allConversations, contactsById]);
   // Novos: pool sem dono. Exige thread SEM dono (conv.assigned_to) E lead SEM
   // dono (contact.assigned_to) — senao threads orfas de leads ja atribuidos
   // (ex.: reassign-lead muda so o contato, nao a thread) vazariam pra ca.
   // Com bot ativo, so threads que ja completaram bot.
   // Operador comum so ve threads do seu departamento (ou sem); admin/supervisor veem todas.
   const novosConversations = useMemo(() => {
-    return conversations.filter((conv) => {
+    return allConversations.filter((conv) => {
       if (conv.is_backup) return false;
       if (conv.assigned_to) return false;
       const c = contactsById.get(conv.contact_id);
@@ -546,40 +564,40 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (!isManagerRole && conv.department_id != null && conv.department_id !== sessionUser?.department_id) return false;
       return true;
     });
-  }, [conversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
+  }, [allConversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
   // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas)
   const meusConversations = useMemo(
-    () => conversations.filter((conv) => conv.assigned_to === sessionUser?.id && !conv.is_backup),
-    [conversations, sessionUser?.id],
+    () => allConversations.filter((conv) => conv.assigned_to === sessionUser?.id && !conv.is_backup),
+    [allConversations, sessionUser?.id],
   );
   // Nao qualificadas: qualification do contato e "nao_qualificado"
   const nqConversations = useMemo(() => {
-    return conversations.filter((conv) => {
+    return allConversations.filter((conv) => {
       if (conv.is_backup) return false;
       const c = contactsById.get(conv.contact_id);
       return c?.qualification === "nao_qualificado";
     });
-  }, [conversations, contactsById]);
+  }, [allConversations, contactsById]);
   // Equipe: atribuidas a outros operadores. Operadores comuns nao veem
   // coexistence de outros; admin/supervisor veem tudo.
   const equipeConversations = useMemo(() => {
-    return conversations.filter((conv) => {
+    return allConversations.filter((conv) => {
       if (conv.is_backup) return false;
       if (!conv.assigned_to || conv.assigned_to === sessionUser?.id) return false;
       if (!isManagerRole && conv.source_channel_type === "coexistence") return false;
       return true;
     });
-  }, [conversations, isManagerRole, sessionUser?.id]);
+  }, [allConversations, isManagerRole, sessionUser?.id]);
 
   // Backup: conversas historicas importadas (is_backup). So privilegiado ve;
   // ordenadas por mais recente — a que recebe msg nova sobe pro topo (triagem).
   const backupConversations = useMemo(() => {
     if (!isManagerRole) return [] as Conversation[];
-    return conversations
+    return allConversations
       .filter((conv) => conv.is_backup === true)
       .slice()
       .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
-  }, [conversations, isManagerRole]);
+  }, [allConversations, isManagerRole]);
 
   // Fase 3.D: unread agregado e a soma das conversations daquela view.
   // Single source of truth — coerente com mark-read otimista por thread.
@@ -845,6 +863,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   function resetUserScopedState() {
     setContacts([]);
     setConversations([]);
+    setExtraConversations(new Map());
+    setExtraContacts(new Map());
+    fetchedExtraRef.current.clear();
     setMessages([]);
     setAllContactsCache(null);
     setAllContactsCacheTotal(0);
@@ -925,15 +946,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // da lista (orfa), mantem o comportamento legado: pula pra 1a ou
       // limpa se a lista esvaziou.
       holdEmptySelectionRef.current = false;
-      if (!conversations.some((c) => c.id === selectedThreadId)) {
-        setSelectedThreadId(conversations.length ? conversations[0].id : null);
+      if (!allConversations.some((c) => c.id === selectedThreadId)) {
+        setSelectedThreadId(allConversations.length ? allConversations[0].id : null);
       }
       return;
     }
-    if (!conversations.length) return;
+    if (!allConversations.length) return;
     if (holdEmptySelectionRef.current) return;
-    setSelectedThreadId(conversations[0].id);
-  }, [conversations, selectedThreadId]);
+    setSelectedThreadId(allConversations[0].id);
+  }, [allConversations, selectedThreadId]);
 
   // Track the selected conversation and restore its recent in-memory cache immediately.
   useEffect(() => {
@@ -1840,25 +1861,33 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       const res = await sendJson(bundle.auth, "/api/wa/conversation/open", payload) as {
         conversation_id: string; contact_id: number; channel_id: number;
       };
-      // Insercao otimista no estado local pra evitar race com o snapshot
-      // listener. Sem isso, o auto-select effect (que reseta seleção
-      // quando selectedThreadId nao esta na lista de conversations)
-      // sobrescreve nossa selecao antes do snapshot Firestore propagar.
+      // A conversa pode estar FORA do top-50 ao vivo (ex.: contato antigo
+      // achado no picker). Fixa em extraConversations pra (a) selectedConversation
+      // resolver o contact_id e o chat abrir, e (b) o auto-select nao derrubar o
+      // painel quando o snapshot republica so com o top-50. O backend
+      // (/conversation/open) valida o acesso via _require_contact_access (operador
+      // comum so abre proprio/pool/thread que atende) -> isolamento por tenant E
+      // entre operadores respeitado. No merge (allConversations), a versao AO VIVO do
+      // listener sempre sobrescreve esta estatica.
       if (res.conversation_id) {
-        setConversations((prev) => {
-          if (prev.some((c) => c.id === res.conversation_id)) return prev;
-          const optimistic = normalizeConversation({
-            id: res.conversation_id,
-            contact_id: res.contact_id,
-            channel_id: res.channel_id,
-            assigned_to: sessionUser?.id ?? null,
-            assigned_to_uid: sessionUser?.firebase_uid ?? "",
-            status: "open",
-            unread_count: 0,
-          }, res.conversation_id);
-          return [optimistic, ...prev];
-        });
-        setSelectedThreadId(res.conversation_id);
+        const cid = res.conversation_id;
+        if (!conversations.some((c) => c.id === cid)) {
+          setExtraConversations((prev) => {
+            if (prev.has(cid)) return prev;
+            const next = new Map(prev);
+            next.set(cid, normalizeConversation({
+              id: cid,
+              contact_id: res.contact_id,
+              channel_id: res.channel_id,
+              assigned_to: sessionUser?.id ?? null,
+              assigned_to_uid: sessionUser?.firebase_uid ?? "",
+              status: "open",
+              unread_count: 0,
+            }, cid));
+            return next;
+          });
+        }
+        setSelectedThreadId(cid);
         setActiveView("meus");
       }
       return res.conversation_id || null;
