@@ -366,10 +366,25 @@ def bootstrap_admin_user():
         logger.info("Bootstrap admin Firebase nao configurado")
         return
 
-    department_id = create_department(
-        BOOTSTRAP_ADMIN_DEPARTMENT,
-        "Setor criado automaticamente no primeiro deploy",
+    # Resolve o setor do admin SEM recriar default: usa o setor existente por
+    # nome (ativo ou nao); so cria se o tenant ainda estiver vazio. Sem este
+    # gate, rodar a cada boot recriaria um 'Geral' fantasma num tenant cujo
+    # 'Geral' foi renomeado — mesma causa-raiz do gate em bootstrap_departments.
+    _existing_depts = get_all_departments(include_inactive=True)
+    _admin_dept_norm = (BOOTSTRAP_ADMIN_DEPARTMENT or "").strip().lower()
+    _match = next(
+        (d for d in _existing_depts if (d.get("name") or "").strip().lower() == _admin_dept_norm),
+        None,
     )
+    if _match:
+        department_id = _match["id"]
+    elif not _existing_depts:
+        department_id = create_department(
+            BOOTSTRAP_ADMIN_DEPARTMENT,
+            "Setor criado automaticamente no primeiro deploy",
+        )
+    else:
+        department_id = None
     user = upsert_firebase_user(
         firebase_uid="",
         email=BOOTSTRAP_ADMIN_EMAIL,
@@ -401,8 +416,17 @@ def bootstrap_admin_user():
 
 
 def bootstrap_departments():
+    # So semeia os defaults se o tenant ainda nao tem NENHUM setor (inclusive
+    # inativos). Sem esse gate, ensure_default_departments rodava a CADA startup
+    # e recriava setores default cujo nome foi renomeado (o nome default ficava
+    # orfao) — causa-raiz das duplicatas 'Geral'(6) e 'Vendas'(7,8). Apos o seed
+    # inicial, qualquer ajuste de setor e feito pela UI (admin), nao pelo boot.
+    existing = get_all_departments(include_inactive=True)
+    if existing:
+        logger.info("Setores ja existentes (%d) — seed de defaults pulado", len(existing))
+        return
     dept_map = ensure_default_departments(create_department)
-    logger.info("Departamentos padrao sincronizados | total=%d", len(dept_map))
+    logger.info("Setores padrao semeados | total=%d", len(dept_map))
 
 
 def bootstrap_default_tenant():
@@ -3137,6 +3161,17 @@ async def wa_contact_detail(contact_id: int, current_user: dict = Depends(get_cu
     return {"contact": contact}
 
 
+def _validate_transfer_department(to_department_id):
+    """Rejeita transferir/reatribuir para um setor inexistente ou inativo —
+    senao a conversa fica carimbada com setor fantasma e some da pool dos
+    operadores. None/vazio = sem troca de setor (permitido)."""
+    if to_department_id in (None, "", 0, "0"):
+        return
+    dept = get_department_by_id(to_department_id)
+    if not dept or not dept.get("is_active", 1):
+        raise HTTPException(status_code=400, detail="Setor destino invalido ou inativo")
+
+
 @app.post("/api/wa/transfer")
 async def wa_transfer(request: Request, current_user: dict = Depends(get_current_user)):
     body = await request.json()
@@ -3152,6 +3187,7 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
         raise HTTPException(status_code=400, detail="Selecione o operador destino")
     if not summary:
         raise HTTPException(status_code=400, detail="Resumo do atendimento e obrigatorio")
+    _validate_transfer_department(to_department_id)
 
     conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
 
@@ -3218,6 +3254,7 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
         raise HTTPException(status_code=400, detail="contact_id obrigatorio")
     if not to_user_id:
         raise HTTPException(status_code=400, detail="Selecione o operador destino")
+    _validate_transfer_department(to_department_id)
     result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
