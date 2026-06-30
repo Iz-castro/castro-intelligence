@@ -975,7 +975,18 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
         "WA_CONVERSATION_OPEN",
         f"contact_id={contact_id} channel_id={channel_id} conv_id={conversation_id}",
     )
-    return {"conversation_id": conversation_id, "contact_id": int(contact_id), "channel_id": int(channel_id)}
+    # Devolve o dono REAL: upsert_wa_conversation so auto-atribui se a conversa
+    # nao tinha dono; se ja era de outro operador (coex multi-canal), o dono
+    # original permanece. O front usa isso pra nao forjar "assigned_to=eu" na
+    # entrada otimista do picker.
+    conv = get_wa_conversation_by_id(conversation_id) or {}
+    return {
+        "conversation_id": conversation_id,
+        "contact_id": int(contact_id),
+        "channel_id": int(channel_id),
+        "assigned_to": conv.get("assigned_to"),
+        "assigned_to_uid": conv.get("assigned_to_uid") or "",
+    }
 
 
 def _require_contact_access(contact: dict, current_user: dict):

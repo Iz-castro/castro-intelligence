@@ -1958,6 +1958,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (channel_id) payload.channel_id = channel_id;
       const res = await sendJson(bundle.auth, "/api/wa/conversation/open", payload) as {
         conversation_id: string; contact_id: number; channel_id: number;
+        assigned_to?: number | null; assigned_to_uid?: string;
       };
       // A conversa pode estar FORA do top-50 ao vivo (ex.: contato antigo
       // achado no picker). Fixa em extraConversations pra (a) selectedConversation
@@ -1969,6 +1970,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // listener sempre sobrescreve esta estatica.
       if (res.conversation_id) {
         const cid = res.conversation_id;
+        // Dono REAL devolvido pelo backend (nao forja "meu"): se a conversa ja
+        // era de outro operador, vem o dono original -> nao vira fantasma em
+        // "Meus" com dono falso.
+        const realAssignedTo = res.assigned_to ?? null;
+        const realAssignedUid = res.assigned_to_uid ?? "";
         if (!conversations.some((c) => c.id === cid)) {
           setExtraConversations((prev) => {
             if (prev.has(cid)) return prev;
@@ -1977,8 +1983,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
               id: cid,
               contact_id: res.contact_id,
               channel_id: res.channel_id,
-              assigned_to: sessionUser?.id ?? null,
-              assigned_to_uid: sessionUser?.firebase_uid ?? "",
+              assigned_to: realAssignedTo,
+              assigned_to_uid: realAssignedUid,
               status: "open",
               unread_count: 0,
             }, cid));
@@ -1986,7 +1992,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           });
         }
         setSelectedThreadId(cid);
-        setActiveView("meus");
+        // So pula pra "Meus" se a conversa e de fato do operador — senao ela nao
+        // apareceria na lista filtrada de "Meus" (so abriria no chat). O chat
+        // abre via selectedThreadId independentemente da view.
+        const mine = realAssignedTo === sessionUser?.id || (!!realAssignedUid && realAssignedUid === sessionUser?.firebase_uid);
+        if (mine) setActiveView("meus");
       }
       return res.conversation_id || null;
     } catch (e) {
