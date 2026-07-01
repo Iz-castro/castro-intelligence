@@ -2672,7 +2672,7 @@ async def list_pending_webhook_events(
 
 
 @app.post("/api/admin/pending-webhook-events/{event_id}/retry")
-async def retry_pending_webhook_event(event_id: int, current_user: dict = Depends(get_current_user)):
+async def retry_pending_webhook_event(event_id: str, current_user: dict = Depends(get_current_user)):
     """Re-roda process_webhook_payload com o payload original. Idempotente
     via wa_message_id (save_wa_message detecta duplicata)."""
     if current_user.get("role") not in ("admin", "supervisor"):
@@ -2698,7 +2698,7 @@ async def retry_pending_webhook_event(event_id: int, current_user: dict = Depend
 
 
 @app.post("/api/admin/pending-webhook-events/{event_id}/dismiss")
-async def dismiss_pending_webhook_event(event_id: int, current_user: dict = Depends(get_current_user)):
+async def dismiss_pending_webhook_event(event_id: str, current_user: dict = Depends(get_current_user)):
     """Marca evento como definitivamente falho (nao retentar). Usar quando
     intervencao confirma que o evento nao tem como ser recuperado."""
     if current_user.get("role") != "admin":
@@ -2712,7 +2712,7 @@ async def dismiss_pending_webhook_event(event_id: int, current_user: dict = Depe
 
 
 @app.delete("/api/admin/pending-webhook-events/{event_id}")
-async def delete_pending_webhook_event_endpoint(event_id: int, current_user: dict = Depends(get_current_user)):
+async def delete_pending_webhook_event_endpoint(event_id: str, current_user: dict = Depends(get_current_user)):
     """Remove evento da fila. Use apos retry confirmado ou eventos sem
     valor de retencao."""
     if current_user.get("role") != "admin":

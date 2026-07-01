@@ -23,6 +23,7 @@ from typing import Any
 from firestore_common import (
     _flat_collection as collection,
     _flat_document as document,
+    get_tenant_context,
     next_sequence,
     utcnow,
     normalize_record,
@@ -46,7 +47,10 @@ CHANNEL_TYPE_COEXISTENCE = "coexistence"
 _lock = threading.Lock()
 _channels_by_id: dict[int, dict] = {}
 _channels_by_phone_id: dict[str, dict] = {}
-_default_channel_id: int | None = None
+# Default por tenant (ADR 0007 Fase 1): tenant_id -> channel_id (1o standard ativo).
+# Antes era um int global -> envio sem channel_id explicito podia sair pela WABA
+# de outro tenant.
+_default_channel_id: dict[str, int] = {}
 _last_refresh: float = 0
 _CACHE_TTL_SECONDS = 60
 
@@ -57,7 +61,7 @@ def _needs_refresh() -> bool:
 
 def refresh_channels() -> None:
     """Recarrega todos os canais ativos do Firestore para o cache."""
-    global _last_refresh, _default_channel_id
+    global _last_refresh
 
     rows = []
     for snap in collection("channels").stream():
@@ -72,7 +76,7 @@ def refresh_channels() -> None:
 
     by_id: dict[int, dict] = {}
     by_phone: dict[str, dict] = {}
-    default_id: int | None = None
+    default_by_tenant: dict[str, int] = {}
 
     for row in rows:
         cid = row["id"]
@@ -80,15 +84,19 @@ def refresh_channels() -> None:
         phone_id = str(row.get("phone_number_id", "")).strip()
         if phone_id:
             by_phone[phone_id] = row
-        if row.get("channel_type") == CHANNEL_TYPE_STANDARD and default_id is None:
-            default_id = cid
+        # 1o canal standard ativo de CADA tenant vira o default daquele tenant.
+        if row.get("channel_type") == CHANNEL_TYPE_STANDARD:
+            tid = str(row.get("tenant_id") or "hubloc")
+            if tid not in default_by_tenant:
+                default_by_tenant[tid] = cid
 
     with _lock:
         _channels_by_id.clear()
         _channels_by_id.update(by_id)
         _channels_by_phone_id.clear()
         _channels_by_phone_id.update(by_phone)
-        _default_channel_id = default_id
+        _default_channel_id.clear()
+        _default_channel_id.update(default_by_tenant)
         _last_refresh = time.monotonic()
 
     logger.info("Channel cache refreshed: %d active channels", len(by_id))
@@ -120,19 +128,30 @@ def get_channel_by_phone_id(phone_number_id: str) -> dict | None:
 
 
 def get_default_channel() -> dict | None:
-    """Retorna o canal standard (bot) padrao."""
+    """Retorna o canal standard (bot) padrao DO TENANT ATUAL (ADR 0007)."""
     _ensure_cache()
+    tid = get_tenant_context() or "hubloc"
     with _lock:
-        if _default_channel_id is not None:
-            return _channels_by_id.get(_default_channel_id)
+        cid = _default_channel_id.get(tid)
+        if cid is not None:
+            return _channels_by_id.get(cid)
     return None
 
 
 def get_all_active_channels() -> list[dict]:
-    """Retorna todos os canais ativos."""
+    """Retorna os canais ativos DO TENANT ATUAL (ADR 0007 Fase 1: isolamento).
+
+    Filtro logico por tenant_id do contexto (o middleware seta por request via
+    custom claim; fallback 'hubloc' durante a transicao single-tenant).
+    """
     _ensure_cache()
+    tid = get_tenant_context() or "hubloc"
     with _lock:
-        return [normalize_record(ch) for ch in _channels_by_id.values()]
+        return [
+            normalize_record(ch)
+            for ch in _channels_by_id.values()
+            if str(ch.get("tenant_id") or "hubloc") == tid
+        ]
 
 
 def get_channels_for_user(user_id: int) -> list[dict]:
@@ -142,9 +161,12 @@ def get_channels_for_user(user_id: int) -> list[dict]:
     - Canal coexistence: acessivel apenas pelo owner + admin/supervisor
     """
     _ensure_cache()
+    tid = get_tenant_context() or "hubloc"
     with _lock:
         result = []
         for ch in _channels_by_id.values():
+            if str(ch.get("tenant_id") or "hubloc") != tid:
+                continue
             if ch.get("channel_type") == CHANNEL_TYPE_STANDARD:
                 result.append(ch)
             elif ch.get("owner_user_id") == user_id:

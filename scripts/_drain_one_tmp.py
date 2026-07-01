@@ -17,7 +17,7 @@ import webhook  # noqa: E402
 
 
 def main() -> int:
-    event_id = int(sys.argv[1])
+    event_id = sys.argv[1]  # auto-id do Firestore e string (ids legados numericos tb funcionam crus)
     ev = get_pending_event(event_id)
     if not ev or ev.get("status") != "pending":
         return 3

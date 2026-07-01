@@ -16,7 +16,7 @@ pendente.
 
 Schema:
     {
-        "id": int,
+        "id": str,                     # auto-id do Firestore (era int sequencial)
         "received_at": datetime,
         "change_field": str,           # "messages"/"smb_message_echoes"/etc
         "phone_number_id": str,        # do payload, pode estar vazio
@@ -35,8 +35,6 @@ from datetime import datetime, timezone
 from firestore_common import (
     global_collection,
     global_document,
-    get_firestore_client,
-    next_sequence,
     utcnow,
     normalize_record,
 )
@@ -51,15 +49,21 @@ STATUS_FAILED = "failed"
 
 
 def enqueue_pending_event(payload: dict, change_field: str,
-                          phone_number_id: str, reason: str) -> int:
-    """Persiste um evento pendente. Retorna event_id.
+                          phone_number_id: str, reason: str) -> str:
+    """Persiste um evento pendente. Retorna event_id (auto-id do Firestore, string).
 
     Chamada do webhook quando o canal nao puder ser resolvido pra um
     change especifico. payload e o dict completo do webhook (entry+changes),
     nao apenas o change pendente — facilita retry posterior reusando
     process_webhook_payload.
+
+    Usa auto-id do Firestore (nao next_sequence): a colecao e flat/global, mas
+    next_sequence lia o contador do tenant do contexto (webhook ja setou o
+    contexto) -> com 2+ tenants o event_id colidia e o tenant B sobrescrevia o
+    doc do tenant A (ADR 0007 risco 3). Auto-id elimina a colisao.
     """
-    event_id = next_sequence("pending_webhook_events")
+    ref = global_collection(PENDING_COLLECTION).document()
+    event_id = ref.id
     doc = {
         "id": event_id,
         "received_at": utcnow(),
@@ -72,7 +76,7 @@ def enqueue_pending_event(payload: dict, change_field: str,
         "last_error": "",
         "payload": payload,
     }
-    global_document(PENDING_COLLECTION, event_id).set(doc)
+    ref.set(doc)
     logger.warning(
         "[PENDING] Evento enfileirado | id=%s field=%s phone_id=%s reason=%s",
         event_id, change_field, phone_number_id, reason,
@@ -103,7 +107,7 @@ def list_pending_events(status: str | None = None, limit: int = 100) -> list[dic
     return [normalize_record(r) for r in rows]
 
 
-def get_pending_event(event_id: int) -> dict | None:
+def get_pending_event(event_id: str) -> dict | None:
     snap = global_document(PENDING_COLLECTION, event_id).get()
     if not snap.exists:
         return None
@@ -113,7 +117,7 @@ def get_pending_event(event_id: int) -> dict | None:
     return normalize_record(data)
 
 
-def mark_event_attempt(event_id: int, success: bool, error: str = "") -> None:
+def mark_event_attempt(event_id: str, success: bool, error: str = "") -> None:
     """Atualiza contador de tentativas e status final."""
     snap = global_document(PENDING_COLLECTION, event_id).get()
     if not snap.exists:
@@ -129,7 +133,7 @@ def mark_event_attempt(event_id: int, success: bool, error: str = "") -> None:
     global_document(PENDING_COLLECTION, event_id).set(updates, merge=True)
 
 
-def mark_event_failed(event_id: int, error: str) -> None:
+def mark_event_failed(event_id: str, error: str) -> None:
     """Marca um evento como definitivamente falho (nao retentar)."""
     global_document(PENDING_COLLECTION, event_id).set(
         {
@@ -141,7 +145,7 @@ def mark_event_failed(event_id: int, error: str) -> None:
     )
 
 
-def delete_pending_event(event_id: int) -> bool:
+def delete_pending_event(event_id: str) -> bool:
     snap = global_document(PENDING_COLLECTION, event_id).get()
     if not snap.exists:
         return False

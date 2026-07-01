@@ -12,6 +12,7 @@ Uso:
 import argparse
 import asyncio
 import sys
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -40,10 +41,10 @@ def _fetch(limit, shard=None, workers=None):
         if str(d.get("change_field")) in _SKIP_FIELDS:
             continue
         if shard is not None and workers:
-            try:
-                if int(d["_id"]) % workers != shard:
-                    continue
-            except (TypeError, ValueError):
+            # Hash estavel: funciona p/ auto-id string (novo) E id numerico (legado).
+            # int(d["_id"]) estourava ValueError no auto-id e o except pulava o evento
+            # SILENCIOSAMENTE (residual sumia da contagem de convergencia tb).
+            if zlib.crc32(str(d["_id"]).encode()) % workers != shard:
                 continue
         rows.append(d)
     rows.sort(key=lambda r: (_ORDER.get(r.get("reason"), 2), str(r.get("received_at"))))
