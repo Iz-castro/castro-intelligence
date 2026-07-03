@@ -26,7 +26,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
-from bootstrap_data import ensure_default_departments
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
@@ -89,12 +88,8 @@ from channel_service import (
 from auth import authenticate_firebase_token
 from firestore_common import (
     collection_name, document as fs_document, utcnow as fs_utcnow,
-    set_tenant_context, tenant_context, get_tenant_context,
 )
 from pii_redaction import redact_phone, redact_name
-from tenant_service import (
-    create_tenant, get_tenant, tenant_exists, lookup_phone_routing,
-)
 from webhook import process_webhook_payload, validate_signature
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
@@ -361,92 +356,9 @@ def _serve_frontend_app():
     return FileResponse(FRONTEND_INDEX_FILE)
 
 
-def bootstrap_admin_user():
-    if not BOOTSTRAP_ADMIN_EMAIL:
-        logger.info("Bootstrap admin Firebase nao configurado")
-        return
-
-    # Resolve o setor do admin SEM recriar default: usa o setor existente por
-    # nome (ativo ou nao); so cria se o tenant ainda estiver vazio. Sem este
-    # gate, rodar a cada boot recriaria um 'Geral' fantasma num tenant cujo
-    # 'Geral' foi renomeado — mesma causa-raiz do gate em bootstrap_departments.
-    _existing_depts = get_all_departments(include_inactive=True)
-    _admin_dept_norm = (BOOTSTRAP_ADMIN_DEPARTMENT or "").strip().lower()
-    _match = next(
-        (d for d in _existing_depts if (d.get("name") or "").strip().lower() == _admin_dept_norm),
-        None,
-    )
-    if _match:
-        department_id = _match["id"]
-    elif not _existing_depts:
-        department_id = create_department(
-            BOOTSTRAP_ADMIN_DEPARTMENT,
-            "Setor criado automaticamente no primeiro deploy",
-        )
-    else:
-        department_id = None
-    user = upsert_firebase_user(
-        firebase_uid="",
-        email=BOOTSTRAP_ADMIN_EMAIL,
-        display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
-        role="admin",
-        department_id=department_id,
-    )
-    if user:
-        # Sincroniza custom_claim tenant_id no usuario Firebase para a
-        # proxima sessao. O usuario precisa renovar o ID token (logout/login
-        # ou getIdToken(true)) para o claim aparecer.
-        firebase_uid = user.get("firebase_uid", "")
-        tenant_id = get_tenant_context() or "hubloc"
-        if firebase_uid:
-            try:
-                from firebase_admin_client import set_tenant_claims
-                set_tenant_claims(firebase_uid, tenant_id, role="admin")
-            except Exception as exc:
-                logger.warning("Falha ao setar custom_claim tenant_id no admin: %s", exc)
-        logger.info(
-            "Bootstrap admin Firebase sincronizado | email=%s tenant_id=%s",
-            redact_name(BOOTSTRAP_ADMIN_EMAIL), tenant_id,
-        )
-    else:
-        logger.warning(
-            "Falha ao sincronizar bootstrap admin Firebase | email=%s",
-            redact_name(BOOTSTRAP_ADMIN_EMAIL),
-        )
-
-
-def bootstrap_departments():
-    # So semeia os defaults se o tenant ainda nao tem NENHUM setor (inclusive
-    # inativos). Sem esse gate, ensure_default_departments rodava a CADA startup
-    # e recriava setores default cujo nome foi renomeado (o nome default ficava
-    # orfao) — causa-raiz das duplicatas 'Geral'(6) e 'Vendas'(7,8). Apos o seed
-    # inicial, qualquer ajuste de setor e feito pela UI (admin), nao pelo boot.
-    existing = get_all_departments(include_inactive=True)
-    if existing:
-        logger.info("Setores ja existentes (%d) — seed de defaults pulado", len(existing))
-        return
-    dept_map = ensure_default_departments(create_department)
-    logger.info("Setores padrao semeados | total=%d", len(dept_map))
-
-
-def bootstrap_default_tenant():
-    """Cria o tenant 'hubloc' (default single-tenant) se ainda nao existir.
-
-    Esse tenant e usado durante a transicao multi-tenant: todos os
-    usuarios e dados que nao tem tenant_id explicito sao roteados para
-    ele. Quando UI super-admin de criacao de tenants estiver pronta
-    (Roadmap pos-Fase 2), tenants adicionais sao criados via interface.
-    """
-    if tenant_exists("hubloc"):
-        logger.info("Tenant default 'hubloc' ja existe")
-        return
-    create_tenant(
-        tenant_id="hubloc",
-        name="Hubloc Imobiliaria",
-        plan="professional",
-        cnpj="",
-    )
-    logger.info("Tenant default 'hubloc' criado")
+# Bootstrap de tenant (tenant/setores/admin) vive em tenant_bootstrap.py
+# (M-A2): mesma funcao serve o hubloc no startup e o onboarding de tenants
+# novos pelo painel super-admin (Cloud Run B).
 
 
 def validate_runtime_config():
@@ -472,13 +384,18 @@ def validate_runtime_config():
 async def startup():
     validate_runtime_config()
     init_database()
-    # Cria o tenant default antes de qualquer bootstrap escopado.
-    bootstrap_default_tenant()
-    # Departamentos e admin do tenant default rodam DENTRO do contexto
-    # do tenant — assim ficam em tenants/hubloc/{departments,users,...}.
-    with tenant_context("hubloc"):
-        bootstrap_departments()
-        bootstrap_admin_user()
+    # Garante o tenant default 'hubloc' (transicao multi-tenant): tenant +
+    # setores + admin com claim atomico, tudo em tenants/hubloc/... —
+    # idempotente, no-op em boot repetido (M-A2, tenant_bootstrap.py).
+    from tenant_bootstrap import bootstrap_tenant
+    bootstrap_tenant(
+        "hubloc",
+        name="Hubloc Imobiliaria",
+        plan="professional",
+        admin_email=BOOTSTRAP_ADMIN_EMAIL,
+        admin_display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
+        admin_department_name=BOOTSTRAP_ADMIN_DEPARTMENT,
+    )
     ensure_media_dir()
     # Channel ainda fica em colecao flat (compartilhado por enquanto).
     # Migrar para tenants/{tid}/channels e parte da Fase 2 (sub-fase
