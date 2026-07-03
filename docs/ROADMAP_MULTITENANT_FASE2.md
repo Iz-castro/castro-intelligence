@@ -39,7 +39,45 @@ staging; bloqueia go-live em prod.
 0. VERIFY-FIRST ✅ FEITO 2026-07-01 — rules estritas de PROD CONFIRMADAS publicadas (console).
      ACHADO: ownsTenant() depende de emailAllowed() (whitelist hubloc) → operador de
      tenant #2 (email não-hubloc) seria BARRADO nas rules. Vira item obrigatório pré-#2 (M-A4).
-     Drift: repo tem castrointelligence@gmail.com no emailAllowed() que o publicado não tem → republicar.
+     [CORRIGIDO 2026-07-03: o "drift" do castrointelligence@gmail.com era FALSO — leitura via
+     API (fonte autoritativa) confirmou publicado ≡ repo HEAD, zero diferença.]
+
+0b. NOVO BLOQUEADOR (achado no M-A4, 2026-07-03): o gate de LOGIN do backend
+     (auth._firebase_email_allowed + env ALLOWED_FIREBASE_EMAIL_DOMAIN=hubloc.com.br,
+     ALLOWED_FIREBASE_EMAILS=founders, AUTO_PROVISION=true) é OUTRA whitelist hubloc-only.
+     Operador do #2 passaria nas rules pós-M-A4 mas levaria 403 NO LOGIN. Precisa evoluir pro
+     design soft allowed_email_domains por tenant (usuário PROVISIONADO loga independente de
+     domínio; auto-provision só para domínio de algum tenant). Item "M-A4b", escopo próprio —
+     mexe no caminho de login de prod. (Hoje esse gate é o que impede estranho de auto-provisionar
+     → é pré-requisito ele continuar equivalente ao evoluir.)
+
+0c. M-A4 ✅ PUBLICADO EM PROD 2026-07-03 — ownsTenant() autoriza SÓ por claim tenant_id
+     (removido `emailAllowed() &&`). Ruleset ativo `faa492f1-c3c7-45d9-b5b3-8f141af2a1c9`
+     (createTime 21:34:18Z; backup do anterior em firestore.rules.bak-publicado-20260703 +
+     rollback via scratchpad publish_ma4_rules.py --rollback). Revisão adversarial (18 agentes,
+     0 erros): veredito SHIP, 0 bloqueadores — para a população viva do hubloc é NO-OP byte-a-byte
+     (13/13 ativos com claim; o termo removido era redundante com deter o claim, que só é emitido
+     após passar o mesmo gate de email do backend). Canário OK (operador comum + admin enviam/recebem).
+     4 FOLLOW-UPS pré-existentes (NÃO bloquearam este deploy; são PRÉ-REQUISITO do #2 — grupo "M-A4b"):
+       (i)  OFFBOARDING ⭐ — deactivate_user (database_firestore.py:393) só grava is_active=0;
+            falta revoke_refresh_tokens + remover claim tenant_id/role + invalidar cache. As ~11
+            subcoleções gateadas SÓ por ownsTenant (departments:204, wa_contacts/wa_conversations
+            via canSeeContactScoped:209/213, wa_messages não-backup:221, system_settings:240,
+            health_status:259, gc_*:264/269, messages:274, media_assets:291) não checam
+            operator_profile ativo → desativado com claim residual lê PII do próprio tenant por
+            ~1h (TTL do ID token) até revogar. Alternativa/complemento: trocar essas subcoleções
+            para tenantOperatorActive (que exige profile ativo).
+       (ii) ROLE STALE — troca de cargo na UI (main.py:666) não reescreve o claim role
+            (auth._resolve_tenant_id early-return em auth.py:114); admin rebaixado mantém leitura
+            privilegiada direta (tokenRole em isPrivilegedInTenant). Reemitir claim role +
+            revoke_refresh_tokens na troca, ou rules privilegiadas consultarem operator_profile.
+       (iii) MIS-PROVISIONAMENTO cross-tenant ao abrir o gate — _resolve_tenant_id faz fallback
+            cego p/ _DEFAULT_TENANT=hubloc (auth.py:172) e admin_create_user (main.py:640) cria
+            operador SEM claim. Antes de ampliar ALLOWED_FIREBASE_EMAIL_DOMAIN p/ o #2: setar
+            claim atômico na criação (como ensure_tenant_admin) e remover o default cego p/ hubloc.
+       (iv) storage.rules (LOW) — ainda whitelist single-tenant hubloc (falta até
+            castrointelligence@gmail.com); inócuo hoje (mídia via backend Admin SDK main.py:448,
+            sem Storage client-side). Migrar p/ claim tenant_id antes de ligar leitura client-side.
 
 PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
   A. Isolamento de canais
@@ -52,8 +90,9 @@ PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
   C. RBAC dinâmico no hubloc (D4 — antes do #2)
      M-B2  seed perfis + require_permission/useCan dual-check + ondas + UI toggles  [L]
   D. Rules + gate
-     M-A4  rules multi-tenant: remover emailAllowed() do ownsTenant (isolar por
-           claim + operator_profile) + endurecer rules de STAGING            [M]
+     M-A4  ✅ FEITO 2026-07-03 — removido emailAllowed() do ownsTenant (isolar por
+           claim tenant_id). Publicado + canário OK. Ver bloco 0c. Falta: endurecer
+           rules de STAGING (espelhar PROD) — pendente, baixo risco (staging vazio em Oregon).
      M-A5  ensaio de onboarding + auditoria de vazamento (GATE)
 
 LIGAR TENANT #2 (standard) pela UI do Cloud Run B.
@@ -78,7 +117,8 @@ super-admins provisionados **[Sprint 0 + D3]**.
 
 **Fase 1 — Criar o tenant (super-admin, Cloud Run B):**
 1. Super-admin loga no painel B (MFA) **[Cloud Run B]**.
-2. Formulário: nome, CNPJ, plano, email do admin do cliente.
+2. Formulário: nome, CNPJ, plano, email do admin do cliente, **`allowed_email_domains`**
+   (ver "Identidade/domínio do tenant" abaixo — default = domínio do email do admin).
 3. B chama `bootstrap_tenant(tid,...)` (Admin SDK) **[M-A2]**: `create_tenant` → `tenants/{tid}`
    (metadata/billing) **[hoje: tenant_service]**; semeia setores default; semeia 3 perfis RBAC
    **[M-B2]**; cria admin do cliente; `set_tenant_claims`+`revokeRefreshTokens` (D6).
@@ -108,6 +148,30 @@ super-admins provisionados **[Sprint 0 + D3]**.
 **Transversal:** isolamento em 3 camadas (rules por path/claim + backend por contexto + frontend);
 billing managed (health-cron monitora pagamento por canal); LGPD (Oregon DPA/SCCs; coex→ADR 0002).
 
+### Identidade/domínio do tenant — decisão SOFT (fechada 2026-07-03)
+
+**O domínio NÃO autoriza acesso — o claim `tenant_id` autoriza** (setado no provisionamento;
+o M-A4 remove a whitelist de email de propósito). Um operador pode ter qualquer email (domínio
+do cliente, gmail, etc.); o que vale é ter sido provisionado (claim).
+
+Mesmo assim, guardar o domínio no tenant (`allowed_email_domains: ["clientenovo.com.br"]`, LISTA,
+default = domínio do email do admin, **editável** pelo admin do tenant e/ou super-admin) por 2 usos:
+- **Guarda-corpo:** ao criar um operador com email fora do(s) domínio(s), o sistema **avisa**
+  ("fora dos domínios, adicionar mesmo assim?") — evita botar operador no tenant errado. Combina
+  com o guard "um email = um tenant" já no `bootstrap_tenant`.
+- **Self-service / roteamento:** login Google novo (sem claim ainda) de um domínio conhecido →
+  roteia pro tenant certo, em vez do fallback "hubloc" errado do `auth._resolve_tenant_id`.
+
+**Modelo SOFT (Forma A — escolhida):** o domínio é guarda-corpo + roteamento, **nunca a trava**.
+Exceção (operador de fora do domínio, ex: contratado gmail) **não é um campo/allowlist** — é só
+o admin criar o operador mesmo assim (com o aviso). Os "de fora" são deriváveis (operadores cujo
+email não bate com nenhum domínio) sem campo extra. Rejeitada a Forma B (campo `extra_allowed_emails`
+explícito) por adicionar manutenção sem ganho de acesso.
+
+**Pré-requisito técnico:** criar operador pela UI deve **setar o claim** (igual o `bootstrap_tenant`
+faz pro admin) — senão o operador loga sem claim e o domínio vira NECESSÁRIO pra rotear. Ideal:
+criar operador já seta o claim (dispensa o domínio) E guardamos o domínio como guarda-corpo/self-service.
+
 ---
 
 # PARTE 1 — DETALHE DO MULTI-TENANT
@@ -135,7 +199,7 @@ sai pela WABA do outro tenant; (3) colisão de `event_id` na fila. **Bloqueante,
 | **M-B2** | RBAC dinâmico (D4, antes do #2): `perfis_acesso` por tenant, 3 seed = comportamento atual, `require_permission`/`useCan` dual-check, ondas, UI toggles. | L | backend + rules + frontend (PLANO_RBAC §3) |
 | **Cloud Run B** | Sprint 0 (§6) + serviço mínimo com criação de tenant (D3). | L | novo serviço |
 | **M-B1** | ADR 0007 Fase 2: migrar canais → `tenants/{tid}/channels`, cache por tenant, backfill `phone_routing`, preservar `channel_id`. | L | `channel_service.py` |
-| **M-A4/A5** | **Rules multi-tenant:** tirar `emailAllowed()` do `ownsTenant`/`tenantOperatorActive` (isolar por claim `tenant_id` + `operator_profile` ativo — hoje a whitelist hubloc BARRARIA operador do #2); endurecer rules de STAGING (espelhar PROD); ensaio de onboarding (GATE). | M | `firestore.rules` |
+| **M-A4/A5** | ✅ **M-A4 FEITO (2026-07-03):** removido `emailAllowed()` do `ownsTenant` (isolar por claim `tenant_id`) — publicado em prod, canário OK, veredito de revisão SHIP (ver bloco 0c + 4 follow-ups pré-#2). Pendente: endurecer rules de STAGING (espelhar PROD, baixo risco); M-A5 ensaio de onboarding (GATE). | M | `firestore.rules` |
 
 ---
 

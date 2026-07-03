@@ -3,14 +3,8 @@ service cloud.firestore {
   match /databases/{database}/documents {
     // Estas rules precisam usar o mesmo prefixo definido em FIRESTORE_COLLECTION_PREFIX.
     // No ambiente atual, as collections reais sao "castro_crm_*".
-    //
-    // M-A4 (multi-tenant): as rules tenant-scoped (castro_crm_tenants/...) autorizam
-    // por CLAIM tenant_id + operator_profile ativo — SEM whitelist de email. Um
-    // operador de qualquer tenant/dominio acessa apenas o proprio tenant. A whitelist
-    // emailAllowed() abaixo permanece SO para as colecoes flat legadas (vazias em
-    // Oregon) e o bloco de staging; nao gateia mais nada tenant-scoped.
-    // (allowed_email_domains do tenant e guarda-corpo SOFT no provisionamento/
-    // roteamento — decisao 2026-07-03 — e nao entra nas rules.)
+    // Whitelist single-tenant (hubloc) — quando entrar tenant #2, mover whitelist
+    // para tenants/{tid}.allowed_email_domains e usar claim tenant_id.
     function signedIn() {
       return request.auth != null && request.auth.token.email != null;
     }
@@ -63,12 +57,7 @@ service cloud.firestore {
     }
 
     function ownsTenant(tid) {
-      // M-A4: autorizacao por claim tenant_id (setado pelo backend no
-      // provisionamento, assinado no JWT) — sem whitelist de email, senao
-      // operador de tenant novo (dominio proprio/gmail) seria barrado.
-      // tokenTenantId() exige signedIn() e claim nao-nulo ('' se ausente,
-      // que nunca casa com um {tid} valido do path).
-      return tokenTenantId() == tid;
+      return emailAllowed() && tokenTenantId() == tid;
     }
 
     function isPrivilegedInTenant(tid) {
