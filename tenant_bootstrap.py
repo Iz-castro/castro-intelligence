@@ -21,6 +21,7 @@ import logging
 
 from bootstrap_data import ensure_default_departments
 from database_firestore import (
+    backfill_perfil_acesso_ids,
     create_department,
     get_all_departments,
     get_user_raw_by_firebase_uid_or_email,
@@ -28,6 +29,7 @@ from database_firestore import (
 )
 from firestore_common import get_tenant_context, tenant_context
 from pii_redaction import redact_name
+from rbac import seed_perfis_acesso
 from tenant_service import create_tenant, tenant_exists
 
 logger = logging.getLogger("castro_crm.tenant_bootstrap")
@@ -317,6 +319,11 @@ def bootstrap_tenant(
 
     with tenant_context(tenant_id):
         bootstrap_departments()
+        # M-B2: perfis RBAC seed (idempotente — nao sobrescreve ajustes do
+        # admin do tenant) + backfill do perfil_acesso_id em usuarios
+        # pre-RBAC (escreve so onde falta).
+        seed_perfis_acesso()
+        backfill_perfil_acesso_ids()
         admin = ensure_tenant_admin(
             admin_email,
             admin_display_name=admin_display_name,

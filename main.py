@@ -89,6 +89,11 @@ from auth import authenticate_firebase_token, invalidate_auth_cache
 from firestore_common import (
     collection_name, document as fs_document, utcnow as fs_utcnow,
 )
+from rbac import (
+    LOCKED_ADMIN_TOGGLES, PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
+    default_perfil_for_role, effective_toggles, ensure_permission, get_perfil,
+    has_permission, invalidate_perfil_cache,
+)
 from pii_redaction import redact_phone, redact_name
 from webhook import process_webhook_payload, validate_signature
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
@@ -242,6 +247,19 @@ def get_current_user(request: Request):
     if not result["success"]:
         raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
     return result["user"]
+
+
+def require_permission(perm: str):
+    """Dependency factory RBAC (M-B2): autentica e exige o toggle `perm`.
+
+    Dual-check (PLANO_RBAC §3.8): o toggle do perfil do usuario decide; se o
+    perfil/chave nao existe, cai no default do seed da role (comportamento
+    pre-RBAC). Endpoints que precisam do check no meio do corpo usam
+    `ensure_permission(current_user, perm)` direto.
+    """
+    async def _dep(current_user: dict = Depends(get_current_user)):
+        return ensure_permission(current_user, perm)
+    return _dep
 
 
 # -- Validacao de imagem --
@@ -513,6 +531,7 @@ async def session_info(current_user: dict = Depends(get_current_user)):
     tenant_collections = {
         "departments": f"{tenants_root}/{tenant_id}/departments",
         "operator_profiles": f"{tenants_root}/{tenant_id}/operator_profiles",
+        "perfis_acesso": f"{tenants_root}/{tenant_id}/perfis_acesso",
         "wa_contacts": f"{tenants_root}/{tenant_id}/wa_contacts",
         "wa_messages": f"{tenants_root}/{tenant_id}/wa_messages",
         "wa_conversations": f"{tenants_root}/{tenant_id}/wa_conversations",
@@ -520,11 +539,18 @@ async def session_info(current_user: dict = Depends(get_current_user)):
         "gc_conversations": f"{tenants_root}/{tenant_id}/gc_conversations",
         "gc_messages": f"{tenants_root}/{tenant_id}/gc_messages",
     }
+    # M-B2: mapa EFETIVO de toggles (perfil do usuario + fallback de role no
+    # dual-check) — o useCan do frontend le daqui e do snapshot do perfil.
+    perfil_id = str(current_user.get("perfil_acesso_id") or "") or default_perfil_for_role(current_user.get("role"))
     return {
         "user": current_user,
         "auth_mode": AUTH_MODE,
         "tenant_id": tenant_id,
         "firestore_collections": tenant_collections,
+        "perfil": {
+            "id": perfil_id,
+            "toggles": effective_toggles(current_user),
+        },
     }
 
 
@@ -619,8 +645,7 @@ async def upload_contact_avatar(contact_id: int, request: Request, file: UploadF
 
 @app.post("/api/admin/users")
 async def admin_create_user(request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Permissao negada")
+    ensure_permission(current_user, "gerenciar_usuarios")
     body = await request.json()
     email = (body.get("email", "")).strip().lower()
     display_name = (body.get("display_name", "")).strip()
@@ -634,6 +659,11 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
         raise HTTPException(status_code=400, detail="Display name excede limite de caracteres")
     if role not in ROLE_OPTIONS:
         raise HTTPException(status_code=400, detail=f"Cargo invalido. Opcoes: {', '.join(ROLE_OPTIONS)}")
+    # Guard de escalacao (M-B2): criar um admin exige ser admin — supervisor
+    # com gerenciar_usuarios nao pode provisionar alguem acima do proprio
+    # nivel. (Mudanca consciente: antes o backend nao barrava.)
+    if role == "admin" and current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode criar outro admin")
     existing = get_user_by_email(email)
     if existing:
         raise HTTPException(status_code=409, detail="Usuario ja existe")
@@ -668,8 +698,7 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
 
 @app.put("/api/admin/users/{user_id}")
 async def admin_update_user(user_id: int, request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Permissao negada")
+    ensure_permission(current_user, "gerenciar_usuarios")
     target = get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="Usuario nao encontrado")
@@ -677,15 +706,37 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
     display_name = body.get("display_name")
     department_id = body.get("department_id")
     role = body.get("role")
+    perfil_acesso_id = body.get("perfil_acesso_id")
     if role and role not in ROLE_OPTIONS:
         raise HTTPException(status_code=400, detail=f"Cargo invalido. Opcoes: {', '.join(ROLE_OPTIONS)}")
-    update_user(user_id, display_name=display_name, department_id=department_id, role=role)
+    # -- Guards de escalacao (M-B2; mudanca consciente — antes nao barrava) --
+    my_tid = str(current_user.get("tenant_id") or "") or "hubloc"
+    role_changing = bool(role) and role != target.get("role")
+    perfil_changing = perfil_acesso_id is not None and perfil_acesso_id != (target.get("perfil_acesso_id") or "")
+    if (role_changing or perfil_changing) and user_id == current_user["id"]:
+        raise HTTPException(status_code=403, detail="Nao e permitido alterar o proprio cargo/perfil")
+    if (role_changing or perfil_changing) and current_user.get("role") != "admin":
+        if target.get("role") == "admin" or role == "admin" or perfil_acesso_id == "perfil_admin":
+            raise HTTPException(status_code=403, detail="Apenas admin pode promover/rebaixar admins")
+    if perfil_acesso_id is not None:
+        if not perfil_acesso_id or not get_perfil(my_tid, perfil_acesso_id):
+            raise HTTPException(status_code=400, detail="Perfil de acesso inexistente")
+    update_user(user_id, display_name=display_name, department_id=department_id, role=role,
+                perfil_acesso_id=perfil_acesso_id)
+    if role_changing or perfil_changing:
+        # Audit RBAC (§3.9): governanca de acesso a dados pessoais.
+        log_audit(
+            current_user["id"], "permission_change",
+            f"scope=user id={user_id} role: {target.get('role')} -> {role or target.get('role')} | "
+            f"perfil: {target.get('perfil_acesso_id') or '(derivado)'} -> "
+            f"{perfil_acesso_id if perfil_acesso_id is not None else '(derivado da role)'}",
+        )
     firebase_uid = (target.get("firebase_uid") or "").strip()
     if firebase_uid:
         # Cache de auth guarda role/setor antigos ate o TTL — invalida pra
         # mudanca valer na proxima request do backend.
         invalidate_auth_cache(firebase_uid)
-    if role and firebase_uid:
+    if (role or perfil_changing) and firebase_uid:
         # M-A4b (role stale): o claim role alimenta as Firestore rules
         # (isPrivilegedInTenant usa tokenRole) e o _resolve_tenant_id do auth
         # early-returna com claim presente (nunca ressincroniza). Sem reemitir
@@ -700,7 +751,10 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
             claims = get_user_claims_strict(firebase_uid)
             claim_tid = str(claims.get("tenant_id") or "")
             claim_role = str(claims.get("role") or "")
-            my_tid = str(current_user.get("tenant_id") or "") or "hubloc"
+            claim_perfil = str(claims.get("perfil_acesso_id") or "")
+            desired_role = role or target.get("role") or "operador"
+            desired_perfil = (perfil_acesso_id if perfil_acesso_id is not None
+                              else default_perfil_for_role(desired_role))
             if claim_tid and claim_tid != my_tid:
                 # Nao deveria ocorrer (lookup e tenant-scoped); nunca
                 # re-apontar claim de outro tenant como efeito colateral.
@@ -708,10 +762,11 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
                     "USER_UPDATE: claim de outro tenant (%s) p/ user id=%s — "
                     "claim NAO alterado", claim_tid, user_id,
                 )
-            elif claim_role != role or not claim_tid:
+            elif claim_role != desired_role or claim_perfil != desired_perfil or not claim_tid:
                 # Claim desatualizado (ou ausente) -> reemite. Se ja bate,
                 # nao faz nada (idempotente).
-                if set_tenant_claims(firebase_uid, claim_tid or my_tid, role=role, base_claims=claims):
+                if set_tenant_claims(firebase_uid, claim_tid or my_tid, role=desired_role,
+                                     base_claims=claims, perfil_acesso_id=desired_perfil):
                     revoke_refresh_tokens(firebase_uid)
                 else:
                     logger.warning(
@@ -729,8 +784,7 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
 
 @app.delete("/api/admin/users/{user_id}")
 async def admin_deactivate_user(user_id: int, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin",):
-        raise HTTPException(status_code=403, detail="Apenas admin pode desativar usuarios")
+    ensure_permission(current_user, "desativar_usuarios")
     if user_id == current_user["id"]:
         raise HTTPException(status_code=400, detail="Nao pode desativar a si mesmo")
     # Lookup RAW (sem filtro is_active): permite RE-EXECUTAR o offboarding em
@@ -775,8 +829,7 @@ async def admin_authorize_coex(user_id: int, request: Request, current_user: dic
     que sera conectado: isso libera a tela 'WhatsApp Coexistence' pra esse
     operador e o /exchange exige que o numero conectado bata com o autorizado.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Permissao negada")
+    ensure_permission(current_user, "autorizar_coex_para_operador")
     target = get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="Usuario nao encontrado")
@@ -792,8 +845,7 @@ async def admin_authorize_coex(user_id: int, request: Request, current_user: dic
 
 @app.delete("/api/admin/users/{user_id}/coex")
 async def admin_revoke_coex(user_id: int, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Permissao negada")
+    ensure_permission(current_user, "autorizar_coex_para_operador")
     target = get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="Usuario nao encontrado")
@@ -807,6 +859,111 @@ async def list_roles(current_user: dict = Depends(get_current_user)):
     return {"roles": ROLE_OPTIONS}
 
 
+# -- API: Admin - Perfis de acesso (RBAC dinamico, M-B2) --
+
+def _perfil_toggle_diff(before: dict, after: dict) -> str:
+    """Diff compacto so das chaves alteradas, p/ audit legivel (§3.9)."""
+    b = (before or {}).get("toggles") or {}
+    a = (after or {}).get("toggles") or {}
+    changes = [f"{k}: {bool(b.get(k))} -> {bool(a.get(k))}"
+               for k in PERMISSION_KEYS if bool(b.get(k)) != bool(a.get(k))]
+    return "; ".join(changes) or "(sem mudanca de toggle)"
+
+
+@app.get("/api/admin/perfis-acesso")
+async def list_perfis_acesso(current_user: dict = Depends(get_current_user)):
+    """Lista perfis do tenant + catalogo de toggles (grupo/rotulo p/ UI).
+
+    Alem do gestor de perfis, a tela de usuarios (gerenciar_usuarios) usa a
+    listagem no dropdown de atribuicao de perfil.
+    """
+    if not (has_permission(current_user, "gerenciar_perfis_acesso")
+            or has_permission(current_user, "gerenciar_usuarios")):
+        raise HTTPException(status_code=403, detail="Permissao negada (gerenciar_perfis_acesso)")
+    from rbac import list_perfis
+    return {
+        "perfis": list_perfis(),
+        "catalogo": [
+            {"grupo": grupo, "chave": chave, "rotulo": rotulo}
+            for grupo, chave, rotulo in PERMISSION_CATALOG
+        ],
+        "locked_admin_toggles": list(LOCKED_ADMIN_TOGGLES),
+    }
+
+
+@app.post("/api/admin/perfis-acesso")
+async def create_perfil_acesso(request: Request, current_user: dict = Depends(get_current_user)):
+    ensure_permission(current_user, "gerenciar_perfis_acesso")
+    body = await request.json()
+    from rbac import create_perfil
+    try:
+        doc = create_perfil(
+            nome=body.get("nome", ""),
+            descricao=body.get("descricao", ""),
+            toggles=body.get("toggles") or {},
+            base_perfil_id=body.get("base_perfil_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    log_audit(
+        current_user["id"], "permission_change",
+        f"scope=perfil op=create id={doc['id']} nome={doc['nome']}",
+    )
+    return {"status": "ok", "perfil": doc}
+
+
+@app.put("/api/admin/perfis-acesso/{perfil_id}")
+async def update_perfil_acesso(perfil_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    ensure_permission(current_user, "gerenciar_perfis_acesso")
+    body = await request.json()
+    from rbac import update_perfil
+    try:
+        result = update_perfil(
+            perfil_id,
+            nome=body.get("nome"),
+            descricao=body.get("descricao"),
+            toggles=body.get("toggles"),
+        )
+    except PermissionError as exc:
+        # Lock do perfil_admin (§3.3): UI desabilita, backend reforca.
+        raise HTTPException(status_code=403, detail=str(exc))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Perfil nao encontrado")
+    before, after = result
+    log_audit(
+        current_user["id"], "permission_change",
+        f"scope=perfil op=update id={perfil_id} | {_perfil_toggle_diff(before, after)}",
+    )
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/perfis-acesso/{perfil_id}")
+async def delete_perfil_acesso(perfil_id: str, current_user: dict = Depends(get_current_user)):
+    ensure_permission(current_user, "gerenciar_perfis_acesso")
+    # Guard de uso: perfil referenciado por usuario ATIVO (explicito ou
+    # derivado da role) nao pode sumir — o dual-check cairia no fallback da
+    # role silenciosamente, mudando permissoes sem acao explicita.
+    in_use = [
+        u["id"] for u in get_all_users()
+        if u.get("is_active", 1)
+        and (u.get("perfil_acesso_id") or default_perfil_for_role(u.get("role"))) == perfil_id
+    ]
+    if in_use:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Perfil em uso por {len(in_use)} usuario(s) ativo(s). Reatribua antes de excluir.",
+        )
+    from rbac import delete_perfil
+    try:
+        removed = delete_perfil(perfil_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    if not removed:
+        raise HTTPException(status_code=404, detail="Perfil nao encontrado")
+    log_audit(current_user["id"], "permission_change", f"scope=perfil op=delete id={perfil_id}")
+    return {"status": "ok"}
+
+
 # -- API: Configuracoes do sistema --
 
 @app.get("/api/settings/system")
@@ -816,8 +973,7 @@ async def get_settings_system(current_user: dict = Depends(get_current_user)):
 
 @app.put("/api/settings/system")
 async def update_settings_system(request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin pode alterar configuracoes do sistema")
+    ensure_permission(current_user, "gerenciar_config_sistema")
     body = await request.json()
     result = save_system_settings(body)
     log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(body))
@@ -849,8 +1005,7 @@ async def upload_alarm_sound(
     current_user: dict = Depends(get_current_user),
 ):
     """Upload de som personalizado para notificacao ou alarme. Apenas admin."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin")
+    ensure_permission(current_user, "gerenciar_config_sistema")
     content = await file.read()
     if len(content) > ALARM_MAX_SIZE_KB * 1024:
         raise HTTPException(status_code=413, detail=f"Arquivo excede {ALARM_MAX_SIZE_KB}KB")
@@ -881,6 +1036,7 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
         current_user.get("id"),
         current_user.get("department_id"),
         current_user.get("role"),
+        see_all=has_permission(current_user, "ver_todos_leads"),
     )
     for c in contacts:
         c["unread"] = int(c.get("unread_count", 0))
@@ -904,7 +1060,7 @@ async def wa_contacts_all(
     declared_name, whatsapp_profile_name e wa_id.
     """
     from firestore_common import collection as fs_coll
-    privileged = current_user.get("role") in ("admin", "supervisor")
+    privileged = has_permission(current_user, "ver_todos_leads")
     rows = []
     if privileged:
         # Admin/supervisor enxerga toda a agenda do tenant (paridade #1).
@@ -1026,7 +1182,7 @@ def _require_contact_access(contact: dict, current_user: dict):
     canSeeContactScoped (rules); o caso thread-propria nao e expressavel em
     rules — coberto via REST (lazy-load extraContacts do frontend).
     Levanta 403 caso contrario. contact pode ser {} (trata como sem acesso)."""
-    if current_user.get("role") in ("admin", "supervisor"):
+    if has_permission(current_user, "ver_todos_leads"):
         return
     if contact and contact.get("assigned_to") == current_user.get("id"):
         return
@@ -1075,7 +1231,7 @@ async def wa_conversations(
     _seen_conv_ids = set()
     _streams = [fs_coll("wa_conversations").order_by(
         "last_message_at", direction=FsQuery.DESCENDING).limit(limit).stream()]
-    if current_user.get("role") in ("admin", "supervisor"):
+    if has_permission(current_user, "ver_todos_leads"):
         _streams.append(fs_coll("wa_conversations").where("is_backup", "==", True).stream())
     for _stream in _streams:
         for snap in _stream:
@@ -1091,10 +1247,11 @@ async def wa_conversations(
     # visiveis a ele (proprios + pool sem dono); conversas cujo contato nao e
     # visivel sao descartadas pelo `if not contact: continue` abaixo
     # (isolamento LGPD, espelha o snapshot). admin/supervisor: todos.
-    _convs_privileged = current_user.get("role") in ("admin", "supervisor")
+    _convs_privileged = has_permission(current_user, "ver_todos_leads")
     contacts_by_id = {}
     _contacts_src = get_all_wa_contacts() if _convs_privileged else get_wa_contacts_visible_to(
         current_user.get("id"), current_user.get("department_id"), current_user.get("role"),
+        see_all=False,  # ja decidido em _convs_privileged (toggle ver_todos_leads)
     )
     for c in _contacts_src:
         contacts_by_id[c["id"]] = c
@@ -1231,7 +1388,7 @@ def _check_send_permission(contact: dict, current_user: dict):
     assigned = contact.get("assigned_to")
     if assigned and assigned != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
-    if not assigned and current_user.get("role") not in ("admin", "supervisor"):
+    if not assigned and not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
         raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
 
 
@@ -1367,6 +1524,7 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
     """
     lead_owner = (contact or {}).get("assigned_to")
     if lead_owner is not None and lead_owner == current_user["id"]:
+        ensure_permission(current_user, "enviar_mensagem_propria_thread")
         if conversation.get("takeover_status") in ("pending", "active"):
             try:
                 clear_conversation_takeover(conversation["id"])
@@ -1380,13 +1538,15 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
     # Modo 2 (co-pilotagem): admin/supervisor pode enviar em QUALQUER thread.
     # Quando nao e o dono do atendimento, e intervencao de supervisao -> retorna
     # "intervention" e o caller assina o texto ([Supervisao - nome]:).
-    is_manager = current_user.get("role") in ("admin", "supervisor")
+    is_manager = has_permission(current_user, "enviar_mensagem_qualquer_thread")
     assigned = conversation.get("assigned_to")
     if is_manager:
         if assigned and assigned != current_user["id"]:
             return "intervention"
         return None
     # --- operadores comuns: regras estritas ---
+    # RBAC: toggle de envio na propria thread (perfil "read-only" desliga).
+    ensure_permission(current_user, "enviar_mensagem_propria_thread")
     # Takeover 'pending' (coex): o handler precisa assumir antes de responder.
     if conversation.get("takeover_status") == "pending":
         raise HTTPException(status_code=403, detail="Assuma o atendimento temporario antes de responder")
@@ -1757,6 +1917,7 @@ async def wa_send_template(
         effective_template_category = None
 
     conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
+    ensure_permission(current_user, "enviar_template")
     _check_conv_send_permission(conv, current_user, contact)
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
@@ -2149,6 +2310,7 @@ class DeclaredNameRequest(BaseModel):
 @app.post("/api/wa/contact/manual")
 async def create_contact_manual(body: ManualContactRequest, current_user: dict = Depends(get_current_user)):
     """Cria contato manualmente para iniciar conversa outbound via template."""
+    ensure_permission(current_user, "adicionar_contato_manual")
     wa_id = normalize_br_phone(body.phone)
     if not wa_id.startswith("55"):
         wa_id = f"55{wa_id}"
@@ -2162,7 +2324,7 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
             raise HTTPException(status_code=400, detail="Nenhum canal WhatsApp disponivel")
         channel_id = default_ch["id"]
 
-    allow_override = current_user.get("role") in ("admin", "supervisor")
+    allow_override = has_permission(current_user, "editar_dono_lead")
     contact_id, error = create_manual_wa_contact(
         declared_name=body.declared_name,
         wa_id=wa_id,
@@ -2187,6 +2349,7 @@ async def update_declared_name(contact_id: int, body: DeclaredNameRequest, curre
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
+    ensure_permission(current_user, "editar_declared_name")
     update_wa_contact_declared_name(contact_id, body.declared_name)
     log_audit(current_user["id"], "CONTACT_DECLARED_NAME", f"Contato {contact_id}: {body.declared_name}")
     updated = get_wa_contact(contact_id)
@@ -2206,6 +2369,7 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
+    ensure_permission(current_user, "qualificar_lead")
     update_wa_contact_qualification(contact_id, qualification, notes)
     log_audit(current_user["id"], "CONTACT_QUALIFY", f"Contato {contact_id}: {qualification}")
 
@@ -2307,9 +2471,12 @@ async def conversation_takeover(conversation_id: str, current_user: dict = Depen
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation nao encontrada")
     handler = conv.get("takeover_handler_user_id")
-    privileged = current_user.get("role") in ("admin", "supervisor")
+    privileged = has_permission(current_user, "assumir_supervisor")
     if handler and int(handler) != current_user["id"] and not privileged:
         raise HTTPException(status_code=403, detail="Apenas o dono do numero pode assumir este atendimento")
+    if not privileged:
+        # RBAC: dono do numero coex assumindo a propria thread.
+        ensure_permission(current_user, "assumir_coex_proprio")
     set_conversation_takeover_active(conversation_id, current_user["id"])
     log_audit(current_user["id"], "TAKEOVER_START", f"conv={conversation_id} lead_owner={conv.get('lead_owner_user_id')}")
     return {"status": "ok", "conversation_id": conversation_id}
@@ -2342,6 +2509,7 @@ async def delete_contact(contact_id: int, current_user: dict = Depends(get_curre
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
+    ensure_permission(current_user, "arquivar_lead")
     archive_wa_contact(contact_id)
     log_audit(current_user["id"], "CONTACT_ARCHIVE", f"Contato {contact_id}")
     return {"status": "ok"}
@@ -2353,6 +2521,7 @@ async def restore_contact(contact_id: int, current_user: dict = Depends(get_curr
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
+    ensure_permission(current_user, "arquivar_lead")
     restore_wa_contact(contact_id)
     log_audit(current_user["id"], "CONTACT_RESTORE", f"Contato {contact_id}")
     return {"status": "ok"}
@@ -2372,8 +2541,7 @@ async def list_departments(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/admin/departments")
 async def create_department_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_departamentos")
     body = await request.json()
     name = (body.get("name") or "").strip()
     if not name:
@@ -2387,8 +2555,7 @@ async def create_department_endpoint(request: Request, current_user: dict = Depe
 
 @app.put("/api/admin/departments/{department_id}")
 async def update_department_endpoint(department_id: int, request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_departamentos")
     existing = get_department_by_id(department_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Departamento nao encontrado")
@@ -2412,8 +2579,7 @@ async def update_department_endpoint(department_id: int, request: Request, curre
 
 @app.delete("/api/admin/departments/{department_id}")
 async def delete_department_endpoint(department_id: int, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin")
+    ensure_permission(current_user, "desativar_departamentos")
     existing = get_department_by_id(department_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Departamento nao encontrado")
@@ -2428,7 +2594,7 @@ async def delete_department_endpoint(department_id: int, current_user: dict = De
 
 @app.get("/api/admin/channels")
 async def list_channels(current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") in ("admin", "supervisor"):
+    if has_permission(current_user, "gerenciar_canais"):
         channels = get_all_active_channels()
     else:
         channels = get_channels_for_user(current_user["id"])
@@ -2451,8 +2617,7 @@ async def admin_conflicts(current_user: dict = Depends(get_current_user)):
     Fase 4). Conflito = >=2 assignees distintos no mesmo contato. O nome do
     operador e resolvido no frontend (ja tem `operators` em memoria).
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "ver_painel_conflitos")
     from firestore_common import collection as fs_coll
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
@@ -2518,8 +2683,7 @@ async def admin_get_protocol(protocol_id: str, current_user: dict = Depends(get_
     """Fase 5A: busca por protocolo (admin/supervisor) — retorna o Atendimento
     diario + timeline de mensagens daquele dia pra aquele Lead (todas as
     threads/canais, pois protocolo e 1 por Lead/dia)."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "buscar_protocolo")
     atendimento = get_daily_attendance(protocol_id)
     if not atendimento:
         raise HTTPException(status_code=404, detail="Protocolo nao encontrado")
@@ -2543,8 +2707,7 @@ async def admin_get_protocol(protocol_id: str, current_user: dict = Depends(get_
 
 @app.post("/api/admin/channels")
 async def create_channel_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_canais")
     body = await request.json()
     channel_type = body.get("channel_type", CHANNEL_TYPE_COEXISTENCE)
     label = (body.get("label") or "").strip()
@@ -2571,8 +2734,7 @@ async def create_channel_endpoint(request: Request, current_user: dict = Depends
 
 @app.put("/api/admin/channels/{channel_id}")
 async def update_channel_endpoint(channel_id: int, request: Request, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_canais")
     existing = get_channel_by_id_from_db(channel_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Canal nao encontrado")
@@ -2586,8 +2748,7 @@ async def update_channel_endpoint(channel_id: int, request: Request, current_use
 
 @app.delete("/api/admin/channels/{channel_id}")
 async def delete_channel_endpoint(channel_id: int, current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin")
+    ensure_permission(current_user, "desativar_canais")
     existing = get_channel_by_id_from_db(channel_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Canal nao encontrado")
@@ -2609,8 +2770,7 @@ async def trigger_coex_sync(
     antes, Meta retorna erro. Janela de 24h apos signup — passou disso
     precisa desligar canal e refazer signup.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_canais")
     if sync_type not in ("smb_app_state_sync", "history", "both"):
         raise HTTPException(status_code=400, detail="sync_type deve ser smb_app_state_sync, history, ou both")
     channel = get_channel_by_id_from_db(channel_id)
@@ -2667,8 +2827,7 @@ async def list_pending_webhook_events(
     (canal nao indexado ainda durante onboarding, phone_id sem canal,
     excecao no processamento). Garantia de zero perda — operador retenta
     apos o canal estar disponivel."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_canais")
     from pending_events import list_pending_events
     events = list_pending_events(status=status, limit=limit)
     return {"events": events, "count": len(events)}
@@ -2678,8 +2837,7 @@ async def list_pending_webhook_events(
 async def retry_pending_webhook_event(event_id: str, current_user: dict = Depends(get_current_user)):
     """Re-roda process_webhook_payload com o payload original. Idempotente
     via wa_message_id (save_wa_message detecta duplicata)."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_canais")
     from pending_events import get_pending_event, mark_event_attempt
     event = get_pending_event(event_id)
     if not event:
@@ -2704,8 +2862,7 @@ async def retry_pending_webhook_event(event_id: str, current_user: dict = Depend
 async def dismiss_pending_webhook_event(event_id: str, current_user: dict = Depends(get_current_user)):
     """Marca evento como definitivamente falho (nao retentar). Usar quando
     intervencao confirma que o evento nao tem como ser recuperado."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin")
+    ensure_permission(current_user, "desativar_canais")
     from pending_events import mark_event_failed, get_pending_event
     if not get_pending_event(event_id):
         raise HTTPException(status_code=404, detail="Evento nao encontrado")
@@ -2718,8 +2875,7 @@ async def dismiss_pending_webhook_event(event_id: str, current_user: dict = Depe
 async def delete_pending_webhook_event_endpoint(event_id: str, current_user: dict = Depends(get_current_user)):
     """Remove evento da fila. Use apos retry confirmado ou eventos sem
     valor de retencao."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin")
+    ensure_permission(current_user, "desativar_canais")
     from pending_events import delete_pending_event
     if not delete_pending_event(event_id):
         raise HTTPException(status_code=404, detail="Evento nao encontrado")
@@ -3177,6 +3333,7 @@ def _validate_transfer_department(to_department_id):
 
 @app.post("/api/wa/transfer")
 async def wa_transfer(request: Request, current_user: dict = Depends(get_current_user)):
+    ensure_permission(current_user, "transferir_atendimento")
     body = await request.json()
     conversation_id = body.get("conversation_id")
     contact_id = body.get("contact_id")
@@ -3245,8 +3402,7 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
     atendimentos — as threads mantem seus donos (Dono do Atendimento). Acao
     explicita e separada da transferencia de thread. Apenas admin/supervisor.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "editar_dono_lead")
     body = await request.json()
     contact_id = body.get("contact_id")
     to_user_id = body.get("to_user_id")
@@ -3300,8 +3456,7 @@ async def wa_internal_note(request: Request, current_user: dict = Depends(get_cu
     tempo real; o cliente NAO recebe (nada vai pra Meta). Apenas
     admin/supervisor escrevem; operador da thread + managers leem.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "enviar_nota_interna")
     body = await request.json()
     content = (body.get("content") or "").strip()
     if not content:
@@ -3324,8 +3479,7 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
     Atendimento (nao muda o Dono do Lead). Avisa o lead com texto livre se
     dentro da janela de 24h; fora, assume sem mensagem. Apenas admin/supervisor.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "assumir_supervisor")
     conv, contact, channel = _resolve_send_target(conversation_id, None)
     if not conv:
         raise HTTPException(status_code=404, detail="Atendimento nao encontrado")
@@ -3460,9 +3614,14 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
     conv = get_wa_conversation_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Atendimento nao encontrado")
-    is_manager = current_user.get("role") in ("admin", "supervisor")
+    is_manager = has_permission(current_user, "enviar_mensagem_qualquer_thread")
     if not is_manager and conv.get("assigned_to") != current_user["id"]:
         raise HTTPException(status_code=403, detail="Apenas o dono do atendimento ou admin/supervisor")
+    # RBAC: toggle da acao em si (fechar/reabrir), alem do escopo acima.
+    ensure_permission(
+        current_user,
+        "fechar_atendimento_manual" if status == "fechado_manual" else "reabrir_atendimento_manual",
+    )
     set_attendance_status(conversation_id, status, clear_takeover=(status == "fechado_manual"))
     contact_id = conv.get("contact_id")
     if contact_id is not None:
@@ -3547,8 +3706,7 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
 @app.post("/api/admin/operator/{user_id}/reset-assume-counter")
 async def admin_reset_assume_counter(user_id: int, current_user: dict = Depends(get_current_user)):
     """Reseta o contador de assumidas sem resposta de um operador. Apenas admin/supervisor."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "gerenciar_usuarios")
     target = get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="Operador nao encontrado")
@@ -3569,8 +3727,7 @@ async def wa_transfer_hist(contact_id: int, current_user: dict = Depends(get_cur
 @app.post("/api/wa/contact/{contact_id}/return-to-bot")
 async def wa_return_to_bot(contact_id: int, current_user: dict = Depends(get_current_user)):
     """Devolve o contato para a fila do bot. Apenas admin/supervisor."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "editar_dono_lead")
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
@@ -3594,8 +3751,7 @@ async def admin_bulk_reassign(request: Request, current_user: dict = Depends(get
     contatos pertencem ao WhatsApp pessoal dele e nao podem ser
     transferidos sem perder acesso ao numero — o operador continua dono.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "editar_dono_lead")
     body = await request.json()
     from_user_id = body.get("from_user_id")
     action = body.get("action", "return_to_bot")
@@ -3649,6 +3805,7 @@ async def list_operators(current_user: dict = Depends(get_current_user)):
             "department_id": u.get("department_id"),
             "avatar_path": u.get("avatar_path", ""),
             "role": u.get("role", "operador"),
+            "perfil_acesso_id": u.get("perfil_acesso_id", ""),
             "email": u.get("email", ""),
             "firebase_uid": u.get("firebase_uid", ""),
             "coex_authorized": u.get("coex_authorized", 0),
@@ -3791,8 +3948,7 @@ async def dashboard_summary(
     current_user: dict = Depends(get_current_user),
 ):
     """Retorna metricas agregadas para o periodo."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "ver_dashboard_uso")
     if not date_from:
         date_from = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
     if not date_to:
@@ -3857,8 +4013,7 @@ async def dashboard_ratings(
     date_to: str = Query(""),
     current_user: dict = Depends(get_current_user),
 ):
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "ver_dashboard_uso")
     ratings = get_all_ratings(date_from or None, date_to or None)
     return {"ratings": ratings}
 
@@ -3874,8 +4029,7 @@ async def wa_usage_current_month(current_user: dict = Depends(get_current_user))
     free_form_sent, inbound_received, media_uploaded_bytes }.
     Acessivel a admin/supervisor — visibilidade pra cruzar com fatura Meta.
     """
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "ver_dashboard_uso")
     return get_monthly_usage()
 
 
@@ -3885,8 +4039,7 @@ async def wa_usage_history(
     current_user: dict = Depends(get_current_user),
 ):
     """Retorna ultimos N meses de usage do tenant atual (mes corrente primeiro)."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "ver_dashboard_uso")
     return {"months": get_usage_history(months)}
 
 
@@ -3896,8 +4049,7 @@ async def wa_usage_specific_month(
     current_user: dict = Depends(get_current_user),
 ):
     """Retorna usage de um mes especifico (formato YYYY-MM)."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "ver_dashboard_uso")
     if len(year_month) != 7 or year_month[4] != "-":
         raise HTTPException(status_code=400, detail="Formato esperado: YYYY-MM")
     try:
@@ -3920,8 +4072,7 @@ async def export_data(
     current_user: dict = Depends(get_current_user),
 ):
     """Exporta conversas e contatos em JSON ou CSV."""
-    if current_user.get("role") not in ("admin", "supervisor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/supervisor")
+    ensure_permission(current_user, "exportar_contatos")
 
     contacts = get_all_wa_contacts(include_archived=True)
     # Filtrar por data se especificado
@@ -3965,10 +4116,9 @@ async def embedded_signup_config(type: str = "coexistence", current_user: dict =
     """
     is_standard = type == "standard"
     if is_standard:
-        if current_user.get("role") not in ("admin", "supervisor"):
-            raise HTTPException(status_code=403, detail="Apenas admin/supervisor podem conectar canal standard (Cloud API).")
+        ensure_permission(current_user, "gerenciar_canais")
     else:
-        if current_user.get("role") not in ("admin", "supervisor") and not current_user.get("coex_authorized"):
+        if not has_permission(current_user, "gerenciar_canais") and not current_user.get("coex_authorized"):
             raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     missing: list[str] = []
     if not META_APP_ID:
@@ -4031,7 +4181,7 @@ async def embedded_signup_exchange(
     current_user: dict = Depends(get_current_user),
 ):
     """Troca o code do Embedded Signup por token e descobre WABA/Phone IDs."""
-    if current_user.get("role") not in ("admin", "supervisor") and not current_user.get("coex_authorized"):
+    if not has_permission(current_user, "gerenciar_canais") and not current_user.get("coex_authorized"):
         raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     if not META_APP_ID or not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
@@ -4199,7 +4349,7 @@ async def embedded_signup_exchange(
     # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
     is_coexistence = body.channel_type == "coexistence"
     channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
-    is_privileged = current_user.get("role") in ("admin", "supervisor")
+    is_privileged = has_permission(current_user, "gerenciar_canais")
     # Operador autorizado so conecta canal COEX do PROPRIO numero: ignora
     # owner_user_id do body (so admin/supervisor atribui canal a outro user) e
     # nao pode criar canal standard.

@@ -27,9 +27,9 @@ def verify_firebase_id_token(id_token):
     return auth.verify_id_token(id_token, app=app, check_revoked=False)
 
 
-def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None):
-    """Define custom claims tenant_id (e role opcional) no usuario Firebase,
-    PRESERVANDO os demais claims ja existentes.
+def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None, perfil_acesso_id=None):
+    """Define custom claims tenant_id (e role/perfil opcionais) no usuario
+    Firebase, PRESERVANDO os demais claims ja existentes.
 
     O JWT do usuario passa a carregar essas claims, lidas pelo backend em
     get_current_user. O cliente precisa renovar o ID token (forceRefresh)
@@ -40,6 +40,11 @@ def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None):
     usa como base e evita reler o usuario. Sem base_claims, le do Firebase;
     se a leitura falhar, NAO grava (retorna False) — gravar sobre base {}
     apagaria claims extras (ex: super_admin) do usuario.
+
+    perfil_acesso_id (M-B2, PLANO_RBAC §3.6): claim leve com o ID do perfil
+    RBAC. Sem valor explicito, deriva do seed da role — assim todo caminho
+    que ja emite role mantem o par role/perfil coerente. Nenhuma rule le o
+    toggle em si (source of truth = doc perfis_acesso; backend cacheia).
     """
     if not firebase_uid:
         raise ValueError("firebase_uid obrigatorio")
@@ -61,6 +66,11 @@ def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None):
     current_claims["tenant_id"] = str(tenant_id)
     if role:
         current_claims["role"] = str(role)
+    if not perfil_acesso_id and role:
+        from rbac import default_perfil_for_role
+        perfil_acesso_id = default_perfil_for_role(role)
+    if perfil_acesso_id:
+        current_claims["perfil_acesso_id"] = str(perfil_acesso_id)
     try:
         auth.set_custom_user_claims(firebase_uid, current_claims, app=app)
         logger.info(
@@ -74,7 +84,8 @@ def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None):
 
 
 def clear_tenant_claims(firebase_uid):
-    """Remove os custom claims tenant_id/role do usuario, PRESERVANDO os demais.
+    """Remove os custom claims tenant_id/role/perfil_acesso_id do usuario,
+    PRESERVANDO os demais.
 
     Offboarding (M-A4b): apos o M-A4 as Firestore rules autorizam por claim
     tenant_id — desativar o operador exige LIMPAR o claim, senao ele re-loga
@@ -99,10 +110,11 @@ def clear_tenant_claims(firebase_uid):
             "claims existentes | uid=%s exc=%s", firebase_uid, exc,
         )
         return False
-    if "tenant_id" not in current_claims and "role" not in current_claims:
+    if not any(k in current_claims for k in ("tenant_id", "role", "perfil_acesso_id")):
         return True
     current_claims.pop("tenant_id", None)
     current_claims.pop("role", None)
+    current_claims.pop("perfil_acesso_id", None)
     try:
         auth.set_custom_user_claims(firebase_uid, current_claims or None, app=app)
         logger.info("Claims tenant_id/role removidos (offboarding) | uid=%s", firebase_uid)

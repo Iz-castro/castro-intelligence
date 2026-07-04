@@ -16,6 +16,7 @@ from firestore_common import (
     normalize_record,
     utcnow,
 )
+from rbac import default_perfil_for_role
 
 logger = logging.getLogger("castro_crm.database")
 
@@ -143,6 +144,8 @@ def _sync_operator_profile_from_user(user):
         "email": user.get("email", ""),
         "display_name": user.get("display_name", ""),
         "role": user.get("role", "operador"),
+        "perfil_acesso_id": user.get("perfil_acesso_id")
+            or default_perfil_for_role(user.get("role", "operador")),
         "department_id": user.get("department_id"),
         "is_active": user.get("is_active", 1),
         "coex_authorized": user.get("coex_authorized", 0),
@@ -327,6 +330,7 @@ def get_user_by_id(user_id):
         "department_id": department_id,
         "department_name": department_name,
         "role": row.get("role", "operador"),
+        "perfil_acesso_id": row.get("perfil_acesso_id", ""),
         "is_active": row.get("is_active", 1),
         "email": row.get("email", ""),
         "firebase_uid": row.get("firebase_uid", ""),
@@ -365,6 +369,7 @@ def create_user(username, display_name, password_hash, department_id=None, role=
         "password_hash": password_hash,
         "department_id": department_id,
         "role": role,
+        "perfil_acesso_id": default_perfil_for_role(role),
         "email": "",
         "firebase_uid": "",
         "auth_provider": "firebase",
@@ -380,7 +385,7 @@ def create_user(username, display_name, password_hash, department_id=None, role=
     return user_id
 
 
-def update_user(user_id, display_name=None, department_id=None, role=None):
+def update_user(user_id, display_name=None, department_id=None, role=None, perfil_acesso_id=None):
     fields = {}
     if display_name is not None:
         fields["display_name"] = display_name
@@ -388,6 +393,12 @@ def update_user(user_id, display_name=None, department_id=None, role=None):
         fields["department_id"] = department_id if department_id else None
     if role is not None:
         fields["role"] = role
+        if perfil_acesso_id is None:
+            # Troca de role sem perfil explicito re-alinha ao seed da role
+            # nova — senao um ex-admin rebaixado manteria perfil_admin.
+            fields["perfil_acesso_id"] = default_perfil_for_role(role)
+    if perfil_acesso_id is not None:
+        fields["perfil_acesso_id"] = perfil_acesso_id
     if not fields:
         return False
     document("users", user_id).set(fields, merge=True)
@@ -395,6 +406,27 @@ def update_user(user_id, display_name=None, department_id=None, role=None):
     if updated:
         _sync_operator_profile_from_user(updated)
     return True
+
+
+def backfill_perfil_acesso_ids():
+    """Preenche users.perfil_acesso_id derivado da role onde falta (M-B2
+    fase 1). Idempotente: escreve apenas docs sem o campo; ajustes manuais
+    de perfil nunca sao sobrescritos. Roda no bootstrap do tenant."""
+    updated = 0
+    for row in _all_docs("users"):
+        if not row or row.get("perfil_acesso_id"):
+            continue
+        perfil_id = default_perfil_for_role(row.get("role", "operador"))
+        if not perfil_id:
+            continue
+        document("users", row["id"]).set({"perfil_acesso_id": perfil_id}, merge=True)
+        fresh = _get_doc("users", row["id"])
+        if fresh:
+            _sync_operator_profile_from_user(fresh)
+        updated += 1
+    if updated:
+        logger.info("Backfill perfil_acesso_id | users=%d", updated)
+    return updated
 
 
 def set_coex_authorization(user_id, phone, authorized=True):
@@ -1451,17 +1483,22 @@ def get_all_wa_contacts(include_archived=False):
     return _enrich_and_sort_contacts(_all_docs("wa_contacts"), include_archived=include_archived)
 
 
-def get_wa_contacts_visible_to(user_id, department_id=None, role=None, include_archived=False):
+def get_wa_contacts_visible_to(user_id, department_id=None, role=None, include_archived=False, see_all=None):
     """Contatos visiveis a um usuario, com o mesmo enriquecimento/ordenacao de
     get_all_wa_contacts.
 
-    Admin/supervisor enxergam todos. Operador comum ve apenas o proprio escopo
-    (atribuidos a si ou sem dono/pool) — espelha as Firestore rules do caminho
-    de snapshot e evita varrer/expor a agenda inteira do tenant (milhares de
-    contatos da agenda coex) no fallback de polling do frontend. NAO inclui
-    contatos de colegas do mesmo departamento (isolamento LGPD).
+    Escopo amplo (ver tudo) e decidido pelo caller via `see_all` — no M-B2 o
+    main.py passa has_permission(user, "ver_todos_leads") (RBAC dinamico).
+    Sem see_all explicito, cai no criterio legado por role (compat). Operador
+    comum ve apenas o proprio escopo (atribuidos a si ou sem dono/pool) —
+    espelha as Firestore rules do caminho de snapshot e evita varrer/expor a
+    agenda inteira do tenant (milhares de contatos da agenda coex) no
+    fallback de polling do frontend. NAO inclui contatos de colegas do mesmo
+    departamento (isolamento LGPD).
     """
-    if role in ("admin", "supervisor"):
+    if see_all is None:
+        see_all = role in ("admin", "supervisor")
+    if see_all:
         rows = _all_docs("wa_contacts")
     else:
         rows = get_wa_contacts_scoped_for_user(user_id, department_id)
