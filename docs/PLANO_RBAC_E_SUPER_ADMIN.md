@@ -28,6 +28,9 @@
 | 2026-06-02 | Modelo de identidade super admin: híbrido (claim `super_admin: true` fast-path + doc `super_admins/{uid}` source of truth) | aprovado |
 | 2026-06-02 | Termos de Uso devem cobrir suporte/debug com impersonate read-only | aprovado |
 | 2026-06-02 | RBAC dinâmico via perfis em subcoleção por tenant + claim leva `perfil_acesso_id` | aprovado |
+| 2026-07-04 | §10.1 resolvida: catálogo de toggles é FIXO da plataforma; admin escolhe perfis/valores | aprovado |
+| 2026-07-04 | Catálogo enxuto: só toggles com enforcement real no código (ver §3.4.1) | aprovado |
+| 2026-07-04 | **M-B2 IMPLEMENTADO** (fases 1–4 do §3.8 de uma vez, dual-check ativo; fase 5 pendente). Código: `rbac.py` + migração `main.py`/`App.tsx`/`CrmContext.tsx` + rules `perfis_acesso` + UI master-detail. Pendente: staging → prod. | implementado |
 
 Decisões em aberto listadas em §10.
 
@@ -199,6 +202,40 @@ Lista derivada do código atual (`main.py`, `database_firestore.py`,
 `firestore.rules`, `App.tsx`, `CrmContext.tsx`) e dos comportamentos
 descritos no PLANO_LEAD_ATENDIMENTO. Identificadores em snake_case
 estável (entram em `perfis_acesso/{id}.toggles.<chave>`).
+
+#### 3.4.1. Catálogo REAL implementado (M-B2, 2026-07-04)
+
+> A fonte da verdade do catálogo é `PERMISSION_CATALOG` em `rbac.py`
+> (28 chaves). O inventário 1:1 dos checks reais divergiu do rascunho
+> abaixo em pontos importantes — regra aplicada: **só entra no catálogo
+> chave com ponto de enforcement real**; toggle sem efeito enganaria o
+> admin do tenant (LGPD: pareceria mudar escopo de dados sem mudar).
+>
+> **Removidos do rascunho** (sem check de código controlável): 
+> `ver_proprios_leads`, `ver_leads_sem_dono`, `ver_leads_setor`,
+> `ver_canal_coex_proprio` (escopo do operador é estrutural — queries
+> scoped + rules por claim `role`), `ver_audit_log`, `ver_transfer_log`
+> (enforcement só nas rules, que não leem toggles — §3.6),
+> `re_onboarding_coex` (não há fluxo distinto no código).
+> **Adicionados** (ações destrutivas eram só-admin no código):
+> `desativar_usuarios`, `desativar_canais`, `desativar_departamentos`,
+> `gerenciar_config_sistema`.
+> **Divergências 1:1 vs rascunho §3.5** (o código venceu): supervisor
+> TEM `exportar_contatos`, `autorizar_coex_para_operador` e
+> `gerenciar_canais`; operador TEM `transferir_atendimento` (o
+> `/api/wa/transfer` nunca teve gate de role — o fluxo do bot depende).
+>
+> **Teto das rules:** rules seguem autorizando leitura ampla pelo claim
+> `role` (§3.6). Perfil customizado que AMPLIE visibilidade além da
+> role vale só no caminho REST/backend; snapshot continua limitado. No
+> frontend, `canSeeAll = toggle && role privilegiada` protege os
+> listeners. Visibilidade fina por toggle exige redesenho das rules
+> (fora do M-B2).
+>
+> **Guards de escalação** (follow-up M-A4b absorvido): criar/promover
+> admin exige caller admin; ninguém altera o próprio cargo/perfil;
+> não-admin não rebaixa admin (`main.py` admin_create_user /
+> admin_update_user — mudança consciente de comportamento).
 
 #### Visibilidade
 

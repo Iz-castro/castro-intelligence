@@ -79,6 +79,55 @@ staging; bloqueia go-live em prod.
             castrointelligence@gmail.com); inócuo hoje (mídia via backend Admin SDK main.py:448,
             sem Storage client-side). Migrar p/ claim tenant_id antes de ligar leitura client-side.
 
+0d. M-A4b (lifecycle de claims) ✅ EM PROD 2026-07-04 — commit 1dbb752, rev castro-crm-00041-rij.
+     Fecha 0c(i) OFFBOARDING e 0c(ii) ROLE STALE, mais o guard anti-ressurreição:
+     - DELETE /api/admin/users/{id}: limpa claim (clear_tenant_claims, preserva extras;
+       UserNotFound=ok) + revoke + invalida cache; guard em auth.authenticate_firebase_token
+       nega login de conta DESATIVADA (403) ANTES do auto-provision → offboarding TERMINAL
+       mesmo com AUTO_PROVISION=true (não depende mais de flipar o flag); DELETE idempotente
+       (get_user_raw_by_id → retry do clear em vez de 404); retorna claims_cleared.
+     - PUT /api/admin/users/{id}: reemite claim role por divergência do CLAIM (re-salvar = retry)
+       + revoke + invalida cache; guard cross-tenant.
+     - POST /api/admin/users: provision_operator (tenant_bootstrap) — lookup-only da conta
+       Firebase (não pré-cria: 8/13 usam senha), claim atômico se conta existe, guard
+       "um email=um tenant" (409); recusa recriar sobre desativado (DeactivatedUserError→409,
+       evita gêmeo ativo+inativo que sombrearia o guard). Helpers: clear_tenant_claims,
+       get_firebase_uid_by_email, get_user_raw_by_firebase_uid_or_email, get_user_raw_by_id.
+     Revisões: core SHIP (22 ag) + delta SHIP (gate pré-deploy de duplicatas PASSOU: 13 docs, 0
+     gêmeos). Testes: 44 (claims) + 11 (guard) em memória + integração ponta-a-ponta em teste@
+     contra Firebase real (restaurada). Rollback: update-traffic p/ rev anterior 00040-*.
+     PENDENTE do grupo M-A4b (NÃO shipado; pré-#2): 0c(iii-parcial) matar fallback cego
+     _DEFAULT_TENANT=hubloc + AUTO_PROVISION tenant-aware; 0b gate de login por domínio
+     (allowed_email_domains soft); 0c(iv) storage.rules. Follow-ups: disabled=True na conta
+     Firebase ao desativar (belt-and-suspenders — fecha 100% o resíduo client-SDK se o clear
+     falhar; muda reativação p/ exigir re-habilitar); guards de escalação (supervisor não
+     cria/promove admin, ninguém muda próprio cargo) → M-B2 RBAC.
+
+0e. M-B2 (RBAC dinâmico) 🔨 IMPLEMENTADO 2026-07-04 — pendente staging → prod.
+     Fases 1–4 do PLANO_RBAC §3.8 numa tacada, com dual-check (dia 0 = comportamento
+     idêntico; fallback = seed da role):
+     - `rbac.py`: catálogo FIXO de 28 toggles (só chaves com enforcement real — ver
+       PLANO_RBAC §3.4.1), 3 perfis seed validados 1:1 contra o inventário dos ~46
+       checks de main.py + 30 do frontend; cache TTL 60s (RBAC_PERFIL_CACHE_TTL_SECONDS);
+       has_permission/ensure_permission/effective_toggles; CRUD com lock do perfil_admin.
+     - Seed + backfill perfil_acesso_id no bootstrap_tenant (idempotente, não sobrescreve);
+       claim perfil_acesso_id em set_tenant_claims (derivado da role se não explícito);
+       clear_tenant_claims limpa também o perfil.
+     - main.py: 46 checks de role migrados p/ ensure_permission/has_permission + novos
+       enforcements (transfer, template, qualify, declared-name, arquivar, contato manual,
+       envio própria thread, fechar/reabrir, assumir_coex) — todos true nos seeds = sem
+       regressão dia 0. CRUD /api/admin/perfis-acesso (audit permission_change §3.9,
+       delete bloqueado se em uso/seed). GUARDS DE ESCALAÇÃO (follow-up M-A4b): supervisor
+       não cria/promove/rebaixa admin; ninguém muda o próprio cargo/perfil.
+     - Frontend: perfil efetivo via /api/session + snapshot ao vivo de perfis_acesso;
+       can()/useCan (deny-by-default) + canSeeAll (toggle E role — teto das rules);
+       UI master-detail "Perfis de acesso" (admin) + select de perfil no editor de usuário.
+     - Rules: perfis_acesso read p/ membros do tenant, write só backend. Rules seguem
+       autorizando por claim role (PLANO_RBAC §3.6) — perfil ampliado além da role só
+       vale no REST.
+     Fase 5 (matar fallback de role) fica pós-bake-in. Divergências 1:1 documentadas no
+     PLANO_RBAC §3.4.1.
+
 PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
   A. Isolamento de canais
      M-A1  ADR 0007 Fase 1 (filtro lógico + id UUID na fila)   [S, baixo risco]  ← COMEÇANDO
@@ -88,7 +137,7 @@ PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
      Sprint 0 RBAC/super-admin (§6 PLANO_RBAC — fundação)      [S]
      Cloud Run B mínimo (só criar tenant, D3)                  [L, front-load segurança]
   C. RBAC dinâmico no hubloc (D4 — antes do #2)
-     M-B2  seed perfis + require_permission/useCan dual-check + ondas + UI toggles  [L]
+     M-B2  🔨 IMPLEMENTADO 2026-07-04 (ver bloco 0e) — pendente staging → prod
   D. Rules + gate
      M-A4  ✅ FEITO 2026-07-03 — removido emailAllowed() do ownsTenant (isolar por
            claim tenant_id). Publicado + canário OK. Ver bloco 0c. Falta: endurecer
