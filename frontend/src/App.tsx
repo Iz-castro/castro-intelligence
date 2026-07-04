@@ -7,7 +7,7 @@ import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
-import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -87,7 +87,7 @@ function LoginScreen() {
 }
 
 function TopBar() {
-  const { sessionUser, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout } = useCrm();
+  const { sessionUser, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout, can } = useCrm();
   const [gcOpen, setGcOpen] = useState(false);
   useClickOutside(settingsMenuRef, showSettings === "menu", () => setShowSettings(false));
   if (!sessionUser) return null;
@@ -114,10 +114,11 @@ function TopBar() {
             <div className="settings-dropdown">
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
-              {sessionUser.role === "admin" && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
-              {(sessionUser.role === "admin" || sessionUser.role === "supervisor" || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
-              {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp-standard")}><span>☁️</span><span>Conectar numero (Cloud API)</span></button>}
-              {(sessionUser.role === "admin" || sessionUser.role === "supervisor") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
+              {can("gerenciar_config_sistema") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
+              {can("gerenciar_perfis_acesso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("perfis")}><span>🛡️</span><span>Perfis de acesso</span></button>}
+              {(can("gerenciar_canais") || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
+              {can("gerenciar_canais") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp-standard")}><span>☁️</span><span>Conectar numero (Cloud API)</span></button>}
+              {can("ver_dashboard_uso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
         </div>
@@ -129,10 +130,10 @@ function TopBar() {
 }
 
 function NavBar() {
-  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, isManagerRole, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, systemSettings } = useCrm();
+  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, canSeeAll, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, systemSettings } = useCrm();
   return (
     <nav className="crm-nav">
-      {isManagerRole && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); }} title="Contatos no bot">
+      {canSeeAll && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); }} title="Contatos no bot">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><line x1="8" y1="16" x2="8" y2="16.01"/><line x1="16" y1="16" x2="16" y2="16.01"/><line x1="12" y1="19" x2="12" y2="19.01"/></svg>
         <span className="nav-label">Bot</span>
         {botUnread > 0 && <span className="nav-badge">{botUnread > 99 ? "99+" : botUnread}</span>}
@@ -152,12 +153,12 @@ function NavBar() {
         <span className="nav-label">N/Q</span>
         {nqUnread > 0 && <span className="nav-badge">{nqUnread > 99 ? "99+" : nqUnread}</span>}
       </button>
-      {isManagerRole && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
+      {canSeeAll && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span className="nav-label">Equipe</span>
         {equipeUnread > 0 && <span className="nav-badge">{equipeUnread > 99 ? "99+" : equipeUnread}</span>}
       </button>}
-      {isManagerRole && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); }} title="Conversas em backup (historico importado)">
+      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); }} title="Conversas em backup (historico importado)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/></svg>
         <span className="nav-label">Backup</span>
         {backupUnread > 0 && <span className="nav-badge">{backupUnread > 99 ? "99+" : backupUnread}</span>}
@@ -169,7 +170,7 @@ function NavBar() {
 type ContactPickerMode = "list" | "create";
 
 function NewContactModal({ onClose }: { onClose: () => void }) {
-  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact, operators, sessionUser, isManagerRole } = useCrm();
+  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact, operators, sessionUser, canSeeAll } = useCrm();
   const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -272,7 +273,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
         >
           + Novo contato
         </button>
-        {isManagerRole && operators.length > 0 ? (
+        {canSeeAll && operators.length > 0 ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", marginBottom: "0.6rem" }}>
             <button type="button" className={ownerFilter === sessionUser?.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(sessionUser?.id ?? null)}>Meus</button>
             {operators.filter((o) => o.id !== sessionUser?.id).map((o) => (
@@ -677,9 +678,9 @@ function ChatPanel() {
   const iAmLeadOwner = selectedContact?.assigned_to != null && sessionUser?.id === selectedContact.assigned_to;
   const isTakeoverPending = takeoverStatus === "pending" && isTakeoverHandler && !iAmLeadOwner;
   const isTakeoverActive = takeoverStatus === "active" && isTakeoverHandler && !iAmLeadOwner;
-  const isManager = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
-  // Modo 2/3: admin/sup vendo thread que nao e dele (nem do lead dele) ->
-  // intervindo como supervisao (envio assinado) e pode assumir.
+  const isManager = ctx.can("enviar_mensagem_qualquer_thread");
+  // Modo 2/3: quem pode co-pilotar vendo thread que nao e dele (nem do lead
+  // dele) -> intervindo como supervisao (envio assinado) e pode assumir.
   const iAmIntervening = isManager && selectedThread?.assigned_to != null && selectedThread.assigned_to !== sessionUser?.id && !iAmLeadOwner;
   // Fase 4 (ciclo de vida): ausente = aberto.
   const attendanceStatus = selectedThread?.attendance_status || "aberto";
@@ -910,7 +911,7 @@ function ChatPanel() {
                       <div className={`bubble-menu attach-menu ${openMessageMenuDirection === "up" ? "open-upward" : ""}`}>
                         <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }}><span>Responder</span></button>
                         <button type="button" className="attach-option" onClick={() => { void copyMessageText(message); setOpenMessageMenuId(null); }}><span>Copiar</span></button>
-                        {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && (message.operator_id === sessionUser?.id || sessionUser?.role === "admin" || sessionUser?.role === "supervisor") ? (
+                        {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && (message.operator_id === sessionUser?.id || isManager) ? (
                           <button type="button" className="attach-option" onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }}><span>Corrigir</span></button>
                         ) : null}
                       </div>
@@ -985,7 +986,7 @@ function ChatPanel() {
           <div className={`composer-shell ${recording ? "is-recording" : ""}`}>
             <div className="composer-menu" ref={attachMenuRef}>
               <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busyUpload || busyAudio} aria-label="Abrir menu de anexos"><PlusIcon /></button>
-              {(sessionUser?.role === "admin" || sessionUser?.role === "supervisor") ? (
+              {ctx.can("enviar_nota_interna") ? (
                 <button type="button" className="composer-icon" onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
               ) : null}
               {showAttachMenu ? (
@@ -1292,13 +1293,23 @@ function CollapsibleCard({ title, defaultOpen = true, children }: { title: strin
 }
 
 function DetailPanel() {
-  const { bundle, selectedContact, selectedThreadId, selectedConversation, sessionUser, isManagerRole, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
+  const { bundle, selectedContact, selectedThreadId, selectedConversation, sessionUser, can, canSeeAll, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
   const [bulkFromUser, setBulkFromUser] = useState<number | "">("");
   const [bulkAction, setBulkAction] = useState<"return_to_bot" | "transfer">("return_to_bot");
   const [bulkToUser, setBulkToUser] = useState<number | "">("");
   const [busyBulk, setBusyBulk] = useState(false);
   const [busyResetCounter, setBusyResetCounter] = useState<number | null>(null);
+  // RBAC (M-B2): opcoes de perfil pro editor de usuario (fetch preguicoso —
+  // so quando alguem abre a edicao e tem permissao de gerir perfis).
+  const [perfilOptions, setPerfilOptions] = useState<PerfilAcesso[] | null>(null);
+  const canEditPerfis = can("gerenciar_perfis_acesso");
+  useEffect(() => {
+    if (editingUserId == null || perfilOptions !== null || !bundle || !canEditPerfis) return;
+    getJson<{ perfis: PerfilAcesso[] }>(bundle.auth, "/api/admin/perfis-acesso")
+      .then((res) => setPerfilOptions(res.perfis))
+      .catch(() => setPerfilOptions([]));
+  }, [editingUserId, perfilOptions, bundle, canEditPerfis]);
 
   const resetAssumeCounter = useCallback(async (userId: number, displayName: string) => {
     if (!bundle) return;
@@ -1360,8 +1371,8 @@ function DetailPanel() {
             </div>
           ) : null}
 
-          {/* Rating (visivel apenas para admin/supervisor) */}
-          {isManagerRole && selectedContact.qualification === "convertido" ? (
+          {/* Rating (visivel apenas para quem supervisiona o tenant) */}
+          {canSeeAll && selectedContact.qualification === "convertido" ? (
             <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
               {selectedContact.rating != null ? (
                 <><span style={{ fontWeight: 600 }}>Avaliacao:</span><span className="chip" style={{ fontSize: "0.8rem", background: selectedContact.rating >= 7 ? "var(--success)" : selectedContact.rating >= 4 ? "#e6a817" : "var(--danger)", color: "#fff" }}>{selectedContact.rating}/10</span></>
@@ -1375,37 +1386,41 @@ function DetailPanel() {
             <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option></select>
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" />
             <button className="primary" onClick={() => void saveQualification()} disabled={busySave}>{busySave ? "Salvando..." : "Salvar"}</button>
-            {isManagerRole && selectedContact.assigned_to ? (
+            {can("editar_dono_lead") && selectedContact.assigned_to ? (
               <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={busyReturnBot} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
             ) : null}
           </CollapsibleCard>
-          <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
+          {can("transferir_atendimento") ? <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move so este atendimento (thread). O Dono do Lead nao muda.</span>
             <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
             <select value={toDepartmentId} onChange={(e) => setToDepartmentId(e.target.value ? Number(e.target.value) : "")}><option value="">Manter departamento atual</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
             <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferencia" />
             <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatorio" />
             <button className="primary" onClick={() => void transferContact()} disabled={!toUserId || !transferSummary.trim() || busyTransfer}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
-          </CollapsibleCard>
-          {isManagerRole ? <ReassignLeadCard /> : null}
+          </CollapsibleCard> : null}
+          {can("editar_dono_lead") ? <ReassignLeadCard /> : null}
         </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
 
-        {isManagerRole ? (
+        {can("ver_painel_conflitos") ? (
           <CollapsibleCard title="Conflitos de atendimento" defaultOpen={false}>
             <ConflictsPanel />
           </CollapsibleCard>
         ) : null}
 
-        {isManagerRole ? <ProtocolSearchCard /> : null}
+        {can("buscar_protocolo") ? <ProtocolSearchCard /> : null}
 
-        {isManagerRole ? (
-          <CollapsibleCard title={sessionUser?.role === "admin" ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
+        {can("gerenciar_usuarios") ? (
+          <CollapsibleCard title={can("gerenciar_perfis_acesso") ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
             <div className="admin-user-list">{operators.map((op) => (
               <div key={op.id} className="admin-user-row">
                 <div className="admin-user-info"><strong>{op.display_name}</strong><span className="sub">{op.email || ""}</span></div>
-                {sessionUser?.role === "admin" && editingUserId === op.id ? (
+                {can("gerenciar_perfis_acesso") && editingUserId === op.id ? (
                   <div className="admin-user-edit">
-                    <select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="admin">admin</option><option value="supervisor">supervisor</option><option value="operador">operador</option></select>
+                    <select value={editRole} onChange={(e) => { setEditRole(e.target.value); setEditPerfilId(""); }}><option value="admin">admin</option><option value="supervisor">supervisor</option><option value="operador">operador</option></select>
+                    <select value={editPerfilId} onChange={(e) => setEditPerfilId(e.target.value)} title="Perfil de acesso (RBAC)">
+                      <option value="">Perfil padrao do cargo</option>
+                      {(perfilOptions || []).map((p) => <option key={p.id} value={p.id}>{p.nome}</option>)}
+                    </select>
                     <select value={editDeptId} onChange={(e) => setEditDeptId(e.target.value ? Number(e.target.value) : "")}><option value="">Sem setor</option>{departments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>
                     <div style={{ display: "flex", gap: "0.4rem" }}>
                       <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveUserRole(op.id)} disabled={busyRoleUpdate}>{busyRoleUpdate ? "..." : "Salvar"}</button>
@@ -1426,8 +1441,8 @@ function DetailPanel() {
                   <div style={{ display: "flex", alignItems: "center", gap: "0.25rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <span className="chip" style={{ fontSize: "0.68rem" }}>{op.role}</span>
                     {op.coex_authorized ? <span className="chip" style={{ fontSize: "0.62rem" }} title={op.coex_phone ? `Coex liberado: ${op.coex_phone}` : "Coex liberado"}>📱 Coex</span> : null}
-                    {sessionUser?.role === "admin" && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)}>Editar</button>}
-                    {isManagerRole && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditCoex(op)} title="Autorizar WhatsApp coexistence do operador">Coex</button>}
+                    {can("gerenciar_perfis_acesso") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)}>Editar</button>}
+                    {can("autorizar_coex_para_operador") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditCoex(op)} title="Autorizar WhatsApp coexistence do operador">Coex</button>}
                     <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} disabled={busyResetCounter === op.id} onClick={() => void resetAssumeCounter(op.id, op.display_name)} title="Resetar contador">{busyResetCounter === op.id ? "..." : "Reset"}</button>
                   </div>
                 )}
@@ -1436,7 +1451,7 @@ function DetailPanel() {
           </CollapsibleCard>
         ) : null}
 
-        {isManagerRole ? (
+        {can("editar_dono_lead") ? (
           <CollapsibleCard title="Reatribuicao em lote" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Reatribuir todos os contatos de um operador:</span>
             <select value={bulkFromUser} onChange={(e) => setBulkFromUser(e.target.value ? Number(e.target.value) : "")}>
@@ -1678,7 +1693,7 @@ WHATSAPP_WABA_ID=${result.waba_id || "???"}`}
 }
 
 function SettingsModals() {
-  const { showSettings, setShowSettings, sessionUser, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, saveUserSettingsAction, saveSystemSettingsAction } = useCrm();
+  const { showSettings, setShowSettings, sessionUser, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, saveUserSettingsAction, saveSystemSettingsAction, can } = useCrm();
   if (!sessionUser) return null;
   return (
     <>
@@ -1729,10 +1744,183 @@ function SettingsModals() {
       {showSettings === "whatsapp" ? <WhatsAppSignupModal /> : null}
       {showSettings === "whatsapp-standard" ? <WhatsAppSignupModal channelType="standard" /> : null}
 
-      {showSettings === "admin" && sessionUser.role === "admin" ? <AdminSettingsModal /> : null}
+      {showSettings === "admin" && can("gerenciar_config_sistema") ? <AdminSettingsModal /> : null}
 
-      {showSettings === "dashboard" && (sessionUser.role === "admin" || sessionUser.role === "supervisor") ? <DashboardModal /> : null}
+      {showSettings === "perfis" && can("gerenciar_perfis_acesso") ? <PerfisAcessoModal /> : null}
+
+      {showSettings === "dashboard" && can("ver_dashboard_uso") ? <DashboardModal /> : null}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Perfis de Acesso (RBAC dinamico M-B2) — master-detail de toggles
+// ---------------------------------------------------------------------------
+
+type PerfilCatalogoItem = { grupo: string; chave: string; rotulo: string };
+
+function PerfisAcessoModal() {
+  const { bundle, setShowSettings, setError, setNotice } = useCrm();
+  const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
+  const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
+  const [lockedToggles, setLockedToggles] = useState<string[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [draftNome, setDraftNome] = useState("");
+  const [draftDescricao, setDraftDescricao] = useState("");
+  const [draftToggles, setDraftToggles] = useState<Record<string, boolean>>({});
+  const [busy, setBusy] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [newNome, setNewNome] = useState("");
+  const [newBase, setNewBase] = useState("perfil_operador");
+
+  const selected = perfis.find((p) => p.id === selectedId) || null;
+
+  const load = useCallback(async (focusId?: string) => {
+    if (!bundle) return;
+    try {
+      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[]; locked_admin_toggles: string[] }>(bundle.auth, "/api/admin/perfis-acesso");
+      setPerfis(res.perfis);
+      setCatalogo(res.catalogo);
+      setLockedToggles(res.locked_admin_toggles || []);
+      setSelectedId((prev) => focusId || prev || res.perfis[0]?.id || null);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+  }, [bundle, setError]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  // Sincroniza o rascunho ao trocar de perfil selecionado.
+  useEffect(() => {
+    if (!selected) return;
+    setDraftNome(selected.nome || "");
+    setDraftDescricao(selected.descricao || "");
+    const toggles: Record<string, boolean> = {};
+    for (const item of catalogo) toggles[item.chave] = selected.toggles?.[item.chave] === true;
+    setDraftToggles(toggles);
+    setCreating(false);
+  }, [selectedId, perfis, catalogo]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const grupos = catalogo.reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
+    (acc[item.grupo] = acc[item.grupo] || []).push(item);
+    return acc;
+  }, {});
+
+  async function savePerfil() {
+    if (!bundle || !selected) return;
+    setBusy(true);
+    try {
+      await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles: draftToggles });
+      setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em ate 1 minuto.`);
+      await load(selected.id);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusy(false);
+  }
+
+  async function createPerfil() {
+    if (!bundle || !newNome.trim()) return;
+    setBusy(true);
+    try {
+      const res = await sendJson(bundle.auth, "/api/admin/perfis-acesso", { nome: newNome.trim(), base_perfil_id: newBase }) as { perfil: PerfilAcesso };
+      setNotice(`Perfil "${newNome.trim()}" criado.`);
+      setNewNome("");
+      setCreating(false);
+      await load(res.perfil?.id);
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusy(false);
+  }
+
+  async function removePerfil() {
+    if (!bundle || !selected) return;
+    if (!confirm(`Excluir o perfil "${selected.nome}"? Usuarios ativos com este perfil bloqueiam a exclusao.`)) return;
+    setBusy(true);
+    try {
+      await deleteJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`);
+      setNotice(`Perfil "${selected.nome}" excluido.`);
+      setSelectedId(null);
+      await load();
+    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    setBusy(false);
+  }
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Perfis de acesso" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 860, maxHeight: "90vh", overflow: "auto" }}>
+        <h2 style={{ margin: "0 0 0.3rem" }}>Perfis de acesso</h2>
+        <p className="sub" style={{ margin: "0 0 0.9rem", fontSize: "0.82rem" }}>
+          Cada usuario segue um perfil. Ajustes valem para todos os usuarios do perfil, sem deploy.
+          O catalogo de permissoes e fixo da plataforma.
+        </p>
+        <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start", flexWrap: "wrap" }}>
+          {/* Mestre: lista de perfis */}
+          <div style={{ flex: "0 0 220px", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+            {perfis.map((p) => (
+              <button key={p.id} type="button" className={p.id === selectedId ? "primary" : "ghost"} style={{ textAlign: "left", padding: "0.55rem 0.7rem" }} onClick={() => setSelectedId(p.id)}>
+                <strong style={{ display: "block", fontSize: "0.88rem" }}>{p.nome}</strong>
+                <span className="sub" style={{ fontSize: "0.68rem" }}>
+                  {p.is_system_locked ? "🔒 sistema" : p.is_seed ? "seed" : "customizado"}
+                </span>
+              </button>
+            ))}
+            {creating ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", border: "1px solid var(--border, #444)", borderRadius: 8, padding: "0.55rem" }}>
+                <input value={newNome} onChange={(e) => setNewNome(e.target.value)} placeholder="Nome do perfil" />
+                <select value={newBase} onChange={(e) => setNewBase(e.target.value)}>
+                  <option value="perfil_operador">Base: Operador</option>
+                  <option value="perfil_supervisor">Base: Supervisor</option>
+                  <option value="perfil_admin">Base: Administrador</option>
+                </select>
+                <div style={{ display: "flex", gap: "0.35rem" }}>
+                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={busy || !newNome.trim()} onClick={() => void createPerfil()}>{busy ? "..." : "Criar"}</button>
+                  <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setCreating(false)}>✕</button>
+                </div>
+              </div>
+            ) : (
+              <button type="button" className="ghost" style={{ padding: "0.5rem" }} onClick={() => setCreating(true)}>+ Novo perfil</button>
+            )}
+          </div>
+
+          {/* Detalhe: toggles do perfil selecionado */}
+          {selected ? (
+            <div style={{ flex: "1 1 380px", minWidth: 300 }}>
+              <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem", flexWrap: "wrap" }}>
+                <input value={draftNome} onChange={(e) => setDraftNome(e.target.value)} disabled={selected.is_system_locked} style={{ flex: "1 1 180px" }} />
+                <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} />
+              </div>
+              {selected.is_system_locked ? (
+                <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: as permissoes de gestao criticas nao podem ser desligadas (protecao contra auto-bloqueio).</p>
+              ) : null}
+              {Object.entries(grupos).map(([grupo, itens]) => (
+                <div key={grupo} style={{ marginBottom: "0.8rem" }}>
+                  <h3 style={{ margin: "0 0 0.35rem", fontSize: "0.82rem", textTransform: "uppercase", opacity: 0.7 }}>{grupo}</h3>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: "0.25rem 0.8rem" }}>
+                    {itens.map((item) => {
+                      const locked = !!selected.is_system_locked && lockedToggles.includes(item.chave);
+                      return (
+                        <label key={item.chave} style={{ display: "flex", alignItems: "center", gap: "0.45rem", fontSize: "0.82rem", opacity: locked ? 0.6 : 1, cursor: locked ? "not-allowed" : "pointer" }} title={locked ? "Travado no perfil de sistema" : item.chave}>
+                          <input
+                            type="checkbox"
+                            checked={draftToggles[item.chave] === true}
+                            disabled={locked || busy}
+                            onChange={(e) => setDraftToggles((prev) => ({ ...prev, [item.chave]: e.target.checked }))}
+                          />
+                          <span>{item.rotulo}{locked ? " 🔒" : ""}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.8rem" }}>
+                <button className="primary" disabled={busy || !draftNome.trim()} onClick={() => void savePerfil()}>{busy ? "Salvando..." : "Salvar perfil"}</button>
+                {!selected.is_seed && !selected.is_system_locked ? (
+                  <button className="ghost" style={{ color: "var(--danger)" }} disabled={busy} onClick={() => void removePerfil()}>Excluir</button>
+                ) : null}
+              </div>
+            </div>
+          ) : <div className="empty" style={{ flex: 1 }}>Selecione um perfil.</div>}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2288,11 +2476,11 @@ function Lightbox() {
 // envio de templates de marketing/utility falha. Apenas roles
 // admin/supervisor veem o banner.
 function BillingHealthBanner() {
-  const { sessionUser, channels, fetchBillingStatus } = useCrm();
+  const { channels, fetchBillingStatus, can } = useCrm();
   const [status, setStatus] = useState<{ ok: boolean; has_payment_method: boolean; error?: string } | null>(null);
   const [dismissed, setDismissed] = useState(false);
 
-  const isPrivileged = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
+  const isPrivileged = can("ver_dashboard_uso");
   const standardChannel = channels.find((c) => c.is_active && c.channel_type === "standard");
 
   useEffect(() => {

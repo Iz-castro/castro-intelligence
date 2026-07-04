@@ -31,6 +31,7 @@ export type SessionUser = {
   username: string;
   display_name: string;
   role: string;
+  perfil_acesso_id?: string;
   department_id?: number | null;
   department_name?: string;
   email?: string;
@@ -39,6 +40,58 @@ export type SessionUser = {
   is_active?: number;
   coex_authorized?: number;
   coex_phone?: string;
+};
+
+// RBAC dinamico (M-B2). Catalogo FIXO da plataforma — manter em sincronia
+// com PERMISSION_CATALOG em rbac.py (backend e a fonte da verdade).
+export type PermissionKey =
+  | "ver_todos_leads"
+  | "enviar_mensagem_propria_thread"
+  | "enviar_mensagem_qualquer_thread"
+  | "assumir_coex_proprio"
+  | "assumir_supervisor"
+  | "transferir_atendimento"
+  | "fechar_atendimento_manual"
+  | "reabrir_atendimento_manual"
+  | "enviar_nota_interna"
+  | "enviar_template"
+  | "editar_dono_lead"
+  | "qualificar_lead"
+  | "editar_declared_name"
+  | "arquivar_lead"
+  | "adicionar_contato_manual"
+  | "exportar_contatos"
+  | "gerenciar_canais"
+  | "desativar_canais"
+  | "autorizar_coex_para_operador"
+  | "ver_painel_conflitos"
+  | "ver_dashboard_uso"
+  | "buscar_protocolo"
+  | "gerenciar_usuarios"
+  | "desativar_usuarios"
+  | "gerenciar_perfis_acesso"
+  | "gerenciar_departamentos"
+  | "desativar_departamentos"
+  | "gerenciar_config_sistema";
+
+// Perfil EFETIVO da sessao (toggles ja resolvidos pelo backend com o
+// fallback de role do dual-check). O snapshot do doc perfis_acesso mescla
+// por cima para refletir edicoes ao vivo.
+export type SessionPerfil = {
+  id: string;
+  toggles: Record<string, boolean>;
+};
+
+// Doc completo de tenants/{tid}/perfis_acesso/{id} (UI de gestao).
+export type PerfilAcesso = {
+  id: string;
+  nome: string;
+  descricao?: string;
+  role_equivalente?: string;
+  is_system_locked?: boolean;
+  is_seed?: boolean;
+  toggles: Record<string, boolean>;
+  updated_at?: string;
 };
 
 export type BotKey = "comercial" | "financeiro" | "administrativo" | "sac";
@@ -77,6 +130,7 @@ export type Operator = {
   department_name?: string;
   avatar_path?: string;
   role: string;
+  perfil_acesso_id?: string;
   email?: string;
   firebase_uid?: string;
   coex_authorized?: number;
@@ -324,7 +378,7 @@ export type UserSettings = {
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "whatsapp" | "whatsapp-standard" | "dashboard";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
 
 export type QuickMessage = { shortcut: string; message: string };
 

@@ -1,13 +1,13 @@
 import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
-import { collection, getDocs, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
+import { collection, doc as firestoreDoc, getDocs, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
 import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
 import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
 import type {
   ActiveView, Channel, ChatMessage, ClientConfig, ConflictLead, Contact, Conversation, Department,
-  MessageReplyReference, Operator, ProtocolSearchResult, SessionUser, SettingsPage, SystemSettings,
-  TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
+  MessageReplyReference, Operator, PermissionKey, ProtocolSearchResult, SessionPerfil, SessionUser,
+  SettingsPage, SystemSettings, TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
@@ -34,6 +34,13 @@ type CrmContextValue = {
   busyLogin: boolean;
   snapshotMode: boolean;
   isManagerRole: boolean;
+  // RBAC dinamico (M-B2): toggles efetivos da sessao + helper de checagem.
+  perfil: SessionPerfil | null;
+  can: (perm: PermissionKey) => boolean;
+  // Escopo de dados amplo: exige o toggle E a role privilegiada — as
+  // Firestore rules autorizam leitura ampla pelo claim role, entao um
+  // perfil operador "ampliado" nao consegue ouvir a colecao inteira.
+  canSeeAll: boolean;
 
   // Theme
   theme: "dark" | "light";
@@ -221,6 +228,8 @@ type CrmContextValue = {
   setEditingUserId: (v: number | null) => void;
   editRole: string;
   setEditRole: (v: string) => void;
+  editPerfilId: string;
+  setEditPerfilId: (v: string) => void;
   editDeptId: number | "";
   setEditDeptId: (v: number | "") => void;
   busyRoleUpdate: boolean;
@@ -246,7 +255,7 @@ type CrmContextValue = {
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
   toggleSettingsMenu: () => void;
-  openSettingsPage: (page: "chat" | "quick" | "admin" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
+  openSettingsPage: (page: "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
   settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -319,6 +328,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [bundle, setBundle] = useState<FirebaseBundle | null>(null);
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
+  // Perfil RBAC efetivo da sessao (M-B2). Nasce do /api/session (toggles ja
+  // resolvidos com fallback de role) e e atualizado ao vivo pelo snapshot do
+  // doc perfis_acesso/{id} do tenant.
+  const [perfil, setPerfil] = useState<SessionPerfil | null>(null);
   const [operators, setOperators] = useState<Operator[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -505,6 +518,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // -- Admin users --
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
   const [editRole, setEditRole] = useState("");
+  // RBAC (M-B2): perfil explicito no editor de usuario. "" = derivar do
+  // cargo (seed) — o backend re-alinha ao trocar a role sem perfil.
+  const [editPerfilId, setEditPerfilId] = useState("");
   const [editDeptId, setEditDeptId] = useState<number | "">("");
   const [busyRoleUpdate, setBusyRoleUpdate] = useState(false);
   const [coexEditingUserId, setCoexEditingUserId] = useState<number | null>(null);
@@ -557,6 +573,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const selectedContact = selectedContactId != null ? (contactsById.get(selectedContactId) || null) : null;
   const activeContact = activeConversationId != null ? (contactsById.get(activeConversationId) || null) : null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
+  // RBAC (M-B2): checagem por toggle efetivo. Deny-by-default — sem perfil
+  // carregado (sessao ainda montando), tudo false.
+  const can = useCallback(
+    (perm: PermissionKey) => perfil?.toggles?.[perm] === true,
+    [perfil],
+  );
+  // Escopo amplo de DADOS: toggle E role privilegiada (teto das rules — ver
+  // comentario no CrmContextValue). Gates de UI puros usam can(...) direto.
+  const canSeeAll = (perfil?.toggles?.ver_todos_leads === true) && isManagerRole;
 
   const botEnabled = systemSettings.bot_enabled;
   // Fase 3.D: filtros operam sobre conversations (sub-threads por canal).
@@ -589,10 +614,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (c.assigned_to) return false;
       if (c.qualification === "nao_qualificado") return false;
       if (botEnabled && !c.bot_completed) return false;
-      if (!isManagerRole && conv.department_id != null && conv.department_id !== sessionUser?.department_id) return false;
+      if (!canSeeAll && conv.department_id != null && conv.department_id !== sessionUser?.department_id) return false;
       return true;
     });
-  }, [allConversations, contactsById, botEnabled, isManagerRole, sessionUser?.department_id]);
+  }, [allConversations, contactsById, botEnabled, canSeeAll, sessionUser?.department_id]);
   // Meus: atribuidas ao usuario logado (inclui coexistence auto-atribuidas).
   // Aceita o id numerico OU o assigned_to_uid (string) — o listener ao vivo e a
   // paginacao filtram por assigned_to_uid, entao casar so o numerico poderia
@@ -608,7 +633,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     () => conversations.filter((c) => c.assigned_to === sessionUser?.id || (!!c.assigned_to_uid && c.assigned_to_uid === sessionUser?.firebase_uid)).length,
     [conversations, sessionUser?.id, sessionUser?.firebase_uid],
   );
-  const canLoadMoreMine = !isManagerRole && activeView === "meus" && myConvHasMore && myLiveCount >= 50;
+  const canLoadMoreMine = !canSeeAll && activeView === "meus" && myConvHasMore && myLiveCount >= 50;
   // Limpa a paginacao estatica do "Meus" ao SAIR da view — bound na janela de
   // staleness (thread paginada reatribuida por terceiros nao fica fantasma) e
   // re-habilita o "Carregar mais" (hasMore=true) ao voltar.
@@ -633,20 +658,20 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return allConversations.filter((conv) => {
       if (conv.is_backup) return false;
       if (!conv.assigned_to || conv.assigned_to === sessionUser?.id) return false;
-      if (!isManagerRole && conv.source_channel_type === "coexistence") return false;
+      if (!canSeeAll && conv.source_channel_type === "coexistence") return false;
       return true;
     });
-  }, [allConversations, isManagerRole, sessionUser?.id]);
+  }, [allConversations, canSeeAll, sessionUser?.id]);
 
   // Backup: conversas historicas importadas (is_backup). So privilegiado ve;
   // ordenadas por mais recente — a que recebe msg nova sobe pro topo (triagem).
   const backupConversations = useMemo(() => {
-    if (!isManagerRole) return [] as Conversation[];
+    if (!canSeeAll) return [] as Conversation[];
     return allConversations
       .filter((conv) => conv.is_backup === true)
       .slice()
       .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
-  }, [allConversations, isManagerRole]);
+  }, [allConversations, canSeeAll]);
 
   // Fase 3.D: unread agregado e a soma das conversations daquela view.
   // Single source of truth — coerente com mark-read otimista por thread.
@@ -687,8 +712,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const busyComposerAction = busyAudio || busySend;
 
   const visibleMessages = messages.filter((message, index, allMessages) => {
-    // Filtrar mensagens admin_only para operadores comuns
-    if (message.visibility === "admin_only" && !isManagerRole) return false;
+    // Filtrar mensagens admin_only para quem nao supervisiona o tenant
+    if (message.visibility === "admin_only" && !canSeeAll) return false;
     const kind = String(message.msg_type || "").trim().toLowerCase();
     if (kind !== "unsupported" && kind !== "unknown") return true;
     const nextMessage = allMessages[index + 1];
@@ -799,7 +824,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const waContacts = collection(bundle.db, config.firestore.collections.wa_contacts);
     const baseConstraints = [where("is_archived", "==", 0), orderBy("last_message_at", "desc"), firestoreLimit(50)] as const;
 
-    if (sessionUser.role === "admin" || sessionUser.role === "supervisor") {
+    // canSeeAll = toggle ver_todos_leads E role privilegiada — as rules
+    // autorizam a query ampla pelo claim role, entao um perfil operador
+    // "ampliado" nao pode receber o target "all" (rules negariam o snapshot).
+    if (canSeeAll) {
       return [{ key: "all", ref: query(waContacts, ...baseConstraints) }];
     }
 
@@ -848,7 +876,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
     const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
 
-    if (sessionUser.role === "admin" || sessionUser.role === "supervisor") {
+    if (canSeeAll) {
       // Corte de leitura: a colecao cresceu (~3k conversas) e o snapshot sem
       // limite custava ~3k reads por sessao e 1000+ itens em memoria/DOM.
       // Admin ouve as 300 mais recentes (orderBy single-field = indice
@@ -922,6 +950,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // arrays contacts/conversations — ficam visiveis ao proximo usuario
   // ate um hard refresh (vazamento LGPD em PC compartilhado).
   function resetUserScopedState() {
+    setPerfil(null);
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
@@ -971,6 +1000,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           user: SessionUser;
           tenant_id?: string;
           firestore_collections?: Record<string, string>;
+          perfil?: SessionPerfil;
         }>(bundle.auth, "/api/session");
         const [ops, deps, chs] = await Promise.all([
           getJson<Operator[]>(bundle.auth, "/api/operators"),
@@ -978,6 +1008,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           getJson<{ channels: Channel[] }>(bundle.auth, "/api/admin/channels").catch(() => ({ channels: [] as Channel[] })),
         ]);
         setSessionUser(session.user);
+        setPerfil(session.perfil ?? null);
         setOperators(ops);
         setDepartments(deps.departments);
         setChannels(chs.channels);
@@ -1001,6 +1032,28 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       } catch (e) { setError(errorText(e)); await signOut(bundle.auth); }
     });
   }, [bundle]);
+
+  // RBAC (M-B2): mantem os toggles do perfil ao vivo. Mescla o doc do
+  // Firestore POR CIMA do mapa efetivo vindo do /api/session — edicao de
+  // perfil pelo admin reflete sem re-login, e chave nova de catalogo
+  // ausente no doc antigo preserva o valor efetivo (fallback) da sessao.
+  // Depende de perfil?.id (nao do objeto) pra nao reassinar a cada merge.
+  useEffect(() => {
+    const path = config?.firestore.collections["perfis_acesso"];
+    const perfilId = perfil?.id;
+    if (!bundle?.db || !path || !perfilId || !snapshotMode) return undefined;
+    return onSnapshot(
+      firestoreDoc(bundle.db, path, perfilId),
+      (snap) => {
+        const toggles = (snap.data()?.toggles ?? null) as Record<string, boolean> | null;
+        if (!toggles) return;
+        setPerfil((prev) => (prev && prev.id === perfilId
+          ? { ...prev, toggles: { ...prev.toggles, ...toggles } }
+          : prev));
+      },
+      () => { /* sem permissao/offline: segue com os toggles da sessao */ },
+    );
+  }, [bundle, config, perfil?.id, snapshotMode]);
 
   // Auto-select primeira conversation se nada selecionado (ou seleção orfã).
   // Excecao: apos desselecao explicita (holdEmptySelectionRef, ex.:
@@ -1126,7 +1179,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // valores — depender da identidade causava teardown/re-subscribe (e
     // re-leitura completa) recorrente. Re-subscreve so se o escopo mudar.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bundle, snapshotMode, config?.firestore.collections.wa_contacts, sessionUser?.role, sessionUser?.firebase_uid, sessionUser?.department_id]);
+  }, [bundle, snapshotMode, config?.firestore.collections.wa_contacts, canSeeAll, sessionUser?.firebase_uid, sessionUser?.department_id]);
 
   // Snapshot: wa_conversations (Fase 3 — sub-threads por canal).
   // Escopado por operador (espelha o listener de contatos): operador comum
@@ -1161,7 +1214,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     };
     // Deps primitivas — ver nota no listener de contatos acima.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bundle, snapshotMode, config?.firestore.collections.wa_conversations, sessionUser?.role, sessionUser?.firebase_uid, sessionUser?.department_id]);
+  }, [bundle, snapshotMode, config?.firestore.collections.wa_conversations, canSeeAll, sessionUser?.firebase_uid, sessionUser?.department_id]);
 
   // Snapshot: selected conversation/thread
   // V2 Fase 3: se activeThreadId setado, filtra por conversation_id
@@ -1660,11 +1713,21 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusySave(false); }
   }
 
-  function startEditUser(op: Operator) { setEditingUserId(op.id); setEditRole(op.role); setEditDeptId(op.department_id ?? ""); }
+  function startEditUser(op: Operator) { setEditingUserId(op.id); setEditRole(op.role); setEditPerfilId(op.perfil_acesso_id || ""); setEditDeptId(op.department_id ?? ""); }
 
   async function saveUserRole(userId: number) {
     if (!bundle) return;
-    try { setBusyRoleUpdate(true); setError(""); await putJson(bundle.auth, `/api/admin/users/${userId}`, { role: editRole, department_id: editDeptId || null }); setNotice("Usuario atualizado."); setEditingUserId(null); if (!snapshotMode) await refreshPollingViews(); }
+    try {
+      setBusyRoleUpdate(true); setError("");
+      // perfil vazio = derivar do cargo (backend re-alinha ao seed da role).
+      const body: Record<string, unknown> = { role: editRole, department_id: editDeptId || null };
+      if (editPerfilId) body.perfil_acesso_id = editPerfilId;
+      await putJson(bundle.auth, `/api/admin/users/${userId}`, body);
+      setNotice("Usuario atualizado.");
+      setEditingUserId(null);
+      setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators"));
+      if (!snapshotMode) await refreshPollingViews();
+    }
     catch (e) { setError(errorText(e)); }
     finally { setBusyRoleUpdate(false); }
   }
@@ -1923,7 +1986,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // (assigned_to_uid, last_message_at). Admin/supervisor ja ouvem 300 ao vivo.
   async function loadMoreMyConversations() {
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser?.firebase_uid) return;
-    if (sessionUser.role === "admin" || sessionUser.role === "supervisor") return;
+    if (canSeeAll) return;
     if (loadingMoreConvs) return;
     const nextLimit = myConvPageLimit + 50;
     setLoadingMoreConvs(true);
@@ -2094,9 +2157,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
-  async function openSettingsPage(page: "chat" | "quick" | "admin" | "whatsapp" | "whatsapp-standard" | "dashboard") {
+  async function openSettingsPage(page: "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") {
     if (!bundle) return;
-    if (page === "whatsapp" || page === "whatsapp-standard") {
+    if (page === "whatsapp" || page === "whatsapp-standard" || page === "perfis") {
       setShowSettings(page);
       return;
     }
@@ -2128,6 +2191,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   const value: CrmContextValue = {
     config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
+    perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout,
     contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
@@ -2152,7 +2216,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
-    editingUserId, setEditingUserId, editRole, setEditRole, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
+    editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
