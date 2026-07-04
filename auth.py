@@ -14,6 +14,7 @@ from database import (
     get_user_by_email,
     get_user_by_firebase_uid,
     get_user_by_id,
+    get_user_raw_by_firebase_uid_or_email,
     log_audit,
     sync_user_identity,
     update_last_login,
@@ -189,12 +190,27 @@ def authenticate_firebase_token(id_token, ip_address=""):
             display_name=display_name or user.get("display_name", ""),
         )
         user = get_user_by_id(user["id"])
-    elif AUTO_PROVISION_FIREBASE_USERS and email:
-        user = upsert_firebase_user(
-            firebase_uid=firebase_uid,
-            email=email,
-            display_name=display_name or email,
-        )
+    else:
+        # M-A4b (offboarding terminal): nenhum doc ATIVO casou. Se existe um
+        # doc DESATIVADO para este uid/email, e um ex-operador tentando
+        # re-logar — NEGAR. Sem isso, com AUTO_PROVISION ligado o desativado
+        # seria recriado como doc novo ativo (e o claim re-emitido no
+        # _resolve_tenant_id), ressuscitando o acesso e anulando a
+        # desativacao. Tambem evita a duplicata "_2" (auto-provision sobre
+        # doc filtrado). Reativacao legitima = is_active=1 no doc original.
+        prior = get_user_raw_by_firebase_uid_or_email(firebase_uid, email)
+        if prior is not None and not prior.get("is_active", 1):
+            logger.warning(
+                "Login negado: conta desativada tentou re-provisionar | uid=%s",
+                firebase_uid,
+            )
+            return {"success": False, "status_code": 403, "error": "Usuario desativado"}
+        if AUTO_PROVISION_FIREBASE_USERS and email:
+            user = upsert_firebase_user(
+                firebase_uid=firebase_uid,
+                email=email,
+                display_name=display_name or email,
+            )
 
     if not user:
         return {"success": False, "status_code": 403, "error": "Usuario nao provisionado no CRM"}

@@ -46,7 +46,7 @@ from config import (
     EMBEDDED_SIGNUP_CONFIG_ID_STANDARD, WHATSAPP_SYSTEM_USER_TOKEN,
 )
 from database import (
-    init_database, get_user_by_id, get_all_users,
+    init_database, get_user_by_id, get_user_raw_by_id, get_all_users,
     get_all_wa_contacts, get_wa_conversation,
     mark_wa_conversation_read, mark_wa_conversation_read_by_id,
     save_wa_message, get_wa_contact,
@@ -58,7 +58,7 @@ from database import (
     get_wa_contacts_scoped_for_user, get_wa_contacts_visible_to,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user, set_coex_authorization,
-    upsert_firebase_user, get_user_by_email,
+    get_user_by_email,
     update_wa_contact_qualification, archive_wa_contact, restore_wa_contact,
     update_contact_avatar, insert_transfer_system_message, insert_internal_note, set_attendance_protocol,
     get_daily_attendance, close_daily_attendance, mark_protocol_informed,
@@ -85,7 +85,7 @@ from channel_service import (
     get_channel_by_id_from_db, get_channel_by_phone_id_from_db, rebind_channel,
     CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
-from auth import authenticate_firebase_token
+from auth import authenticate_firebase_token, invalidate_auth_cache
 from firestore_common import (
     collection_name, document as fs_document, utcnow as fs_utcnow,
 )
@@ -637,13 +637,29 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
     existing = get_user_by_email(email)
     if existing:
         raise HTTPException(status_code=409, detail="Usuario ja existe")
-    user = upsert_firebase_user(
-        firebase_uid="",
-        email=email,
-        display_name=display_name,
-        role=role,
-        department_id=department_id,
+    # M-A4b: se a conta Firebase do email JA existe, linka uid + claims
+    # tenant_id/role no ato (primeiro login ja passa nas rules M-A4) com
+    # guard "um email = um tenant". Conta inexistente segue o fluxo atual
+    # (doc local; conta e criada no onboarding por senha/console e o claim
+    # sincroniza no primeiro login) — lookup-only pra nao quebrar o runbook
+    # de operador por senha (conta pre-criada nao teria provider password).
+    from tenant_bootstrap import (
+        DeactivatedUserError, TenantConflictError, provision_operator,
     )
+    try:
+        user = provision_operator(
+            email,
+            display_name=display_name,
+            role=role,
+            department_id=department_id,
+        )
+    except TenantConflictError:
+        raise HTTPException(status_code=409, detail="Email ja vinculado a outro tenant")
+    except DeactivatedUserError:
+        raise HTTPException(
+            status_code=409,
+            detail="Usuario existe mas esta desativado. Reative-o em vez de recriar.",
+        )
     if not user:
         raise HTTPException(status_code=500, detail="Falha ao provisionar usuario Firebase")
     log_audit(current_user["id"], "USER_CREATE", f"{email} ({role})")
@@ -664,6 +680,49 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
     if role and role not in ROLE_OPTIONS:
         raise HTTPException(status_code=400, detail=f"Cargo invalido. Opcoes: {', '.join(ROLE_OPTIONS)}")
     update_user(user_id, display_name=display_name, department_id=department_id, role=role)
+    firebase_uid = (target.get("firebase_uid") or "").strip()
+    if firebase_uid:
+        # Cache de auth guarda role/setor antigos ate o TTL — invalida pra
+        # mudanca valer na proxima request do backend.
+        invalidate_auth_cache(firebase_uid)
+    if role and firebase_uid:
+        # M-A4b (role stale): o claim role alimenta as Firestore rules
+        # (isPrivilegedInTenant usa tokenRole) e o _resolve_tenant_id do auth
+        # early-returna com claim presente (nunca ressincroniza). Sem reemitir
+        # aqui, um admin rebaixado manteria leitura privilegiada via client
+        # SDK. Decide reemissao pela divergencia do CLAIM (nao do doc) — assim
+        # re-salvar o mesmo cargo funciona como RETRY se um set anterior
+        # falhou. Reemite + revoga refresh (ID token corrente expira em ~1h).
+        try:
+            from firebase_admin_client import (
+                get_user_claims_strict, revoke_refresh_tokens, set_tenant_claims,
+            )
+            claims = get_user_claims_strict(firebase_uid)
+            claim_tid = str(claims.get("tenant_id") or "")
+            claim_role = str(claims.get("role") or "")
+            my_tid = str(current_user.get("tenant_id") or "") or "hubloc"
+            if claim_tid and claim_tid != my_tid:
+                # Nao deveria ocorrer (lookup e tenant-scoped); nunca
+                # re-apontar claim de outro tenant como efeito colateral.
+                logger.error(
+                    "USER_UPDATE: claim de outro tenant (%s) p/ user id=%s — "
+                    "claim NAO alterado", claim_tid, user_id,
+                )
+            elif claim_role != role or not claim_tid:
+                # Claim desatualizado (ou ausente) -> reemite. Se ja bate,
+                # nao faz nada (idempotente).
+                if set_tenant_claims(firebase_uid, claim_tid or my_tid, role=role, base_claims=claims):
+                    revoke_refresh_tokens(firebase_uid)
+                else:
+                    logger.warning(
+                        "USER_UPDATE: set_tenant_claims falhou p/ id=%s — "
+                        "re-salvar o mesmo cargo re-tenta", user_id,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "USER_UPDATE: claim role nao reemitido p/ id=%s (%s) — "
+                "re-salvar o mesmo cargo re-tenta", user_id, exc,
+            )
     log_audit(current_user["id"], "USER_UPDATE", f"id={user_id}")
     return {"status": "ok"}
 
@@ -674,12 +733,39 @@ async def admin_deactivate_user(user_id: int, current_user: dict = Depends(get_c
         raise HTTPException(status_code=403, detail="Apenas admin pode desativar usuarios")
     if user_id == current_user["id"]:
         raise HTTPException(status_code=400, detail="Nao pode desativar a si mesmo")
-    target = get_user_by_id(user_id)
+    # Lookup RAW (sem filtro is_active): permite RE-EXECUTAR o offboarding em
+    # um usuario ja desativado (retry idempotente) em vez de 404 — importante
+    # se um clear/revoke anterior falhou (blip do Admin SDK).
+    target = get_user_raw_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="Usuario nao encontrado")
-    deactivate_user(user_id)
-    log_audit(current_user["id"], "USER_DEACTIVATE", f"id={user_id} ({target['display_name']})")
-    return {"status": "ok"}
+    already_inactive = not target.get("is_active", 1)
+    deactivate_user(user_id)  # set is_active=0 (idempotente)
+    # M-A4b (offboarding): as rules M-A4 autorizam por claim tenant_id, e as
+    # subcolecoes gateadas so por ownsTenant nao checam operator_profile —
+    # sem limpar o claim, o desativado re-loga (revoke nao impede novo login)
+    # e segue lendo PII do tenant via client SDK. Limpa claim + revoga
+    # refresh (ID token corrente expira em ate ~1h) + derruba o cache de
+    # auth (que retorna antes do check de is_active). O guard anti-
+    # ressurreicao em auth.py fecha o re-login com AUTO_PROVISION.
+    firebase_uid = (target.get("firebase_uid") or "").strip()
+    claims_cleared = True
+    if firebase_uid:
+        from firebase_admin_client import clear_tenant_claims, revoke_refresh_tokens
+        claims_cleared = clear_tenant_claims(firebase_uid)
+        revoke_refresh_tokens(firebase_uid)
+        invalidate_auth_cache(firebase_uid)
+        if not claims_cleared:
+            logger.warning(
+                "USER_DEACTIVATE: claims NAO limpos p/ id=%s (blip do Admin "
+                "SDK) — repetir o DELETE re-tenta o clear", user_id,
+            )
+    log_audit(
+        current_user["id"], "USER_DEACTIVATE",
+        f"id={user_id} ({target.get('display_name')}) "
+        f"claims_cleared={claims_cleared} already_inactive={already_inactive}",
+    )
+    return {"status": "ok", "claims_cleared": claims_cleared}
 
 
 @app.post("/api/admin/users/{user_id}/coex")

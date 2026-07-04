@@ -23,6 +23,7 @@ from bootstrap_data import ensure_default_departments
 from database_firestore import (
     create_department,
     get_all_departments,
+    get_user_raw_by_firebase_uid_or_email,
     upsert_firebase_user,
 )
 from firestore_common import get_tenant_context, tenant_context
@@ -30,6 +31,114 @@ from pii_redaction import redact_name
 from tenant_service import create_tenant, tenant_exists
 
 logger = logging.getLogger("castro_crm.tenant_bootstrap")
+
+
+class TenantConflictError(Exception):
+    """Email ja vinculado a OUTRO tenant (um email = um tenant)."""
+
+
+class DeactivatedUserError(Exception):
+    """Ja existe um doc DESATIVADO para o email no tenant — reativar o
+    original, nao recriar (recriar geraria um gemeo ativo+inativo que
+    sombrearia o login: _get_first_by_field usa limit(1) sem order_by)."""
+
+
+def provision_operator(email, display_name="", role="operador", department_id=None):
+    """Cria/vincula um usuario do tenant ATUAL com claim atomico (M-A4b).
+
+    Mesma politica D6 do ensure_tenant_admin, mas para a criacao de usuario
+    pela UI admin (POST /api/admin/users) e futuro painel super-admin:
+
+    - LOOKUP-ONLY da conta Firebase (nao cria): 8/13 operadores hubloc usam
+      provider password, e conta pre-criada sem provider quebraria o
+      onboarding real (console 'Add user' falha com email-already-in-use e
+      o login por senha nao funciona). Conta INEXISTENTE segue o fluxo
+      atual (doc local com uid vazio; claim sincroniza no primeiro login).
+      Conta JA EXISTENTE e linkada com uid + claims tenant_id/role no ato —
+      o primeiro login ja passa nas rules M-A4. Criacao antecipada com
+      invite-link e escopo do painel super-admin (Cloud Run B);
+    - guard "um email = um tenant": conta cujo claim aponta OUTRO tenant
+      aborta com TenantConflictError ANTES de escrever qualquer doc (LGPD —
+      re-apontar claim moveria um usuario entre clientes silenciosamente);
+    - degrada sem claim se o Auth estiver indisponivel: cria so o doc local
+      (uid vazio) e o claim converge no primeiro login (comportamento
+      pre-M-A4b). Retorna o user doc, ou None em falha de upsert.
+    """
+    tenant_id = get_tenant_context() or "hubloc"
+
+    firebase_uid = ""
+    try:
+        from firebase_admin_client import get_firebase_uid_by_email
+        firebase_uid = get_firebase_uid_by_email(email)
+    except Exception as exc:
+        logger.warning(
+            "provision_operator: lookup da conta Firebase falhou (%s) — segue so com doc local",
+            exc,
+        )
+
+    # M-A4b: nao recriar sobre um doc DESATIVADO do mesmo tenant. Recriar
+    # geraria um gemeo ativo+inativo que pode sombrear o login (o guard anti-
+    # ressurreicao poderia 403ar a pessoa com doc valido). Reativar o doc
+    # original (is_active=1) preserva historico e evita a duplicata.
+    prior = get_user_raw_by_firebase_uid_or_email(firebase_uid, email)
+    if prior is not None and not prior.get("is_active", 1):
+        logger.warning(
+            "provision_operator: email %s tem doc DESATIVADO no tenant %s — "
+            "recriacao recusada (reative o original)",
+            redact_name(email), tenant_id,
+        )
+        raise DeactivatedUserError(email)
+
+    claims = None
+    if firebase_uid:
+        try:
+            from firebase_admin_client import get_user_claims_strict
+            claims = get_user_claims_strict(firebase_uid)
+        except Exception as exc:
+            logger.warning(
+                "provision_operator: leitura de claims falhou (%s) — claim "
+                "sera sincronizado no primeiro login", exc,
+            )
+        if claims is not None:
+            claimed_tid = str(claims.get("tenant_id") or "")
+            if claimed_tid and claimed_tid != str(tenant_id):
+                logger.error(
+                    "provision_operator: conta %s ja pertence ao tenant '%s' — "
+                    "criacao em '%s' ABORTADA (um email = um tenant)",
+                    redact_name(email), claimed_tid, tenant_id,
+                )
+                raise TenantConflictError(email)
+
+    user = upsert_firebase_user(
+        firebase_uid=firebase_uid,
+        email=email,
+        display_name=display_name,
+        role=role,
+        department_id=department_id,
+    )
+    if not user:
+        return None
+
+    uid = user.get("firebase_uid", "") or firebase_uid
+    if uid and claims is not None and (
+        str(claims.get("tenant_id") or "") != str(tenant_id)
+        or str(claims.get("role") or "") != str(role)
+    ):
+        try:
+            from firebase_admin_client import revoke_refresh_tokens, set_tenant_claims
+            if set_tenant_claims(uid, tenant_id, role=role, base_claims=claims):
+                # Conta pre-existente (lookup-only) pode ter sessao ativa —
+                # revoga pro proximo login ja emitir o JWT com o claim.
+                revoke_refresh_tokens(uid)
+            else:
+                logger.warning(
+                    "provision_operator: set_tenant_claims falhou — claim "
+                    "sincroniza no primeiro login"
+                )
+        except Exception as exc:
+            logger.warning("provision_operator: falha ao setar claims: %s", exc)
+
+    return user
 
 
 def bootstrap_departments():

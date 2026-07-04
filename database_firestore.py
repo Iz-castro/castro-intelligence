@@ -276,6 +276,33 @@ def get_user_by_firebase_uid(firebase_uid):
     return normalize_record(row)
 
 
+def get_user_raw_by_firebase_uid_or_email(firebase_uid, email):
+    """Lookup RAW (SEM filtro is_active) por firebase_uid e depois por email.
+
+    Offboarding (M-A4b): get_user_by_* filtram is_active, entao um doc
+    DESATIVADO aparece como "inexistente" e um login com AUTO_PROVISION o
+    ressuscitaria como doc NOVO ativo, re-emitindo o claim e anulando a
+    desativacao. Este lookup enxerga o desativado para o login poder NEGAR.
+    Retorna o doc normalizado (com is_active) ou None.
+    """
+    row = None
+    if firebase_uid:
+        row = _get_first_by_field("users", "firebase_uid", firebase_uid)
+    if not row and email:
+        row = _get_first_by_field("users", "email", email.strip().lower())
+    return normalize_record(row) if row else None
+
+
+def get_user_raw_by_id(user_id):
+    """Doc do usuario SEM filtro is_active (get_user_by_id filtra desativados).
+
+    Usado no offboarding idempotente (M-A4b): agir sobre um usuario JA
+    desativado (repetir DELETE re-tenta clear/revoke em vez de 404).
+    """
+    row = _get_doc("users", user_id)
+    return normalize_record(row) if row else None
+
+
 def get_operator_profile_by_uid(firebase_uid):
     row = _operator_profile_doc(firebase_uid)
     if not row or not row.get("is_active", 1):

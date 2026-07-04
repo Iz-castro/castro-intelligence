@@ -73,6 +73,45 @@ def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None):
         return False
 
 
+def clear_tenant_claims(firebase_uid):
+    """Remove os custom claims tenant_id/role do usuario, PRESERVANDO os demais.
+
+    Offboarding (M-A4b): apos o M-A4 as Firestore rules autorizam por claim
+    tenant_id — desativar o operador exige LIMPAR o claim, senao ele re-loga
+    (revoke_refresh_tokens nao impede novo login) e o ID token novo ainda
+    carrega o claim, mantendo leitura do tenant via client SDK. Leitura
+    ESTRITA como no set_tenant_claims: se get_user falhar, NAO grava nada
+    (retorna False) — gravar sobre base {} apagaria claims extras (ex:
+    super_admin). Retorna True se limpou ou nao havia nada a limpar.
+    """
+    if not firebase_uid:
+        return False
+    app = get_firebase_app()
+    try:
+        current_claims = dict(auth.get_user(firebase_uid, app=app).custom_claims or {})
+    except auth.UserNotFoundError:
+        # Conta ja nao existe -> nao ha claim a limpar (offboarding cumprido).
+        logger.info("clear_tenant_claims: conta inexistente | uid=%s (nada a limpar)", firebase_uid)
+        return True
+    except Exception as exc:
+        logger.error(
+            "clear_tenant_claims: get_user falhou; NAO gravando p/ nao apagar "
+            "claims existentes | uid=%s exc=%s", firebase_uid, exc,
+        )
+        return False
+    if "tenant_id" not in current_claims and "role" not in current_claims:
+        return True
+    current_claims.pop("tenant_id", None)
+    current_claims.pop("role", None)
+    try:
+        auth.set_custom_user_claims(firebase_uid, current_claims or None, app=app)
+        logger.info("Claims tenant_id/role removidos (offboarding) | uid=%s", firebase_uid)
+        return True
+    except Exception as exc:
+        logger.error("clear_tenant_claims: falha ao gravar | uid=%s exc=%s", firebase_uid, exc)
+        return False
+
+
 def get_user_claims(firebase_uid):
     """Retorna o dict de custom claims do usuario Firebase, ou {} se none."""
     if not firebase_uid:
@@ -97,6 +136,27 @@ def get_user_claims_strict(firebase_uid):
         return {}
     app = get_firebase_app()
     return dict((auth.get_user(firebase_uid, app=app).custom_claims or {}))
+
+
+def get_firebase_uid_by_email(email):
+    """Lookup puro (NAO cria): uid da conta Firebase do email, ou '' se nao
+    existe. Erros de rede/Auth propagam — o caller decide degradar.
+
+    Usado no provisionamento de operador via UI (M-A4b): criar a conta
+    antecipadamente quebraria o onboarding por senha (8/13 operadores hubloc
+    usam provider password; conta pre-criada sem provider bloqueia o 'Add
+    user' do console E o login por senha). Conta nova continua nascendo no
+    fluxo atual (console/primeiro login); se a conta JA existe, o caller
+    consegue linkar uid + claims atomicamente.
+    """
+    email_norm = (email or "").strip().lower()
+    if not email_norm:
+        return ""
+    app = get_firebase_app()
+    try:
+        return auth.get_user_by_email(email_norm, app=app).uid
+    except auth.UserNotFoundError:
+        return ""
 
 
 def get_or_create_firebase_user(email, display_name=""):
