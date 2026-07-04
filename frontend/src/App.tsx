@@ -7,7 +7,8 @@ import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
-import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import { errorText } from "./utils/errors";
+import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -1757,8 +1758,6 @@ function SettingsModals() {
 // Perfis de Acesso (RBAC dinamico M-B2) — master-detail de toggles
 // ---------------------------------------------------------------------------
 
-type PerfilCatalogoItem = { grupo: string; chave: string; rotulo: string };
-
 function PerfisAcessoModal() {
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
@@ -1783,7 +1782,7 @@ function PerfisAcessoModal() {
       setCatalogo(res.catalogo);
       setLockedToggles(res.locked_admin_toggles || []);
       setSelectedId((prev) => focusId || prev || res.perfis[0]?.id || null);
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setError(errorText(e)); }
   }, [bundle, setError]);
 
   useEffect(() => { void load(); }, [load]);
@@ -1811,7 +1810,7 @@ function PerfisAcessoModal() {
       await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles: draftToggles });
       setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em ate 1 minuto.`);
       await load(selected.id);
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setError(errorText(e)); }
     setBusy(false);
   }
 
@@ -1824,7 +1823,7 @@ function PerfisAcessoModal() {
       setNewNome("");
       setCreating(false);
       await load(res.perfil?.id);
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setError(errorText(e)); }
     setBusy(false);
   }
 
@@ -1837,7 +1836,7 @@ function PerfisAcessoModal() {
       setNotice(`Perfil "${selected.nome}" excluido.`);
       setSelectedId(null);
       await load();
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setError(errorText(e)); }
     setBusy(false);
   }
 

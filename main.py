@@ -91,8 +91,8 @@ from firestore_common import (
 )
 from rbac import (
     LOCKED_ADMIN_TOGGLES, PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
-    default_perfil_for_role, effective_toggles, ensure_permission, get_perfil,
-    has_permission, invalidate_perfil_cache,
+    can_see_all_tenant, default_perfil_for_role, effective_toggles,
+    ensure_permission, get_perfil, has_permission, toggles_beyond_user,
 )
 from pii_redaction import redact_phone, redact_name
 from webhook import process_webhook_payload, validate_signature
@@ -248,18 +248,9 @@ def get_current_user(request: Request):
         raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
     return result["user"]
 
-
-def require_permission(perm: str):
-    """Dependency factory RBAC (M-B2): autentica e exige o toggle `perm`.
-
-    Dual-check (PLANO_RBAC §3.8): o toggle do perfil do usuario decide; se o
-    perfil/chave nao existe, cai no default do seed da role (comportamento
-    pre-RBAC). Endpoints que precisam do check no meio do corpo usam
-    `ensure_permission(current_user, perm)` direto.
-    """
-    async def _dep(current_user: dict = Depends(get_current_user)):
-        return ensure_permission(current_user, perm)
-    return _dep
+# Convencao RBAC (M-B2): endpoints chamam ensure_permission(current_user,
+# perm) no corpo — padrao unico em toda a base (dual-check PLANO_RBAC §3.8:
+# toggle do perfil decide; perfil/chave ausente cai no seed da role).
 
 
 # -- Validacao de imagem --
@@ -718,9 +709,27 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
     if (role_changing or perfil_changing) and current_user.get("role") != "admin":
         if target.get("role") == "admin" or role == "admin" or perfil_acesso_id == "perfil_admin":
             raise HTTPException(status_code=403, detail="Apenas admin pode promover/rebaixar admins")
+    perfil_doc = None
     if perfil_acesso_id is not None:
-        if not perfil_acesso_id or not get_perfil(my_tid, perfil_acesso_id):
+        if not perfil_acesso_id:
+            raise HTTPException(status_code=400, detail="Perfil de acesso invalido")
+        perfil_doc = get_perfil(my_tid, perfil_acesso_id)
+        # Seeds valem mesmo sem doc (tenant pre-seed): o dual-check resolve
+        # pelo fallback da role ate o bootstrap semear.
+        if not perfil_doc and perfil_acesso_id not in SEED_PERFIL_IDS:
             raise HTTPException(status_code=400, detail="Perfil de acesso inexistente")
+    if perfil_changing and current_user.get("role") != "admin" and perfil_doc:
+        # Anti-amplificacao por NIVEL, nao por id literal: um perfil custom
+        # clonado do admin (ou com qualquer toggle que o caller nao tem)
+        # nao pode ser concedido por quem nao e admin.
+        if str(perfil_doc.get("role_equivalente") or "") == "admin":
+            raise HTTPException(status_code=403, detail="Apenas admin pode atribuir perfis de nivel admin")
+        beyond = toggles_beyond_user(perfil_doc.get("toggles") or {}, current_user)
+        if beyond:
+            raise HTTPException(
+                status_code=403,
+                detail="Perfil concede permissoes que voce nao possui: " + ", ".join(beyond),
+            )
     update_user(user_id, display_name=display_name, department_id=department_id, role=role,
                 perfil_acesso_id=perfil_acesso_id)
     if role_changing or perfil_changing:
@@ -754,7 +763,14 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
             claim_perfil = str(claims.get("perfil_acesso_id") or "")
             desired_role = role or target.get("role") or "operador"
             desired_perfil = (perfil_acesso_id if perfil_acesso_id is not None
-                              else default_perfil_for_role(desired_role))
+                              else str(target.get("perfil_acesso_id") or "")
+                              or default_perfil_for_role(desired_role))
+            # Claim perfil ausente + desejado == seed derivado da role NAO e
+            # divergencia real (estado de todo usuario pre-M-B2): reemitir/
+            # revogar aqui deslogaria o operador na primeira edicao inocua.
+            perfil_stale = claim_perfil != desired_perfil and (
+                bool(claim_perfil) or desired_perfil != default_perfil_for_role(desired_role)
+            )
             if claim_tid and claim_tid != my_tid:
                 # Nao deveria ocorrer (lookup e tenant-scoped); nunca
                 # re-apontar claim de outro tenant como efeito colateral.
@@ -762,7 +778,7 @@ async def admin_update_user(user_id: int, request: Request, current_user: dict =
                     "USER_UPDATE: claim de outro tenant (%s) p/ user id=%s — "
                     "claim NAO alterado", claim_tid, user_id,
                 )
-            elif claim_role != desired_role or claim_perfil != desired_perfil or not claim_tid:
+            elif claim_role != desired_role or perfil_stale or not claim_tid:
                 # Claim desatualizado (ou ausente) -> reemite. Se ja bate,
                 # nao faz nada (idempotente).
                 if set_tenant_claims(firebase_uid, claim_tid or my_tid, role=desired_role,
@@ -882,7 +898,7 @@ async def list_perfis_acesso(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Permissao negada (gerenciar_perfis_acesso)")
     from rbac import list_perfis
     return {
-        "perfis": list_perfis(),
+        "perfis": list_perfis(str(current_user.get("tenant_id") or "") or "hubloc"),
         "catalogo": [
             {"grupo": grupo, "chave": chave, "rotulo": rotulo}
             for grupo, chave, rotulo in PERMISSION_CATALOG
@@ -895,9 +911,21 @@ async def list_perfis_acesso(current_user: dict = Depends(get_current_user)):
 async def create_perfil_acesso(request: Request, current_user: dict = Depends(get_current_user)):
     ensure_permission(current_user, "gerenciar_perfis_acesso")
     body = await request.json()
-    from rbac import create_perfil
+    from rbac import SEED_PERFIS, create_perfil, sanitize_toggles
+    # Anti-amplificacao: quem cria perfil nao pode ligar toggle que nao tem
+    # (base + overrides). Admin (tudo true) nunca e limitado.
+    base_id = body.get("base_perfil_id") or "perfil_operador"
+    candidate = dict(SEED_PERFIS.get(base_id, {}).get("toggles") or {})
+    candidate.update(sanitize_toggles(body.get("toggles") or {}))
+    beyond = toggles_beyond_user(candidate, current_user)
+    if beyond:
+        raise HTTPException(
+            status_code=403,
+            detail="Voce nao pode conceder permissoes que nao possui: " + ", ".join(beyond),
+        )
     try:
         doc = create_perfil(
+            str(current_user.get("tenant_id") or "") or "hubloc",
             nome=body.get("nome", ""),
             descricao=body.get("descricao", ""),
             toggles=body.get("toggles") or {},
@@ -919,13 +947,16 @@ async def update_perfil_acesso(perfil_id: str, request: Request, current_user: d
     from rbac import update_perfil
     try:
         result = update_perfil(
+            str(current_user.get("tenant_id") or "") or "hubloc",
             perfil_id,
             nome=body.get("nome"),
             descricao=body.get("descricao"),
             toggles=body.get("toggles"),
+            editor_user=current_user,
         )
     except PermissionError as exc:
-        # Lock do perfil_admin (§3.3): UI desabilita, backend reforca.
+        # Lock do perfil_admin (§3.3) e anti-amplificacao ("nao concede o
+        # que nao tem"): UI desabilita, backend reforca.
         raise HTTPException(status_code=403, detail=str(exc))
     if result is None:
         raise HTTPException(status_code=404, detail="Perfil nao encontrado")
@@ -955,7 +986,7 @@ async def delete_perfil_acesso(perfil_id: str, current_user: dict = Depends(get_
         )
     from rbac import delete_perfil
     try:
-        removed = delete_perfil(perfil_id)
+        removed = delete_perfil(str(current_user.get("tenant_id") or "") or "hubloc", perfil_id)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     if not removed:
@@ -1035,8 +1066,7 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
     contacts = get_wa_contacts_visible_to(
         current_user.get("id"),
         current_user.get("department_id"),
-        current_user.get("role"),
-        see_all=has_permission(current_user, "ver_todos_leads"),
+        see_all=can_see_all_tenant(current_user),
     )
     for c in contacts:
         c["unread"] = int(c.get("unread_count", 0))
@@ -1060,7 +1090,7 @@ async def wa_contacts_all(
     declared_name, whatsapp_profile_name e wa_id.
     """
     from firestore_common import collection as fs_coll
-    privileged = has_permission(current_user, "ver_todos_leads")
+    privileged = can_see_all_tenant(current_user)
     rows = []
     if privileged:
         # Admin/supervisor enxerga toda a agenda do tenant (paridade #1).
@@ -1182,7 +1212,7 @@ def _require_contact_access(contact: dict, current_user: dict):
     canSeeContactScoped (rules); o caso thread-propria nao e expressavel em
     rules — coberto via REST (lazy-load extraContacts do frontend).
     Levanta 403 caso contrario. contact pode ser {} (trata como sem acesso)."""
-    if has_permission(current_user, "ver_todos_leads"):
+    if can_see_all_tenant(current_user):
         return
     if contact and contact.get("assigned_to") == current_user.get("id"):
         return
@@ -1231,7 +1261,7 @@ async def wa_conversations(
     _seen_conv_ids = set()
     _streams = [fs_coll("wa_conversations").order_by(
         "last_message_at", direction=FsQuery.DESCENDING).limit(limit).stream()]
-    if has_permission(current_user, "ver_todos_leads"):
+    if can_see_all_tenant(current_user):
         _streams.append(fs_coll("wa_conversations").where("is_backup", "==", True).stream())
     for _stream in _streams:
         for snap in _stream:
@@ -1247,11 +1277,11 @@ async def wa_conversations(
     # visiveis a ele (proprios + pool sem dono); conversas cujo contato nao e
     # visivel sao descartadas pelo `if not contact: continue` abaixo
     # (isolamento LGPD, espelha o snapshot). admin/supervisor: todos.
-    _convs_privileged = has_permission(current_user, "ver_todos_leads")
+    _convs_privileged = can_see_all_tenant(current_user)
     contacts_by_id = {}
-    _contacts_src = get_all_wa_contacts() if _convs_privileged else get_wa_contacts_visible_to(
-        current_user.get("id"), current_user.get("department_id"), current_user.get("role"),
-        see_all=False,  # ja decidido em _convs_privileged (toggle ver_todos_leads)
+    _contacts_src = get_wa_contacts_visible_to(
+        current_user.get("id"), current_user.get("department_id"),
+        see_all=_convs_privileged,
     )
     for c in _contacts_src:
         contacts_by_id[c["id"]] = c
@@ -1379,17 +1409,6 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
 # -- Helper: janela de 24h do WhatsApp --
 
 _24H = timedelta(hours=24)
-
-
-def _check_send_permission(contact: dict, current_user: dict):
-    """LEGADO. Substituido por _check_conv_send_permission (atua na conversation).
-    Mantido apenas como fallback caso algum codigo legado interno chame.
-    """
-    assigned = contact.get("assigned_to")
-    if assigned and assigned != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
-    if not assigned and not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
-        raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
 
 
 def _check_24h_window(contact: dict):
@@ -1524,7 +1543,10 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
     """
     lead_owner = (contact or {}).get("assigned_to")
     if lead_owner is not None and lead_owner == current_user["id"]:
-        ensure_permission(current_user, "enviar_mensagem_propria_thread")
+        # O toggle amplo (qualquer thread) engloba o restrito: quem pode
+        # co-pilotar qualquer thread nao pode ficar 403 justo nas proprias.
+        if not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
+            ensure_permission(current_user, "enviar_mensagem_propria_thread")
         if conversation.get("takeover_status") in ("pending", "active"):
             try:
                 clear_conversation_takeover(conversation["id"])
@@ -3614,7 +3636,11 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
     conv = get_wa_conversation_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Atendimento nao encontrado")
-    is_manager = has_permission(current_user, "enviar_mensagem_qualquer_thread")
+    # Gerir atendimento de terceiros e coberto por QUALQUER um dos toggles
+    # de supervisao — desligar so a co-pilotagem (mensagem em thread alheia)
+    # nao pode quebrar fechar/reabrir da equipe.
+    is_manager = (has_permission(current_user, "enviar_mensagem_qualquer_thread")
+                  or has_permission(current_user, "assumir_supervisor"))
     if not is_manager and conv.get("assigned_to") != current_user["id"]:
         raise HTTPException(status_code=403, detail="Apenas o dono do atendimento ou admin/supervisor")
     # RBAC: toggle da acao em si (fechar/reabrir), alem do escopo acima.

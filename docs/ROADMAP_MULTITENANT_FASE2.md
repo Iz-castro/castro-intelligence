@@ -127,6 +127,13 @@ staging; bloqueia go-live em prod.
        vale no REST.
      Fase 5 (matar fallback de role) fica pós-bake-in. Divergências 1:1 documentadas no
      PLANO_RBAC §3.4.1.
+     REVISÃO ADVERSARIAL (8 finders → verify) rodada 2026-07-04: 10 findings, todos
+     corrigidos no commit de fixes — destaques: anti-amplificação por NÍVEL ("não concede
+     o que não tem", cobre perfil-clone de admin e auto-edição de perfil), teto de role
+     também no REST (can_see_all_tenant — 3 camadas em sincronia), update_user só re-deriva
+     perfil quando a role MUDA (payload que ecoa role não reseta perfil custom), sem
+     fallback hubloc no _resolve_tenant, claim churn zerado p/ usuários pré-M-B2, cache
+     curto de falha de leitura (anti retry-storm; fallback de role cobre a janela).
 
 PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
   A. Isolamento de canais

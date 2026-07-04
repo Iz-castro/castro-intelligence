@@ -126,7 +126,14 @@ def _resolve_tenant_id(decoded_token, user):
         firebase_uid = (user or {}).get("firebase_uid", "") or (decoded_token or {}).get("uid", "")
         if firebase_uid:
             try:
-                set_tenant_claims(firebase_uid, str(db_tenant), role=(user or {}).get("role") or "operador")
+                # Propaga o perfil CUSTOM do doc (se houver) — sem isso o
+                # claim nasceria com o seed derivado da role e divergiria do
+                # banco ate a proxima edicao do usuario (M-B2).
+                set_tenant_claims(
+                    firebase_uid, str(db_tenant),
+                    role=(user or {}).get("role") or "operador",
+                    perfil_acesso_id=(user or {}).get("perfil_acesso_id") or None,
+                )
                 logger.info(
                     "tenant_id sincronizado em custom_claims | user_id=%s tenant_id=%s "
                     "(usuario precisa renovar ID token para refletir)",

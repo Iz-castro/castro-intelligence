@@ -394,9 +394,14 @@ def update_user(user_id, display_name=None, department_id=None, role=None, perfi
     if role is not None:
         fields["role"] = role
         if perfil_acesso_id is None:
-            # Troca de role sem perfil explicito re-alinha ao seed da role
-            # nova — senao um ex-admin rebaixado manteria perfil_admin.
-            fields["perfil_acesso_id"] = default_perfil_for_role(role)
+            # Re-alinha o perfil ao seed APENAS quando a role de fato MUDA
+            # (ex-admin rebaixado nao pode manter perfil_admin). Payload que
+            # apenas ECOA a role atual (UI sempre envia role; bootstrap
+            # re-passa a cada boot) NAO pode resetar um perfil customizado —
+            # seria downgrade silencioso sem audit a cada edicao/deploy.
+            existing = _get_doc("users", user_id)
+            if existing is not None and existing.get("role") != role:
+                fields["perfil_acesso_id"] = default_perfil_for_role(role)
     if perfil_acesso_id is not None:
         fields["perfil_acesso_id"] = perfil_acesso_id
     if not fields:
@@ -411,7 +416,10 @@ def update_user(user_id, display_name=None, department_id=None, role=None, perfi
 def backfill_perfil_acesso_ids():
     """Preenche users.perfil_acesso_id derivado da role onde falta (M-B2
     fase 1). Idempotente: escreve apenas docs sem o campo; ajustes manuais
-    de perfil nunca sao sobrescritos. Roda no bootstrap do tenant."""
+    de perfil nunca sao sobrescritos. Roda no bootstrap do tenant.
+
+    Sem log_audit por usuario de proposito: o campo derivado e identico ao
+    fallback de role do dual-check — permissao EFETIVA de ninguem muda."""
     updated = 0
     for row in _all_docs("users"):
         if not row or row.get("perfil_acesso_id"):
@@ -420,9 +428,10 @@ def backfill_perfil_acesso_ids():
         if not perfil_id:
             continue
         document("users", row["id"]).set({"perfil_acesso_id": perfil_id}, merge=True)
-        fresh = _get_doc("users", row["id"])
-        if fresh:
-            _sync_operator_profile_from_user(fresh)
+        # Espelha sem re-ler: a unica mudanca e o campo recem-derivado.
+        row = dict(row)
+        row["perfil_acesso_id"] = perfil_id
+        _sync_operator_profile_from_user(row)
         updated += 1
     if updated:
         logger.info("Backfill perfil_acesso_id | users=%d", updated)
@@ -1483,21 +1492,20 @@ def get_all_wa_contacts(include_archived=False):
     return _enrich_and_sort_contacts(_all_docs("wa_contacts"), include_archived=include_archived)
 
 
-def get_wa_contacts_visible_to(user_id, department_id=None, role=None, include_archived=False, see_all=None):
+def get_wa_contacts_visible_to(user_id, department_id=None, include_archived=False, see_all=False):
     """Contatos visiveis a um usuario, com o mesmo enriquecimento/ordenacao de
     get_all_wa_contacts.
 
-    Escopo amplo (ver tudo) e decidido pelo caller via `see_all` — no M-B2 o
-    main.py passa has_permission(user, "ver_todos_leads") (RBAC dinamico).
-    Sem see_all explicito, cai no criterio legado por role (compat). Operador
-    comum ve apenas o proprio escopo (atribuidos a si ou sem dono/pool) —
-    espelha as Firestore rules do caminho de snapshot e evita varrer/expor a
-    agenda inteira do tenant (milhares de contatos da agenda coex) no
-    fallback de polling do frontend. NAO inclui contatos de colegas do mesmo
-    departamento (isolamento LGPD).
+    Escopo amplo (ver tudo) e decidido SEMPRE pelo caller via `see_all` — no
+    M-B2 o main.py passa rbac.can_see_all_tenant(user) (toggle
+    ver_todos_leads + teto de role, mesmo criterio das rules/frontend).
+    Default e o escopo restrito. Operador comum ve apenas o proprio escopo
+    (atribuidos a si ou sem dono/pool) — espelha as Firestore rules do
+    caminho de snapshot e evita varrer/expor a agenda inteira do tenant
+    (milhares de contatos da agenda coex) no fallback de polling do
+    frontend. NAO inclui contatos de colegas do mesmo departamento
+    (isolamento LGPD).
     """
-    if see_all is None:
-        see_all = role in ("admin", "supervisor")
     if see_all:
         rows = _all_docs("wa_contacts")
     else:

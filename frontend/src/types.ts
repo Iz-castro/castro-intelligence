@@ -82,6 +82,9 @@ export type SessionPerfil = {
   toggles: Record<string, boolean>;
 };
 
+// Item do catalogo de toggles retornado por GET /api/admin/perfis-acesso.
+export type PerfilCatalogoItem = { grupo: string; chave: string; rotulo: string };
+
 // Doc completo de tenants/{tid}/perfis_acesso/{id} (UI de gestao).
 export type PerfilAcesso = {
   id: string;

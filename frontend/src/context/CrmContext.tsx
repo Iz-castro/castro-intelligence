@@ -33,8 +33,9 @@ type CrmContextValue = {
   booting: boolean;
   busyLogin: boolean;
   snapshotMode: boolean;
-  isManagerRole: boolean;
   // RBAC dinamico (M-B2): toggles efetivos da sessao + helper de checagem.
+  // (Nao ha mais gate por role exportado — checagens de UI usam can(), e
+  // escopo de dados usa canSeeAll; role cru so vive dentro do contexto.)
   perfil: SessionPerfil | null;
   can: (perm: PermissionKey) => boolean;
   // Escopo de dados amplo: exige o toggle E a role privilegiada — as
@@ -1725,7 +1726,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       await putJson(bundle.auth, `/api/admin/users/${userId}`, body);
       setNotice("Usuario atualizado.");
       setEditingUserId(null);
-      setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators"));
+      // Patch local (evita full-scan server-side de /api/operators por
+      // clique): os valores novos ja estao no estado do editor; perfil
+      // vazio = seed derivado do cargo (mesma derivacao do backend).
+      setOperators((prev) => prev.map((op) => op.id === userId
+        ? { ...op, role: editRole, department_id: editDeptId || null, perfil_acesso_id: editPerfilId || `perfil_${editRole}` }
+        : op));
       if (!snapshotMode) await refreshPollingViews();
     }
     catch (e) { setError(errorText(e)); }
@@ -2190,7 +2196,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode, isManagerRole,
+    config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout,

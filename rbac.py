@@ -172,8 +172,15 @@ _PERFIL_CACHE_TTL = float(os.getenv("RBAC_PERFIL_CACHE_TTL_SECONDS", "60") or 60
 _perfil_cache: dict = {}
 
 # Sentinela para cachear tambem a AUSENCIA do doc (evita re-read por request
-# em tenant pre-seed) sem confundir com falha de leitura (que nao cacheia).
+# em tenant pre-seed) sem confundir com falha de leitura.
 _MISSING = object()
+
+# Falha de leitura e cacheada por TTL CURTO: sem isso, numa janela de
+# degradacao do Firestore toda request autenticada re-tentaria a leitura
+# sincrona no hot path (retry storm que amplifica o incidente). O dual-check
+# cobre o intervalo com o fallback da role.
+_FAILED = object()
+_FAILURE_CACHE_TTL = min(5.0, _PERFIL_CACHE_TTL) if _PERFIL_CACHE_TTL > 0 else 5.0
 
 
 def invalidate_perfil_cache(tenant_id=None, perfil_id=None):
@@ -214,12 +221,13 @@ def get_perfil(tenant_id, perfil_id):
     if entry is not None:
         expires_at, value = entry
         if time.monotonic() < expires_at:
-            return None if value is _MISSING else value
+            return None if value in (_MISSING, _FAILED) else value
         _perfil_cache.pop(key, None)
     try:
         doc = _read_perfil_doc(tenant_id, perfil_id)
     except Exception as exc:
         logger.warning("get_perfil: leitura falhou (tenant=%s perfil=%s): %s", tenant_id, perfil_id, exc)
+        _perfil_cache[key] = (time.monotonic() + _FAILURE_CACHE_TTL, _FAILED)
         return None
     if _PERFIL_CACHE_TTL > 0:
         _perfil_cache[key] = (time.monotonic() + _PERFIL_CACHE_TTL, doc if doc is not None else _MISSING)
@@ -240,7 +248,11 @@ def get_perfil_toggles(tenant_id, perfil_id):
 # ---------------------------------------------------------------------------
 
 def _resolve_tenant(current_user):
-    return str((current_user or {}).get("tenant_id") or "") or get_tenant_context() or "hubloc"
+    # SEM fallback cego pra um tenant fixo: fora de um contexto tenant-aware
+    # a resolucao retorna '' e a decisao cai no fallback do seed da ROLE
+    # (nunca nos docs de outro tenant). Matar o _DEFAULT_TENANT e debito
+    # aberto do M-A4b — a infra nova nao reintroduz o padrao.
+    return str((current_user or {}).get("tenant_id") or "") or get_tenant_context() or ""
 
 
 def _fallback_role_toggle(role, perm):
@@ -278,23 +290,35 @@ def ensure_permission(current_user, perm):
 
 def effective_toggles(current_user):
     """Mapa EFETIVO {chave: bool} de todo o catalogo para o usuario —
-    mesma decisao do has_permission, chave a chave. Alimenta o frontend
-    (/api/session) para o useCan nao precisar replicar o fallback."""
-    if not current_user:
-        return {key: False for key in PERMISSION_KEYS}
-    role = current_user.get("role")
-    perfil_id = str(current_user.get("perfil_acesso_id") or "") or default_perfil_for_role(role)
-    toggles = get_perfil_toggles(_resolve_tenant(current_user), perfil_id) if perfil_id else None
-    read_only = bool(current_user.get("read_only") or current_user.get("impersonating"))
-    result = {}
-    for key in PERMISSION_KEYS:
-        if read_only:
-            result[key] = False
-        elif toggles is not None and key in toggles:
-            result[key] = bool(toggles[key])
-        else:
-            result[key] = _fallback_role_toggle(role, key)
-    return result
+    exatamente a decisao do has_permission, chave a chave (o perfil vem do
+    cache, entao as N chamadas custam 1 leitura). Alimenta o frontend
+    (/api/session) para o can() nao precisar replicar o fallback."""
+    return {key: has_permission(current_user, key) for key in PERMISSION_KEYS}
+
+
+def can_see_all_tenant(current_user):
+    """Escopo de DADOS amplo: toggle ver_todos_leads E role privilegiada.
+
+    O teto por role e o mesmo das Firestore rules (§3.6) e do frontend
+    (canSeeAll): um perfil "ampliado" alem da role NAO ganha a agenda do
+    tenant nem via REST — senao as 3 camadas de isolamento (rules,
+    snapshot, REST) divergiriam por transporte (LGPD). Ampliar visibilidade
+    exige mudar a role."""
+    if str((current_user or {}).get("role") or "") not in ("admin", "supervisor"):
+        return False
+    return has_permission(current_user, "ver_todos_leads")
+
+
+def toggles_beyond_user(toggles, current_user):
+    """Chaves em `toggles` ligadas (true) que o proprio usuario NAO tem.
+
+    Mecanismo anti-amplificacao: ninguem concede (via atribuicao de perfil
+    ou edicao de toggles) um privilegio que nao possui. Admin (perfil_admin
+    seed, tudo true) nunca e limitado por isso."""
+    return sorted(
+        key for key, value in (toggles or {}).items()
+        if value and key in PERMISSION_KEYS and not has_permission(current_user, key)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -310,14 +334,15 @@ def sanitize_toggles(toggles):
     return {k: bool(v) for k, v in toggles.items() if k in PERMISSION_KEYS}
 
 
-def list_perfis():
-    """Todos os perfis do tenant atual, seeds primeiro, ordem estavel."""
+def list_perfis(tenant_id):
+    """Todos os perfis do tenant, seeds primeiro, ordem estavel."""
     from firestore_common import collection
     rows = []
-    for snap in collection("perfis_acesso").stream():
-        data = snap.to_dict() or {}
-        data.setdefault("id", snap.id)
-        rows.append(data)
+    with tenant_context(tenant_id):
+        for snap in collection("perfis_acesso").stream():
+            data = snap.to_dict() or {}
+            data.setdefault("id", snap.id)
+            rows.append(data)
     seed_order = {pid: i for i, pid in enumerate(SEED_PERFIL_IDS)}
     rows.sort(key=lambda r: (seed_order.get(r.get("id"), len(seed_order)), str(r.get("nome") or "")))
     return rows
@@ -331,82 +356,103 @@ def _slugify_perfil_id(nome):
     return f"perfil_{base}"[:60]
 
 
-def create_perfil(nome, descricao="", toggles=None, base_perfil_id=None):
-    """Cria perfil customizado no tenant atual. Toggles partem do perfil
-    base (default: operador — menor privilegio) e recebem os overrides
-    sanitizados. Retorna o doc criado. Levanta ValueError em conflito."""
+def create_perfil(tenant_id, nome, descricao="", toggles=None, base_perfil_id=None):
+    """Cria perfil customizado no tenant. Toggles partem do perfil base
+    SEED (default: operador — menor privilegio) e recebem os overrides
+    sanitizados. base_perfil_id desconhecido e ERRO explicito — fallback
+    silencioso criaria um perfil minimo que o admin acharia ser um clone.
+    Retorna o doc criado. Levanta ValueError em conflito/base invalida."""
     nome = str(nome or "").strip()
     if not nome:
         raise ValueError("nome obrigatorio")
-    base = SEED_PERFIS.get(base_perfil_id or "perfil_operador", SEED_PERFIS["perfil_operador"])
+    base_id = base_perfil_id or "perfil_operador"
+    if base_id not in SEED_PERFIS:
+        raise ValueError(f"base_perfil_id invalido: '{base_id}' (use um perfil seed)")
+    base = SEED_PERFIS[base_id]
     merged = dict(base["toggles"])
     merged.update(sanitize_toggles(toggles or {}))
-    perfil_id = _slugify_perfil_id(nome)
-    ref = document("perfis_acesso", perfil_id)
-    if ref.get().exists:
-        raise ValueError(f"Perfil '{perfil_id}' ja existe")
-    now = utcnow()
-    doc = {
-        "id": perfil_id,
-        "nome": nome,
-        "descricao": str(descricao or ""),
-        "role_equivalente": base["role_equivalente"],
-        "is_system_locked": False,
-        "is_seed": False,
-        "toggles": merged,
-        "created_at": now,
-        "updated_at": now,
-    }
-    ref.set(doc)
-    invalidate_perfil_cache(get_tenant_context() or None, perfil_id)
+    with tenant_context(tenant_id):
+        perfil_id = _slugify_perfil_id(nome)
+        ref = document("perfis_acesso", perfil_id)
+        if ref.get().exists:
+            raise ValueError(f"Perfil '{perfil_id}' ja existe")
+        now = utcnow()
+        doc = {
+            "id": perfil_id,
+            "nome": nome,
+            "descricao": str(descricao or ""),
+            "role_equivalente": base["role_equivalente"],
+            "is_system_locked": False,
+            "is_seed": False,
+            "toggles": merged,
+            "created_at": now,
+            "updated_at": now,
+        }
+        ref.set(doc)
+    invalidate_perfil_cache(tenant_id, perfil_id)
     return doc
 
 
-def update_perfil(perfil_id, nome=None, descricao=None, toggles=None):
-    """Atualiza perfil do tenant atual. Enforce do lock (§3.3): em perfil
-    is_system_locked, os LOCKED_ADMIN_TOGGLES nao podem ser desligados
-    (defense-in-depth — a UI ja desabilita). Retorna (before, after) para
-    audit, ou None se o perfil nao existe."""
-    ref = document("perfis_acesso", perfil_id)
-    snap = ref.get()
-    if not snap.exists:
-        return None
-    before = snap.to_dict() or {}
-    fields = {"updated_at": utcnow()}
-    if nome is not None and str(nome).strip():
-        fields["nome"] = str(nome).strip()
-    if descricao is not None:
-        fields["descricao"] = str(descricao)
-    if toggles is not None:
-        incoming = sanitize_toggles(toggles)
-        if before.get("is_system_locked"):
-            for locked_key in LOCKED_ADMIN_TOGGLES:
-                if incoming.get(locked_key) is False:
+def update_perfil(tenant_id, perfil_id, nome=None, descricao=None, toggles=None, editor_user=None):
+    """Atualiza perfil do tenant. Dois guards (defense-in-depth — a UI ja
+    desabilita):
+    - lock (§3.3): em perfil is_system_locked, os LOCKED_ADMIN_TOGGLES nao
+      podem ser desligados;
+    - anti-amplificacao: se editor_user for passado, ele nao pode LIGAR um
+      toggle que ele proprio nao tem (senao quem tem so
+      gerenciar_perfis_acesso editaria o proprio perfil ate virar admin).
+    Retorna (before, after) para audit, ou None se o perfil nao existe."""
+    with tenant_context(tenant_id):
+        ref = document("perfis_acesso", perfil_id)
+        snap = ref.get()
+        if not snap.exists:
+            return None
+        before = snap.to_dict() or {}
+        fields = {"updated_at": utcnow()}
+        if nome is not None and str(nome).strip():
+            fields["nome"] = str(nome).strip()
+        if descricao is not None:
+            fields["descricao"] = str(descricao)
+        if toggles is not None:
+            incoming = sanitize_toggles(toggles)
+            if before.get("is_system_locked"):
+                for locked_key in LOCKED_ADMIN_TOGGLES:
+                    if incoming.get(locked_key) is False:
+                        raise PermissionError(
+                            f"Toggle '{locked_key}' e travado neste perfil de sistema"
+                        )
+            if editor_user is not None:
+                previous = before.get("toggles") or {}
+                enabling = {k: v for k, v in incoming.items() if v and not previous.get(k)}
+                beyond = toggles_beyond_user(enabling, editor_user)
+                if beyond:
                     raise PermissionError(
-                        f"Toggle '{locked_key}' e travado neste perfil de sistema"
+                        "Voce nao pode conceder permissoes que nao possui: "
+                        + ", ".join(beyond)
                     )
-        merged = dict(before.get("toggles") or {})
-        merged.update(incoming)
-        fields["toggles"] = merged
-    ref.set(fields, merge=True)
-    invalidate_perfil_cache(get_tenant_context() or None, perfil_id)
+            merged = dict(before.get("toggles") or {})
+            merged.update(incoming)
+            fields["toggles"] = merged
+        ref.set(fields, merge=True)
+    invalidate_perfil_cache(tenant_id, perfil_id)
     after = dict(before)
     after.update(fields)
     return before, after
 
 
-def delete_perfil(perfil_id):
-    """Remove perfil customizado do tenant atual. Seeds/travados nunca —
+def delete_perfil(tenant_id, perfil_id):
+    """Remove perfil customizado do tenant. Seeds/travados nunca —
     o caller tambem valida que nenhum usuario ativo referencia o perfil."""
-    ref = document("perfis_acesso", perfil_id)
-    snap = ref.get()
-    if not snap.exists:
-        return False
-    data = snap.to_dict() or {}
-    if data.get("is_seed") or data.get("is_system_locked") or perfil_id in SEED_PERFIL_IDS:
-        raise PermissionError("Perfis de sistema nao podem ser excluidos")
-    ref.delete()
-    invalidate_perfil_cache(get_tenant_context() or None, perfil_id)
+    with tenant_context(tenant_id):
+        ref = document("perfis_acesso", perfil_id)
+        snap = ref.get()
+        if not snap.exists:
+            return False
+        data = snap.to_dict() or {}
+        if data.get("is_seed") or data.get("is_system_locked") or perfil_id in SEED_PERFIL_IDS:
+            raise PermissionError("Perfis de sistema nao podem ser excluidos")
+        ref.delete()
+    invalidate_perfil_cache(tenant_id, perfil_id)
     return True
 
 
