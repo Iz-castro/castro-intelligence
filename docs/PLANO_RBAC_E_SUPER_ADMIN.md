@@ -236,6 +236,17 @@ estável (entram em `perfis_acesso/{id}.toggles.<chave>`).
 > admin exige caller admin; ninguém altera o próprio cargo/perfil;
 > não-admin não rebaixa admin (`main.py` admin_create_user /
 > admin_update_user — mudança consciente de comportamento).
+>
+> **Endurecimento pós-canário (2026-07-05):** o lock do §3.3 passou de
+> "3 toggles críticos" para **TODOS os toggles do perfil de sistema
+> travados em ligado** — o `perfil_admin` é o teto do tenant. Motivo:
+> no canário, desligar toggles do `perfil_admin` (o modal abre com ele
+> selecionado) + guard anti-amplificação criou um **ratchet
+> irreversível pela UI** (o admin "perdia" o toggle e não podia mais
+> religá-lo em perfil nenhum; reparo exigiu Admin SDK). Junto:
+> `toggles_beyond_user` faz **bypass para role admin** (a role é o teto
+> duro; o guard morde quem está abaixo, ex. supervisor delegado).
+> Perfil administrativo limitado = perfil customizado com base admin.
 
 #### Visibilidade
 

@@ -1762,7 +1762,6 @@ function PerfisAcessoModal() {
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
-  const [lockedToggles, setLockedToggles] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draftNome, setDraftNome] = useState("");
   const [draftDescricao, setDraftDescricao] = useState("");
@@ -1777,10 +1776,9 @@ function PerfisAcessoModal() {
   const load = useCallback(async (focusId?: string) => {
     if (!bundle) return;
     try {
-      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[]; locked_admin_toggles: string[] }>(bundle.auth, "/api/admin/perfis-acesso");
+      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[] }>(bundle.auth, "/api/admin/perfis-acesso");
       setPerfis(res.perfis);
       setCatalogo(res.catalogo);
-      setLockedToggles(res.locked_admin_toggles || []);
       setSelectedId((prev) => focusId || prev || res.perfis[0]?.id || null);
     } catch (e: unknown) { setError(errorText(e)); }
   }, [bundle, setError]);
@@ -1886,14 +1884,14 @@ function PerfisAcessoModal() {
                 <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} />
               </div>
               {selected.is_system_locked ? (
-                <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: as permissoes de gestao criticas nao podem ser desligadas (protecao contra auto-bloqueio).</p>
+                <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: todas as permissoes ficam sempre ligadas (e o teto do tenant — protecao contra auto-bloqueio). Para um perfil administrativo limitado, crie um perfil customizado com base Administrador.</p>
               ) : null}
               {Object.entries(grupos).map(([grupo, itens]) => (
                 <div key={grupo} style={{ marginBottom: "0.8rem" }}>
                   <h3 style={{ margin: "0 0 0.35rem", fontSize: "0.82rem", textTransform: "uppercase", opacity: 0.7 }}>{grupo}</h3>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: "0.25rem 0.8rem" }}>
                     {itens.map((item) => {
-                      const locked = !!selected.is_system_locked && lockedToggles.includes(item.chave);
+                      const locked = !!selected.is_system_locked;
                       return (
                         <label key={item.chave} style={{ display: "flex", alignItems: "center", gap: "0.45rem", fontSize: "0.82rem", opacity: locked ? 0.6 : 1, cursor: locked ? "not-allowed" : "pointer" }} title={locked ? "Travado no perfil de sistema" : item.chave}>
                           <input

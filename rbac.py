@@ -79,9 +79,13 @@ PERMISSION_CATALOG = [
 
 PERMISSION_KEYS = [key for _, key, _ in PERMISSION_CATALOG]
 
-# Toggles que a UI e o backend TRAVAM no perfil_admin (§3.3) — impede o
-# admin do tenant de se auto-sabotar removendo a propria gestao.
-LOCKED_ADMIN_TOGGLES = ("gerenciar_usuarios", "gerenciar_perfis_acesso", "ver_todos_leads")
+# §3.3 (endurecido pos-canario M-B2): no perfil de SISTEMA (perfil_admin,
+# is_system_locked) TODOS os toggles sao travados em ligado — o perfil e o
+# teto do tenant. Travar so um subconjunto criava um ratchet: desligar um
+# toggle do proprio perfil_admin fazia o guard anti-amplificacao ("nao
+# concede o que nao possui") impedir o admin de RELIGA-lo em qualquer
+# perfil, sem saida pela UI. Perfil administrativo limitado = perfil
+# customizado com base admin, nunca o de sistema.
 
 ROLE_TO_PERFIL = {
     "admin": "perfil_admin",
@@ -313,8 +317,13 @@ def toggles_beyond_user(toggles, current_user):
     """Chaves em `toggles` ligadas (true) que o proprio usuario NAO tem.
 
     Mecanismo anti-amplificacao: ninguem concede (via atribuicao de perfil
-    ou edicao de toggles) um privilegio que nao possui. Admin (perfil_admin
-    seed, tudo true) nunca e limitado por isso."""
+    ou edicao de toggles) um privilegio que nao possui. Role ADMIN e o teto
+    duro do tenant e faz bypass ([]): sem isso, qualquer estado degradado do
+    perfil do admin viraria ratchet irreversivel pela UI (visto no canario
+    M-B2). O guard morde quem esta ABAIXO do teto (ex.: supervisor com
+    gerenciar_perfis_acesso delegado)."""
+    if str((current_user or {}).get("role") or "") == "admin":
+        return []
     return sorted(
         key for key, value in (toggles or {}).items()
         if value and key in PERMISSION_KEYS and not has_permission(current_user, key)
@@ -396,11 +405,13 @@ def create_perfil(tenant_id, nome, descricao="", toggles=None, base_perfil_id=No
 def update_perfil(tenant_id, perfil_id, nome=None, descricao=None, toggles=None, editor_user=None):
     """Atualiza perfil do tenant. Dois guards (defense-in-depth — a UI ja
     desabilita):
-    - lock (§3.3): em perfil is_system_locked, os LOCKED_ADMIN_TOGGLES nao
-      podem ser desligados;
+    - lock (§3.3, endurecido): perfil is_system_locked nao aceita NENHUM
+      toggle desligado — o perfil de sistema e o teto do tenant, sempre
+      tudo ligado (ver nota no topo do modulo sobre o ratchet);
     - anti-amplificacao: se editor_user for passado, ele nao pode LIGAR um
       toggle que ele proprio nao tem (senao quem tem so
       gerenciar_perfis_acesso editaria o proprio perfil ate virar admin).
+      Role admin faz bypass — ver toggles_beyond_user.
     Retorna (before, after) para audit, ou None se o perfil nao existe."""
     with tenant_context(tenant_id):
         ref = document("perfis_acesso", perfil_id)
@@ -416,11 +427,12 @@ def update_perfil(tenant_id, perfil_id, nome=None, descricao=None, toggles=None,
         if toggles is not None:
             incoming = sanitize_toggles(toggles)
             if before.get("is_system_locked"):
-                for locked_key in LOCKED_ADMIN_TOGGLES:
-                    if incoming.get(locked_key) is False:
-                        raise PermissionError(
-                            f"Toggle '{locked_key}' e travado neste perfil de sistema"
-                        )
+                desligados = sorted(k for k, v in incoming.items() if v is False)
+                if desligados:
+                    raise PermissionError(
+                        "Perfil de sistema: todas as permissoes ficam sempre ligadas. "
+                        "Para um perfil administrativo limitado, crie um perfil customizado."
+                    )
             if editor_user is not None:
                 previous = before.get("toggles") or {}
                 enabling = {k: v for k, v in incoming.items() if v and not previous.get(k)}

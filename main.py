@@ -90,7 +90,7 @@ from firestore_common import (
     collection_name, document as fs_document, utcnow as fs_utcnow,
 )
 from rbac import (
-    LOCKED_ADMIN_TOGGLES, PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
+    PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
     can_see_all_tenant, default_perfil_for_role, effective_toggles,
     ensure_permission, get_perfil, has_permission, toggles_beyond_user,
 )
@@ -903,7 +903,6 @@ async def list_perfis_acesso(current_user: dict = Depends(get_current_user)):
             {"grupo": grupo, "chave": chave, "rotulo": rotulo}
             for grupo, chave, rotulo in PERMISSION_CATALOG
         ],
-        "locked_admin_toggles": list(LOCKED_ADMIN_TOGGLES),
     }
 
 
