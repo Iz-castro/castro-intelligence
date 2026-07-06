@@ -103,6 +103,30 @@ staging; bloqueia go-live em prod.
      falhar; muda reativação p/ exigir re-habilitar); guards de escalação (supervisor não
      cria/promove admin, ninguém muda próprio cargo) → M-B2 RBAC.
 
+0f. LOGIN TENANT-AWARE (mata _DEFAULT_TENANT cego + gate 0b) ✅ EM PROD 2026-07-06 —
+     rev castro-crm-00047-sin (rollback = update-traffic p/ 00045-xim). Fecha os
+     bloqueadores 0b (gate de login hubloc-only) e 0c(iii) (mis-provisionamento cego).
+     Resolução de tenant no login (auth.py): claim → domínio (allowed_email_domains do
+     tenant) → rede de transição (single_active_tenant, só enquanto 1 tenant; desarma ao
+     criar o #2). Login que não resolve tenant = NEGADO (sem default cego). Gate tenant-
+     aware (_login_gate): founder OU claim OU domínio casa tenant. AUTO_PROVISION só por
+     domínio + email_verified. tenant_service: allowed_email_domains (create/update),
+     resolve_by_domain (None se ambíguo), single_active_tenant; hubloc backfillado +
+     reconciliado no boot (durável). REVISÃO ADVERSARIAL (workflow 5-dim → verify) achou
+     20 sobreviventes/14 confirmados; corrigidos os críticos em commit 3732ccc: (1)
+     provedor público (gmail/outlook) NUNCA vira allowed_email_domains — senão bootstrap
+     derivava do email founder e qualquer conta do provedor auto-provisionava (PII cross-
+     tenant); (2) email_verified obrigatório no auto-provision; (3) env-domain belt-and-
+     suspenders era ilusório (autorizava sem resolver) — aposentado, robustez vem do
+     reconcile no boot; (4) refresh_tenants resiliente a falha (roda no login path); (5)
+     colisão de domínio rejeitada. Matriz em memória 13/13. CANÁRIO staging (dados reais):
+     admin 200 sem churn, operador 200 escopo próprio, ESTRANHO gmail 403 + zero doc criado.
+     Follow-ups conhecidos (não bloqueiam): founder cross-tenant sem claim + 2 tenants →
+     403 (intencional: Cloud Run A exige tenant concreto; cross-tenant = Cloud Run B);
+     cache cross-instance 60s ao criar #2 (janela transiente); guarda-corpo de domínio na
+     UI (backend devolve domain_warning; falta dialog de confirmação no frontend).
+     PENDENTE pré-#2 restante: só 0c(iv) storage.rules (LOW; mídia via Admin SDK hoje).
+
 0e. M-B2 (RBAC dinâmico) ✅ EM PROD 2026-07-06 — rev castro-crm-00045-xim (100% via
      update-traffic; rollback = update-traffic p/ 00041-rij). Staging tagged validado
      2026-07-05 (boot: seed 3 perfis + backfill 13 users, ninguém deslogado; matriz de
