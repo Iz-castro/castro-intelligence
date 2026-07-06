@@ -103,7 +103,17 @@ staging; bloqueia go-live em prod.
      falhar; muda reativação p/ exigir re-habilitar); guards de escalação (supervisor não
      cria/promove admin, ninguém muda próprio cargo) → M-B2 RBAC.
 
-0e. M-B2 (RBAC dinâmico) 🔨 IMPLEMENTADO 2026-07-04 — pendente staging → prod.
+0e. M-B2 (RBAC dinâmico) ✅ EM PROD 2026-07-06 — rev castro-crm-00045-xim (100% via
+     update-traffic; rollback = update-traffic p/ 00041-rij). Staging tagged validado
+     2026-07-05 (boot: seed 3 perfis + backfill 13 users, ninguém deslogado; matriz de
+     rules 23/23 no motor real; canário manual admin+operador). Rules ruleset 21cf3d0c
+     (perfis_acesso; backup faa492f1 no repo). CANÁRIO ACHOU 1 BUG DE DESIGN (corrigido
+     em f671f88 + redeploy 00045-xim): desligar toggles do perfil_admin + guard
+     anti-amplificação criava ratchet irreversível pela UI → agora perfil de sistema tem
+     TODOS os toggles travados em ligado (teto do tenant) e o guard faz bypass p/ role
+     admin (segue mordendo supervisor delegado); dados reparados via Admin SDK com audit
+     op=repair. Único 503 no cutover = blip de quota cpu_allocation (follow-up: quota
+     Cloud Run apertada p/ revisões staging+prod simultâneas).
      Fases 1–4 do PLANO_RBAC §3.8 numa tacada, com dual-check (dia 0 = comportamento
      idêntico; fallback = seed da role):
      - `rbac.py`: catálogo FIXO de 28 toggles (só chaves com enforcement real — ver
@@ -144,7 +154,7 @@ PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
      Sprint 0 RBAC/super-admin (§6 PLANO_RBAC — fundação)      [S]
      Cloud Run B mínimo (só criar tenant, D3)                  [L, front-load segurança]
   C. RBAC dinâmico no hubloc (D4 — antes do #2)
-     M-B2  🔨 IMPLEMENTADO 2026-07-04 (ver bloco 0e) — pendente staging → prod
+     M-B2  ✅ EM PROD 2026-07-06 (ver bloco 0e)
   D. Rules + gate
      M-A4  ✅ FEITO 2026-07-03 — removido emailAllowed() do ownsTenant (isolar por
            claim tenant_id). Publicado + canário OK. Ver bloco 0c. Falta: endurecer
