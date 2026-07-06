@@ -30,7 +30,14 @@ from database_firestore import (
 from firestore_common import get_tenant_context, tenant_context
 from pii_redaction import redact_name
 from rbac import seed_perfis_acesso
-from tenant_service import create_tenant, tenant_exists
+from tenant_service import (
+    create_tenant,
+    get_tenant,
+    is_public_email_provider,
+    normalize_email_domains,
+    tenant_exists,
+    update_tenant,
+)
 
 logger = logging.getLogger("castro_crm.tenant_bootstrap")
 
@@ -310,19 +317,33 @@ def bootstrap_tenant(
       o claim NAO e setado; num caller one-shot o estado nao converge sozinho
       (no hubloc o proximo boot corrige). O painel deve verificar/re-tentar.
     """
+    # allowed_email_domains (SOFT): default = dominio do email do admin, MAS
+    # nunca um provedor publico (gmail/outlook/... — senao QUALQUER conta desse
+    # provedor auto-provisionaria no tenant; achado critico da revisao). Se o
+    # admin usa email publico e nada explicito foi passado, o tenant nasce SEM
+    # dominio (admin provisiona operadores explicitamente).
+    domains = allowed_email_domains
+    if domains is None and admin_email and "@" in admin_email:
+        cand = admin_email.split("@", 1)[1]
+        domains = None if is_public_email_provider(cand) else [cand]
+    domains_norm = normalize_email_domains(domains) if domains is not None else None
+
     created = False
     if tenant_exists(tenant_id):
         logger.info("Tenant '%s' ja existe", tenant_id)
+        # Reconciliacao duravel (nao depende de backfill manual): se o tenant
+        # existe SEM allowed_email_domains e recebemos um valor, seta agora.
+        # Torna o dominio do hubloc parte do codigo (startup passa explicito),
+        # sobrevivendo a DR/restore. Nao SOBRESCREVE dominios ja configurados.
+        if domains_norm:
+            existing = normalize_email_domains((get_tenant(tenant_id) or {}).get("allowed_email_domains"))
+            if not existing:
+                update_tenant(tenant_id, allowed_email_domains=domains_norm)
+                logger.info("Tenant '%s': allowed_email_domains reconciliado=%s", tenant_id, domains_norm)
     else:
-        # allowed_email_domains (SOFT): default = dominio do email do admin
-        # (roadmap "Identidade/dominio do tenant"). Guarda-corpo + roteamento
-        # de login sem claim; nunca autoriza acesso (so o claim autoriza).
-        domains = allowed_email_domains
-        if domains is None and admin_email and "@" in admin_email:
-            domains = [admin_email.split("@", 1)[1]]
         create_tenant(
             tenant_id=tenant_id, name=name, plan=plan, cnpj=cnpj,
-            allowed_email_domains=domains,
+            allowed_email_domains=domains_norm,
         )
         created = True
         logger.info("Tenant '%s' criado", tenant_id)

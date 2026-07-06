@@ -6,7 +6,6 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from config import (
-    ALLOWED_FIREBASE_EMAIL_DOMAIN,
     ALLOWED_FIREBASE_EMAILS,
     AUTO_PROVISION_FIREBASE_USERS,
 )
@@ -151,17 +150,12 @@ def _resolve_tenant_id(decoded_token, user):
 
 def _is_founder(email):
     """Founder/super-admin da plataforma (env ALLOWED_FIREBASE_EMAILS). Humano
-    cross-tenant da Castro Intelligence — loga independente de tenant/dominio."""
+    cross-tenant da Castro Intelligence. No Cloud Run A ele loga como
+    admin/operador de um tenant CONCRETO (resolve por claim/dominio/rede como
+    qualquer um); operacoes cross-tenant reais sao no Cloud Run B. Aqui o
+    founder so ganha o direito de PASSAR o gate; a resolucao de tenant e a
+    mesma de todos (se nao resolver, 403 — nao ha default cego)."""
     return bool(email) and email in ALLOWED_FIREBASE_EMAILS
-
-
-def _global_env_domain_match(email):
-    """Dominio global do env (ALLOWED_FIREBASE_EMAIL_DOMAIN). Belt-and-
-    suspenders da transicao: uniao com os allowed_email_domains por-tenant,
-    pra nao regredir o hubloc caso o backfill do doc do tenant falhe."""
-    if not ALLOWED_FIREBASE_EMAIL_DOMAIN:
-        return False
-    return bool(email) and "@" in email and email.split("@", 1)[1].lower() == ALLOWED_FIREBASE_EMAIL_DOMAIN
 
 
 def _login_gate(claim_tenant, email, domain_authorized):
@@ -191,9 +185,12 @@ def authenticate_firebase_token(id_token, ip_address=""):
     # claim > dominio do email > rede de transicao (1 tenant ativo).
     claim_tenant = decoded.get("tenant_id")
     domain_tenant = None if claim_tenant else resolve_tenant_by_email_domain(email)
-    # Dominio AUTORIZADO p/ auto-provision: casou um tenant OU o dominio global
-    # do env (transicao). Founder nao conta aqui — founder nao auto-provisiona.
-    domain_authorized = bool(domain_tenant) or _global_env_domain_match(email)
+    # Dominio AUTORIZADO p/ auto-provision = casou um allowed_email_domains de
+    # tenant (proprio, nunca publico). O antigo belt-and-suspenders por env era
+    # ilusorio: autorizava a entrada mas nao resolvia tenant (gate/resolver
+    # desacoplados) — removido. A robustez do hubloc vem do allowed_email_
+    # domains reconciliado no boot (tenant_bootstrap), nao do env.
+    domain_authorized = bool(domain_tenant)
 
     # Gate barato (antes de qualquer read de usuario).
     if not _login_gate(claim_tenant, email, domain_authorized):
@@ -254,11 +251,24 @@ def authenticate_firebase_token(id_token, ip_address=""):
         # tenant (nunca num default cego). Founder/usuario sem dominio casado
         # NAO e auto-criado — cai no "nao provisionado" abaixo. Cria dentro do
         # resolved_tenant (contexto ja setado).
-        if AUTO_PROVISION_FIREBASE_USERS and email and domain_authorized:
+        # email_verified OBRIGATORIO: o provider Email/Password e publico
+        # (accounts:signUp alcancavel com a Web API key) — sem isso um estranho
+        # auto-registraria um email NAO verificado num dominio de tenant e
+        # viraria operador (achado critico da revisao). Operador ja provisionado
+        # (doc existe) e achado pelo lookup acima e NAO passa por aqui, entao
+        # exigir verified so barra auto-registro novo (nao quebra os 8/13 por
+        # senha, que ja tem doc).
+        email_verified = bool(decoded.get("email_verified"))
+        if AUTO_PROVISION_FIREBASE_USERS and email and domain_authorized and email_verified:
             user = upsert_firebase_user(
                 firebase_uid=firebase_uid,
                 email=email,
                 display_name=display_name or email,
+            )
+        elif AUTO_PROVISION_FIREBASE_USERS and email and domain_authorized and not email_verified:
+            logger.warning(
+                "Auto-provision NEGADO: email nao verificado | uid=%s tenant=%s",
+                firebase_uid, resolved_tenant,
             )
 
     if not user:

@@ -57,6 +57,27 @@ PLAN_OPTIONS = ("starter", "professional", "enterprise", "premium")
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9\-]{2,63}$")
 
+# Provedores de email PUBLICOS: NUNCA viram allowed_email_domains de um tenant.
+# Se virassem, resolve_tenant_by_email_domain casaria QUALQUER conta desse
+# provedor e o AUTO_PROVISION criaria estranhos como operadores (vazamento de
+# PII cross-tenant — achado critico da revisao 2026-07-06). O dominio do
+# tenant tem que ser um dominio proprio do cliente (ex: clientenovo.com.br).
+_PUBLIC_EMAIL_PROVIDERS = frozenset({
+    "gmail.com", "googlemail.com",
+    "outlook.com", "outlook.com.br", "hotmail.com", "hotmail.com.br",
+    "live.com", "live.com.br", "msn.com",
+    "yahoo.com", "yahoo.com.br", "ymail.com", "rocketmail.com",
+    "icloud.com", "me.com", "mac.com",
+    "aol.com", "gmx.com", "gmx.net", "mail.com", "zoho.com",
+    "proton.me", "protonmail.com", "pm.me", "tutanota.com",
+    "bol.com.br", "uol.com.br", "terra.com.br", "ig.com.br", "globo.com",
+    "globomail.com", "zipmail.com.br", "oi.com.br", "r7.com",
+})
+
+
+def is_public_email_provider(domain: str) -> bool:
+    return str(domain or "").strip().lower().lstrip("@") in _PUBLIC_EMAIL_PROVIDERS
+
 
 # ---------------------------------------------------------------------------
 # Cache em memoria (thread-safe)
@@ -79,15 +100,28 @@ def _needs_refresh() -> bool:
 
 
 def refresh_tenants() -> None:
-    """Recarrega todos os tenants ativos do Firestore para o cache."""
+    """Recarrega todos os tenants ativos do Firestore para o cache.
+
+    RESILIENTE a falha de leitura: esta funcao roda no caminho de LOGIN
+    (auth resolve tenant por dominio) que corre em toda request autenticada.
+    Uma excecao aqui viraria 500 em toda request durante um blip do Firestore.
+    Em falha, mantem o cache atual (stale) e NAO atualiza _last_refresh (a
+    proxima call re-tenta) — o login por CLAIM nem passa por aqui (short-
+    circuita antes), entao o impacto fica so em login claimless durante a
+    janela de degradacao.
+    """
     global _last_refresh
 
-    rows: dict[str, dict] = {}
-    for snap in global_collection("tenants").stream():
-        data = snap.to_dict() or {}
-        if "id" not in data:
-            data["id"] = snap.id
-        rows[str(data["id"])] = data
+    try:
+        rows: dict[str, dict] = {}
+        for snap in global_collection("tenants").stream():
+            data = snap.to_dict() or {}
+            if "id" not in data:
+                data["id"] = snap.id
+            rows[str(data["id"])] = data
+    except Exception as exc:
+        logger.warning("refresh_tenants: leitura falhou, mantendo cache stale: %s", exc)
+        return
 
     with _lock:
         _tenants_by_id.clear()
@@ -95,6 +129,27 @@ def refresh_tenants() -> None:
         _last_refresh = time.monotonic()
 
     logger.info("Tenant cache refreshed: %d tenants", len(rows))
+
+
+def _domains_owned_by_other_active_tenant(domains, exclude_tenant_id) -> dict:
+    """Mapa {dominio: tenant_id} dos dominios de `domains` ja usados por
+    OUTRO tenant ativo. Vazio = sem colisao. Um dominio proprio nao pode
+    pertencer a 2 tenants (senao resolve_tenant_by_email_domain fica ambiguo
+    -> nega, ou pior, rotearia errado)."""
+    domains = set(normalize_email_domains(domains))
+    if not domains:
+        return {}
+    _ensure_cache()
+    collisions: dict = {}
+    with _lock:
+        for t in _tenants_by_id.values():
+            tid = str(t.get("id"))
+            if tid == str(exclude_tenant_id) or not t.get("is_active", True):
+                continue
+            for d in normalize_email_domains(t.get("allowed_email_domains")):
+                if d in domains:
+                    collisions[d] = tid
+    return collisions
 
 
 def _ensure_cache() -> None:
@@ -154,14 +209,23 @@ def _validate_slug(slug: str) -> None:
 
 def normalize_email_domains(domains) -> list[str]:
     """Lista de dominios canonicos (minusculo, sem @/espacos, sem dup, ordem
-    estavel). Aceita lista ou string CSV."""
+    estavel). Aceita lista ou string CSV. DESCARTA provedores publicos
+    (gmail/outlook/...) — eles nunca podem rotear/auto-provisionar um tenant
+    (defesa em profundidade: vale em qualquer caller, nao so no create)."""
     if isinstance(domains, str):
         domains = domains.split(",")
     out: list[str] = []
     for d in domains or []:
         d = str(d or "").strip().lower().lstrip("@")
-        if d and d not in out:
-            out.append(d)
+        if not d or d in out:
+            continue
+        if is_public_email_provider(d):
+            logger.warning(
+                "allowed_email_domains: provedor publico '%s' IGNORADO (nao "
+                "pode rotear/auto-provisionar tenant)", d,
+            )
+            continue
+        out.append(d)
     return out
 
 
@@ -188,6 +252,11 @@ def create_tenant(
     if tenant_exists(tenant_id):
         raise ValueError(f"Tenant '{tenant_id}' ja existe")
 
+    domains = normalize_email_domains(allowed_email_domains)
+    collisions = _domains_owned_by_other_active_tenant(domains, tenant_id)
+    if collisions:
+        raise ValueError(f"Dominio(s) ja em uso por outro tenant: {collisions}")
+
     now = utcnow()
     doc = {
         "id": tenant_id,
@@ -196,7 +265,7 @@ def create_tenant(
         "cnpj": (cnpj or "").strip(),
         "plan": plan,
         "is_active": True,
-        "allowed_email_domains": normalize_email_domains(allowed_email_domains),
+        "allowed_email_domains": domains,
         "settings": settings or {},
         "billing": billing or {"status": "trial", "next_due": None},
         "created_at": now,
@@ -217,7 +286,11 @@ def update_tenant(tenant_id: str, **fields: Any) -> bool:
     if "plan" in updates and updates["plan"] not in PLAN_OPTIONS:
         raise ValueError(f"plan invalido. Opcoes: {', '.join(PLAN_OPTIONS)}")
     if "allowed_email_domains" in updates:
-        updates["allowed_email_domains"] = normalize_email_domains(updates["allowed_email_domains"])
+        domains = normalize_email_domains(updates["allowed_email_domains"])
+        collisions = _domains_owned_by_other_active_tenant(domains, tenant_id)
+        if collisions:
+            raise ValueError(f"Dominio(s) ja em uso por outro tenant: {collisions}")
+        updates["allowed_email_domains"] = domains
     updates["updated_at"] = utcnow()
     tenant_doc_ref(tenant_id).set(updates, merge=True)
     refresh_tenants()

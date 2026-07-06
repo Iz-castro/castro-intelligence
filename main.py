@@ -404,6 +404,10 @@ async def startup():
         admin_email=BOOTSTRAP_ADMIN_EMAIL,
         admin_display_name=BOOTSTRAP_ADMIN_DISPLAY_NAME,
         admin_department_name=BOOTSTRAP_ADMIN_DEPARTMENT,
+        # Dominio do hubloc explicito (nao derivavel do email founder, que e
+        # outlook/gmail publico): reconciliado no boot -> duravel em DR/restore,
+        # nao depende do backfill manual via Admin SDK.
+        allowed_email_domains=["hubloc.com.br"],
     )
     ensure_media_dir()
     # Channel ainda fica em colecao flat (compartilhado por enquanto).
@@ -691,8 +695,8 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
     domain_warning = None
     try:
         from tenant_service import get_tenant, normalize_email_domains
-        creator_tid = str(current_user.get("tenant_id") or "") or "hubloc"
-        domains = normalize_email_domains((get_tenant(creator_tid) or {}).get("allowed_email_domains"))
+        creator_tid = str(current_user.get("tenant_id") or "")
+        domains = normalize_email_domains((get_tenant(creator_tid) or {}).get("allowed_email_domains")) if creator_tid else []
         email_domain = email.split("@", 1)[1] if "@" in email else ""
         if domains and email_domain and email_domain not in domains:
             domain_warning = f"Email fora dos dominios do tenant ({', '.join(domains)})."
