@@ -1,25 +1,34 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    // Whitelist single-tenant (hubloc) — quando entrar tenant #2, mover whitelist
-    // para tenants/{tid}.allowed_email_domains e usar claim tenant_id.
-    function signedIn() {
-      return request.auth != null && request.auth.token.email != null;
-    }
-
-    function emailAllowed() {
-      return signedIn() && (
-        request.auth.token.email == 'rafaluisc@outlook.com' ||
-        request.auth.token.email == 'izaeldecastro@gmail.com' ||
-        request.auth.token.email.matches('.*@hubloc\\.com\\.br')
-      );
-    }
-
-    match /media/{allPaths=**} {
-      allow read: if emailAllowed();
-      allow write: if false;
-    }
-
+    // ====================================================================
+    // BUCKET BACKEND-ONLY (multi-tenant, pos-M-A4).
+    //
+    // Toda midia (WhatsApp, avatares) e escrita E lida EXCLUSIVAMENTE pelo
+    // backend (Cloud Run A) via Admin SDK, que BYPASSA estas rules:
+    //   - upload: media.py (_get_bucket().blob(...).upload_*)
+    //   - leitura: GET /media/{subdir}/{filename} (main.py serve_media ->
+    //     get_media_asset -> blob.download_as_bytes), streamando os bytes
+    //     pelo backend. O frontend NUNCA usa o Firebase Storage SDK
+    //     (sem getStorage/getDownloadURL/ref) — o storageBucket na config
+    //     do cliente fica inerte.
+    //
+    // Portanto o acesso client-side ao bucket e NEGADO por completo (deny-
+    // by-default). Isto:
+    //   - remove a antiga whitelist single-tenant (rafaluisc/izael/@hubloc)
+    //     que barraria um operador do tenant #2 e desalinhava dos claims;
+    //   - e estritamente mais seguro que o antigo `read: if emailAllowed()`
+    //     (aquela leitura client-side nunca foi usada por nenhum cliente);
+    //   - nao depende de tenant no path (os objetos sao flat:
+    //     media/{subdir}/{filename}, sem tenants/{tid}/) — isolamento por
+    //     tenant aqui nem seria expressavel.
+    //
+    // SE um dia for preciso leitura client-side isolada por tenant (ex:
+    // <img> com signed URL do proprio tenant), sera necessario: (1) mover
+    // os objetos para tenants/{tid}/media/... e (2) autorizar por
+    // request.auth.token.tenant_id == {tid} no path (espelhando o M-A4 das
+    // firestore.rules). Ate la, backend-only.
+    // ====================================================================
     match /{allPaths=**} {
       allow read, write: if false;
     }

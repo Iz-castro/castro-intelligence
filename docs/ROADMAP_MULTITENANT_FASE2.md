@@ -125,7 +125,24 @@ staging; bloqueia go-live em prod.
      403 (intencional: Cloud Run A exige tenant concreto; cross-tenant = Cloud Run B);
      cache cross-instance 60s ao criar #2 (janela transiente); guarda-corpo de domínio na
      UI (backend devolve domain_warning; falta dialog de confirmação no frontend).
-     PENDENTE pré-#2 restante: só 0c(iv) storage.rules (LOW; mídia via Admin SDK hoje).
+
+0g. STORAGE (0c(iv)) ✅ RESOLVIDO 2026-07-06 — o "bloqueador" não existia na prod nova.
+     Investigação (a pergunta "está usando storage antigo?" destravou): a prod Oregon usa
+     um bucket GCS PURO `...-castro-crm-media` (não Firebase Storage), servido 100% pelo
+     backend via Admin SDK (serve_media → download_as_bytes); o frontend NÃO usa Storage
+     SDK. Não existe release `firebase.storage/...` no projeto novo — o storage.rules do
+     repo (whitelist hubloc) estava publicado SÓ no projeto ANTIGO (SP). Logo, sem
+     whitelist em vigor pra travar o #2. Ações: (1) storage.rules reescrito deny-all
+     (backend-only) como backstop documentado — se um dia linkar Firebase Storage, o
+     default do Firebase é permissivo; (2) PAP `enforced` no bucket novo (higiene LGPD;
+     mídia segue 200); (3) bucket Firebase ANTIGO (SP, `.firebasestorage.app`, 1487 objs
+     de mídia duplicada) LIMPO — prova de completude confirmou que nada que a prod
+     referencia vive só lá (2487/2532 mídias no bucket novo; 45 refs órfãs de 10/jun
+     tarde = dado de teste do cutover, sumido de AMBOS os buckets, sem importância);
+     soft-delete 7 dias como rede. Follow-up cosmético: 45 mensagens de 10/jun com
+     media_path apontando pra mídia inexistente (404 nesses anexos; não vale limpar).
+     Decommission do projeto antigo (firestore-backups etc.) fica como item à parte.
+     >>> PRÉ-#2 COMPLETO. Próximo: Cloud Run B mínimo (Sprint 0 + criar-tenant) → M-A5 GATE.
 
 0e. M-B2 (RBAC dinâmico) ✅ EM PROD 2026-07-06 — rev castro-crm-00045-xim (100% via
      update-traffic; rollback = update-traffic p/ 00041-rij). Staging tagged validado
