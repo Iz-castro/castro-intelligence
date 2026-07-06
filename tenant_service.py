@@ -15,6 +15,9 @@ Modelo do doc principal:
         ├── cnpj: str
         ├── plan: str (starter | professional | enterprise | premium)
         ├── is_active: bool
+        ├── allowed_email_domains: list[str] (SOFT — guarda-corpo + roteamento
+        │     de login sem claim; NUNCA autoriza acesso, so o claim autoriza.
+        │     Decisao 2026-07-03, ver ROADMAP "Identidade/dominio do tenant")
         ├── settings: dict (logo_url, brand_color, default_locale)
         ├── billing: dict (status, next_due, ...)
         ├── created_at, updated_at: ISO datetime
@@ -149,6 +152,19 @@ def _validate_slug(slug: str) -> None:
         )
 
 
+def normalize_email_domains(domains) -> list[str]:
+    """Lista de dominios canonicos (minusculo, sem @/espacos, sem dup, ordem
+    estavel). Aceita lista ou string CSV."""
+    if isinstance(domains, str):
+        domains = domains.split(",")
+    out: list[str] = []
+    for d in domains or []:
+        d = str(d or "").strip().lower().lstrip("@")
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
 def create_tenant(
     tenant_id: str,
     name: str,
@@ -156,11 +172,13 @@ def create_tenant(
     plan: str = "professional",
     settings: dict | None = None,
     billing: dict | None = None,
+    allowed_email_domains=None,
 ) -> dict:
     """Cria um novo tenant. Retorna o doc criado.
 
     O tenant_id e tambem o slug do path (tenants/{tenant_id}). Deve ser
-    URL-safe e estavel (nao mudar depois).
+    URL-safe e estavel (nao mudar depois). allowed_email_domains e SOFT
+    (guarda-corpo + roteamento de login; nunca autoriza — ver modulo auth).
     """
     _validate_slug(tenant_id)
     if not name or not name.strip():
@@ -178,6 +196,7 @@ def create_tenant(
         "cnpj": (cnpj or "").strip(),
         "plan": plan,
         "is_active": True,
+        "allowed_email_domains": normalize_email_domains(allowed_email_domains),
         "settings": settings or {},
         "billing": billing or {"status": "trial", "next_due": None},
         "created_at": now,
@@ -191,16 +210,67 @@ def create_tenant(
 
 def update_tenant(tenant_id: str, **fields: Any) -> bool:
     """Atualiza campos do tenant. Retorna True se atualizou."""
-    allowed = {"name", "cnpj", "plan", "settings", "billing", "is_active"}
+    allowed = {"name", "cnpj", "plan", "settings", "billing", "is_active", "allowed_email_domains"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
     if "plan" in updates and updates["plan"] not in PLAN_OPTIONS:
         raise ValueError(f"plan invalido. Opcoes: {', '.join(PLAN_OPTIONS)}")
+    if "allowed_email_domains" in updates:
+        updates["allowed_email_domains"] = normalize_email_domains(updates["allowed_email_domains"])
     updates["updated_at"] = utcnow()
     tenant_doc_ref(tenant_id).set(updates, merge=True)
     refresh_tenants()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Resolucao de tenant no login (SOFT — usado por auth.py). NENHUMA destas
+# AUTORIZA acesso: sao so roteamento/contexto de lookup. A autorizacao e o
+# claim tenant_id (rules) + gate de login (auth._login_gate).
+# ---------------------------------------------------------------------------
+
+def resolve_tenant_by_email_domain(email: str) -> str | None:
+    """tenant_id ativo cujo allowed_email_domains contem o dominio do email.
+
+    Retorna None se nenhum bate OU se >1 bate (ambiguo): nao adivinha o
+    tenant — forca provisionamento explicito. Por um usuario no tenant
+    ERRADO e pior (LGPD) que um login que exige provisionamento manual.
+    """
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return None
+    domain = email.split("@", 1)[1]
+    _ensure_cache()
+    with _lock:
+        matches = sorted({
+            str(t.get("id"))
+            for t in _tenants_by_id.values()
+            if t.get("is_active", True) and domain in normalize_email_domains(t.get("allowed_email_domains"))
+        })
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.error(
+            "resolve_tenant_by_email_domain: dominio '%s' em MULTIPLOS tenants %s -> "
+            "negado (ambiguo; corrija allowed_email_domains)", domain, matches,
+        )
+    return None
+
+
+def single_active_tenant() -> str | None:
+    """Se existe EXATAMENTE 1 tenant ativo, retorna seu id; senao None.
+
+    Rede de transicao multi-tenant: enquanto so existe o hubloc, um login que
+    nao resolve por claim nem por dominio cai nesse unico tenant (equivalente
+    ao antigo _DEFAULT_TENANT, mas SEM literal). Ao criar o 2o tenant, isto
+    passa a retornar None -> logins nao-resolviveis sao negados/roteados so
+    por dominio. Desarma sozinho exatamente quando o risco cross-tenant surge.
+    """
+    _ensure_cache()
+    with _lock:
+        actives = [str(t.get("id")) for t in _tenants_by_id.values() if t.get("is_active", True)]
+    return actives[0] if len(actives) == 1 else None
 
 
 def deactivate_tenant(tenant_id: str) -> bool:

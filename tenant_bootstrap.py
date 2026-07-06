@@ -287,6 +287,7 @@ def bootstrap_tenant(
     admin_email="",
     admin_display_name="",
     admin_department_name=None,
+    allowed_email_domains=None,
 ):
     """Garante tenant + setores default + admin com claim atomico.
 
@@ -313,7 +314,16 @@ def bootstrap_tenant(
     if tenant_exists(tenant_id):
         logger.info("Tenant '%s' ja existe", tenant_id)
     else:
-        create_tenant(tenant_id=tenant_id, name=name, plan=plan, cnpj=cnpj)
+        # allowed_email_domains (SOFT): default = dominio do email do admin
+        # (roadmap "Identidade/dominio do tenant"). Guarda-corpo + roteamento
+        # de login sem claim; nunca autoriza acesso (so o claim autoriza).
+        domains = allowed_email_domains
+        if domains is None and admin_email and "@" in admin_email:
+            domains = [admin_email.split("@", 1)[1]]
+        create_tenant(
+            tenant_id=tenant_id, name=name, plan=plan, cnpj=cnpj,
+            allowed_email_domains=domains,
+        )
         created = True
         logger.info("Tenant '%s' criado", tenant_id)
 

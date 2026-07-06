@@ -684,7 +684,21 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
     if not user:
         raise HTTPException(status_code=500, detail="Falha ao provisionar usuario Firebase")
     log_audit(current_user["id"], "USER_CREATE", f"{email} ({role})")
-    return {"status": "ok", "user_id": user["id"]}
+    # Guarda-corpo SOFT (decisao 2026-07-03): operador com email fora do(s)
+    # dominio(s) do tenant e permitido (o claim autoriza, nao o dominio), mas
+    # devolvemos um aviso pra UI confirmar "adicionar mesmo assim?". Nao
+    # bloqueia — evita botar operador no tenant errado por engano.
+    domain_warning = None
+    try:
+        from tenant_service import get_tenant, normalize_email_domains
+        creator_tid = str(current_user.get("tenant_id") or "") or "hubloc"
+        domains = normalize_email_domains((get_tenant(creator_tid) or {}).get("allowed_email_domains"))
+        email_domain = email.split("@", 1)[1] if "@" in email else ""
+        if domains and email_domain and email_domain not in domains:
+            domain_warning = f"Email fora dos dominios do tenant ({', '.join(domains)})."
+    except Exception as exc:
+        logger.warning("Guarda-corpo de dominio falhou (nao-fatal): %s", exc)
+    return {"status": "ok", "user_id": user["id"], "domain_warning": domain_warning}
 
 
 @app.put("/api/admin/users/{user_id}")

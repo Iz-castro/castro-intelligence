@@ -22,13 +22,15 @@ from database import (
 )
 from firebase_admin_client import set_tenant_claims, verify_firebase_id_token
 from firestore_common import set_tenant_context
+from tenant_service import resolve_tenant_by_email_domain, single_active_tenant
 
 logger = logging.getLogger("castro_crm.auth")
 
-# Tenant default usado durante a transicao multi-tenant — todos os usuarios
-# pre-existentes do CRM Hubloc operam neste tenant ate que o custom_claim
-# correspondente seja propagado.
-_DEFAULT_TENANT = "hubloc"
+# Resolucao de tenant no login (pre-#2): NAO existe mais default cego pra
+# 'hubloc'. Ordem: claim tenant_id -> dominio do email (allowed_email_domains
+# do tenant) -> rede de transicao (single_active_tenant, so enquanto houver 1
+# tenant). Um login que nao resolve tenant e negado (nunca cai num tenant
+# arbitrario). Ver ROADMAP "Identidade/dominio do tenant" (decisao SOFT).
 
 # authenticate_firebase_token roda em TODO request autenticado (validacao de
 # token na dependency get_current_user), nao apenas no login. Logar
@@ -101,10 +103,11 @@ def _resolve_tenant_id(decoded_token, user):
     Ordem de busca:
       1. custom_claims do token (preferencia — set por set_tenant_claims)
       2. user.tenant_id (campo do doc do CRM — raro, redundante com path)
-      3. tenant_context atual (foi setado em authenticate_firebase_token
-         como claim_tenant or _DEFAULT_TENANT). Caso comum hoje — usuario
-         que logou via SSO sem claim nunca teve seu JWT sincronizado.
-      4. None (sistema single-tenant ainda — backend trata como legado).
+      3. tenant_context atual — agora o tenant JA RESOLVIDO em
+         authenticate_firebase_token (claim > dominio > rede de transicao),
+         nunca mais um default cego. Caso comum: operador sem claim ainda,
+         resolvido por dominio, que tera o claim carimbado aqui.
+      4. None (nao resolvivel — backend legado ignora).
 
     Quando claim e ausente mas algum fallback retorna tenant, ressincroniza
     custom_claims em background. Cliente precisa renovar token na
@@ -117,8 +120,8 @@ def _resolve_tenant_id(decoded_token, user):
 
     db_tenant = (user or {}).get("tenant_id") if user else None
     if not db_tenant:
-        # Fallback: tenant context atual (setado upstream em
-        # authenticate_firebase_token a partir do claim ou _DEFAULT_TENANT).
+        # Fallback: tenant context atual — o tenant JA RESOLVIDO em
+        # authenticate_firebase_token (claim > dominio > rede), nunca cego.
         from firestore_common import get_tenant_context as _get_ctx
         db_tenant = _get_ctx()
 
@@ -146,13 +149,28 @@ def _resolve_tenant_id(decoded_token, user):
     return None
 
 
-def _firebase_email_allowed(email):
-    email = (email or "").strip().lower()
-    if ALLOWED_FIREBASE_EMAILS and email in ALLOWED_FIREBASE_EMAILS:
-        return True
-    if ALLOWED_FIREBASE_EMAIL_DOMAIN:
-        return bool(email) and "@" in email and email.split("@", 1)[1].lower() == ALLOWED_FIREBASE_EMAIL_DOMAIN
-    return not ALLOWED_FIREBASE_EMAILS
+def _is_founder(email):
+    """Founder/super-admin da plataforma (env ALLOWED_FIREBASE_EMAILS). Humano
+    cross-tenant da Castro Intelligence — loga independente de tenant/dominio."""
+    return bool(email) and email in ALLOWED_FIREBASE_EMAILS
+
+
+def _global_env_domain_match(email):
+    """Dominio global do env (ALLOWED_FIREBASE_EMAIL_DOMAIN). Belt-and-
+    suspenders da transicao: uniao com os allowed_email_domains por-tenant,
+    pra nao regredir o hubloc caso o backfill do doc do tenant falhe."""
+    if not ALLOWED_FIREBASE_EMAIL_DOMAIN:
+        return False
+    return bool(email) and "@" in email and email.split("@", 1)[1].lower() == ALLOWED_FIREBASE_EMAIL_DOMAIN
+
+
+def _login_gate(claim_tenant, email, domain_authorized):
+    """Quem pode INICIAR sessao (reject barato antes de qualquer read de
+    usuario). Passa se: founder/super-admin; OU ja tem claim tenant_id (o
+    claim autoriza — dominio irrelevante, design SOFT); OU o dominio casa
+    algum tenant (candidato a operador do dominio / auto-provision). Mata o
+    antigo 'sem allowlist -> libera todo mundo'."""
+    return bool(_is_founder(email) or claim_tenant or domain_authorized)
 
 
 def authenticate_firebase_token(id_token, ip_address=""):
@@ -169,21 +187,41 @@ def authenticate_firebase_token(id_token, ip_address=""):
     if not firebase_uid:
         return {"success": False, "status_code": 401, "error": "Token Firebase sem uid"}
 
-    if not _firebase_email_allowed(email):
-        return {"success": False, "status_code": 403, "error": "Acesso restrito ao email ou dominio autorizado"}
+    # -- Resolucao de tenant (SEM default cego) --
+    # claim > dominio do email > rede de transicao (1 tenant ativo).
+    claim_tenant = decoded.get("tenant_id")
+    domain_tenant = None if claim_tenant else resolve_tenant_by_email_domain(email)
+    # Dominio AUTORIZADO p/ auto-provision: casou um tenant OU o dominio global
+    # do env (transicao). Founder nao conta aqui — founder nao auto-provisiona.
+    domain_authorized = bool(domain_tenant) or _global_env_domain_match(email)
+
+    # Gate barato (antes de qualquer read de usuario).
+    if not _login_gate(claim_tenant, email, domain_authorized):
+        return {"success": False, "status_code": 403, "error": "Acesso restrito: usuario nao vinculado a nenhum tenant"}
+
+    # Contexto de LOOKUP: claim > dominio > rede. Se nada resolve (multi-tenant
+    # sem claim/dominio), so um founder chegou aqui — e sem contexto nao ha
+    # como resolver o tenant dele; nega (nao deveria ocorrer: founders sao
+    # provisionados e carregam claim).
+    resolved_tenant = claim_tenant or domain_tenant or single_active_tenant()
+    if not resolved_tenant:
+        logger.error(
+            "Login sem tenant resolvivel | email=%s is_founder=%s (sem claim/dominio, multi-tenant)",
+            (email[:3] + "***") if email else "?", _is_founder(email),
+        )
+        return {"success": False, "status_code": 403, "error": "Usuario sem tenant resolvido"}
+    resolved_tenant = str(resolved_tenant)
 
     # Seta tenant_context EARLY para que todos os lookups abaixo
-    # (get_user_by_firebase_uid, get_user_by_email etc.) operem na
-    # subcolecao correta do tenant. Usa claim do JWT ou fallback para
-    # _DEFAULT_TENANT durante a migration. Nao reseta — o contextvar
-    # vive ate o fim da request via FastAPI dependency lifecycle.
-    claim_tenant = decoded.get("tenant_id") or _DEFAULT_TENANT
-    set_tenant_context(claim_tenant)
+    # (get_user_by_firebase_uid, get_user_by_email etc.) operem na subcolecao
+    # correta. Nao reseta — o contextvar vive ate o fim da request via FastAPI
+    # dependency lifecycle.
+    set_tenant_context(resolved_tenant)
 
     # Cache hit: evita ~4 reads + 3 writes Firestore por request. O token ja foi
     # verificado acima e o tenant_context ja foi setado — so reaproveitamos o
     # perfil de usuario resolvido (com tenant_id anexado).
-    cached_user = _auth_cache_get(claim_tenant, firebase_uid)
+    cached_user = _auth_cache_get(resolved_tenant, firebase_uid)
     if cached_user is not None:
         return {"success": True, "decoded_token": decoded, "user": cached_user}
 
@@ -212,7 +250,11 @@ def authenticate_firebase_token(id_token, ip_address=""):
                 firebase_uid,
             )
             return {"success": False, "status_code": 403, "error": "Usuario desativado"}
-        if AUTO_PROVISION_FIREBASE_USERS and email:
+        # AUTO_PROVISION tenant-aware: so cria quando o DOMINIO resolveu um
+        # tenant (nunca num default cego). Founder/usuario sem dominio casado
+        # NAO e auto-criado — cai no "nao provisionado" abaixo. Cria dentro do
+        # resolved_tenant (contexto ja setado).
+        if AUTO_PROVISION_FIREBASE_USERS and email and domain_authorized:
             user = upsert_firebase_user(
                 firebase_uid=firebase_uid,
                 email=email,
@@ -240,7 +282,7 @@ def authenticate_firebase_token(id_token, ip_address=""):
         user = dict(user)
         user["tenant_id"] = tenant_id
 
-    _auth_cache_put(claim_tenant, firebase_uid, user)
+    _auth_cache_put(resolved_tenant, firebase_uid, user)
     return {
         "success": True,
         "decoded_token": decoded,
