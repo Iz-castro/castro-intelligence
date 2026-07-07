@@ -144,6 +144,28 @@ staging; bloqueia go-live em prod.
      Decommission do projeto antigo (firestore-backups etc.) fica como item à parte.
      >>> PRÉ-#2 COMPLETO. Próximo: Cloud Run B mínimo (Sprint 0 + criar-tenant) → M-A5 GATE.
 
+0h. CLOUD RUN B — FASE A / SPRINT 0 (fundação super-admin) ✅ FEITO 2026-07-07.
+     Fundação (não toca Cloud Run A operacional; escopo enxuto seguro aprovado):
+     - `super_admin.py` (camada de dados, sem FastAPI): super_admins/{uid} (root, source
+       of truth) — get/is_active/seed/list/mfa_enrolled/deactivate; log_system_audit()
+       em audit_logs_system/{id} (root, imutável; PROPAGA falha ≠ log_audit best-effort,
+       pra audit-antes-da-ação nas ops nucleares).
+     - firebase_admin_client.set_super_admin_claim (preserva demais claims, leitura estrita).
+     - `scripts/grant_super_admin.py` — CLI --seed/--list/--grant/--revoke; grant exige doc
+       ativo + mfa_enrolled (--allow-no-mfa p/ bootstrap). SEED JÁ RODADO EM PROD: 2 docs
+       (rafa uid mbg9..., izael uid dFn2...), is_active=true, mfa_enrolled=false, claim NÃO
+       concedido (espera MFA). Inertes até o grant.
+     - firestore.rules: isSuperAdmin() (claim fast-path; CEGO a tenant-scoped — §4.1) +
+       castro_crm_super_admins/* e castro_crm_audit_logs_system/* (read só super-admin,
+       write false). PUBLICADO ruleset cb1bd995 (aditivo puro vs 21cf3d0c; backup
+       firestore.rules.bak-publicado-20260705). Diff = só o bloco super-admin.
+     - docs/RUNBOOK_SUPER_ADMIN_BOOTSTRAP.md (ordem: seed→IP/TOTP→enroll→grant→kill).
+     BLOQUEIO PRA FASE B (ação manual do usuário): TOTP MFA exige UPGRADE do projeto p/
+     Identity Platform (a API retornou OPERATION_NOT_ALLOWED — precisa "aligned product").
+     Grátis abaixo de 50k MAU, TOTP sem custo de SMS. Enrollment vem no login do Cloud Run
+     B (não há auto-enroll no Console). PRÓXIMO: Fase B (serviço castro-superadmin: login+
+     enroll MFA + require_super_admin + POST criar-tenant→bootstrap_tenant+audit + UI mínima).
+
 0e. M-B2 (RBAC dinâmico) ✅ EM PROD 2026-07-06 — rev castro-crm-00045-xim (100% via
      update-traffic; rollback = update-traffic p/ 00041-rij). Staging tagged validado
      2026-07-05 (boot: seed 3 perfis + backfill 13 users, ninguém deslogado; matriz de

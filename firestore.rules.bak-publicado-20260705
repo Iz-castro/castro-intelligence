@@ -205,6 +205,16 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      match /perfis_acesso/{perfilId} {
+        // RBAC M-B2: perfil = so configuracao de permissao (sem PII).
+        // Todo operador le (o frontend assina o proprio perfil em realtime
+        // pro can() refletir edicoes ao vivo); escrita SO via backend Admin
+        // SDK (CRUD audita + trava perfil_admin). Rules NUNCA leem toggles
+        // pra autorizar — o teto continua no claim role (PLANO_RBAC §3.6).
+        allow read: if ownsTenant(tenantId);
+        allow write: if false;
+      }
+
       match /wa_contacts/{contactId} {
         allow read: if canSeeContactScoped(tenantId);
         allow write: if false;

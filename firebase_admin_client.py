@@ -124,6 +124,38 @@ def clear_tenant_claims(firebase_uid):
         return False
 
 
+def set_super_admin_claim(firebase_uid, value=True):
+    """Seta/remove o claim `super_admin` PRESERVANDO os demais (mesma leitura
+    estrita do set_tenant_claims: se get_user falhar, NAO grava). value=False
+    remove o claim (parte do kill switch, §4.8). Retorna True se gravou.
+
+    O claim e so fast-path — o Cloud Run B revalida o doc super_admins/{uid}
+    ativo + MFA-na-sessao antes de qualquer operacao nuclear.
+    """
+    if not firebase_uid:
+        raise ValueError("firebase_uid obrigatorio")
+    app = get_firebase_app()
+    try:
+        current_claims = dict(auth.get_user(firebase_uid, app=app).custom_claims or {})
+    except Exception as exc:
+        logger.error(
+            "set_super_admin_claim: get_user falhou; NAO gravando p/ nao apagar "
+            "claims existentes | uid=%s exc=%s", firebase_uid, exc,
+        )
+        return False
+    if value:
+        current_claims["super_admin"] = True
+    else:
+        current_claims.pop("super_admin", None)
+    try:
+        auth.set_custom_user_claims(firebase_uid, current_claims or None, app=app)
+        logger.info("Claim super_admin=%s | uid=%s", bool(value), firebase_uid)
+        return True
+    except Exception as exc:
+        logger.error("set_super_admin_claim: falha ao gravar | uid=%s exc=%s", firebase_uid, exc)
+        return False
+
+
 def get_user_claims(firebase_uid):
     """Retorna o dict de custom claims do usuario Firebase, ou {} se none."""
     if not firebase_uid:

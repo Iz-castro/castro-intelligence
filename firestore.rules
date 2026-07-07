@@ -44,6 +44,15 @@ service cloud.firestore {
         (myProfile().data.role == 'admin' || myProfile().data.role == 'supervisor');
     }
 
+    // Super-admin da plataforma (Castro Intelligence). Fast-path por claim
+    // super_admin (setado pelo scripts/grant_super_admin.py / Cloud Run B).
+    // NAO autoriza nada tenant-scoped — as rules do CRM (Cloud Run A) sao
+    // cegas a este claim (defense-in-depth §4.1: comprometer o claim nao da
+    // acesso cross-tenant via A). Usado SO nas colecoes root de plataforma.
+    function isSuperAdmin() {
+      return request.auth != null && request.auth.token.super_admin == true;
+    }
+
     // ====================================================================
     // Fase 2 — helpers tenant-scoped estritos (PLANO_COEXISTENCE §2.9).
     // Isolamento por tenant+operador via custom claims tenant_id/role no
@@ -174,6 +183,23 @@ service cloud.firestore {
 
     match /castro_crm__meta/{docId} {
       allow read, write: if false;
+    }
+
+    // ====================================================================
+    // Plataforma super-admin (Sprint 0 — root, fora de qualquer tenant).
+    // Escrita SEMPRE via backend Admin SDK (grant_super_admin.py / Cloud
+    // Run B), que bypassa rules — cliente nunca escreve. Leitura so pra
+    // super-admin (o painel B lista os pares / le a trilha). Colecoes
+    // inexistentes ate o --seed; deny-by-default cobre o intervalo.
+    // ====================================================================
+    match /castro_crm_super_admins/{uid} {
+      allow read: if isSuperAdmin() || (request.auth != null && request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    match /castro_crm_audit_logs_system/{docId} {
+      allow read: if isSuperAdmin();
+      allow write: if false;
     }
 
     // ====================================================================
