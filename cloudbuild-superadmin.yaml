@@ -1,0 +1,11 @@
+# Build da imagem do Cloud Run B com o Dockerfile.superadmin (o
+# `gcloud run deploy --source` usaria o Dockerfile do A). Uso:
+#   gcloud builds submit --config cloudbuild-superadmin.yaml \
+#     --substitutions _IMAGE=us-west1-docker.pkg.dev/<proj>/cloud-run-source-deploy/castro-superadmin:latest .
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.superadmin', '-t', '${_IMAGE}', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE}']
+images:
+  - '${_IMAGE}'

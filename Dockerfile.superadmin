@@ -1,0 +1,25 @@
+# Cloud Run B — castro-superadmin. Imagem MINIMA (surface pequena):
+# - SEM build de frontend (a pagina e estatica: superadmin_web/index.html)
+# - SEM ffmpeg / faster-whisper / modelo embutido
+# - COPY so o fecho de imports do superadmin_main (11 modulos) + a pagina.
+#   NAO leva main.py / webhook.py / media.py etc. do Cloud Run A.
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-superadmin.txt .
+RUN pip install --no-cache-dir -r requirements-superadmin.txt
+
+# Fecho de imports do servico B (computado; ver docs/PLANO_OPERACAO_CLOUDRUN_B).
+COPY config.py firebase_admin_client.py firestore_common.py super_admin.py \
+     tenant_service.py tenant_bootstrap.py database_firestore.py rbac.py \
+     bootstrap_data.py pii_redaction.py superadmin_main.py ./
+COPY superadmin_web/ ./superadmin_web/
+
+EXPOSE 8080
+
+CMD ["uvicorn", "superadmin_main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
