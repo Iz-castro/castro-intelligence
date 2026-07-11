@@ -56,15 +56,10 @@ def _mfa_in_session(decoded: dict) -> bool:
     return bool((decoded.get("firebase") or {}).get("sign_in_second_factor"))
 
 
-def require_super_admin(request: Request) -> dict:
-    """Autoriza SO super-admin da plataforma. Camadas (todas obrigatorias):
-      1. Bearer token valido (Firebase);
-      2. claim super_admin == true (fast-path);
-      3. doc super_admins/{uid} existe e is_active (source of truth);
-      4. MFA-na-sessao (sign_in_second_factor) — a menos que _REQUIRE_MFA
-         desligado (bootstrap/teste).
-    Retorna o principal {uid, email, doc, decoded, ip, user_agent}.
-    """
+def _authorize(request: Request, require_mfa: bool) -> dict:
+    """Camadas: (1) Bearer valido; (2) claim super_admin; (3) doc ativo;
+    (4) MFA-na-sessao — SO se require_mfa (e _REQUIRE_MFA do env).
+    Retorna o principal {uid, email, doc, decoded, ip, user_agent}."""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token ausente")
@@ -83,7 +78,7 @@ def require_super_admin(request: Request) -> dict:
     doc = get_super_admin(uid)
     if not (doc and doc.get("is_active")):
         raise HTTPException(status_code=403, detail="Super-admin inativo ou inexistente")
-    if _REQUIRE_MFA and not _mfa_in_session(decoded):
+    if require_mfa and _REQUIRE_MFA and not _mfa_in_session(decoded):
         raise HTTPException(status_code=401, detail="MFA exigido nesta sessao")
 
     return {
@@ -94,6 +89,20 @@ def require_super_admin(request: Request) -> dict:
         "ip": request.client.host if request.client else "unknown",
         "user_agent": request.headers.get("user-agent", ""),
     }
+
+
+def require_super_admin(request: Request) -> dict:
+    """Gate COMPLETO (claim + doc ativo + MFA-na-sessao). Para as operacoes
+    nucleares (criar tenant, listar, whoami do painel)."""
+    return _authorize(request, require_mfa=True)
+
+
+def require_super_admin_bootstrap(request: Request) -> dict:
+    """Gate LEVE (claim + doc ativo, SEM MFA-na-sessao). SO para o
+    enrollment do MFA: e chamado logo apos o enroll, quando o ID token
+    ainda nao carrega o 2o fator (o enrollment nao muda o token da sessao
+    atual). NAO usar em nada que mute tenant/dados."""
+    return _authorize(request, require_mfa=False)
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +217,10 @@ async def create_tenant_endpoint(body: CreateTenantBody, principal: dict = Depen
 
 
 @app.post("/api/superadmin/mfa/enrolled")
-async def mark_mfa_enrolled(principal: dict = Depends(require_super_admin)):
-    """Chamado pela pagina apos o enrollment TOTP (Firebase). Marca o doc.
-    So o proprio super-admin marca a si mesmo (o uid vem do token)."""
+async def mark_mfa_enrolled(principal: dict = Depends(require_super_admin_bootstrap)):
+    """Chamado pela pagina LOGO APOS o enrollment TOTP — a sessao ainda nao
+    tem o 2o fator, entao usa o gate LEVE (claim + doc, sem MFA). So o
+    proprio super-admin marca a si mesmo (uid do token)."""
     uid = principal["uid"]
     set_super_admin_mfa_enrolled(uid, True)
     log_system_audit(uid, "mfa_enrolled", target=uid, ip=principal["ip"], user_agent=principal["user_agent"])
