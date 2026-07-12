@@ -25,7 +25,7 @@ from pydantic import BaseModel, field_validator
 
 from config import (
     FIREBASE_WEB_API_KEY, FIREBASE_WEB_APP_ID, FIREBASE_WEB_AUTH_DOMAIN,
-    FIREBASE_WEB_MESSAGING_SENDER_ID, FIRESTORE_PROJECT_ID,
+    FIREBASE_WEB_MESSAGING_SENDER_ID, FIRESTORE_PROJECT_ID, IS_CLOUD_RUN,
 )
 from firebase_admin_client import verify_firebase_id_token
 from super_admin import (
@@ -36,19 +36,51 @@ from tenant_service import list_tenants, tenant_exists
 
 logger = logging.getLogger("castro_crm.superadmin")
 
-# Enforcement de MFA-na-sessao. DEFAULT true. So pode ser desligado em
-# bootstrap/teste controlado (antes do enrollment) — nunca em prod. Mesmo
-# desligado, claim super_admin + doc ativo continuam OBRIGATORIOS.
-_REQUIRE_MFA = os.getenv("SUPERADMIN_REQUIRE_MFA", "true").strip().lower() not in ("0", "false", "no", "off")
+# Enforcement de MFA-na-sessao. GUARDA DURA (achado da revisao): no servico
+# DEPLOYADO (Cloud Run, K_SERVICE setado) o MFA e SEMPRE exigido — o env
+# SUPERADMIN_REQUIRE_MFA=false NAO tem efeito ali. So um run LOCAL (uvicorn,
+# sem K_SERVICE) pode desligar o MFA pra bootstrap/teste. Assim um deploy mal
+# configurado nao consegue rodar o painel nuclear sem 2o fator.
+if IS_CLOUD_RUN:
+    _REQUIRE_MFA = True
+else:
+    _REQUIRE_MFA = os.getenv("SUPERADMIN_REQUIRE_MFA", "true").strip().lower() not in ("0", "false", "no", "off")
+if not _REQUIRE_MFA:
+    logger.critical("SUPERADMIN: MFA DESLIGADO (so permitido em run LOCAL). NUNCA em prod.")
 
 _WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "superadmin_web")
 
 app = FastAPI(title="Castro Superadmin", docs_url=None, redoc_url=None)
 
 
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Headers de seguranca na resposta (defense-in-depth). CSP restringe o
+    que NAO quebra o fluxo Firebase (anti-clickjacking, object/base) — o
+    escape do frontend e a defesa primaria contra XSS."""
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Auth: require_super_admin (claim + doc ativo + MFA-na-sessao)
 # ---------------------------------------------------------------------------
+
+def _audit_after(*args, **kwargs):
+    """Audit best-effort para eventos POS-acao (create_tenant_ok/failed/error):
+    a acao ja aconteceu, entao uma falha de auditoria aqui NAO pode mascarar o
+    resultado (virar 500 depois de criar o tenant). Loga e segue. O audit
+    ANTES-da-acao (attempt) continua propagando e abortando."""
+    try:
+        return log_system_audit(*args, **kwargs)
+    except Exception as exc:
+        logger.error("superadmin: audit POS-acao falhou (nao-fatal): %s", exc)
+        return None
+
 
 def _mfa_in_session(decoded: dict) -> bool:
     """True se o ID token veio de um login que usou 2o fator. No Firebase o
@@ -65,9 +97,11 @@ def _authorize(request: Request, require_mfa: bool) -> dict:
         raise HTTPException(status_code=401, detail="Token ausente")
     token = auth_header.split(" ", 1)[1]
     try:
-        decoded = verify_firebase_id_token(token)
+        # check_revoked=True: kill switch imediato (token de super-admin
+        # revogado e recusado na hora). Custo aceitavel no B (baixo trafego).
+        decoded = verify_firebase_id_token(token, check_revoked=True)
     except Exception as exc:
-        logger.warning("superadmin: token invalido: %s", exc)
+        logger.warning("superadmin: token invalido/revogado: %s", exc)
         raise HTTPException(status_code=401, detail="Token invalido")
 
     uid = decoded.get("uid") or decoded.get("sub")
@@ -133,7 +167,9 @@ class CreateTenantBody(BaseModel):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "require_mfa": _REQUIRE_MFA}
+    # Nao vazar o estado de enforcement de MFA a chamador anonimo (achado
+    # da revisao). So liveness.
+    return {"status": "ok"}
 
 
 @app.get("/api/superadmin/whoami")
@@ -189,19 +225,19 @@ async def create_tenant_endpoint(body: CreateTenantBody, principal: dict = Depen
         )
     except ValueError as exc:
         # slug/plan invalido, colisao de dominio, etc. (tenant_service valida)
-        log_system_audit(actor, "create_tenant_failed", detail=f"tid={body.tenant_id} err={exc}",
-                         target=body.tenant_id, ip=ip, user_agent=ua)
+        _audit_after(actor, "create_tenant_failed", detail=f"tid={body.tenant_id} err={exc}",
+                     target=body.tenant_id, ip=ip, user_agent=ua)
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        log_system_audit(actor, "create_tenant_error", detail=f"tid={body.tenant_id} err={exc}",
-                         target=body.tenant_id, ip=ip, user_agent=ua)
+        _audit_after(actor, "create_tenant_error", detail=f"tid={body.tenant_id} err={exc}",
+                     target=body.tenant_id, ip=ip, user_agent=ua)
         logger.exception("superadmin: erro ao criar tenant %s", body.tenant_id)
         raise HTTPException(status_code=500, detail="Erro ao criar tenant")
 
     # Guard "um email = um tenant": ensure_tenant_admin ABORTA (retorna None em
     # admin_user_id) se o email do admin ja pertence a outro tenant. Sinaliza.
     admin_ok = bool(result.get("admin_user_id"))
-    log_system_audit(
+    _audit_after(
         actor, "create_tenant_ok",
         detail=f"tid={body.tenant_id} created={result.get('created')} admin_provisionado={admin_ok}",
         target=body.tenant_id, ip=ip, user_agent=ua,
@@ -220,8 +256,25 @@ async def create_tenant_endpoint(body: CreateTenantBody, principal: dict = Depen
 async def mark_mfa_enrolled(principal: dict = Depends(require_super_admin_bootstrap)):
     """Chamado pela pagina LOGO APOS o enrollment TOTP — a sessao ainda nao
     tem o 2o fator, entao usa o gate LEVE (claim + doc, sem MFA). So o
-    proprio super-admin marca a si mesmo (uid do token)."""
+    proprio super-admin marca a si mesmo (uid do token).
+
+    VERIFICA via Admin SDK que um 2o fator REALMENTE existe no Auth (achado
+    da revisao) — nao confia so na palavra do cliente. Sem isso, um POST
+    forjado marcaria mfa_enrolled=true sem fator nenhum, e o grant script
+    (que confia no flag) concederia o claim a alguem sem MFA."""
     uid = principal["uid"]
+    try:
+        from firebase_admin import auth as _fa
+        from firebase_admin_client import get_firebase_app
+        u = _fa.get_user(uid, app=get_firebase_app())
+        factors = list(getattr(getattr(u, "multi_factor", None), "enrolled_factors", None) or [])
+        if not factors:
+            raise HTTPException(status_code=400, detail="Nenhum 2o fator encontrado no Auth. Conclua o cadastro TOTP antes.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("mark_mfa_enrolled: falha ao verificar fatores no Auth | uid=%s exc=%s", uid, exc)
+        raise HTTPException(status_code=503, detail="Nao foi possivel verificar o 2o fator; tente de novo.")
     set_super_admin_mfa_enrolled(uid, True)
     log_system_audit(uid, "mfa_enrolled", target=uid, ip=principal["ip"], user_agent=principal["user_agent"])
     return {"status": "ok", "uid": uid, "mfa_enrolled": True}

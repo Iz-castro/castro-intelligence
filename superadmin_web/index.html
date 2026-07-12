@@ -105,9 +105,12 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
 const $ = (id) => document.getElementById(id);
+// Escapa TUDO que vem do backend antes de ir pra innerHTML (defesa primaria
+// de XSS — achado da revisao). O painel roda com a sessao super-admin nuclear.
+const esc = (s) => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const views = ["view-login","view-mfa-code","view-enroll","view-panel"];
 function show(id){ views.forEach(v => $(v).classList.toggle("hidden", v!==id)); }
-function gmsg(text, kind){ $("global-msg").innerHTML = text ? `<div class="msg ${kind||''}">${text}</div>` : ""; }
+function gmsg(text, kind){ $("global-msg").innerHTML = text ? `<div class="msg ${kind||''}">${esc(text)}</div>` : ""; }
 
 let auth, currentUser=null, pendingResolver=null, pendingSecret=null;
 
@@ -195,7 +198,9 @@ $("btn-enroll-confirm").onclick = async () => {
   try{
     const assertion = TotpMultiFactorGenerator.assertionForEnrollment(pendingSecret, code);
     await multiFactor(currentUser).enroll(assertion, "Authenticator");
-    await api("/api/superadmin/mfa/enrolled", { method:"POST" });  // best-effort (sessao ainda sem 2o fator)
+    // limpa o secret da memoria e do DOM assim que o enroll conclui
+    pendingSecret = null; $("enroll-secret").textContent = "········"; $("in-enroll-code").value = "";
+    await api("/api/superadmin/mfa/enrolled", { method:"POST" });  // backend verifica o fator via Admin SDK
     gmsg("MFA cadastrado! Saia e entre de novo — o login agora vai pedir o código, e o painel libera.", "ok");
     setTimeout(async ()=>{ await signOut(auth); }, 2500);
   }catch(e){ gmsg("Código inválido no cadastro: "+(e.message||e.code), "err"); }
@@ -209,7 +214,7 @@ async function loadTenants(){
   const r = await api("/api/superadmin/tenants");
   if(!r.ok){ $("tenants-list").textContent="(erro ao listar)"; return; }
   const ts = r.body.tenants||[];
-  $("tenants-list").innerHTML = ts.length ? ts.map(t=>`• <b>${t.id}</b> — ${t.name||''} <span class="taglist">[${t.plan||'?'}${t.is_active===false?' · inativo':''}] ${(t.allowed_email_domains||[]).join(', ')}</span>`).join("<br>") : "(nenhum)";
+  $("tenants-list").innerHTML = ts.length ? ts.map(t=>`• <b>${esc(t.id)}</b> — ${esc(t.name||'')} <span class="taglist">[${esc(t.plan||'?')}${t.is_active===false?' · inativo':''}] ${esc((t.allowed_email_domains||[]).join(', '))}</span>`).join("<br>") : "(nenhum)";
 }
 
 $("btn-create").onclick = async () => {

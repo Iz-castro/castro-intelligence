@@ -22,9 +22,14 @@ def get_firebase_app():
         return firebase_admin.initialize_app(options=options or None)
 
 
-def verify_firebase_id_token(id_token):
+def verify_firebase_id_token(id_token, check_revoked=False):
+    """Valida o ID token. check_revoked=False (default) no Cloud Run A —
+    checar revogacao a cada request custaria um read do Auth por request.
+    O Cloud Run B (super-admin, baixo trafego + poder nuclear) passa
+    check_revoked=True: torna o kill switch IMEDIATO (token de super-admin
+    revogado e recusado na hora, nao apos ~1h)."""
     app = get_firebase_app()
-    return auth.verify_id_token(id_token, app=app, check_revoked=False)
+    return auth.verify_id_token(id_token, app=app, check_revoked=check_revoked)
 
 
 def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None, perfil_acesso_id=None):
