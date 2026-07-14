@@ -271,15 +271,21 @@ def is_bot_enabled() -> bool:
 LGPD_POLICY_VERSION = "hubloc-2026-06"
 
 
-def _record_lgpd_consent(contact_id: int):
+def _record_lgpd_consent(contact_id: int, policy_version: str = ""):
     """Prova de consentimento LGPD: grava no contato (quando + versao da
-    politica) E no audit_log. Best-effort: nunca quebra o fluxo do bot."""
+    politica) E no audit_log. Best-effort: nunca quebra o fluxo do bot.
+
+    policy_version: versao da politica exibida ao titular. Default = a do
+    fluxo builtin (Hubloc); o caminho CX passa a versao do tenant
+    (settings.ai.lgpd_policy_version).
+    """
+    version = (policy_version or "").strip() or LGPD_POLICY_VERSION
     now = utcnow().isoformat()
     try:
         document("wa_contacts", contact_id).set({
             "lgpd_consent": True,
             "lgpd_consent_at": now,
-            "lgpd_policy_version": LGPD_POLICY_VERSION,
+            "lgpd_policy_version": version,
         }, merge=True)
     except Exception as exc:
         logger.warning(
@@ -288,7 +294,7 @@ def _record_lgpd_consent(contact_id: int):
         )
     log_audit(
         0, "LGPD_CONSENT_ACCEPTED",
-        f"contato {contact_id} | politica {LGPD_POLICY_VERSION}",
+        f"contato {contact_id} | politica {version}",
     )
 
 
@@ -414,4 +420,325 @@ def _finalize_bot(contact_id: int, state: dict, setor: int):
     logger.info(
         "[BOT] Fluxo finalizado | contato=%d | setor=%s | dept_id=%s",
         contact_id, setor_nome, dept_id,
+    )
+
+
+# =========================================================================
+# Motor por tenant (dispatcher builtin x Dialogflow CX)
+# =========================================================================
+#
+# tenants/{tid}.settings.ai (gravado pelo super-admin; ver
+# docs/PLANO_TENANT_TESTE_VARIZEMED_CX.md) escolhe o motor. Sem config, ou
+# com bot_engine != "dialogflow_cx", o builtin roda intacto — tenants
+# existentes (Hubloc) nao mudam de comportamento.
+
+_CX_MAX_CONSECUTIVE_FAILURES = 2
+
+_CX_FALLBACK_MSG = (
+    "Desculpe, estamos com uma instabilidade momentânea no atendimento "
+    "automático. Pode reenviar sua mensagem em instantes?"
+)
+
+_CX_HANDOFF_FAIL_MSG = (
+    "Desculpe pela instabilidade. Estou te transferindo para a nossa "
+    "equipe de atendimento — em breve alguém responde por aqui."
+)
+
+# Handoff pedido pelo agente mas sem texto na resposta: nunca transferir em
+# silencio (o cliente ficaria sem nenhuma mensagem).
+_CX_HANDOFF_DEFAULT_MSG = (
+    "Certo! Estou te transferindo para a nossa equipe de atendimento."
+)
+
+_CX_MAX_REPLY_CHARS = 4096  # limite de texto da Cloud API do WhatsApp
+
+
+def _get_tenant_ai_config() -> dict:
+    """Config settings.ai do tenant atual (dict vazio se ausente)."""
+    from firestore_common import get_tenant_context
+    from tenant_service import get_tenant
+
+    tid = get_tenant_context()
+    if not tid:
+        return {}
+    try:
+        tenant = get_tenant(tid) or {}
+    except Exception as exc:
+        logger.warning("[BOT] leitura do tenant %s falhou: %s", tid, exc)
+        return {}
+    # Guard defensivo nos DOIS niveis: um doc de tenant malformado (settings ou
+    # ai como string/lista) nao pode estourar o gate do bot (achado da revisao).
+    settings = tenant.get("settings")
+    if not isinstance(settings, dict):
+        return {}
+    ai_cfg = settings.get("ai")
+    return ai_cfg if isinstance(ai_cfg, dict) else {}
+
+
+def _cx_policy_version(ai_cfg: dict) -> str:
+    """Versao de politica LGPD do tenant para a prova de consentimento.
+
+    NUNCA cai na constante do builtin (LGPD_POLICY_VERSION = Hubloc): para um
+    tenant CX (ex.: clinica, dado sensivel) isso carimbaria o consentimento com
+    a politica de OUTRO tenant (achado alta da revisao). Sem versao configurada,
+    usa um marcador neutro do proprio tenant e loga aviso.
+    """
+    from firestore_common import get_tenant_context
+
+    version = str(ai_cfg.get("lgpd_policy_version") or "").strip()
+    if version:
+        return version
+    tid = get_tenant_context() or "tenant"
+    logger.warning(
+        "[BOT-CX] lgpd_policy_version vazio no tenant %s — configure "
+        "settings.ai.lgpd_policy_version (usando marcador neutro)", tid,
+    )
+    return f"{tid}-sem-versao"
+
+
+async def process_bot_message_async(
+    contact_id: int, text: str, contact_name: str = ""
+) -> Optional[Union[str, dict]]:
+    """Fachada assincrona do bot: decide o motor pelo tenant atual.
+
+    Mesmo contrato de process_bot_message (None | str | dict). O webhook
+    chama esta versao; o builtin continua exposto de forma sincrona para
+    tools/sim_bot_flow.py e chamadas legadas.
+    """
+    from firestore_common import get_tenant_context
+
+    ai_cfg = _get_tenant_ai_config()
+    engine = str(ai_cfg.get("bot_engine") or "").strip().lower()
+    if not engine:
+        # Tenant SEM motor de IA -> bot builtin (Hubloc e afins).
+        return process_bot_message(contact_id, text, contact_name)
+    # Tenant COM motor de IA configurado NUNCA cai no builtin: o builtin e
+    # hardcoded Hubloc (aviso LGPD "Hub Loc", menu de construcao, versao de
+    # politica do Hubloc) — cair nele vazaria a marca e carimbaria consentimento
+    # do tenant errado (achado alta da revisao). Motor pausado/desconhecido =
+    # bot silencioso, nunca builtin.
+    if engine == "dialogflow_cx":
+        status = str(ai_cfg.get("status") or "active").strip().lower()
+        if status == "active":
+            return await _process_cx_message(contact_id, text, ai_cfg)
+        logger.info("[BOT] motor CX pausado (status=%s) — bot silencioso", status)
+        return None
+    logger.warning(
+        "[BOT] bot_engine desconhecido=%r no tenant %s — bot silencioso "
+        "(nao cai no builtin)", engine, get_tenant_context(),
+    )
+    return None
+
+
+def _cx_lgpd_notice(ai_cfg: dict) -> str:
+    """Aviso LGPD do tenant (settings.ai) com fallback seguro generico."""
+    notice = str(ai_cfg.get("lgpd_notice") or "").strip()
+    url = str(ai_cfg.get("lgpd_privacy_url") or "").strip()
+    if not notice:
+        notice = (
+            "Olá! Para seguir com o atendimento, precisamos tratar seus "
+            "dados pessoais conforme a LGPD."
+        )
+    if url:
+        notice += f"\n(Política de Privacidade: {url})"
+    notice += "\n\nPodemos continuar?"
+    return notice
+
+
+async def _process_cx_message(
+    contact_id: int, text: str, ai_cfg: dict
+) -> Optional[Union[str, dict]]:
+    """Turno do motor Dialogflow CX para o contato do tenant atual."""
+    import bot_engine_dialogflow
+    from firestore_common import get_tenant_context
+
+    if not is_bot_enabled():
+        return None
+
+    contact = get_wa_contact(contact_id)
+    # bot_completed re-checado aqui (nao so no webhook): reduz o reprocesso
+    # quando 2 mensagens do mesmo contato correm durante um DetectIntent lento
+    # e a 1a ja transferiu pro humano (achado media da revisao).
+    if not contact or contact.get("assigned_to") or contact.get("bot_completed"):
+        return None
+
+    state = _get_bot_state(contact_id)
+
+    # ------------------------------------------------------------------
+    # Gate LGPD local — SEMPRE antes do motor. A prova de consentimento
+    # (contato + audit + versao) fica no CRM; o agente CX recebe
+    # lgpd_consent=true e nunca refaz a pergunta (flow neutralizado).
+    # ------------------------------------------------------------------
+    lgpd_response = handle_lgpd(state, text, aviso_text=_cx_lgpd_notice(ai_cfg))
+
+    first_cx_text = None
+    if lgpd_response is not None:
+        if state.get("lgpd_status") == "accepted":
+            _record_lgpd_consent(
+                contact_id,
+                policy_version=_cx_policy_version(ai_cfg),
+            )
+            state["step"] = "cx"
+            state.setdefault("started_at", utcnow().isoformat())
+            _set_bot_state(contact_id, state)
+            # Primeira pergunta do cliente (guardada no gate) vai ao agente
+            # neste mesmo turno; a confirmacao do aceite prefixa a resposta.
+            first_cx_text = str(state.get("user_first_input") or "").strip()
+            if not first_cx_text:
+                return lgpd_response
+        else:
+            if not state.get("step"):
+                state["step"] = "lgpd"
+                state["started_at"] = utcnow().isoformat()
+            _set_bot_state(contact_id, state)
+            return lgpd_response
+
+    if state.get("step") != "cx":
+        state["step"] = "cx"
+        state.setdefault("started_at", utcnow().isoformat())
+        _set_bot_state(contact_id, state)
+
+    # ------------------------------------------------------------------
+    # DetectIntent
+    # ------------------------------------------------------------------
+    wa_digits = re.sub(r"\D", "", str(contact.get("wa_id") or ""))
+    if not (10 <= len(wa_digits) <= 15):
+        logger.warning(
+            "[BOT-CX] wa_id do contato %d fora do formato de sessao (%d digitos)",
+            contact_id, len(wa_digits),
+        )
+        return None
+
+    project = str(ai_cfg.get("gcp_project_id") or "").strip()
+    agent = str(ai_cfg.get("agent_id") or "").strip()
+    if project and agent:
+        session_params = {
+            "user_id": f"+{wa_digits}",
+            "tenant_id": str(get_tenant_context() or ""),
+            "lgpd_consent": True,
+        }
+        turn_text = first_cx_text if first_cx_text is not None else text
+        result = await bot_engine_dialogflow.detect_intent_text(
+            ai_cfg, wa_digits, turn_text, session_params
+        )
+    else:
+        logger.warning(
+            "[BOT-CX] settings.ai incompleto (gcp_project_id/agent_id) "
+            "para o contato %d — tratando como falha do motor", contact_id,
+        )
+        result = {"ok": False}
+
+    # ------------------------------------------------------------------
+    # Falha do motor: 1a -> fallback educado; 2a consecutiva -> handoff.
+    # ------------------------------------------------------------------
+    if not result.get("ok"):
+        # cx_fail_count nao e atomico: 2 mensagens concorrentes durante um
+        # outage do CX podem subcontar (lost update), atrasando o handoff de 2
+        # strikes em ~1 turno. Aceito na v1 (so acontece em outage + entrega
+        # concorrente; consequencia = uma msg de desculpa extra). Se virar
+        # problema, trocar por firestore.Increment + releitura antes de decidir.
+        fails = int(state.get("cx_fail_count") or 0) + 1
+        if fails >= _CX_MAX_CONSECUTIVE_FAILURES:
+            _finalize_cx_handoff(
+                contact_id, ai_cfg,
+                summary="Bot IA indisponivel (falhas consecutivas)",
+            )
+            return _CX_HANDOFF_FAIL_MSG
+        _set_bot_state(contact_id, {"cx_fail_count": fails})
+        return _CX_FALLBACK_MSG
+
+    if int(state.get("cx_fail_count") or 0):
+        _set_bot_state(contact_id, {"cx_fail_count": 0})
+
+    reply = str(result.get("reply_text") or "").strip()
+    # No turno do aceite, a confirmacao do consentimento SEMPRE vai ao cliente,
+    # mesmo que o agente responda vazio nesse 1o turno — senao o cliente aceita
+    # a LGPD e fica no silencio total (achado da revisao). lgpd_response e str
+    # (o branch accepted so retorna texto).
+    if first_cx_text is not None and isinstance(lgpd_response, str) and lgpd_response:
+        reply = f"{lgpd_response}\n\n{reply}".strip() if reply else lgpd_response
+    # Trava a invariante 4096 no texto FINAL: o prefixo do aceite e somado
+    # DEPOIS da truncagem do conector (achado da revisao).
+    if len(reply) > _CX_MAX_REPLY_CHARS:
+        reply = reply[:_CX_MAX_REPLY_CHARS]
+
+    # ------------------------------------------------------------------
+    # Handoff pedido pelo agente -> pool do setor configurado
+    # ------------------------------------------------------------------
+    if result.get("handoff_request"):
+        _finalize_cx_handoff(
+            contact_id, ai_cfg,
+            summary=str(result.get("handoff_summary") or "").strip(),
+            user_name=str(result.get("user_name") or "").strip(),
+        )
+        # Nunca transferir em silencio (agente pode pedir handoff sem texto).
+        return reply or _CX_HANDOFF_DEFAULT_MSG
+
+    # conversation_complete sem handoff: cliente pode voltar a falar com o
+    # bot depois. NAO limpa o estado (preservaria re-pergunta da LGPD) —
+    # a sessao do CX expira sozinha no Dialogflow (~30min).
+    return reply or None
+
+
+def _dept_id_by_bot_key(bot_key: str):
+    """department_id do tenant atual cujo bot_key casa (None se nao ha)."""
+    key = (bot_key or "").strip().lower()
+    if not key:
+        return None
+    for dept in get_all_departments():
+        if (dept.get("bot_key") or "").strip().lower() == key:
+            return dept.get("id")
+    return None
+
+
+def _finalize_cx_handoff(
+    contact_id: int, ai_cfg: dict, summary: str = "", user_name: str = ""
+):
+    """Encerra o bot CX transferindo o contato para atendimento humano.
+
+    Mesmo modelo do _finalize_bot: bot_completed=True + department_id (pela
+    bot_key configurada no tenant), propagacao as conversations (pool do
+    setor segmenta por department_id da CONVERSATION), system message com o
+    resumo do agente e limpeza do estado. assigned_to fica vazio (pool).
+    """
+    dept_id = _dept_id_by_bot_key(str(ai_cfg.get("handoff_bot_key") or ""))
+
+    notes = "Bot IA: handoff"
+    if user_name:
+        notes += f" | Nome={user_name}"
+
+    updates = {
+        "bot_completed": True,
+        "bot_notes": notes,
+    }
+    if dept_id:
+        updates["department_id"] = dept_id
+    document("wa_contacts", contact_id).set(updates, merge=True)
+
+    if dept_id:
+        for snap in collection("wa_conversations").where(
+            "contact_id", "==", contact_id
+        ).stream():
+            cd = snap.to_dict() or {}
+            if cd.get("is_backup"):
+                continue
+            snap.reference.set({"department_id": dept_id}, merge=True)
+
+    sys_content = "Bot IA finalizado | Transferido para atendimento humano"
+    if summary:
+        sys_content += f" | Resumo: {summary}"
+    save_wa_message(
+        wa_message_id="",
+        contact_id=contact_id,
+        direction="system",
+        msg_type="system",
+        content=sys_content,
+        status="",
+        timestamp_wa=utcnow().isoformat(),
+    )
+
+    _clear_bot_state(contact_id)
+    logger.info(
+        "[BOT-CX] Handoff finalizado | contato=%d | dept_id=%s",
+        contact_id, dept_id,
     )

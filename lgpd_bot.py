@@ -75,6 +75,15 @@ def _normalizar(texto: str) -> str:
     return re.sub(r"\s+", " ", texto).strip()
 
 
+def _maybe_track_first_input(state: dict, message_text: str) -> None:
+    """Atualiza user_first_input com a ultima entrada substantiva do cliente
+    durante o gate LGPD (usado como replay pelo motor CX no aceite). Ignora
+    IDs de botao (aceitar/recusar) — so texto real do cliente conta."""
+    norm = _normalizar(message_text)
+    if norm and norm not in _ACEITE_TERMOS and norm not in _RECUSA_TERMOS:
+        state["user_first_input"] = message_text
+
+
 def _eh_aceite(texto: str) -> bool:
     return _normalizar(texto) in _ACEITE_TERMOS
 
@@ -161,6 +170,7 @@ _NAO_ENTENDI_CORPO = (
 def handle_lgpd(
     state: dict,
     message_text: str,
+    aviso_text: Optional[str] = None,
 ) -> Optional[Union[str, dict]]:
     """
     Verifica e gerencia o consentimento LGPD.
@@ -169,6 +179,9 @@ def handle_lgpd(
         state: dict do bot_states (sera modificado in place).
         message_text: texto da mensagem recebida do cliente,
                       ou o button_reply.id quando vier de botao interativo.
+        aviso_text: texto do aviso de consentimento exibido no primeiro
+                    contato. Default = aviso do fluxo builtin (Hubloc);
+                    o motor CX passa o aviso do tenant (settings.ai).
 
     Returns:
         None  -> consentimento ja existe (pass through para o bot).
@@ -190,6 +203,10 @@ def handle_lgpd(
             logger.info("[LGPD] Re-consentimento aceito")
             return _ACEITO_RESPOSTA
 
+        # Captura a intencao real digitada durante o re-prompt (ex.: "quero
+        # agendar") — o motor CX faz replay de user_first_input no aceite; sem
+        # isso a 1a mensagem antiga seria reenviada ao agente (achado da revisao).
+        _maybe_track_first_input(state, message_text)
         return _resposta_botoes(
             corpo=_RECUSA_LEMBRETE_CORPO,
             botoes=[_BTN_ACEITAR],
@@ -209,7 +226,9 @@ def handle_lgpd(
             logger.info("[LGPD] Consentimento recusado")
             return _RECUSA_RESPOSTA
 
-        # Resposta nao reconhecida: reenviar botoes
+        # Resposta nao reconhecida: reenviar botoes (e atualizar o replay do CX
+        # com a intencao real, se o cliente digitou algo em vez de tocar botao).
+        _maybe_track_first_input(state, message_text)
         return _resposta_botoes(
             corpo=_NAO_ENTENDI_CORPO,
             botoes=[_BTN_ACEITAR, _BTN_RECUSAR],
@@ -222,6 +241,6 @@ def handle_lgpd(
     logger.info("[LGPD] Aviso enviado ao contato")
 
     return _resposta_botoes(
-        corpo=_AVISO_LGPD,
+        corpo=aviso_text or _AVISO_LGPD,
         botoes=[_BTN_ACEITAR, _BTN_RECUSAR],
     )

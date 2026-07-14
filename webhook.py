@@ -29,7 +29,7 @@ from database import (
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
-from bot_service import process_bot_message
+from bot_service import process_bot_message_async
 from bot_transport import build_outbound_payload, extract_interactive_inbound
 from firestore_common import set_tenant_context, reset_tenant_context, document, utcnow
 from tenant_service import lookup_phone_routing
@@ -657,6 +657,18 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             content = f"[{msg_type}]"
             logger.info("Tipo de mensagem nao tratado: %s", msg_type)
 
+        # Guard de redelivery: a Meta reenvia o payload quando o ACK demora
+        # (o motor CX roda DetectIntent inline). save_wa_message ja deduplica
+        # o DOC, mas nao sinaliza o caller — sem este check o bot rodaria (e
+        # responderia) de novo a cada retry do mesmo msg_id. So consultamos no
+        # path que roda o bot (texto): evita 1 leitura Firestore por inbound de
+        # midia/status no caminho quente de todos os tenants.
+        was_dup = (
+            bool(get_wa_message_by_wa_message_id(msg_id))
+            if (msg_id and effective_msg_type == "text")
+            else False
+        )
+
         # Persistir. sender_user_id=None em inbound (cliente final).
         # channel_owner_user_id captura o dono do numero (relevante p/ coexistence).
         db_id = save_wa_message(
@@ -725,21 +737,31 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # Gate: nao dispara se contato ja foi qualificado pelo bot (bot_completed=True)
         # mesmo que ainda nao tenha operador atribuido. O contato esta na fila
         # do departamento e redirigir pro bot reiniciaria o fluxo do zero.
-        if effective_msg_type == "text" and content.strip():
+        if effective_msg_type == "text" and content.strip() and not was_dup:
             if (
                 contact_row
                 and not contact_row.get("assigned_to")
                 and not contact_row.get("bot_completed")
             ):
                 bot_ran = True
-                bot_reply = process_bot_message(contact_id, content, contact_name)
-                if bot_reply:
-                    _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
-                    _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
-                    await _send_bot_reply(
-                        wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
-                        channel_id=channel_id,
-                        channel_owner_user_id=channel_owner_id,
+                # Isola falha do bot: a mensagem inbound JA foi salva; um erro
+                # aqui NAO deve reenfileirar o payload, porque no retry
+                # was_dup=True pularia o bot permanentemente (achado da revisao).
+                # Degrada so a resposta do bot; auto-recupera na proxima msg.
+                try:
+                    bot_reply = await process_bot_message_async(contact_id, content, contact_name)
+                    if bot_reply:
+                        _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
+                        _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
+                        await _send_bot_reply(
+                            wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
+                            channel_id=channel_id,
+                            channel_owner_user_id=channel_owner_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[BOT] falha ao processar/responder inbound do contato %s",
+                        contact_id,
                     )
 
         # -- Lead convertido: capturar rating ou rerouting --
