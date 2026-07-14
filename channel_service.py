@@ -205,13 +205,16 @@ def get_send_credentials(channel_id: int | None) -> tuple[str, str, str]:
     if channel is None:
         raise ValueError("Nenhum canal WhatsApp configurado.")
 
-    # Para o canal standard, o segredo do Cloud Run e a fonte de verdade.
-    # Isso evita que o registry Firestore fique preso em um token antigo
-    # depois de uma rotacao do secret.
+    # Para o canal standard DO MESMO NUMERO do env, o segredo do Cloud Run
+    # e a fonte de verdade (evita registry Firestore preso em token antigo
+    # apos rotacao do secret). O override NUNCA se aplica a outro canal
+    # standard: com multiplos tenants, cair no env enviaria pelo numero de
+    # outro cliente.
     if channel.get("channel_type") == CHANNEL_TYPE_STANDARD:
         env_token = str(WHATSAPP_TOKEN or "").strip()
         env_phone_id = str(WHATSAPP_PHONE_NUMBER_ID or "").strip()
-        if env_token and env_phone_id:
+        channel_phone_id = str(channel.get("phone_number_id") or "").strip()
+        if env_token and env_phone_id and channel_phone_id == env_phone_id:
             return env_token, env_phone_id, GRAPH_API_BASE
 
     token = str(channel.get("access_token", "")).strip()
