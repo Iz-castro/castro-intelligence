@@ -56,3 +56,15 @@ frontend_dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+
+# Relatorios operacionais com PII (LGPD) — nao versionar
+relatorio_bot_*.md
+
+# Relatorio de migracao Varizemed (IDs reais de infra — o proprio doc pede nao versionar)
+docs/RESPOSTAS-MIGRACAO-CX.md
+
+# Artefatos da Varizemed (export do agente CX + fontes das Cloud Functions).
+# Insumo da trilha do Dev IA — NAO versionar aqui; o destino definitivo e o
+# repo/diretorio do Dev IA (ver docs/PLANO_TENANT_TESTE_VARIZEMED_CX.md, IA-5).
+docs/agenteval05/
+docs/valmr/
