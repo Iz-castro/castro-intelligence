@@ -1,5 +1,5 @@
 import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, type User } from "firebase/auth";
+import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, getMultiFactorResolver, TotpMultiFactorGenerator, type MultiFactorError, type MultiFactorResolver, type User } from "firebase/auth";
 import { collection, doc as firestoreDoc, getDocs, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
 import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
@@ -51,6 +51,11 @@ type CrmContextValue = {
   loginWithGoogle: () => Promise<void>;
   loginWithEmail: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  // MFA (TOTP): so entra em cena quando a conta tem 2o fator enrollado.
+  // Operador comum (sem MFA) nunca ve isso — o login segue direto.
+  mfaPending: boolean;
+  resolveMfaCode: (code: string) => Promise<void>;
+  cancelMfa: () => void;
 
   // Contacts
   contacts: Contact[];
@@ -456,6 +461,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
+  const [mfaPending, setMfaPending] = useState(false);
+  const mfaResolverRef = useRef<{ resolver: MultiFactorResolver; hintUid: string } | null>(null);
 
   // -- Theme --
   const [theme, setTheme] = useState<"dark" | "light">(() => { const p = themePref(); applyTheme(p); return p; });
@@ -1497,18 +1504,48 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // Se o erro for o desafio de 2o fator, prepara o resolver e sinaliza a UI
+  // pra pedir o codigo TOTP. Retorna true se tratou (nao mostrar como erro).
+  function startMfaChallenge(e: unknown): boolean {
+    if (!bundle || (e as { code?: string })?.code !== "auth/multi-factor-auth-required") return false;
+    const resolver = getMultiFactorResolver(bundle.auth, e as MultiFactorError);
+    const hint = resolver.hints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID) || resolver.hints[0];
+    mfaResolverRef.current = { resolver, hintUid: hint.uid };
+    setMfaPending(true);
+    return true;
+  }
+
   async function loginWithGoogle() {
     if (!bundle) return;
     try { setBusyLogin(true); setError(""); await signInWithPopup(bundle.auth, bundle.provider); }
-    catch (e) { setError(errorText(e)); }
+    catch (e) { if (!startMfaChallenge(e)) setError(errorText(e)); }
     finally { setBusyLogin(false); }
   }
 
   async function loginWithEmail(email: string, password: string) {
     if (!bundle) return;
     try { setBusyLogin(true); setError(""); await signInWithEmailAndPassword(bundle.auth, email, password); }
-    catch (e) { setError(errorText(e)); }
+    catch (e) { if (!startMfaChallenge(e)) setError(errorText(e)); }
     finally { setBusyLogin(false); }
+  }
+
+  async function resolveMfaCode(code: string) {
+    const pending = mfaResolverRef.current;
+    if (!pending) return;
+    try {
+      setBusyLogin(true); setError("");
+      const assertion = TotpMultiFactorGenerator.assertionForSignIn(pending.hintUid, code.trim());
+      await pending.resolver.resolveSignIn(assertion);
+      mfaResolverRef.current = null;
+      setMfaPending(false);
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusyLogin(false); }
+  }
+
+  function cancelMfa() {
+    mfaResolverRef.current = null;
+    setMfaPending(false);
+    setError("");
   }
 
   async function logout() { if (bundle) await signOut(bundle.auth); }
@@ -2199,7 +2236,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
-    loginWithGoogle, loginWithEmail, logout,
+    loginWithGoogle, loginWithEmail, logout, mfaPending, resolveMfaCode, cancelMfa,
     contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
     activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,

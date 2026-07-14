@@ -66,10 +66,24 @@ function BootScreen() {
 }
 
 function LoginScreen() {
-  const { config, bundle, busyLogin, error, loginWithGoogle, loginWithEmail } = useCrm();
+  const { config, bundle, busyLogin, error, loginWithGoogle, loginWithEmail, mfaPending, resolveMfaCode, cancelMfa } = useCrm();
   const [showEmailForm, setShowEmailForm] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  if (mfaPending) {
+    return (
+      <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Verificação em duas etapas</h1>
+        <p>Digite o código de 6 dígitos do seu app autenticador.</p>
+        <form style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginTop: "0.8rem" }} onSubmit={(e) => { e.preventDefault(); if (mfaCode.length === 6) void resolveMfaCode(mfaCode); }}>
+          <input inputMode="numeric" autoComplete="one-time-code" value={mfaCode} onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="000000" autoFocus />
+          <button className="primary" type="submit" disabled={busyLogin || mfaCode.length < 6}>{busyLogin ? "Verificando..." : "Verificar"}</button>
+          <button className="ghost" type="button" onClick={() => { setMfaCode(""); cancelMfa(); }}>Cancelar</button>
+        </form>
+        {error ? <div className="alert danger">{error}</div> : null}
+      </div></div>
+    );
+  }
   return (
     <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Entrar</h1>
       <p>{config?.allowed_email_domain ? `Use sua conta ${config.allowed_email_domain}.` : "Use uma conta Google autorizada."}</p>
