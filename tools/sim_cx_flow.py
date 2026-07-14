@@ -336,6 +336,20 @@ print("\n=== e2: pos-handoff o bot silencia (gate bot_completed) ===")
 check(STORE["wa_contacts"]["1"].get("bot_completed") is True,
       "webhook nao rodara o bot (bot_completed=True)")
 
+print("\n=== e3: handoff por TEXTO (param handoff_request=False, mas a Val fala a transferencia) ===")
+novo_contato(12, wa_id="5571111112222")
+STORE["bot_states"]["12"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok(
+    "Entendido. Para te ajudar melhor com essa questao, estou transferindo nossa "
+    "conversa para a equipe de atendimento humano agora mesmo.",
+    handoff_request=False,   # agente NAO setou o parametro (caso real do staging)
+))
+re3 = envia(12, "quero um atendente")
+check(STORE["wa_contacts"]["12"].get("bot_completed") is True,
+      "handoff por texto -> bot_completed=True mesmo com param False")
+check(STORE["wa_contacts"]["12"].get("department_id") == 10,
+      "handoff por texto -> department Recepcao")
+
 print("\n=== f: falha do conector -> fallback e depois handoff ===")
 novo_contato(2, wa_id="5571888887777")
 STORE.setdefault("bot_states", {})["2"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}

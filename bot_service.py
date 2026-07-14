@@ -452,6 +452,31 @@ _CX_HANDOFF_DEFAULT_MSG = (
 
 _CX_MAX_REPLY_CHARS = 4096  # limite de texto da Cloud API do WhatsApp
 
+# Fallback de deteccao de handoff por TEXTO. O agente generativo nem sempre
+# seta o parametro handoff_request (validado no staging 2026-07-14: a Val falou
+# a mensagem de transferencia mas handoff_request veio False). O sistema antigo
+# da Varizemed ja usava 2 sinais (parametro + hints de texto) por isso. Estas
+# frases sao trechos das mensagens IMUTAVEIS de transferencia do playbook do
+# agente (Step 6). Comparadas via _norm (sem acento, minusculo). Sobrescrevivel
+# por tenant em settings.ai.handoff_text_hints.
+_DEFAULT_HANDOFF_TEXT_HINTS = (
+    "estou transferindo nossa conversa para a equipe de atendimento",
+    "deixei sua solicitacao marcada como prioridade",
+)
+
+
+def _cx_is_handoff(result: dict, ai_cfg: dict) -> bool:
+    """Handoff se o parametro handoff_request veio true OU o texto da resposta
+    casa uma das frases de transferencia (fallback pro agente que nao seta o
+    parametro)."""
+    if result.get("handoff_request"):
+        return True
+    hints = ai_cfg.get("handoff_text_hints") or _DEFAULT_HANDOFF_TEXT_HINTS
+    reply_norm = _norm(str(result.get("reply_text") or ""))
+    if not reply_norm:
+        return False
+    return any(_norm(str(h)) in reply_norm for h in hints if h)
+
 
 def _get_tenant_ai_config() -> dict:
     """Config settings.ai do tenant atual (dict vazio se ausente)."""
@@ -663,9 +688,10 @@ async def _process_cx_message(
         reply = reply[:_CX_MAX_REPLY_CHARS]
 
     # ------------------------------------------------------------------
-    # Handoff pedido pelo agente -> pool do setor configurado
+    # Handoff pedido pelo agente -> pool do setor configurado.
+    # Detecta por parametro OU por texto (o agente nem sempre seta o param).
     # ------------------------------------------------------------------
-    if result.get("handoff_request"):
+    if _cx_is_handoff(result, ai_cfg):
         _finalize_cx_handoff(
             contact_id, ai_cfg,
             summary=str(result.get("handoff_summary") or "").strip(),
