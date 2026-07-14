@@ -53,7 +53,41 @@ from firestore_common import (
 
 logger = logging.getLogger("castro_crm.tenants")
 
-PLAN_OPTIONS = ("starter", "professional", "enterprise", "premium")
+# Planos comerciais (decisao PO 2026-07-13):
+#   professional  — bot de triagem, setores, transferencias, templates, humano.
+#   ai_custom     — professional + agente de IA dedicado (Dialogflow CX).
+#   enterprise_ai — ai_custom + integracoes/SLA/relatorios (sob consulta).
+PLAN_OPTIONS = ("professional", "ai_custom", "enterprise_ai")
+
+# Docs gravados antes da renomeacao podem carregar valores legados; o mapa
+# normaliza NA LEITURA (get_tenant/list_tenants) ate o backfill
+# (scripts/migrate_plans.py) rodar em todos os ambientes.
+_LEGACY_PLAN_MAP = {
+    "starter": "professional",
+    "enterprise": "enterprise_ai",
+    "premium": "ai_custom",
+}
+
+# Modulos derivados do plano EM CODIGO (fonte unica, sem persistencia — evita
+# drift entre doc e codigo). Override por tenant, se um dia precisar, entra
+# como settings.modules_extra, nunca editando este mapa em runtime.
+PLAN_MODULES = {
+    "professional": ("crm", "whatsapp", "bot_builtin"),
+    "ai_custom": ("crm", "whatsapp", "bot_builtin", "ai_agent"),
+    "enterprise_ai": ("crm", "whatsapp", "bot_builtin", "ai_agent"),
+}
+
+
+def normalize_plan(plan: str | None) -> str:
+    """Traduz plano legado pro vocabulario atual; default professional."""
+    value = str(plan or "").strip().lower()
+    value = _LEGACY_PLAN_MAP.get(value, value)
+    return value if value in PLAN_OPTIONS else "professional"
+
+
+def modules_for_plan(plan: str | None) -> list[str]:
+    """Modulos habilitados pelo plano (lista nova a cada call)."""
+    return list(PLAN_MODULES.get(normalize_plan(plan), PLAN_MODULES["professional"]))
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9\-]{2,63}$")
 
@@ -169,7 +203,7 @@ def get_tenant(tenant_id: str) -> dict | None:
     with _lock:
         cached = _tenants_by_id.get(str(tenant_id))
     if cached:
-        return normalize_record(cached)
+        return _with_normalized_plan(normalize_record(cached))
     # Fallback: leitura direta caso o cache esteja stale.
     snap = tenant_doc_ref(tenant_id).get()
     if not snap.exists:
@@ -177,7 +211,7 @@ def get_tenant(tenant_id: str) -> dict | None:
     data = snap.to_dict() or {}
     if "id" not in data:
         data["id"] = snap.id
-    return normalize_record(data)
+    return _with_normalized_plan(normalize_record(data))
 
 
 def list_tenants(active_only: bool = True) -> list[dict]:
@@ -188,7 +222,14 @@ def list_tenants(active_only: bool = True) -> list[dict]:
     if active_only:
         rows = [t for t in rows if t.get("is_active", True)]
     rows.sort(key=lambda t: str(t.get("name") or t.get("id") or ""))
-    return [normalize_record(t) for t in rows]
+    return [_with_normalized_plan(normalize_record(t)) for t in rows]
+
+
+def _with_normalized_plan(record: dict) -> dict:
+    """Aplica o mapa de planos legados na leitura (pre-backfill)."""
+    if "plan" in record:
+        record["plan"] = normalize_plan(record.get("plan"))
+    return record
 
 
 def tenant_exists(tenant_id: str) -> bool:

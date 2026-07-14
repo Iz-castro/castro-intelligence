@@ -537,6 +537,16 @@ async def session_info(current_user: dict = Depends(get_current_user)):
     # M-B2: mapa EFETIVO de toggles (perfil do usuario + fallback de role no
     # dual-check) — o useCan do frontend le daqui e do snapshot do perfil.
     perfil_id = str(current_user.get("perfil_acesso_id") or "") or default_perfil_for_role(current_user.get("role"))
+    # Entitlements: plano + modulos derivados (fonte: PLAN_MODULES em codigo).
+    # Falha de leitura do tenant NAO derruba a sessao — cai no plano default.
+    from tenant_service import get_tenant, modules_for_plan, normalize_plan
+
+    try:
+        tenant_doc = get_tenant(tenant_id) or {}
+    except Exception as exc:
+        logger.warning("session_info: get_tenant(%s) falhou: %s", tenant_id, exc)
+        tenant_doc = {}
+    tenant_plan = normalize_plan(tenant_doc.get("plan"))
     return {
         "user": current_user,
         "auth_mode": AUTH_MODE,
@@ -545,6 +555,12 @@ async def session_info(current_user: dict = Depends(get_current_user)):
         "perfil": {
             "id": perfil_id,
             "toggles": effective_toggles(current_user),
+        },
+        "tenant": {
+            "id": tenant_id,
+            "name": tenant_doc.get("name") or tenant_id,
+            "plan": tenant_plan,
+            "modules": modules_for_plan(tenant_plan),
         },
     }
 
