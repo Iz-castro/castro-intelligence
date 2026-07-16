@@ -38,7 +38,16 @@ logger = logging.getLogger("castro_crm.firestore")
 _current_tenant_id: ContextVar[str | None] = ContextVar("castro_crm_tenant", default=None)
 
 # Colecoes que permanecem globais mesmo com tenant context ativo.
-_GLOBAL_COLLECTIONS = frozenset({"_meta", "tenants", "phone_routing"})
+# "channels" e FLAT/global (castro_crm_channels/{id}, com campo tenant_id pra
+# isolamento) — o webhook precisa resolver o canal ANTES de saber o tenant, e o
+# indice phone_routing aponta pra id global. Sem "channels" aqui, um
+# collection("channels")/document("channels") rodando sob contexto de tenant
+# (ex.: refresh_channels disparado numa chamada autenticada de admin) lia/escrevia
+# tenants/{tid}/channels (VAZIO) -> refresh montava cache vazio -> todos os
+# phone_id davam no_channel_for_phone por 60s -> mensagens caiam em pending
+# (causa raiz da perda cronica; pioraria com multi-tenant). main.py ja usava
+# global_document("channels") num call site — aqui unifica todos.
+_GLOBAL_COLLECTIONS = frozenset({"_meta", "tenants", "phone_routing", "channels"})
 
 
 def set_tenant_context(tenant_id):
