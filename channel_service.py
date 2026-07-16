@@ -257,7 +257,12 @@ def create_channel(
     `phone_number_id` esta disponivel — permite ao webhook resolver
     tenant em O(1) sem varrer canais por tenant.
     """
-    channel_id = next_sequence("channels")
+    # ID do canal vem do contador GLOBAL (tenant_id=None), NAO do por-tenant:
+    # a colecao `channels` e FLAT/global (_flat_document), entao um contador
+    # por-tenant faria tenants diferentes gerarem os mesmos ids (1,2,...) e um
+    # SOBRESCREVER os canais do outro (incidente 2026-07-16: varizemed
+    # sobrescreveu os canais 1 e 2 do hubloc). Global garante id unico.
+    channel_id = next_sequence("channels", tenant_id=None)
     now = utcnow()
     phone_id_norm = str(phone_number_id).strip()
     # Resolve tenant: prioridade explicito > contexto atual > 'hubloc'.
