@@ -35,6 +35,7 @@ from firestore_common import set_tenant_context, reset_tenant_context, document,
 from tenant_service import lookup_phone_routing
 from pii_redaction import redact_phone, redact_name
 from pending_events import enqueue_pending_event
+from contextvars import ContextVar
 
 logger = logging.getLogger("castro_crm.webhook")
 
@@ -42,6 +43,16 @@ logger = logging.getLogger("castro_crm.webhook")
 # valido OU quando phone_routing ainda nao tem entrada pra esse numero.
 # Sub-fase: enquanto canais sao flat, canal default pertence a 'hubloc'.
 _WEBHOOK_DEFAULT_TENANT = "hubloc"
+
+# Reprocessamento silencioso (drain de pending_webhook_events acumulados): quando
+# True no contexto async atual, _process_messages salva a mensagem/contato/conversa
+# mas PULA toda a automacao pos-persistencia (botao de reabertura, flag de
+# takeover, bot, rating) — zero outbound pro cliente e zero mutacao de bot_state
+# de contato que esteja mid-fluxo agora. O webhook ao vivo NUNCA seta isto
+# (default False) -> impacto zero no trafego real; so o script de drain seta,
+# antes de chamar process_webhook_payload, pra entregar mensagens historicas sem
+# disparar auto-reply em mensagem antiga.
+_silent_reprocess: "ContextVar[bool]" = ContextVar("silent_reprocess", default=False)
 
 
 def _resolve_webhook_tenant(channel, phone_number_id: str | None = None):
@@ -696,6 +707,12 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             "[WA IN] %s (%s) | tipo=%s | id=%s",
             redact_name(contact_name), redact_phone(wa_id), effective_msg_type, msg_id[:20]
         )
+
+        # -- Gate de reprocessamento silencioso --
+        # Mensagem/contato/conversa ja persistidos acima; se estamos drenando
+        # pending antigos, para AQUI: nada de botao/takeover/bot/rating/outbound.
+        if _silent_reprocess.get():
+            continue
 
         # -- Resposta de botao quick-reply (template de reabertura) --
         # Registra a escolha do cliente (Retomar/Encerrar), atualiza o
