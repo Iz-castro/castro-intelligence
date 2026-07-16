@@ -47,7 +47,16 @@ _current_tenant_id: ContextVar[str | None] = ContextVar("castro_crm_tenant", def
 # phone_id davam no_channel_for_phone por 60s -> mensagens caiam em pending
 # (causa raiz da perda cronica; pioraria com multi-tenant). main.py ja usava
 # global_document("channels") num call site — aqui unifica todos.
-_GLOBAL_COLLECTIONS = frozenset({"_meta", "tenants", "phone_routing", "channels"})
+#
+# super_admins/audit_logs_system/pending_webhook_events sao FLAT e hoje so
+# acessadas via global_collection/global_document (super_admin.py, pending_events.py)
+# — ja seguras. Ficam aqui como blindagem defensiva (zero mudanca de comportamento
+# hoje): se algum codigo futuro acessar via collection()/document() puro, elas
+# continuam globais em vez de repetir o bug do channels (auditoria 2026-07-16).
+_GLOBAL_COLLECTIONS = frozenset({
+    "_meta", "tenants", "phone_routing", "channels",
+    "super_admins", "audit_logs_system", "pending_webhook_events",
+})
 
 
 def set_tenant_context(tenant_id):
