@@ -447,7 +447,7 @@ function ConflictsPanel() {
 }
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, loadAllContacts, loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, loadAllContacts, loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
   // nao apenas conversas ativas). Usado no header da sidebar.
@@ -466,7 +466,7 @@ function ContactList() {
   // segue sendo o total carregado. Reseta ao trocar de caixa/busca/filtro.
   const SIDEBAR_PAGE = 50;
   const [visibleLimit, setVisibleLimit] = useState(SIDEBAR_PAGE);
-  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, equipeOperatorFilter]);
+  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, channelFilter, equipeOperatorFilter]);
 
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
@@ -541,6 +541,7 @@ function ContactList() {
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar contato" />
         {activeView === "meus" && <>
           <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Selecionar ou criar contato" aria-label="Selecionar contato"><AddressBookIcon /></button>
+          {myChannelOptions.length > 1 && <select className="compact" value={channelFilter} onChange={(e) => setChannelFilter(e.target.value)} title="Filtrar por canal" aria-label="Filtrar por canal">{myChannelOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</select>}
           <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>
         </>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}

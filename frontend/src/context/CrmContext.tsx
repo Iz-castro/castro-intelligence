@@ -21,6 +21,10 @@ import { installAudioUnlock, playBeep } from "../utils/audio";
 // Context value shape
 // ---------------------------------------------------------------------------
 
+// Opcao do filtro por canal do "Meus": um canal distinto entre as conversas
+// do operador. label pronto pra UI ("Standard - <numero>" / "Coex - <numero>").
+export type ChannelFilterOption = { id: string; type: "standard" | "coexistence"; label: string };
+
 type CrmContextValue = {
   // Core
   config: ClientConfig | null;
@@ -272,6 +276,11 @@ type CrmContextValue = {
   searchText: string;
   qualificationFilter: string;
   setQualificationFilter: (v: string) => void;
+  // Filtro por canal do "Meus" (standard vs coex). Opcoes derivadas das
+  // conversas do proprio operador; só ha filtro com 2+ canais.
+  channelFilter: string;
+  setChannelFilter: (v: string) => void;
+  myChannelOptions: ChannelFilterOption[];
   filteredConversations: Conversation[];
   viewConversations: Conversation[];
 
@@ -475,6 +484,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [activeView, setActiveView] = useState<ActiveView>("novos");
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
   const [qualificationFilter, setQualificationFilter] = useState("");
+  const [channelFilter, setChannelFilter] = useState("");
   const searchText = useDeferredValue(search.trim().toLowerCase());
 
   // -- Composer --
@@ -634,6 +644,38 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     () => allConversations.filter((conv) => (conv.assigned_to === sessionUser?.id || (!!conv.assigned_to_uid && conv.assigned_to_uid === sessionUser?.firebase_uid)) && !conv.is_backup),
     [allConversations, sessionUser?.id, sessionUser?.firebase_uid],
   );
+  // Filtro por canal do "Meus": canal "acessivel" = canal onde o operador tem
+  // thread (derivado das proprias conversas; sem endpoint novo). channel_id
+  // pode faltar em doc antigo — o id deterministico "{channel_id}__{wa_id}"
+  // cobre o fallback, entao nenhuma thread fica invisivel sob filtro.
+  const convChannelKey = (conv: Conversation): string =>
+    conv.channel_id != null ? String(conv.channel_id) : (conv.id.includes("__") ? conv.id.split("__")[0] : "");
+  const myChannelOptions = useMemo<ChannelFilterOption[]>(() => {
+    const byKey = new Map<string, { id: string; type: "standard" | "coexistence"; phone: string }>();
+    for (const conv of meusConversations) {
+      const key = convChannelKey(conv);
+      if (!key) continue;
+      const phone = conv.channel_phone_number || conv.channel_label || "";
+      const existing = byKey.get(key);
+      if (existing && (existing.phone || !phone)) continue;
+      const type: "standard" | "coexistence" =
+        (conv.channel_type || conv.source_channel_type) === "standard" ? "standard" : "coexistence";
+      byKey.set(key, { id: key, type, phone });
+    }
+    return [...byKey.values()]
+      .sort((a, b) => (a.type !== b.type ? (a.type === "standard" ? -1 : 1) : a.phone.localeCompare(b.phone)))
+      .map((o) => ({ id: o.id, type: o.type, label: `${o.type === "standard" ? "Standard" : "Coex"} - ${o.phone || `canal ${o.id}`}` }));
+  }, [meusConversations]);
+  // Sem opcao "Todos" (decisao de produto): com 2+ canais o filtro abre no
+  // primeiro (standard vem antes); com 0-1 canal a caixa some e o filtro
+  // desarma pra nao esconder nada.
+  useEffect(() => {
+    if (myChannelOptions.length > 1) {
+      if (!myChannelOptions.some((o) => o.id === channelFilter)) setChannelFilter(myChannelOptions[0].id);
+    } else if (channelFilter) {
+      setChannelFilter("");
+    }
+  }, [myChannelOptions, channelFilter]);
   // "Carregar mais" do "Meus" so faz sentido se o mine AO VIVO saturou os 50
   // (senao nao ha pagina antiga e um getDocs seria leitura desperdicada). Conta
   // a camada ao vivo (conversations), nao allConversations (que ja inclui paged).
@@ -711,7 +753,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       c?.assigned_name || "",
     ].join(" ").toLowerCase().includes(searchText);
     const matchesQual = !qualificationFilter || c?.qualification === qualificationFilter;
-    return matchesSearch && matchesQual;
+    const matchesChannel = activeView !== "meus" || !channelFilter || convChannelKey(conv) === channelFilter;
+    return matchesSearch && matchesQual && matchesChannel;
   });
 
   const chatSearchLower = chatSearch.trim().toLowerCase();
@@ -2263,7 +2306,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
-    search, setSearch, searchText, qualificationFilter, setQualificationFilter, filteredConversations, viewConversations,
+    search, setSearch, searchText, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
     refreshPollingViews,
