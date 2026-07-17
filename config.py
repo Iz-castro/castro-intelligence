@@ -132,6 +132,9 @@ def _bool_env(key, default="false"):
 
 FEATURE_MESSAGE_STATUS = _bool_env("FEATURE_MESSAGE_STATUS", "true")
 FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
+# Contador de "assumidas sem resposta" (bloqueia assume com 2+ pendentes).
+# Desligado a pedido do cliente; religar via env sem mudar codigo.
+FEATURE_ASSUME_COUNTER = _bool_env("FEATURE_ASSUME_COUNTER", "false")
 STT_LANGUAGE_CODE = os.getenv("STT_LANGUAGE_CODE", "pt-BR").strip()
 STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30.0"))
 STT_FALLBACK_TEXT = os.getenv("STT_FALLBACK_TEXT", "").strip()

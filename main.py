@@ -29,6 +29,7 @@ from pydantic import BaseModel, field_validator
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
+    FEATURE_ASSUME_COUNTER,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
@@ -1682,7 +1683,12 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
 
 
 def _maybe_credit_assume_counter(contact: dict, operator_id: int):
-    """Incrementa o contador do operador se esta e a primeira resposta apos assumir."""
+    """Incrementa o contador do operador se esta e a primeira resposta apos assumir.
+
+    Roda mesmo com FEATURE_ASSUME_COUNTER desligada: quita flags/contadores
+    pendentes de antes do desligamento (senao religar bloqueia por divida velha).
+    Sem divida antiga vira no-op — o assume nao marca mais pendencia.
+    """
     if contact.get("assume_pending_response") and contact.get("assigned_to") == operator_id:
         clear_contact_pending_response(contact["id"])
         increment_assume_counter(operator_id)
@@ -3728,19 +3734,21 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
         current_id = None
     if existing_id is not None and existing_id != current_id:
         raise HTTPException(status_code=409, detail="Atendimento ja assumido por outro operador")
-    # -- Regra do contador de assumidas sem resposta --
-    assume_counter = get_assume_counter(current_user["id"])
-    if assume_counter <= -2:
-        raise HTTPException(
-            status_code=403,
-            detail="Voce atingiu o limite de atendimentos assumidos sem resposta. Responda as conversas pendentes antes de assumir novas.",
-        )
+    # -- Regra do contador de assumidas sem resposta (FEATURE_ASSUME_COUNTER) --
+    if FEATURE_ASSUME_COUNTER:
+        assume_counter = get_assume_counter(current_user["id"])
+        if assume_counter <= -2:
+            raise HTTPException(
+                status_code=403,
+                detail="Voce atingiu o limite de atendimentos assumidos sem resposta. Responda as conversas pendentes antes de assumir novas.",
+            )
     result = assign_wa_contact(contact_id, current_user["id"], contact.get("department_id"), current_user["id"], reason="Assumido pelo operador", summary="Assumido pelo operador")
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
-    # Decrementar contador e marcar contato como pendente de resposta
-    decrement_assume_counter(current_user["id"])
-    mark_contact_pending_response(contact_id)
+    if FEATURE_ASSUME_COUNTER:
+        # Decrementar contador e marcar contato como pendente de resposta
+        decrement_assume_counter(current_user["id"])
+        mark_contact_pending_response(contact_id)
     # Gravar original_operator_id se ainda nao definido (para roteamento de lead retornante)
     if not contact.get("original_operator_id"):
 
