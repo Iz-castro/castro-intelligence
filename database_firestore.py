@@ -1865,6 +1865,34 @@ def get_wa_contacts_scoped_for_user(user_id, department_id=None):
     return [normalize_record(dict(row)) for row in seen.values()]
 
 
+def count_wa_contacts_scoped_for_user(user_id):
+    """Contador BARATO da agenda do operador comum — espelha as mesmas
+    queries de get_wa_contacts_scoped_for_user, mas com aggregate count()
+    (1 read por 1000 docs) em vez de stream (1 read POR DOC). Usado pelo
+    header da sidebar (count_only=1), que so precisa do numero — pra
+    carteira grande (aline/danielle, ~3k docs) corta ~3k reads por
+    page-load pra ~3.
+
+    Aproximacoes conscientes (contador e cosmetico):
+    - Nao deduplica entre as queries: os conjuntos sao disjuntos por
+      definicao (assigned_to_uid = <uid> / "" / None sao mutuamente
+      exclusivos por doc).
+    - Nao subtrai is_archived (0 docs arquivados em prod hoje).
+    - O sentinela "__backup__" fica de fora naturalmente (nao casa ""/None).
+    """
+    col = collection("wa_contacts")
+    queries = []
+    if user_id is not None:
+        queries.append(col.where("assigned_to", "==", user_id))
+    queries.append(col.where("assigned_to_uid", "==", ""))
+    queries.append(col.where("assigned_to_uid", "==", None))
+    total = 0
+    for query in queries:
+        res = query.count(alias="n").get()
+        total += int(res[0][0].value)
+    return total
+
+
 def insert_transfer_system_message(contact_id, content, operator_id=None,
                                    conversation_id=None, channel_id=None,
                                    advance_recency=True):

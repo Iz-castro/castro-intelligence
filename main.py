@@ -1111,6 +1111,7 @@ async def wa_contacts(current_user: dict = Depends(get_current_user)):
 async def wa_contacts_all(
     q: str | None = Query(default=None, description="Busca por nome ou telefone"),
     limit: int = Query(default=5000, ge=1, le=10000),
+    count_only: int = Query(default=0, description="1 = retorna so o total via aggregate count (~7 reads em vez de full scan)"),
     current_user: dict = Depends(get_current_user),
 ):
     """Lista TODOS os contatos do tenant — usado pelo modal de selecao
@@ -1122,9 +1123,30 @@ async def wa_contacts_all(
     contatos COM nome real antes de contatos sem nome (telefones).
     Aceita filtro 'q' pra busca parcial em display_name,
     declared_name, whatsapp_profile_name e wa_id.
+
+    count_only=1: retorna apenas {"total": N} via aggregate count().
+    O header da sidebar so exibe o numero, mas carregava a agenda
+    INTEIRA (~6.5k docs) a cada page-load de cada usuario — era o maior
+    dreno de leitura do Firestore (~250k reads/dia; ver
+    docs/INVESTIGACAO_READS_FIRESTORE_2026-07.md). Aggregate custa
+    1 read por 1000 docs. O filtro q e ignorado nesse modo.
     """
     from firestore_common import collection as fs_coll
     privileged = can_see_all_tenant(current_user)
+
+    if count_only:
+        if privileged:
+            # Total do tenant menos arquivados (is_archived e sempre int
+            # 0/1 — archive_contact grava 1). Docs sem o campo nao casam
+            # o where — exatamente o comportamento do filtro do full scan.
+            res_all = fs_coll("wa_contacts").count(alias="n").get()
+            res_arch = fs_coll("wa_contacts").where("is_archived", "==", 1).count(alias="n").get()
+            total = int(res_all[0][0].value) - int(res_arch[0][0].value)
+        else:
+            from database import count_wa_contacts_scoped_for_user
+            total = count_wa_contacts_scoped_for_user(current_user.get("id"))
+        return {"contacts": [], "total": total, "returned": 0}
+
     rows = []
     if privileged:
         # Admin/supervisor enxerga toda a agenda do tenant (paridade #1).

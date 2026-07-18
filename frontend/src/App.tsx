@@ -447,18 +447,23 @@ function ConflictsPanel() {
 }
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, loadAllContacts, loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
   // nao apenas conversas ativas). Usado no header da sidebar.
+  // countAllContacts (aggregate count, ~7 reads) — NAO carregar a agenda
+  // inteira aqui: este effect roda em todo page-load de todo usuario e o
+  // full scan de ~6.5k docs era o maior dreno de leitura do Firestore
+  // (~250k reads/dia). A lista completa so e carregada quando o picker +
+  // e aberto (NewContactModal).
   const [totalContacts, setTotalContacts] = useState(0);
   useEffect(() => {
     let disposed = false;
-    void loadAllContacts().then((res) => {
-      if (!disposed) setTotalContacts(res.total);
+    void countAllContacts().then((n) => {
+      if (!disposed) setTotalContacts(n);
     });
     return () => { disposed = true; };
-  }, [loadAllContacts]);
+  }, [countAllContacts, contactsCountNonce]);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
 
   // Render incremental: com ~3k conversas, montar 1000+ itens no DOM trava a

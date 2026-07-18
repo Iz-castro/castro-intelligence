@@ -188,6 +188,12 @@ type CrmContextValue = {
   // Contact picker — lista TODOS contatos do tenant (inclui state_sync da agenda).
   // Cache em memoria do provider (zera no logout/fechar aba — LGPD-safe).
   loadAllContacts: (q?: string) => Promise<{ contacts: Contact[]; total: number }>;
+  // Contador BARATO da agenda (aggregate count no backend, ~7 reads) — usado
+  // pelo header da sidebar, que so exibe o numero. NAO carrega a lista.
+  countAllContacts: () => Promise<number>;
+  // Incrementa quando a agenda muda (contato manual criado / refresh) —
+  // dependencia do useEffect do contador pra ele se atualizar sem F5.
+  contactsCountNonce: number;
   refreshAllContacts: () => Promise<void>;
   openConversationForContact: (contact_id: number, channel_id?: number) => Promise<string | null>;
   loadConflicts: () => Promise<ConflictLead[]>;
@@ -390,6 +396,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // persistencia em localStorage por LGPD.
   const [allContactsCache, setAllContactsCache] = useState<Contact[] | null>(null);
   const [allContactsCacheTotal, setAllContactsCacheTotal] = useState<number>(0);
+  // Nonce do contador da sidebar: bump quando a agenda muda (contato manual
+  // criado / refreshAllContacts) pro contador re-buscar sem recarregar pagina.
+  const [contactsCountNonce, setContactsCountNonce] = useState(0);
   // Contatos puxados sob demanda porque sao referenciados por uma conversa
   // atribuida a este operador mas estao FORA do snapshot escopado dele
   // (ex.: takeover — lead de outro operador escreveu no numero dele).
@@ -1985,6 +1994,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // aparecer no proximo open do modal.
       setAllContactsCache(null);
       setAllContactsCacheTotal(0);
+      setContactsCountNonce((n) => n + 1);
       // Backend retorna conversation_id deterministico do contato manual
       // (Fase 3). Setamos a thread direto — o snapshot listener vai trazer
       // a Conversation logo em seguida.
@@ -2025,6 +2035,25 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // useCallback: o contador da sidebar (ContactList) depende da IDENTIDADE
+  // desta funcao no useEffect — mesmo motivo do fetchBillingStatus acima.
+  // Antes o ContactList chamava loadAllContacts() (full scan de ~6.5k docs
+  // no backend) so pra exibir o TOTAL no header, em todo page-load de todo
+  // usuario — o maior dreno de leitura do Firestore (~250k reads/dia; ver
+  // docs/INVESTIGACAO_READS_FIRESTORE_2026-07.md). count_only=1 usa
+  // aggregate count (~7 reads). A lista completa continua sendo carregada
+  // APENAS quando o picker + e aberto (NewContactModal -> loadAllContacts).
+  const countAllContacts = useCallback(async (): Promise<number> => {
+    if (!bundle) return 0;
+    try {
+      const r = await getJson<{ total: number }>(bundle.auth, "/api/wa/contacts/all?count_only=1");
+      return r.total || 0;
+    } catch {
+      // Contador e cosmetico — falha nao vira banner de erro nem retry.
+      return 0;
+    }
+  }, [bundle]);
+
   async function loadAllContacts(q?: string): Promise<{ contacts: Contact[]; total: number }> {
     if (!bundle) return { contacts: [], total: 0 };
     // Carrega a lista completa uma vez por sessao e cacheia em memoria.
@@ -2064,6 +2093,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // se admin sabe que houve sincronizacao nova.
     setAllContactsCache(null);
     setAllContactsCacheTotal(0);
+    setContactsCountNonce((n) => n + 1);
   }
 
   // "Carregar mais" do "Meus" (operador comum): pagina ESTATICA via getDocs do
@@ -2298,7 +2328,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
-    loadAllContacts, refreshAllContacts, openConversationForContact, loadConflicts,
+    loadAllContacts, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
