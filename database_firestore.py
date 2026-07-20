@@ -1112,7 +1112,8 @@ def mark_wa_conversation_read_by_id(conversation_id):
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
                       auto_assign_user_id=None,
-                      from_message_event=True):
+                      from_message_event=True,
+                      skip_conversation_upsert=False):
     """Cria ou atualiza um contato WhatsApp.
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
@@ -1131,6 +1132,10 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     (sincronizacao da agenda telefonica do dono). Nao popula timestamps
     de mensagem nem cria conversation — contato fica disponivel pra
     busca/seleção, mas só vira thread quando houver mensagem real.
+
+    `skip_conversation_upsert=True`: caller chama save_wa_message logo em
+    seguida (que ja upserta a mesma conversation com message_at correto).
+    Evita o dobro de read+write de conversation por mensagem.
     """
     wa_id = normalize_br_phone(wa_id)
     now = utcnow()
@@ -1139,6 +1144,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         return _update_existing_wa_contact(
             existing, wa_id, display_name, channel_id, phone_number_id,
             source_channel_type, auto_assign_user_id, from_message_event, now,
+            skip_conversation_upsert=skip_conversation_upsert,
         )
 
     phone_formatted = format_phone_br(wa_id)
@@ -1208,6 +1214,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             return _update_existing_wa_contact(
                 winner, wa_id, display_name, channel_id, phone_number_id,
                 source_channel_type, auto_assign_user_id, from_message_event, now,
+                skip_conversation_upsert=skip_conversation_upsert,
             )
         logger.warning(
             "wa_contact_index %s aponta p/ contato inexistente (%s) — recriando",
@@ -1217,7 +1224,8 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     # Upsert conversation correspondente (Fase 2 — sub-threads por canal).
     # Pulado em state_sync: thread so nasce com mensagem real, pra nao
     # poluir sidebar com 165 contatos da agenda telefonica.
-    if from_message_event:
+    # Pulado tambem quando o caller upserta via save_wa_message em seguida.
+    if from_message_event and not skip_conversation_upsert:
         upsert_wa_conversation(
             contact_id=contact_id,
             wa_id=wa_id,
@@ -1231,10 +1239,16 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
 
 def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
                                 phone_number_id, source_channel_type,
-                                auto_assign_user_id, from_message_event, now):
+                                auto_assign_user_id, from_message_event, now,
+                                skip_conversation_upsert=False):
     """Aplica updates a um contato JA existente. Usado pelo caminho normal
     (achado por wa_id) e pelo fallback do claim atomico (corrida perdida).
-    Retorna o contact_id."""
+    Retorna o contact_id.
+
+    `skip_conversation_upsert=True`: caller garante que save_wa_message vem
+    logo em seguida (que upserta a MESMA conversation com args mais ricos —
+    message_at/direction_for_unread). Evita ler+escrever a conversation 2x
+    por mensagem (dieta de reads do webhook, 2026-07-20)."""
     updates = {}
     if from_message_event:
         updates["last_message_at"] = now
@@ -1253,8 +1267,11 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
             "Contato %s migrado wa_id %s -> %s (nono digito BR)",
             existing["id"], existing_wa, wa_id,
         )
-    # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name
-    if display_name:
+    # Atualizar whatsapp_profile_name do webhook sem sobrescrever declared_name.
+    # So quando MUDOU: o state_sync reenvia a agenda inteira a cada reconexao
+    # do celular — regravar o mesmo nome em milhares de contatos era write puro
+    # desperdicado (e o gate `if updates` abaixo nao funcionaria nunca).
+    if display_name and display_name != existing.get("whatsapp_profile_name", ""):
         updates["whatsapp_profile_name"] = display_name
         # Recalcular display_name efetivo
         declared = existing.get("declared_name", "")
@@ -1276,7 +1293,11 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
                 updates["department_id"] = user["department_id"]
             if existing.get("qualification") == "novo":
                 updates["qualification"] = "em_atendimento"
-    document("wa_contacts", existing["id"]).set(updates, merge=True)
+    # So escreve se ha mudanca real. state_sync repetido (agenda inteira a
+    # cada reconexao do celular) com nada mudado = 0 writes; era 1 write
+    # vazio POR CONTATO da agenda (milhares por sync).
+    if updates:
+        document("wa_contacts", existing["id"]).set(updates, merge=True)
     # Reflete wa_id canonizado no dict local pra _maybe_upsert_conversation
     # propagar a forma certa pra wa_conversations.
     if updates.get("wa_id"):
@@ -1284,7 +1305,8 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
         existing["wa_id"] = updates["wa_id"]
     # Garante que a conversation deste (channel, wa_id) tambem existe.
     # Pulado em state_sync — contato existe sem thread ate ter mensagem.
-    if from_message_event:
+    # Pulado tambem quando o caller upserta via save_wa_message em seguida.
+    if from_message_event and not skip_conversation_upsert:
         _maybe_upsert_conversation_for_existing_contact(
             existing, channel_id, source_channel_type, phone_number_id, auto_assign_user_id,
         )
@@ -1563,12 +1585,16 @@ def _setor_code(department_id):
     return letters or "GERAL"
 
 
-def ensure_daily_attendance(contact_id, setor=None):
+def ensure_daily_attendance(contact_id, setor=None, contact=None):
     """Get-or-create do Atendimento diario. Trigger: 1o inbound do dia (chamado
     de save_wa_message). Reabre se estava fechado PRESERVANDO
     protocolo_informado (regra do retorno-zumbi). Espelha o id em
-    wa_contacts.attendance_protocol. Retorna o protocol_id ou None."""
-    contact = _get_doc("wa_contacts", contact_id)
+    wa_contacts.attendance_protocol. Retorna o protocol_id ou None.
+
+    `contact`: dict ja lido pelo caller (save_wa_message acabou de ler o
+    mesmo doc) — evita re-ler wa_contacts por inbound. None = le aqui."""
+    if contact is None:
+        contact = _get_doc("wa_contacts", contact_id)
     if not contact:
         return None
     date_str = _today_br_str()
@@ -1968,7 +1994,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     conversation_id=None,
                     channel_owner_user_id=None, sender_user_id=None,
                     template_category=None, media_size_bytes=0,
-                    advance_recency=True):
+                    advance_recency=True, contact=None):
     """Persiste mensagem WhatsApp.
 
     Auditoria coexistence (Fase 2C):
@@ -2037,7 +2063,10 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
             # Vencedor ainda nao visivel (lag extremo) — segue criando com o
             # message_id ja alocado; a query-dedup do proximo evento reconcilia.
 
-    contact = _get_doc("wa_contacts", contact_id)
+    # `contact` pode vir pre-lido do caller (webhook le 1x e reaproveita em
+    # save + daily attendance + takeover + gate do bot) — dieta de reads.
+    if contact is None:
+        contact = _get_doc("wa_contacts", contact_id)
     # Resolve channel/wa_id efetivos pra calcular conversation_id
     eff_channel_id = channel_id if channel_id is not None else (contact or {}).get("channel_id")
     eff_wa_id = (contact or {}).get("wa_id", "")
@@ -2067,7 +2096,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     if contact_id is not None:
         if direction == "inbound":
             try:
-                protocol_id = ensure_daily_attendance(contact_id)
+                protocol_id = ensure_daily_attendance(contact_id, contact=contact)
             except Exception as exc:
                 logger.warning("ensure_daily_attendance falhou contact=%s: %s", contact_id, exc)
         else:

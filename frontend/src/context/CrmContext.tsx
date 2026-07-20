@@ -1542,6 +1542,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function refreshPollingViews() {
     if (!bundle) return;
+    // Em snapshot mode os listeners ja entregam as mudancas (contacts,
+    // conversations e mensagens) — o refresh manual e relicario do polling.
+    // Pro admin, este par de GETs custa ~14k reads Firestore por clique
+    // (conversations 500+backup+join full-scan + contacts see_all): era
+    // disparado por "Devolver ao bot" e "Reatribuicao em lote" mesmo com
+    // snapshot ativo (dieta de reads 2026-07-20).
+    if (snapshotMode) return;
     const [cr, vr] = await Promise.all([
       getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts"),
       getJson<{ conversations: Conversation[] }>(bundle.auth, "/api/wa/conversations").catch(() => ({ conversations: [] })),

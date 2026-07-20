@@ -534,13 +534,17 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             except (ValueError, OSError):
                 ts_iso = datetime.now(timezone.utc).isoformat()
 
-        # Registrar ou atualizar contato (com dados do canal)
+        # Registrar ou atualizar contato (com dados do canal).
+        # skip_conversation_upsert: o save_wa_message logo abaixo upserta a
+        # MESMA conversation (com message_at/unread corretos) — sem o skip
+        # eram 2 reads + 2 writes de conversation POR mensagem.
         contact_id = upsert_wa_contact(
             wa_id, contact_name,
             channel_id=channel_id,
             phone_number_id=channel_phone_id,
             source_channel_type=channel_type,
             auto_assign_user_id=channel_owner_id if channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+            skip_conversation_upsert=True,
         )
         reply_fields = _resolve_reply_reference(contact_id, msg.get("context"))
 
@@ -680,12 +684,19 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             else False
         )
 
+        # Leitura UNICA do contato por inbound (pos-upsert, ja fresco):
+        # reaproveitada pelo save_wa_message (denorm assigned/lma/unread),
+        # ensure_daily_attendance, takeover e gate do bot abaixo. Antes eram
+        # 4 leituras do MESMO doc por mensagem (dieta de reads 2026-07-20).
+        contact_row = get_wa_contact(contact_id)
+
         # Persistir. sender_user_id=None em inbound (cliente final).
         # channel_owner_user_id captura o dono do numero (relevante p/ coexistence).
         db_id = save_wa_message(
             wa_message_id=msg_id,
             contact_id=contact_id,
             direction="inbound",
+            contact=contact_row,
             msg_type=effective_msg_type,
             content=content,
             media_path=media_path,
@@ -738,11 +749,10 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # lead ja pertence a outro operador (contact.assigned_to). Marca a
         # conversa como 'pending' pra UI oferecer "assumir temporariamente" sem
         # roubar o lead. Cliente novo (sem dono previo) nao gera conflito.
-        # Leitura unica do contato, reaproveitada pelo takeover e pelo gate
-        # do bot (antes eram 3 get_wa_contact por inbound). _contact_fresh
-        # abaixo so re-le do banco se o bot rodar — process_bot_message e a
-        # unica fonte de mutacao do contato nesta janela.
-        contact_row = get_wa_contact(contact_id)
+        # contact_row ja foi lido antes do save (leitura unica por inbound) —
+        # save so muta last_message_at/unread, nao os campos usados aqui.
+        # _contact_fresh abaixo so re-le do banco se o bot rodar —
+        # process_bot_message e a unica fonte de mutacao relevante nesta janela.
         bot_ran = False
 
         if channel_type == CHANNEL_TYPE_COEXISTENCE and channel_owner_id:
@@ -971,7 +981,9 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
         # Reentrega: se o echo ja foi salvo com midia, nao re-baixar.
         skip_media = _media_already_downloaded(msg_id)
 
-        # Normalizar telefone do cliente e criar/atualizar contato
+        # Normalizar telefone do cliente e criar/atualizar contato.
+        # skip_conversation_upsert: o save_wa_message abaixo (incondicional)
+        # ja upserta a mesma conversation — evita read+write dobrados.
         normalized_phone = normalize_br_phone(customer_phone)
         contact_id = upsert_wa_contact(
             normalized_phone, "",
@@ -979,6 +991,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             phone_number_id=channel_phone_id_outer,
             source_channel_type=channel_type_outer,
             auto_assign_user_id=channel_owner_outer if channel_type_outer == CHANNEL_TYPE_COEXISTENCE else None,
+            skip_conversation_upsert=True,
         )
 
         # Extrair conteudo conforme tipo de mensagem
