@@ -183,6 +183,23 @@ def _resolve_webhook_channel(value):
         channel = get_channel_by_phone_id(phone_number_id)
         if channel:
             return channel, None
+        # Fallback anti-transiente: o cache em memoria pode dar miss num
+        # instante de cold-start/reciclagem de instancia (observado 18-19/07:
+        # recibos do canal standard cairam em pending em rajadas de ~100ms).
+        # Antes de declarar no_channel, tenta leitura DIRETA no Firestore —
+        # 1 read, so no caminho de miss (nunca no caminho quente). Aceita
+        # apenas canal ATIVO: o from_db inclui inativos (uso do rebind), e
+        # canal desativado deve continuar indo pra pending (decisao 2026-06-05
+        # de nao vazar coex desconectado pro canal default).
+        from channel_service import get_channel_by_phone_id_from_db
+        db_channel = get_channel_by_phone_id_from_db(phone_number_id)
+        if db_channel and db_channel.get("is_active"):
+            logger.info(
+                "Webhook: canal %s resolvido via fallback direto no Firestore "
+                "(cache miss transiente) | phone_id=%s",
+                db_channel.get("id"), phone_number_id,
+            )
+            return db_channel, None
         logger.warning(
             "Webhook: phone_number_id=%s nao bate com nenhum canal cadastrado.",
             phone_number_id,
