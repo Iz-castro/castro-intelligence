@@ -17,6 +17,9 @@ Contrato de retorno de detect_intent_text:
       "handoff_summary": str,        # resumo para o atendente (se houver)
       "conversation_complete": bool, # fim de sessao sem handoff
       "user_name": str,              # nome declarado (se o agente coletou)
+      "parameters": dict,            # session params BRUTOS acumulados
+                                     # (temperatura do lead + sumario do
+                                     # handoff; pode ter PII — nao logar)
     }
 
 Autenticacao: ADC (service account do Cloud Run) com scope cloud-platform.
@@ -118,6 +121,10 @@ def _normalize_response(payload: dict) -> dict:
         "handoff_summary": str(parameters.get("handoff_summary") or "").strip(),
         "conversation_complete": _coerce_bool(parameters.get("conversation_complete")),
         "user_name": str(parameters.get("user_name") or "").strip(),
+        # Dict BRUTO dos session params acumulados — consumido pelo
+        # _finalize_cx_handoff (temperatura do lead + sumario enriquecido).
+        # Pode conter PII (nome/sintoma): NUNCA logar o conteudo.
+        "parameters": dict(parameters) if isinstance(parameters, dict) else {},
     }
 
 
@@ -128,6 +135,7 @@ _FAILURE = {
     "handoff_summary": "",
     "conversation_complete": False,
     "user_name": "",
+    "parameters": {},
 }
 
 

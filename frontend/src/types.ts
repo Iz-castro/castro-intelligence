@@ -176,6 +176,8 @@ export type Contact = {
   attendance_started_at?: string;
   bot_completed?: boolean;
   bot_setor_nome?: string;
+  // Temperatura do lead (tenants com motor CX; gravada UMA vez, no handoff).
+  lead_temperature?: "quente" | "morno" | "frio" | string;
 };
 
 // Conversation = thread unica (channel_id + wa_id). Mesmo wa_id em
@@ -220,6 +222,8 @@ export type Conversation = {
   contact_avatar_path?: string;
   attendance_protocol?: string;
   attendance_started_at?: string;
+  // Temperatura do lead (denorm; tenants com motor CX, gravada no handoff).
+  lead_temperature?: "quente" | "morno" | "frio" | string;
   // Takeover temporario (coexistence multi-operador): quando um lead de outro
   // operador manda mensagem pro numero deste operador.
   takeover_status?: "none" | "pending" | "active" | string;

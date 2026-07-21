@@ -190,6 +190,7 @@ def _cx_ok(reply, **extra):
         "handoff_summary": "",
         "conversation_complete": False,
         "user_name": "",
+        "parameters": {},
     }
     base.update(extra)
     return base
@@ -198,6 +199,7 @@ def _cx_ok(reply, **extra):
 _CX_FAIL = {
     "ok": False, "reply_text": "", "handoff_request": False,
     "handoff_summary": "", "conversation_complete": False, "user_name": "",
+    "parameters": {},
 }
 
 
@@ -443,6 +445,116 @@ check(pv and "hubloc" not in pv.lower(),
       f"policy_version nao carimba hubloc (veio {pv!r})")
 check(pv == "varizemed-nover-sem-versao", "usa marcador neutro do proprio tenant")
 _CURRENT_TENANT["id"] = _TENANT_ID
+
+print("\n=== n: temperatura — EXECUCAO ADIADA (nenhum write durante o bot) ===")
+novo_contato(13, wa_id="5571123451234", attendance_protocol="20260721-13-GERAL")
+STORE["bot_states"]["13"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Posso agendar sim!", parameters={"wants_appointment": True}))
+envia(13, "quero agendar uma consulta")
+check("lead_temperature" not in STORE["wa_contacts"]["13"],
+      "turno quente NAO grava temperatura (calculo so no handoff)")
+check("lead_temperature" not in STORE["wa_conversations"]["c13"],
+      "conversation sem temperatura durante o bot")
+
+print("\n=== n2: handoff QUENTE — batch write + sumario enriquecido ===")
+CX_SCRIPT.append(_cx_ok(
+    "Transferindo para a equipe!",
+    handoff_request=True,
+    handoff_summary="Paciente quer agendar angiologia com Unimed",
+    user_name="Daniel",
+    parameters={
+        "wants_appointment": "true",            # coercao string do CX
+        "wants_treatment": True,
+        "insurance_validated": True,
+        "user_insurance": "Unimed",
+        "user_specialty": "angiologia",
+        "user_symptom": "dores e vasinhos nas pernas",
+        "user_name": "Daniel",
+    },
+))
+envia(13, "pode transferir")
+c13 = STORE["wa_contacts"]["13"]
+check(c13.get("lead_temperature") == "quente", "handoff -> contato quente")
+check(c13.get("lead_temperature_at") is not None, "carimbo temporal no contato")
+check(STORE["wa_conversations"]["c13"].get("lead_temperature") == "quente",
+      "denorm quente na conversation")
+check(STORE.get("attendances_daily", {}).get("20260721-13-GERAL", {}).get("lead_temperature") == "quente",
+      "carimbo IMUTAVEL no protocolo do dia")
+_m13 = [m for m in MESSAGES if m.get("direction") == "system"
+        and "Temperatura do lead: QUENTE" in m.get("content", "")]
+check(len(_m13) == 1, "system message com a temperatura")
+if _m13:
+    _c = _m13[0]["content"]
+    check(_c.startswith("Bot IA finalizado | Transferido para atendimento humano"),
+          "1a linha do sumario imutavel")
+    check("Nome: Daniel" in _c, "sumario: nome")
+    check("Sintoma: dores e vasinhos nas pernas" in _c, "sumario: sintoma")
+    check("Convenio: Unimed (validado)" in _c, "sumario: convenio validado")
+    check("Especialidade: angiologia" in _c, "sumario: especialidade")
+    check("Quer agendar: sim" in _c, "sumario: quer agendar")
+    check("Quer tratamento: sim" in _c, "sumario: quer tratamento")
+    check("Resumo: Paciente quer agendar angiologia com Unimed" in _c,
+          "sumario: resumo do agente")
+
+print("\n=== n3: handoff FRIO — minimizacao (sem linhas vazias) ===")
+novo_contato(14, wa_id="5571123459999")
+STORE["bot_states"]["14"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Transferindo.", handoff_request=True, parameters={}))
+envia(14, "atendente por favor")
+check(STORE["wa_contacts"]["14"].get("lead_temperature") == "frio",
+      "handoff sem sinais -> frio")
+_m14 = [m for m in MESSAGES if m.get("direction") == "system"
+        and m.get("contact_id") == 14]
+check(bool(_m14) and "Temperatura do lead: FRIO" in _m14[-1].get("content", ""),
+      "sumario frio presente")
+if _m14:
+    _c = _m14[-1]["content"]
+    check("Nome:" not in _c and "Sintoma:" not in _c and "Convenio:" not in _c,
+          "minimizacao: nenhuma linha de campo vazio")
+
+print("\n=== n4: handoff por FALHA classifica frio (cenario f la atras) ===")
+check(STORE["wa_contacts"]["2"].get("lead_temperature") == "frio",
+      "handoff por falha do motor -> frio (sem params)")
+
+print("\n=== n5: re-handoff SOBRESCREVE (semantica por-atendimento) ===")
+c13 = STORE["wa_contacts"]["13"]
+c13["bot_completed"] = False  # simulando 'Devolver ao bot'
+c13["attendance_protocol"] = "20260722-13-GERAL"  # novo protocolo (outro dia)
+STORE["bot_states"]["13"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Transferindo.", handoff_request=True, parameters={}))
+envia(13, "so queria o endereco mesmo, me passa um atendente")
+check(STORE["wa_contacts"]["13"].get("lead_temperature") == "frio",
+      "novo engajamento generico REBAIXA quente->frio (nao fura a fila)")
+check(STORE.get("attendances_daily", {}).get("20260721-13-GERAL", {}).get("lead_temperature") == "quente",
+      "protocolo ANTIGO preserva o quente historico (carimbo imutavel)")
+check(STORE.get("attendances_daily", {}).get("20260722-13-GERAL", {}).get("lead_temperature") == "frio",
+      "protocolo NOVO carimbado frio")
+
+print("\n=== n6: override temperature_signals por tenant (parcial) ===")
+_SIG_CFG = dict(_AI_CFG, temperature_signals={"quente_bool_any": ["custom_flag"]})
+_TENANTS["varizemed-sig"] = {"id": "varizemed-sig", "plan": "ai_custom",
+                             "settings": {"ai": _SIG_CFG}}
+_CURRENT_TENANT["id"] = "varizemed-sig"
+novo_contato(15, wa_id="5571123457777")
+STORE["bot_states"]["15"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Transferindo.", handoff_request=True,
+                        parameters={"custom_flag": "true", "wants_appointment": True}))
+envia(15, "atendente")
+check(STORE["wa_contacts"]["15"].get("lead_temperature") == "quente",
+      "override: custom_flag esquenta")
+novo_contato(16, wa_id="5571123456666")
+STORE["bot_states"]["16"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Transferindo.", handoff_request=True,
+                        parameters={"wants_appointment": True, "user_specialty": "vascular"}))
+envia(16, "atendente")
+check(STORE["wa_contacts"]["16"].get("lead_temperature") == "morno",
+      "override substitui quente_bool_any (wants_appointment nao esquenta mais) "
+      "mas morno default segue valendo (user_specialty)")
+_CURRENT_TENANT["id"] = _TENANT_ID
+
+print("\n=== n7: builtin hubloc NUNCA ganha o campo ===")
+check("lead_temperature" not in STORE["wa_contacts"]["4"],
+      "contato do tenant professional sem lead_temperature")
 
 print("\n" + "=" * 70)
 if FAILS:

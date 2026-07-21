@@ -39,6 +39,14 @@ def main() -> int:
     p.add_argument("--core-version", default="")
     p.add_argument("--customization-version", default="1")
     p.add_argument("--status", default="active", choices=("active", "paused"))
+    p.add_argument(
+        "--temperature-signals", default=None,
+        help=("JSON opcional com override dos sinais de temperatura do lead "
+              "(chaves: quente_bool_any, morno_bool_any, morno_nonempty_any; "
+              "ver lead_temperature.DEFAULT_TEMPERATURE_SIGNALS). Ex.: "
+              "'{\"quente_bool_any\": [\"wants_appointment\"]}'. Sem o arg, "
+              "um override ja gravado e PRESERVADO no re-run."),
+    )
     p.add_argument("--yes", action="store_true", help="aplica (default: dry-run)")
     args = p.parse_args()
 
@@ -78,6 +86,23 @@ def main() -> int:
     }
 
     current = (tenant.get("settings") or {}).get("ai") or {}
+
+    # temperature_signals: o script reescreve settings.ai INTEIRO — sem esta
+    # preservacao, um re-run sem o arg droparia um override existente.
+    # (Gap identico ja existe pro handoff_text_hints — fora de escopo aqui.)
+    if args.temperature_signals is not None:
+        try:
+            sig = json.loads(args.temperature_signals)
+        except json.JSONDecodeError as exc:
+            print(f"--temperature-signals nao e JSON valido: {exc}")
+            return 1
+        known = {"quente_bool_any", "morno_bool_any", "morno_nonempty_any"}
+        if not isinstance(sig, dict) or not set(sig).issubset(known):
+            print(f"--temperature-signals: dict com chaves {sorted(known)} apenas.")
+            return 1
+        ai_cfg["temperature_signals"] = sig
+    elif isinstance(current.get("temperature_signals"), dict):
+        ai_cfg["temperature_signals"] = current["temperature_signals"]
     print(f"=== settings.ai atual do tenant {args.tenant} ===")
     print(json.dumps(current, indent=2, ensure_ascii=False) if current else "  (vazio)")
     print("=== settings.ai a gravar ===")

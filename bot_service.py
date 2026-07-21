@@ -30,6 +30,7 @@ from database import (
     save_wa_message, log_audit,
 )
 from lgpd_bot import handle_lgpd
+from lead_temperature import classify_lead_temperature
 
 logger = logging.getLogger("castro_crm.bot")
 
@@ -664,9 +665,13 @@ async def _process_cx_message(
         # problema, trocar por firestore.Increment + releitura antes de decidir.
         fails = int(state.get("cx_fail_count") or 0) + 1
         if fails >= _CX_MAX_CONSECUTIVE_FAILURES:
+            # Sem params (motor caiu) -> temperatura classifica frio; sem
+            # detalhes coletados no sumario. contact vai pro carimbo do
+            # protocolo do dia.
             _finalize_cx_handoff(
                 contact_id, ai_cfg,
                 summary="Bot IA indisponivel (falhas consecutivas)",
+                contact=contact,
             )
             return _CX_HANDOFF_FAIL_MSG
         _set_bot_state(contact_id, {"cx_fail_count": fails})
@@ -696,6 +701,11 @@ async def _process_cx_message(
             contact_id, ai_cfg,
             summary=str(result.get("handoff_summary") or "").strip(),
             user_name=str(result.get("user_name") or "").strip(),
+            # Params acumulados da sessao CX: unica fonte da temperatura do
+            # lead e do sumario enriquecido (calculo adiado ate aqui — zero
+            # writes por turno).
+            cx_params=result.get("parameters") or {},
+            contact=contact,
         )
         # Nunca transferir em silencio (agente pode pedir handoff sem texto).
         return reply or _CX_HANDOFF_DEFAULT_MSG
@@ -717,8 +727,53 @@ def _dept_id_by_bot_key(bot_key: str):
     return None
 
 
+def _cx_handoff_details(
+    summary: str, user_name: str, cx_params: dict, temperature: str
+) -> str:
+    """Corpo da system message do handoff pro operador (interna ao CRM —
+    cliente nunca recebe). Minimizacao LGPD: so linhas com campo PREENCHIDO;
+    os params crus NUNCA sao persistidos, so estas linhas derivadas.
+    A 1a linha e IMUTAVEL (tooling/sims dependem dela)."""
+    params = cx_params if isinstance(cx_params, dict) else {}
+
+    def _s(key):
+        v = params.get(key)
+        v = str(v).strip() if v is not None else ""
+        return "" if v.lower() in ("null", "none") else v
+
+    def _b(key):
+        v = params.get(key)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("true", "1", "yes", "sim")
+
+    lines = ["Bot IA finalizado | Transferido para atendimento humano"]
+    if temperature:
+        lines.append(f"Temperatura do lead: {temperature.upper()}")
+    nome = (user_name or "").strip() or _s("user_name")
+    if nome:
+        lines.append(f"Nome: {nome}")
+    if _s("user_symptom"):
+        lines.append(f"Sintoma: {_s('user_symptom')}")
+    if _s("user_insurance"):
+        convenio = _s("user_insurance")
+        if _b("insurance_validated"):
+            convenio += " (validado)"
+        lines.append(f"Convenio: {convenio}")
+    if _s("user_specialty"):
+        lines.append(f"Especialidade: {_s('user_specialty')}")
+    if _b("wants_appointment"):
+        lines.append("Quer agendar: sim")
+    if _b("wants_treatment"):
+        lines.append("Quer tratamento: sim")
+    if summary:
+        lines.append(f"Resumo: {summary}")
+    return "\n".join(lines)
+
+
 def _finalize_cx_handoff(
-    contact_id: int, ai_cfg: dict, summary: str = "", user_name: str = ""
+    contact_id: int, ai_cfg: dict, summary: str = "", user_name: str = "",
+    cx_params: Optional[dict] = None, contact: Optional[dict] = None,
 ):
     """Encerra o bot CX transferindo o contato para atendimento humano.
 
@@ -726,8 +781,20 @@ def _finalize_cx_handoff(
     bot_key configurada no tenant), propagacao as conversations (pool do
     setor segmenta por department_id da CONVERSATION), system message com o
     resumo do agente e limpeza do estado. assigned_to fica vazio (pool).
+
+    Temperatura do lead (execucao adiada — decisao do PO 2026-07-21,
+    docs/PLANO_LEAD_TEMPERATURE.md): calculada UMA unica vez AQUI, sobre os
+    session params acumulados da sessao CX (`cx_params`), e gravada em batch
+    junto dos writes que ja existem: contato (mesmo set), conversations
+    (mesmo set do department) e carimbo imutavel no protocolo do dia
+    (attendances_daily). NENHUM write por turno. Handoff novo SOBRESCREVE a
+    temperatura anterior (semantica por-atendimento: historico nao suja a
+    fila do dia). Handoff por falha do motor chega sem params -> frio.
     """
     dept_id = _dept_id_by_bot_key(str(ai_cfg.get("handoff_bot_key") or ""))
+    temperature = classify_lead_temperature(
+        cx_params or {}, ai_cfg.get("temperature_signals")
+    )
 
     notes = "Bot IA: handoff"
     if user_name:
@@ -736,23 +803,34 @@ def _finalize_cx_handoff(
     updates = {
         "bot_completed": True,
         "bot_notes": notes,
+        "lead_temperature": temperature,
+        "lead_temperature_at": utcnow(),
     }
     if dept_id:
         updates["department_id"] = dept_id
     document("wa_contacts", contact_id).set(updates, merge=True)
 
-    if dept_id:
-        for snap in collection("wa_conversations").where(
-            "contact_id", "==", contact_id
-        ).stream():
-            cd = snap.to_dict() or {}
-            if cd.get("is_backup"):
-                continue
-            snap.reference.set({"department_id": dept_id}, merge=True)
+    for snap in collection("wa_conversations").where(
+        "contact_id", "==", contact_id
+    ).stream():
+        cd = snap.to_dict() or {}
+        if cd.get("is_backup"):
+            continue
+        conv_updates = {"lead_temperature": temperature}
+        if dept_id:
+            conv_updates["department_id"] = dept_id
+        snap.reference.set(conv_updates, merge=True)
 
-    sys_content = "Bot IA finalizado | Transferido para atendimento humano"
-    if summary:
-        sys_content += f" | Resumo: {summary}"
+    # Carimbo IMUTAVEL no protocolo do dia (1 dia = 1 protocolo): registro
+    # historico da classificacao daquele atendimento, nao sobrescrito por
+    # engajamentos futuros (cada engajamento carimba o SEU protocolo).
+    protocol_id = str((contact or {}).get("attendance_protocol") or "").strip()
+    if protocol_id:
+        document("attendances_daily", protocol_id).set(
+            {"lead_temperature": temperature}, merge=True,
+        )
+
+    sys_content = _cx_handoff_details(summary, user_name, cx_params or {}, temperature)
     save_wa_message(
         wa_message_id="",
         contact_id=contact_id,
@@ -765,6 +843,6 @@ def _finalize_cx_handoff(
 
     _clear_bot_state(contact_id)
     logger.info(
-        "[BOT-CX] Handoff finalizado | contato=%d | dept_id=%s",
-        contact_id, dept_id,
+        "[BOT-CX] Handoff finalizado | contato=%d | dept_id=%s | temperatura=%s",
+        contact_id, dept_id, temperature,
     )

@@ -446,6 +446,26 @@ function ConflictsPanel() {
   );
 }
 
+// Temperatura do lead (tenants com motor CX): bolinha vermelha/amarela/branca.
+// Data-driven: sem campo no doc (tenants sem IA) -> null, nenhum plumbing de
+// plano/modulo necessario. Gravada pelo backend UMA vez, no handoff do bot.
+const LEAD_TEMPERATURE_META: Record<string, { bg: string; border: string; label: string }> = {
+  quente: { bg: "#dc2626", border: "#dc2626", label: "Lead quente — alta intencao / SLA critico" },
+  morno: { bg: "#f59e0b", border: "#f59e0b", label: "Lead morno — exploratorio" },
+  frio: { bg: "#ffffff", border: "#94a3b8", label: "Lead frio — suporte generico / curiosidade" },
+};
+function LeadTemperatureDot({ temperature }: { temperature?: string }) {
+  const meta = temperature ? LEAD_TEMPERATURE_META[temperature] : undefined;
+  if (!meta) return null;
+  return (
+    <span
+      title={meta.label}
+      aria-label={meta.label}
+      style={{ width: 10, height: 10, borderRadius: "50%", display: "inline-block", flexShrink: 0, background: meta.bg, border: `1.5px solid ${meta.border}` }}
+    />
+  );
+}
+
 function ContactList() {
   const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
@@ -572,6 +592,7 @@ function ContactList() {
                 <div className="row">
                   <strong>{contact.display_name}</strong>
                   <div className="contact-meta">
+                    <LeadTemperatureDot temperature={conversation.lead_temperature || contact.lead_temperature} />
                     {assignedOperator ? (
                       <span
                         className="contact-operator-dot"
@@ -851,6 +872,12 @@ function ChatPanel() {
             <div className="chips">
               <span className="chip">{selectedContact.department_name || "Sem setor"}</span>
               <span className="chip">{selectedContact.qualification || "sem classificacao"}</span>
+              {(selectedThread?.lead_temperature || selectedContact.lead_temperature) ? (
+                <span className="chip" style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem" }}>
+                  <LeadTemperatureDot temperature={selectedThread?.lead_temperature || selectedContact.lead_temperature} />
+                  {selectedThread?.lead_temperature || selectedContact.lead_temperature}
+                </span>
+              ) : null}
             </div>
             <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.4rem", justifyContent: "flex-end" }}>
               {!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={busyAssume}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}

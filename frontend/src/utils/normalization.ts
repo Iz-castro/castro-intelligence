@@ -52,6 +52,7 @@ export function normalizeContact(record: Record<string, unknown>, docId: string)
     attendance_started_at: iso(record.attendance_started_at),
     bot_completed: Boolean(record.bot_completed),
     bot_setor_nome: String(record.bot_setor_nome || ""),
+    lead_temperature: String(record.lead_temperature || ""),
   };
 }
 
@@ -125,5 +126,6 @@ export function normalizeConversation(record: Record<string, unknown>, docId: st
     takeover_status: String(record.takeover_status || "none"),
     lead_owner_user_id: record.lead_owner_user_id == null ? null : num(record.lead_owner_user_id),
     takeover_handler_user_id: record.takeover_handler_user_id == null ? null : num(record.takeover_handler_user_id),
+    lead_temperature: String(record.lead_temperature || ""),
   };
 }
