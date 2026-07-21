@@ -81,6 +81,10 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     phone_number_id: String(record.phone_number_id || ""),
     is_corrected: Boolean(record.is_corrected),
     corrected_by_message_id: record.corrected_by_message_id == null ? null : num(record.corrected_by_message_id),
+    // Sem este mapeamento o filtro de admin_only (CrmContext visibleMessages)
+    // fica INERTE em snapshot mode: a whitelist dropava o campo e mensagens
+    // restritas (ex.: rating) apareciam pra operador comum.
+    visibility: String(record.visibility || "all"),
   };
 }
 
