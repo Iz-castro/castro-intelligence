@@ -102,14 +102,16 @@ function LoginScreen() {
 }
 
 function TopBar() {
-  const { sessionUser, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout, can } = useCrm();
+  const { sessionUser, tenantName, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout, can } = useCrm();
   const [gcOpen, setGcOpen] = useState(false);
   useClickOutside(settingsMenuRef, showSettings === "menu", () => setShowSettings(false));
   if (!sessionUser) return null;
   const gcEnabled = config?.feature_google_chat ?? false;
   return (
     <header className="crm-topbar">
-      <div className="topbar-brand"><p className="eyebrow">Hubloc CRM</p></div>
+      {/* Branding por tenant: nome dado no super-admin (tenant.name via
+          /api/session). Fallback neutro so no instante entre login e sessao. */}
+      <div className="topbar-brand"><p className="eyebrow">{tenantName || "CRM"}</p></div>
       <div className="topbar-user">
         <strong>{sessionUser.display_name}</strong>
         <span className="sub">{sessionUser.email || sessionUser.username} · <span className="chip">{sessionUser.role}</span>{sessionUser.department_name ? <> · <span className="chip">{sessionUser.department_name}</span></> : null}</span>

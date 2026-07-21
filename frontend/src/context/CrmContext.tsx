@@ -31,6 +31,8 @@ type CrmContextValue = {
   bundle: FirebaseBundle | null;
   firebaseUser: User | null;
   sessionUser: SessionUser | null;
+  // Nome do tenant (dado no super-admin) — branding do topbar por tenant.
+  tenantName: string;
   operators: Operator[];
   departments: Department[];
   channels: Channel[];
@@ -349,6 +351,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [bundle, setBundle] = useState<FirebaseBundle | null>(null);
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
+  const [tenantName, setTenantName] = useState("");
   // Perfil RBAC efetivo da sessao (M-B2). Nasce do /api/session (toggles ja
   // resolvidos com fallback de role) e e atualizado ao vivo pelo snapshot do
   // doc perfis_acesso/{id} do tenant.
@@ -1011,6 +1014,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // ate um hard refresh (vazamento LGPD em PC compartilhado).
   function resetUserScopedState() {
     setPerfil(null);
+    setTenantName("");
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
@@ -1059,6 +1063,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         const session = await getJson<{
           user: SessionUser;
           tenant_id?: string;
+          tenant?: { id: string; name?: string; plan?: string; modules?: string[] };
           firestore_collections?: Record<string, string>;
           perfil?: SessionPerfil;
         }>(bundle.auth, "/api/session");
@@ -1068,6 +1073,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           getJson<{ channels: Channel[] }>(bundle.auth, "/api/admin/channels").catch(() => ({ channels: [] as Channel[] })),
         ]);
         setSessionUser(session.user);
+        // Branding por tenant: o nome dado no super-admin (tenant.name) vira o
+        // titulo do topbar. Fallback = tenant_id (o backend ja faz isso).
+        setTenantName(session.tenant?.name || "");
         setPerfil(session.perfil ?? null);
         setOperators(ops);
         setDepartments(deps.departments);
@@ -2313,7 +2321,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, operators, departments, channels, booting, busyLogin, snapshotMode,
+    config, bundle, firebaseUser, sessionUser, tenantName, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, logout, mfaPending, resolveMfaCode, cancelMfa,
