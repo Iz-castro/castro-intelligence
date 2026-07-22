@@ -3782,6 +3782,17 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     # Fase 5A: protocolo NAO e mais gerado no assume (so no 1o inbound do dia
     # via webhook -> ensure_daily_attendance). Reusa o atual se ja existe.
     protocol = get_current_protocol_id(contact_id) or ""
+    # Lead self-service do bot CX (conversou com a IA mas NUNCA pediu handoff,
+    # ex.: foi agendar online): classifica a temperatura e emite o resumo do
+    # que a IA coletou, a partir do snapshot em bot_states. Sem isto o lead
+    # ficava sem badge e sem resumo justamente pra quem assume. Antes da
+    # system message do assume pra ordem de leitura ficar cronologica.
+    # Nao-fatal: falha aqui nunca derruba o assume.
+    try:
+        from bot_service import apply_cx_snapshot_on_assume
+        apply_cx_snapshot_on_assume(contact_id, contact)
+    except Exception:
+        logger.exception("[ASSUME] resumo do bot CX falhou | contato=%s", contact_id)
     sys_content = f"Atendimento assumido por {current_user['display_name']}" + (f" | Protocolo: {protocol}" if protocol else "")
     insert_transfer_system_message(contact_id, sys_content, current_user["id"])
     log_audit(current_user["id"], "WA_ASSUME", f"Contato {contact_id}" + (f" | Protocolo {protocol}" if protocol else ""))

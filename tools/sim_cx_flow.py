@@ -556,6 +556,81 @@ print("\n=== n7: builtin hubloc NUNCA ganha o campo ===")
 check("lead_temperature" not in STORE["wa_contacts"]["4"],
       "contato do tenant professional sem lead_temperature")
 
+print("\n=== o: LEAD SELF-SERVICE (bot resolve, sem handoff) -> assume classifica ===")
+# Reproduz o caso real de 2026-07-21: cliente conversou, perguntou endereco/
+# horario, decidiu agendar ONLINE e nunca pediu atendente.
+novo_contato(17, wa_id="5531982779779", attendance_protocol="20260721-17-GERAL")
+STORE["bot_states"]["17"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Temos microespuma e laser.",
+                        parameters={"user_specialty": "angiologia"}))
+envia(17, "me fale sobre os tratamentos")
+check(STORE["bot_states"]["17"].get("cx_snapshot") == {"user_specialty": "angiologia"},
+      "turno sem handoff guarda snapshot em bot_states")
+check("lead_temperature" not in STORE["wa_contacts"]["17"],
+      "NENHUM write em wa_contacts durante o bot (execucao adiada preservada)")
+check("lead_temperature" not in STORE["wa_conversations"]["c17"],
+      "NENHUM write em wa_conversations durante o bot")
+
+_snap_antes = dict(STORE["bot_states"]["17"]["cx_snapshot"])
+CX_SCRIPT.append(_cx_ok("O endereco e Rua X.",
+                        parameters={"user_specialty": "angiologia"}))
+envia(17, "qual o endereco?")
+check(STORE["bot_states"]["17"]["cx_snapshot"] == _snap_antes,
+      "params IGUAIS no turno seguinte -> snapshot inalterado (sem write inutil)")
+
+CX_SCRIPT.append(_cx_ok("Voce pode agendar online.",
+                        parameters={"user_specialty": "angiologia", "user_name": "Izael",
+                                    "wants_appointment": True}))
+envia(17, "como faco para agendar?")
+check(STORE["bot_states"]["17"]["cx_snapshot"].get("wants_appointment") is True,
+      "snapshot atualiza quando a informacao coletada MUDA")
+check("lead_temperature" not in STORE["wa_contacts"]["17"],
+      "ainda sem write no contato (cliente nunca pediu handoff)")
+
+# Operador assume (o que o endpoint /api/wa/assume passa a chamar)
+emitiu = bot.apply_cx_snapshot_on_assume(17)
+check(emitiu is True, "assume com snapshot -> emite")
+c17 = STORE["wa_contacts"]["17"]
+check(c17.get("lead_temperature") == "quente",
+      "assume classifica QUENTE (wants_appointment coletado no bot)")
+check(STORE["wa_conversations"]["c17"].get("lead_temperature") == "quente",
+      "badge: denorm na conversation")
+check(STORE.get("attendances_daily", {}).get("20260721-17-GERAL", {}).get("lead_temperature") == "quente",
+      "carimbo no protocolo do dia")
+_m17 = [m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17]
+check(bool(_m17), "resumo emitido no thread")
+if _m17:
+    _c = _m17[-1]["content"]
+    check(_c.startswith("Resumo do bot IA | Atendimento assumido durante a conversa"),
+          "header do assume (NAO diz 'Transferido para atendimento humano')")
+    check("Temperatura do lead: QUENTE" in _c, "resumo do assume traz a temperatura")
+    check("Nome: Izael" in _c and "Especialidade: angiologia" in _c,
+          "resumo do assume traz o que a IA coletou")
+
+print("\n=== o2: assume e IDEMPOTENTE (2o clique nao duplica) ===")
+_antes = len([m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17])
+emitiu2 = bot.apply_cx_snapshot_on_assume(17)
+check(emitiu2 is False, "2o assume nao reemite (snapshot consumido)")
+check(len([m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17]) == _antes,
+      "nenhuma system message duplicada")
+
+print("\n=== o3: assume de contato SEM bot CX -> no-op ===")
+novo_contato(18, wa_id="5531999997777")
+check(bot.apply_cx_snapshot_on_assume(18) is False,
+      "contato sem snapshot (nunca falou com a IA) -> no-op")
+check("lead_temperature" not in STORE["wa_contacts"]["18"], "nada gravado")
+_CURRENT_TENANT["id"] = "hubloc"
+novo_contato(19, wa_id="5531999996666")
+STORE["bot_states"]["19"] = {"cx_snapshot": {"wants_appointment": True}}
+check(bot.apply_cx_snapshot_on_assume(19) is False,
+      "tenant builtin (hubloc) -> no-op mesmo com snapshot")
+_CURRENT_TENANT["id"] = _TENANT_ID
+
+print("\n=== o4: handoff normal segue com o header antigo (sem regressao) ===")
+_hdr = [m for m in MESSAGES if m.get("direction") == "system"
+        and str(m.get("content", "")).startswith("Bot IA finalizado | Transferido")]
+check(len(_hdr) >= 3, "handoffs anteriores mantem o header 'Bot IA finalizado'")
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")

@@ -72,6 +72,23 @@ def _resolve_signals(overrides) -> dict:
     return signals
 
 
+def signal_keys(signals=None) -> list:
+    """Todos os nomes de param referenciados pela config (default ou override).
+
+    Usado pelo bot_service pra montar o snapshot MINIMO persistido em
+    bot_states — sem isto, um override de tenant apontando pra params
+    exoticos ficaria de fora do snapshot e a classificacao no 'assumir'
+    sairia errada.
+    """
+    cfg = _resolve_signals(signals)
+    names = []
+    for key in ("quente_bool_any", "morno_bool_any", "morno_nonempty_any"):
+        for name in cfg.get(key) or []:
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def classify_lead_temperature(params, signals=None) -> str:
     """Classifica os params de sessao do CX em quente/morno/frio.
 

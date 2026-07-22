@@ -30,7 +30,7 @@ from database import (
     save_wa_message, log_audit,
 )
 from lgpd_bot import handle_lgpd
-from lead_temperature import classify_lead_temperature
+from lead_temperature import classify_lead_temperature, signal_keys
 
 logger = logging.getLogger("castro_crm.bot")
 
@@ -710,6 +710,15 @@ async def _process_cx_message(
         # Nunca transferir em silencio (agente pode pedir handoff sem texto).
         return reply or _CX_HANDOFF_DEFAULT_MSG
 
+    # Turno SEM handoff: guarda o snapshot minimo dos params coletados em
+    # bot_states (doc efemero, SEM listener no frontend e fora do caminho
+    # quente) pra que o operador que ASSUMIR um lead self-service tenha
+    # temperatura + resumo. Grava so quando a informacao MUDA — nao e write
+    # por turno, e nao toca wa_contacts/wa_conversations durante o bot.
+    snapshot = _cx_snapshot(result.get("parameters"), ai_cfg.get("temperature_signals"))
+    if snapshot and snapshot != (state.get("cx_snapshot") or {}):
+        _set_bot_state(contact_id, {"cx_snapshot": snapshot})
+
     # conversation_complete sem handoff: cliente pode voltar a falar com o
     # bot depois. NAO limpa o estado (preservaria re-pergunta da LGPD) —
     # a sessao do CX expira sozinha no Dialogflow (~30min).
@@ -727,13 +736,123 @@ def _dept_id_by_bot_key(bot_key: str):
     return None
 
 
+# Campos do CX usados no SUMARIO (alem dos sinais de temperatura, que vem da
+# config). Definem, junto com signal_keys(), o snapshot MINIMO persistido em
+# bot_states — minimizacao LGPD: nada do dict cru de params vai pro banco.
+_CX_SUMMARY_KEYS = (
+    "user_name", "user_symptom", "user_insurance", "user_specialty",
+    "wants_appointment", "wants_treatment", "insurance_validated",
+)
+
+_CX_HANDOFF_HEADER = "Bot IA finalizado | Transferido para atendimento humano"
+_CX_ASSUME_HEADER = "Resumo do bot IA | Atendimento assumido durante a conversa"
+
+
+def _cx_snapshot(params, signals=None) -> dict:
+    """Subconjunto minimo e ESTAVEL dos params (so chaves preenchidas) que
+    alimenta temperatura + sumario. Guardado em bot_states pra permitir
+    classificar quando o operador ASSUME um lead que nunca pediu handoff
+    (self-service) — bot_states nao tem listener no frontend nem e doc quente,
+    entao isto NAO reintroduz o write-por-turno vetado nos wa_contacts/
+    wa_conversations (so grava quando a informacao coletada muda)."""
+    if not isinstance(params, dict):
+        return {}
+    keys = list(_CX_SUMMARY_KEYS) + [k for k in signal_keys(signals) if k not in _CX_SUMMARY_KEYS]
+    snap = {}
+    for key in keys:
+        value = params.get(key)
+        if value is None or value == "":
+            continue
+        snap[key] = value
+    return snap
+
+
+def _persist_lead_temperature(
+    contact_id: int, temperature: str, contact: Optional[dict] = None,
+    contact_extra: Optional[dict] = None, dept_id=None,
+):
+    """Grava a temperatura no contato + conversations + protocolo do dia.
+
+    `contact_extra`/`dept_id` entram no MESMO set do contato (o handoff
+    aproveita pra gravar bot_completed/notes/department sem write extra).
+    O carimbo em attendances_daily e IMUTAVEL por protocolo: engajamento
+    novo carimba o protocolo do SEU dia, sem apagar o historico."""
+    updates = dict(contact_extra or {})
+    updates["lead_temperature"] = temperature
+    updates["lead_temperature_at"] = utcnow()
+    if dept_id:
+        updates["department_id"] = dept_id
+    document("wa_contacts", contact_id).set(updates, merge=True)
+
+    for snap in collection("wa_conversations").where(
+        "contact_id", "==", contact_id
+    ).stream():
+        cd = snap.to_dict() or {}
+        if cd.get("is_backup"):
+            continue
+        conv_updates = {"lead_temperature": temperature}
+        if dept_id:
+            conv_updates["department_id"] = dept_id
+        snap.reference.set(conv_updates, merge=True)
+
+    protocol_id = str((contact or {}).get("attendance_protocol") or "").strip()
+    if protocol_id:
+        document("attendances_daily", protocol_id).set(
+            {"lead_temperature": temperature}, merge=True,
+        )
+
+
+def apply_cx_snapshot_on_assume(contact_id: int, contact: Optional[dict] = None) -> bool:
+    """Classifica + emite o resumo quando um operador ASSUME um contato que
+    estava em conversa com o bot CX SEM ter chegado a handoff (lead
+    self-service: resolveu no proprio bot, ex.: foi agendar online).
+
+    Sem isto o lead ficava invisivel — sem badge e sem resumo — justamente
+    quem o operador precisa priorizar (caso real do teste 2026-07-21).
+    Idempotente: consome o snapshot (zera) pra um 2o assume nao duplicar.
+    Retorna True se emitiu. Nunca levanta pro caller."""
+    ai_cfg = _get_tenant_ai_config()
+    if str(ai_cfg.get("bot_engine") or "").strip().lower() != "dialogflow_cx":
+        return False
+    state = _get_bot_state(contact_id)
+    snap = state.get("cx_snapshot") or {}
+    if not isinstance(snap, dict) or not snap:
+        return False
+
+    if contact is None:
+        contact = get_wa_contact(contact_id) or {}
+    temperature = classify_lead_temperature(snap, ai_cfg.get("temperature_signals"))
+    _persist_lead_temperature(contact_id, temperature, contact)
+
+    sys_content = _cx_handoff_details(
+        summary="", user_name=str(snap.get("user_name") or ""),
+        cx_params=snap, temperature=temperature, header=_CX_ASSUME_HEADER,
+    )
+    save_wa_message(
+        wa_message_id="",
+        contact_id=contact_id,
+        direction="system",
+        msg_type="system",
+        content=sys_content,
+        status="",
+        timestamp_wa=utcnow().isoformat(),
+    )
+    _set_bot_state(contact_id, {"cx_snapshot": None})
+    logger.info(
+        "[BOT-CX] Resumo emitido no assume | contato=%d | temperatura=%s",
+        contact_id, temperature,
+    )
+    return True
+
+
 def _cx_handoff_details(
-    summary: str, user_name: str, cx_params: dict, temperature: str
+    summary: str, user_name: str, cx_params: dict, temperature: str,
+    header: str = _CX_HANDOFF_HEADER,
 ) -> str:
-    """Corpo da system message do handoff pro operador (interna ao CRM —
-    cliente nunca recebe). Minimizacao LGPD: so linhas com campo PREENCHIDO;
-    os params crus NUNCA sao persistidos, so estas linhas derivadas.
-    A 1a linha e IMUTAVEL (tooling/sims dependem dela)."""
+    """Corpo da system message pro operador (interna ao CRM — cliente nunca
+    recebe). Minimizacao LGPD: so linhas com campo PREENCHIDO; os params crus
+    NUNCA sao persistidos, so estas linhas derivadas. A 1a linha (header) e
+    IMUTAVEL por caminho (tooling/sims dependem dela)."""
     params = cx_params if isinstance(cx_params, dict) else {}
 
     def _s(key):
@@ -747,7 +866,7 @@ def _cx_handoff_details(
             return v
         return str(v).strip().lower() in ("true", "1", "yes", "sim")
 
-    lines = ["Bot IA finalizado | Transferido para atendimento humano"]
+    lines = [header]
     if temperature:
         lines.append(f"Temperatura do lead: {temperature.upper()}")
     nome = (user_name or "").strip() or _s("user_name")
@@ -800,35 +919,11 @@ def _finalize_cx_handoff(
     if user_name:
         notes += f" | Nome={user_name}"
 
-    updates = {
-        "bot_completed": True,
-        "bot_notes": notes,
-        "lead_temperature": temperature,
-        "lead_temperature_at": utcnow(),
-    }
-    if dept_id:
-        updates["department_id"] = dept_id
-    document("wa_contacts", contact_id).set(updates, merge=True)
-
-    for snap in collection("wa_conversations").where(
-        "contact_id", "==", contact_id
-    ).stream():
-        cd = snap.to_dict() or {}
-        if cd.get("is_backup"):
-            continue
-        conv_updates = {"lead_temperature": temperature}
-        if dept_id:
-            conv_updates["department_id"] = dept_id
-        snap.reference.set(conv_updates, merge=True)
-
-    # Carimbo IMUTAVEL no protocolo do dia (1 dia = 1 protocolo): registro
-    # historico da classificacao daquele atendimento, nao sobrescrito por
-    # engajamentos futuros (cada engajamento carimba o SEU protocolo).
-    protocol_id = str((contact or {}).get("attendance_protocol") or "").strip()
-    if protocol_id:
-        document("attendances_daily", protocol_id).set(
-            {"lead_temperature": temperature}, merge=True,
-        )
+    _persist_lead_temperature(
+        contact_id, temperature, contact,
+        contact_extra={"bot_completed": True, "bot_notes": notes},
+        dept_id=dept_id,
+    )
 
     sys_content = _cx_handoff_details(summary, user_name, cx_params or {}, temperature)
     save_wa_message(
