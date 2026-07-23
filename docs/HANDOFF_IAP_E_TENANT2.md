@@ -1,82 +1,117 @@
-# Handoff — IAP no Cloud Run B → ligar o tenant #2
+# Handoff — IAP no Cloud Run B (hardening do painel super-admin)
 
-> Documento de retomada (conversa nova). Estado em 2026-07-12. Autossuficiente:
+> **Doc de retomada (conversa nova). Estado em 2026-07-23.** Autossuficiente:
 > dá pra continuar só com este doc + `docs/PLANO_OPERACAO_CLOUDRUN_B.md` +
-> `docs/PLANO_RBAC_E_SUPER_ADMIN.md` + a memória `project_multitenant_fase2_roadmap`.
+> `docs/PLANO_RBAC_E_SUPER_ADMIN.md` + as memórias `project_multitenant_fase2_roadmap`
+> e `project_oregon_prod_cutover`.
 >
-> **Próximo passo escolhido:** montar **IAP + domínio** na frente do Cloud Run B
-> (2ª camada de rede) ANTES de ligar o tenant #2 real. (Alternativa ainda válida
-> se faltar tempo: aceitar o v1 com a auth do app endurecida e fazer o IAP depois.)
+> **O que é:** montar **IAP + domínio** na frente do **Cloud Run B** (painel
+> super-admin `castro-superadmin`) — uma 2ª camada de rede, independente da auth
+> do app, pra proteger o serviço mais sensível do sistema.
+>
+> **Status:** NÃO iniciado (a API `compute.googleapis.com` do projeto nem está
+> habilitada). Deixou de ser bloqueador de qualquer coisa em produção — ver
+> "Mudança de contexto" abaixo. É uma **hardening recomendada ANTES de criar
+> tenants de CLIENTES REAIS pelo painel B**.
+>
+> **Dependência crítica única:** decidir o **subdomínio/DNS** do painel
+> (sugestão: `admin.castrointelligence.com.br`, registro A sob controle da Castro).
+> Sem isso o IAP não sai do lugar.
 
 ---
 
-## 1. Estado atual (tudo pronto e em prod)
+## 0. Mudança de contexto desde 2026-07-12 (LEIA ISTO)
 
-**Projeto GCP (Oregon):** `project-4a851bf9-f475-418c-800` · região `us-west1`.
+O doc original tratava o IAP como **gate pra "ligar o tenant #2 real"**. Isso
+mudou — o produto evoluiu por outro caminho:
 
-**Pré-#2 — 100% em prod:** M-A1, M-A2, M-A4, M-A4b, M-B2 (RBAC), login tenant-aware,
-storage. (Detalhe no ROADMAP blocos 0d–0g.)
+- O **tenant #2 virou a Varizemed** (clínica), atacada como **motor de bot
+  Dialogflow CX por tenant**, não via criação de tenant pelo painel B. O tenant
+  de teste **`varizemed-test` foi criado DIRETO no banco de prod** (o webhook da
+  Meta aponta pra prod; isolamento é estrutural por path), com número real DDD 71,
+  bot da Val respondendo, handoff, e a feature de **temperatura do lead**
+  (quente/morno/frio) — tudo em prod e validado. Ver memórias
+  `project_varizemed_migration`, `project_lead_temperature`.
+- Logo, **o IAP não bloqueia mais nada do que já foi entregue.** Ele volta a ser
+  o que sempre foi na essência: **endurecer o painel B** pro dia em que a Castro
+  for provisionar tenants de **clientes reais** por lá (fluxo self-service do
+  super-admin), OU simplesmente pra fechar a superfície de ataque do serviço mais
+  poderoso do sistema. Recomendável, não urgente.
+- A **Varizemed REAL** (go-live com pacientes de verdade) tem o **seu próprio
+  gate — J-3 hardening LGPD** (cripto de campo sensível, audit de leitura, TTL/
+  retenção, DPA; clínica = dado de saúde), que é **separado** do IAP. Ver
+  `docs/PLANO_LEAD_TEMPERATURE.md` e `docs/PLANO_TENANT_TESTE_VARIZEMED_CX.md` (J-3).
+
+---
+
+## 1. Estado atual da infra (Oregon)
+
+**Projeto GCP:** `project-4a851bf9-f475-418c-800` · região `us-west1` · Firestore
+`(default)` Native · banco de prod = prefixo `castro_crm` (staging = tagged
+revision, prefixo `castro_crm_staging`). ⚠ `gcloud config` pode apontar pro
+projeto ANTIGO (SP) — passar `--project` explícito sempre
+(ver `project_oregon_prod_cutover`).
 
 **Cloud Run A (CRM operacional):** serviço `castro-crm` · URL
-`https://castro-crm-jdznvidcxq-uw.a.run.app` · rev atual `castro-crm-00047-sin`.
+`https://castro-crm-jdznvidcxq-uw.a.run.app` · **rev atual `castro-crm-00096-ray`**
+(saltou de 00047 em 12/07 — CX bot engine, recuperação do incidente de colisão de
+canal, fix channels-global, dieta de reads, temperatura do lead, branding topbar).
+minScale=1. NÃO é alvo do IAP (é o app dos operadores, internet-facing por design).
 
-**Cloud Run B (painel super-admin):** serviço `castro-superadmin` ·
-URL `https://castro-superadmin-28179318848.us-west1.run.app` · rev `00002-7pm`
-(com o hardening da revisão). Deploy: imagem
-`us-west1-docker.pkg.dev/project-4a851bf9-f475-418c-800/cloud-run-source-deploy/castro-superadmin:latest`,
-buildada por `cloudbuild-superadmin.yaml` + `Dockerfile.superadmin` (imagem mínima,
-só o fecho de imports + a página). SA dedicada
+**Cloud Run B (painel super-admin) — ALVO DO IAP:** serviço `castro-superadmin` ·
+URL `https://castro-superadmin-jdznvidcxq-uw.a.run.app` · **rev `castro-superadmin-00003-lsw`**.
+Deploy: imagem `.../cloud-run-source-deploy/castro-superadmin:latest`, buildada por
+`cloudbuild-superadmin.yaml` + `Dockerfile.superadmin` (imagem mínima). SA dedicada
 `castro-superadmin-sa@project-4a851bf9-f475-418c-800.iam.gserviceaccount.com`
-(roles `datastore.user` + `firebaseauth.admin`). Hoje: `--allow-unauthenticated` +
-`--ingress all` (é o que o IAP vem endurecer).
+(roles `datastore.user` + `firebaseauth.admin`). **Hoje: internet-facing**
+(`--allow-unauthenticated`, ingress default `all`) — é exatamente o que o IAP vem
+endurecer.
 
-**Fundação (Sprint 0):** `super_admins/{uid}` root + `audit_logs_system/{id}` root +
-`isSuperAdmin()` nas rules (ruleset **cb1bd995**). Founders com claim `super_admin`
-concedido (`--allow-no-mfa`, bootstrap):
+**IAP/LB: ZERO.** `compute.googleapis.com` não está habilitada no projeto →
+nenhum IP estático, NEG, backend service ou LB existe. Habilitar a Compute API é
+o passo 0 de fato.
+
+**Fundação super-admin (pronta e em prod):** `super_admins/{uid}` root +
+`audit_logs_system/{id}` root + `isSuperAdmin()` nas rules. Founders com claim
+`super_admin`:
 - Rafael — `rafaluisc@outlook.com` — uid `mbg9JRY86MUADtfja6pi3zxs7Az2`
 - Izael  — `izaeldecastro@gmail.com` — uid `dFn2kayBsEOnS7A9BFmbBivNUGt1`
 
-**Identity Platform:** upgradado; **TOTP habilitado** (`mfa.state=ENABLED`). Domínios
-autorizados do Firebase Auth incluem a URL do B.
+**Identity Platform:** upgradado; TOTP habilitado (`mfa.state=ENABLED`). Rafael
+validou o painel B ponta a ponta (login + TOTP + criar/limpar tenant de ensaio +
+isolamento). Izael: confirmar se já enrollou TOTP no painel B ao retomar.
 
-**M-A5 (ensaio):** VALIDADO ponta a ponta — Rafael logou no B, enrollou TOTP, criou o
-tenant de teste `ensaio1`, e confirmou o isolamento por dentro (logando no CRM como
-admin do ensaio). Depois o `ensaio1` foi **removido** (limpo). Rafael tem TOTP enrollado
-no app; Izael provavelmente ainda não (verificar ao retomar).
-
-**Revisão adversarial do B (2026-07-12):** 25 achados (16 confirmados). Corrigidos
-(commit `a7cc82e`, rev `00002-7pm`): MFA guarda-dura (deployado sempre exige MFA), XSS
-(escape), `mfa_enrolled` verificado via Admin SDK, kill switch imediato
-(`check_revoked=True`), security headers/CSP, audit-after best-effort, `/healthz` sem
-leak, secret TOTP limpo. Teste 18/18. **Pendente = a decisão de infra (IAP).**
-
-**Commits locais** (todos os da Fase B — confirmar `git push origin develop`):
-`a59736e` (backend), `a17d0cc` (página+MFA), `d5fc00d` (deploy artifacts),
-`537fcf2` (Fase A), `a7cc82e` (hardening).
+**Hardening do B (revisão adversarial 2026-07-12, commit `a7cc82e`):** 25 achados,
+16 corrigidos — MFA guarda-dura, XSS escapado, `mfa_enrolled` via Admin SDK, kill
+switch `check_revoked=True`, security headers/CSP, `/healthz` sem leak. A auth do
+app (`require_super_admin`) é sólida e fail-closed. O IAP é a 2ª camada por cima
+dela, não a única.
 
 ---
 
 ## 2. Por que IAP (o problema)
 
-O B é internet-facing e nuclear: a SA lê Firestore de TODOS os tenants e seta qualquer
-claim. Hoje a única trava de rede é o `require_super_admin` do app (fail-closed, MFA
-sempre, revogação imediata — sólido). O IAP adiciona uma **2ª camada independente**: só
-identidades Google allowlistadas (Rafael + Izael) chegam no container; o resto é barrado
-no load balancer. Rafael confirmou que o outlook dele **é conta Google** → serve pro IAP
+O B é internet-facing e nuclear: a SA lê Firestore de TODOS os tenants e seta
+qualquer claim. Hoje a única trava de rede é o `require_super_admin` do app (MFA
+sempre, revogação imediata — sólido). O IAP adiciona uma **2ª camada independente**:
+só identidades Google allowlistadas (Rafael + Izael) chegam no container; o resto é
+barrado no load balancer. O outlook do Rafael **é conta Google** → serve pro IAP
 (sem precisar gmail).
 
 ---
 
-## 3. Plano do IAP + domínio (a executar)
+## 3. Plano do IAP + domínio (a executar — comandos, ainda 100% válidos)
 
-IAP no Cloud Run exige um **HTTPS Load Balancer** na frente (Serverless NEG) + IAP no
-backend service. Passos (ajustar nomes):
+IAP no Cloud Run exige um **HTTPS Load Balancer** na frente (Serverless NEG) + IAP
+no backend service. Passos (ajustar nomes):
+
+**Passo 0 — Compute API:** `gcloud services enable compute.googleapis.com --project project-4a851bf9-f475-418c-800`.
 
 **Pré-requisito — domínio:** escolher um subdomínio com DNS sob controle da Castro
 (sugestão: `admin.castrointelligence.com.br`). Precisa poder criar um registro A.
 
-1. **OAuth consent screen** (uma vez): configurar a brand no GCP (APIs & Services →
-   OAuth consent screen, Internal se for Workspace).
+1. **OAuth consent screen** (uma vez): APIs & Services → OAuth consent screen
+   (Internal se for Workspace).
 2. **IP estático global:** `gcloud compute addresses create castro-superadmin-ip --global`.
 3. **Serverless NEG** → o Cloud Run B:
    `gcloud compute network-endpoint-groups create castro-superadmin-neg --region us-west1 --network-endpoint-type serverless --cloud-run-service castro-superadmin`.
@@ -85,54 +120,57 @@ backend service. Passos (ajustar nomes):
 5. **Cert gerenciado** (precisa do domínio):
    `gcloud compute ssl-certificates create castro-superadmin-cert --domains admin.castrointelligence.com.br --global`.
 6. **URL map + target HTTPS proxy + forwarding rule** apontando pro IP estático (porta 443).
-7. **DNS:** registro **A** de `admin.castrointelligence.com.br` → o IP estático. Aguardar
-   o cert gerenciado ficar ACTIVE (pode levar minutos/horas após o DNS propagar).
-8. **Habilitar IAP** no backend service + **allowlist**: adicionar `rafaluisc@outlook.com`
-   e `izaeldecastro@gmail.com` como **IAP-secured Web App User**
+7. **DNS:** registro **A** de `admin.castrointelligence.com.br` → o IP estático.
+   Aguardar o cert gerenciado ficar ACTIVE (minutos/horas após o DNS propagar).
+8. **Habilitar IAP** no backend service + **allowlist**: `rafaluisc@outlook.com` e
+   `izaeldecastro@gmail.com` como **IAP-secured Web App User**
    (`roles/iap.httpsResourceAccessor`). Conceder o IAP service agent como invoker no
    Cloud Run (`roles/run.invoker` ao `service-...@gcp-sa-iap.iam.gserviceaccount.com`).
-9. **Trancar o ingress:** `gcloud run services update castro-superadmin --region us-west1
-   --ingress internal-and-cloud-load-balancing` → a URL `.run.app` direta para de
-   responder; só passa pelo LB+IAP.
-10. **Testar:** abrir `https://admin.castrointelligence.com.br` → tela do Google (IAP) →
-    login do painel (Firebase + TOTP) → painel. Confirmar que a URL `.run.app` direta dá 403.
-11. **Atualizar domínios autorizados do Firebase Auth** com o novo domínio
-    `admin.castrointelligence.com.br` (senão o login Firebase dá `auth/unauthorized-domain`).
+9. **Trancar o ingress:** `gcloud run services update castro-superadmin --region us-west1 --ingress internal-and-cloud-load-balancing` → a URL `.run.app` direta para de responder; só passa pelo LB+IAP.
+10. **Testar:** abrir `https://admin.castrointelligence.com.br` → tela do Google (IAP)
+    → login do painel (Firebase + TOTP) → painel. Confirmar que a `.run.app` direta dá 403.
+11. **Domínios autorizados do Firebase Auth:** adicionar `admin.castrointelligence.com.br`
+    (senão o login Firebase dá `auth/unauthorized-domain`).
 
-> Nota: o `--allow-unauthenticated` do Cloud Run pode permanecer (o ingress
-> internal-and-LB já impede acesso direto; o IAP gateia o LB). Rever se convém trocar
-> pra `--no-allow-unauthenticated` + invoker só pro IAP.
+> Nota: o `--allow-unauthenticated` pode permanecer (o ingress internal-and-LB já
+> impede acesso direto; o IAP gateia o LB). Rever se convém trocar pra
+> `--no-allow-unauthenticated` + invoker só pro IAP.
 
 ---
 
-## 4. Depois do IAP — ligar o tenant #2 real
+## 4. Depois do IAP — criar tenant de CLIENTE REAL pelo painel B
+
+(Fluxo self-service do super-admin. Distinto do `varizemed-test`, que foi criado
+direto no banco por script.)
 
 1. (Se ainda não) Izael enrolla o TOTP no painel B.
-2. No painel B: criar o tenant #2 com os dados reais do cliente (slug, nome, CNPJ, plano,
-   email do admin do cliente, `allowed_email_domains` = domínio próprio do cliente — NUNCA
-   provedor público; o sistema já ignora públicos). O `bootstrap_tenant` cria setores + 3
-   perfis RBAC + admin com claim atômico, tudo auditado.
-3. Provisionar o canal WhatsApp do cliente (standard, Embedded Signup — fluxo do CRM A, já
-   existe). Ver ROADMAP "Fase 2 — provisionar o canal".
-4. Convidar o admin do cliente (a conta Firebase nasce sem senha → link de convite/definir
+2. No painel B: criar o tenant com dados reais (slug, nome, CNPJ, plano, email do
+   admin do cliente, `allowed_email_domains` = domínio próprio do cliente — NUNCA
+   provedor público; o sistema já ignora públicos). O `bootstrap_tenant` cria
+   setores + 3 perfis RBAC + admin com claim atômico, tudo auditado.
+3. Provisionar o canal WhatsApp (standard via Embedded Signup, fluxo do CRM A).
+   ⚠ Colisão de channel_id JÁ CORRIGIDA (contador global; ver
+   `project_channel_id_collision`).
+4. Convidar o admin do cliente (conta Firebase nasce sem senha → link/definir
    senha, ou login Google do domínio dele).
+5. Se for **clínica** (dado de saúde): cumprir o **gate J-3 LGPD** antes do
+   go-live (fora deste doc).
 
 ---
 
-## 5. Follow-ups deferidos (pós-#2)
+## 5. Follow-ups deferidos (pós-IAP)
 - Sessão-cookie 15min + re-MFA; sink BigQuery do `audit_logs_system`; impersonate
   read-only (M-B3) + ToS; rate-limit/Cloud Armor no LB.
-- Dialog de confirmação do guarda-corpo de domínio no frontend do A.
+- Diálogo de confirmação do guarda-corpo de domínio no frontend do A.
 - Fase 5 do RBAC (remover fallback de role, pós-bake-in).
 - Decommission do projeto GCP antigo (SP). Quota `cpu_allocation` do Cloud Run.
-- `/healthz` do B com 404 preso (cache de edge, cosmético).
 
 ---
 
 ## 6. Achados da revisão do B — aceitos/documentados (residual, baixo)
-- SA `firebaseauth.admin` é necessária pro bootstrap (sem role mais fino).
+- SA `firebaseauth.admin` necessária pro bootstrap (sem role mais fino).
 - TOCTOU na criação de tenant (create_tenant re-checa; atores confiáveis; raro).
-- Pré-check email-por-tenant (limitação documentada; o endpoint devolve `warning`).
+- Pré-check email-por-tenant (limitação documentada; endpoint devolve `warning`).
 - `isSuperAdmin` por claim no path client-SDK de `super_admins`/`audit_logs_system`
   (ninguém lê essas coleções pelo client SDK; o backend já é `check_revoked`).
 
