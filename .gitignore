@@ -8,6 +8,9 @@ venv/
 env/
 ENV/
 
+# Config local do Claude Code (permissoes/preferencias por maquina)
+.claude/
+
 # Environment
 .env
 .env.local
