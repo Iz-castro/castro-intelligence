@@ -7,6 +7,16 @@
 > **Dev IA: sua parte é a "TRILHA IA" + o "CONTRATO COMPARTILHADO".**
 > Entregável final da sua trilha (SYNC-1): `AI_PROJECT` real, `AGENT_ID` do
 > agente restaurado e as URLs das 2 functions.
+>
+> ⚠️ **PEGADINHA DO DEPLOY (staging tag → prod):** o staging roda como revisão
+> com tag `staging` + `--no-traffic` + `--update-env-vars FIRESTORE_COLLECTION_PREFIX=castro_crm_staging`.
+> Como a revisão staging fica com esse prefixo, o deploy de PROMOÇÃO pra prod
+> DEVE setar o prefixo de volta EXPLICITAMENTE, senão a prod herda `castro_crm_staging`:
+> ```
+> gcloud run deploy castro-crm --source . --region us-west1 \
+>   --project project-4a851bf9-f475-418c-800 \
+>   --update-env-vars FIRESTORE_COLLECTION_PREFIX=castro_crm
+> ```
 
 ## Contexto (resumo)
 
