@@ -225,9 +225,13 @@ def titulo(txt):
 # =========================================================================
 
 def cenario_fluxo_feliz_botoes():
-    titulo("CENARIO 1 — Fluxo feliz com BOTOES (LGPD -> setor)")
+    titulo("CENARIO 1 — Fluxo feliz com BOTOES (LGPD -> fila do Comercial direto)")
     cid = 1
     _novo_contato(cid)
+    STORE.setdefault("wa_conversations", {})["conv1"] = {
+        "id": "conv1", "contact_id": cid,
+        "assigned_to": None, "assigned_to_uid": "", "department_id": None,
+    }
 
     reply, payload, store = cliente_envia(cid, text="oi")
     check(isinstance(reply, dict) and reply.get("type") == "interactive_buttons",
@@ -253,16 +257,19 @@ def cenario_fluxo_feliz_botoes():
     check(any(a["action"] == "LGPD_CONSENT_ACCEPTED" for a in AUDIT),
           "audit_log registrou LGPD_CONSENT_ACCEPTED")
     check(isinstance(reply, str) and "comercial" in reply.lower(),
-          "apos aceite, ja apresenta o menu de setores (sem pedir nome)")
-    check(STORE["bot_states"]["1"].get("step") == "ask_sector",
-          "estado avancou direto para ask_sector")
-
-    reply, _, _ = cliente_envia(cid, text="1")
-    contato = STORE["wa_contacts"]["1"]
-    check(reply is None, "setor escolhido finaliza o bot (sem nova resposta)")
-    check(contato.get("bot_completed") is True, "bot_completed=True")
-    check(contato.get("department_id") == 1, "encaminhado ao Comercial (department_id=1)")
+          "apos aceite, confirma o encaminhamento pra fila do Comercial")
+    check(contato.get("bot_completed") is True,
+          "aceite ja finaliza o bot (bot_completed=True, sem menu)")
+    check(contato.get("department_id") == 1,
+          "encaminhado ao Comercial (department_id=1)")
+    check(STORE["wa_conversations"]["conv1"].get("department_id") == 1,
+          "thread tambem recebeu department_id=1 (pool Novos Leads/Comercial)")
     check("1" not in STORE.get("bot_states", {}), "bot_state limpo apos finalizar")
+    check(any("Bot finalizado" in str(m.get("content", "")) for m in MESSAGES),
+          "system message 'Bot finalizado' registrada")
+
+    reply, _, _ = cliente_envia(cid, text="obrigado")
+    check(reply is None, "apos finalizar, bot nao responde mais (gate bot_completed)")
 
 
 def cenario_recusa_reconsentimento():
@@ -279,8 +286,13 @@ def cenario_recusa_reconsentimento():
 
     # Cliente muda de ideia e toca em Sim
     reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
-    check(STORE["wa_contacts"]["2"].get("lgpd_consent") is True,
+    contato = STORE["wa_contacts"]["2"]
+    check(contato.get("lgpd_consent") is True,
           "re-consentimento grava consentimento no contato")
+    check(contato.get("bot_completed") is True and contato.get("department_id") == 1,
+          "re-consentimento tambem encaminha direto pro Comercial")
+    check(isinstance(reply, str) and "comercial" in reply.lower(),
+          "resposta confirma a fila do Comercial")
 
 
 def cenario_fallback_texto():
@@ -292,61 +304,62 @@ def cenario_fallback_texto():
     check("podemos continuar" in payload["interactive"]["body"]["text"].lower(),
           "aviso LGPD apresentado no primeiro contato")
     reply, _, _ = cliente_envia(cid, text="sim")
-    check(STORE["wa_contacts"]["3"].get("lgpd_consent") is True,
+    contato = STORE["wa_contacts"]["3"]
+    check(contato.get("lgpd_consent") is True,
           "aceite por TEXTO ('sim') tambem funciona")
+    check(contato.get("bot_completed") is True and contato.get("department_id") == 1,
+          "aceite textual tambem encaminha direto pro Comercial")
     check(isinstance(reply, str) and "comercial" in reply.lower(),
-          "apos aceite textual, apresenta o menu de setores")
+          "apos aceite textual, confirma a fila do Comercial")
 
 
-def cenario_selecao_setor():
-    titulo("CENARIO 4 — Selecao de setor: invalida, roteamento e propagacao p/ thread")
-    cid = 4
+def _contato_legado_ask_sector(cid, conv_id):
+    """Contato em voo no deploy: ja aceitou a LGPD e recebeu o menu antigo
+    (bot_states com step=ask_sector), mas ainda nao respondeu."""
     _novo_contato(cid)
-    # Thread (conversation) do contato, como o webhook cria no inbound.
-    STORE.setdefault("wa_conversations", {})["conv4"] = {
-        "id": "conv4", "contact_id": cid,
+    STORE.setdefault("wa_conversations", {})[conv_id] = {
+        "id": conv_id, "contact_id": cid,
         "assigned_to": None, "assigned_to_uid": "", "department_id": None,
     }
-    cliente_envia(cid, text="oi")
-    cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
+    STORE.setdefault("bot_states", {})[str(cid)] = {
+        "step": "ask_sector", "lgpd_consent": True, "lgpd_status": "accepted",
+    }
 
-    # Entrada sem setor reconhecivel -> pede opcao valida, mantem o estado
-    reply, _, _ = cliente_envia(cid, text="asdf ????")
-    st = STORE["bot_states"]["4"]
-    check("inválida" in (reply or "").lower() and st.get("step") == "ask_sector",
-          "entrada sem setor reconhecivel -> 'opcao invalida', mantem ask_sector")
+
+def cenario_legado_escolha_setor():
+    titulo("CENARIO 4 — LEGADO: estado ask_sector em voo honra a escolha digitada")
+    cid = 4
+    _contato_legado_ask_sector(cid, "conv4")
 
     # Palavra-chave de troca/defeito -> Assistencia Tecnica (setor 2 / bot_key sac)
     reply, _, _ = cliente_envia(
         cid, text="preciso trocar um equipamento com defeito"
     )
     contato = STORE["wa_contacts"]["4"]
-    check(reply is None, "palavra-chave de troca/defeito finaliza o bot")
+    check(reply is None, "escolha reconhecida finaliza o bot sem nova resposta")
     check(contato.get("bot_setor") == 2, "classificado como setor 2 (Assistencia)")
     check(contato.get("department_id") == 2,
           "contato encaminhado ao Suporte (department_id=2, bot_key=sac)")
     check(STORE["wa_conversations"]["conv4"].get("department_id") == 2,
           "thread tambem recebeu department_id=2 (pool segmenta por setor)")
+    check("4" not in STORE.get("bot_states", {}), "bot_state legado drenado")
 
 
-def cenario_outros_administrativo():
-    titulo("CENARIO 5 — Opcao 4 (Outros) roteia p/ Administrativo (bot_key administrativo)")
+def cenario_legado_invalida_vai_comercial():
+    titulo("CENARIO 5 — LEGADO: entrada nao reconhecida cai no Comercial (sem re-prompt)")
     cid = 6
-    _novo_contato(cid)
-    STORE.setdefault("wa_conversations", {})["conv6"] = {
-        "id": "conv6", "contact_id": cid,
-        "assigned_to": None, "assigned_to_uid": "", "department_id": None,
-    }
-    cliente_envia(cid, text="oi")
-    cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
-    reply, _, _ = cliente_envia(cid, text="4")
+    _contato_legado_ask_sector(cid, "conv6")
+
+    reply, _, _ = cliente_envia(cid, text="asdf ????")
     contato = STORE["wa_contacts"]["6"]
-    check(reply is None, "opcao 4 finaliza o bot")
-    check(contato.get("bot_setor") == 4, "classificado como setor 4 (Outros/Administrativo)")
-    check(contato.get("department_id") == 4,
-          "encaminhado ao Administrativo (department_id=4, bot_key=administrativo)")
-    check(STORE["wa_conversations"]["conv6"].get("department_id") == 4,
-          "thread recebeu department_id=4 (pool segmenta por setor)")
+    check(isinstance(reply, str) and "comercial" in reply.lower(),
+          "entrada invalida responde com a fila do Comercial (menu nao existe mais)")
+    check(contato.get("bot_completed") is True, "bot finalizado (bot_completed=True)")
+    check(contato.get("department_id") == 1,
+          "encaminhado ao Comercial (department_id=1)")
+    check(STORE["wa_conversations"]["conv6"].get("department_id") == 1,
+          "thread recebeu department_id=1")
+    check("6" not in STORE.get("bot_states", {}), "bot_state legado drenado")
 
 
 def cenario_limites_payload():
@@ -383,8 +396,8 @@ def main():
     cenario_fluxo_feliz_botoes()
     cenario_recusa_reconsentimento()
     cenario_fallback_texto()
-    cenario_selecao_setor()
-    cenario_outros_administrativo()
+    cenario_legado_escolha_setor()
+    cenario_legado_invalida_vai_comercial()
     cenario_limites_payload()
 
     print("\n" + "=" * 70)

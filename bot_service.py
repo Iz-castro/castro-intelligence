@@ -2,12 +2,17 @@
 
 """
 Servico de bot para atendimento automatico via WhatsApp.
-Fluxo conversacional enxuto: gate LGPD e, apos o aceite, coleta do setor
-(departamento) desejado. Opera como state machine: cada mensagem do cliente
-avanca o estado.
+Fluxo conversacional enxuto: gate LGPD e, apos o aceite, encaminhamento
+DIRETO para a fila do setor Comercial (pool "Novos Leads" do frontend),
+sem dono. Opera como state machine: cada mensagem do cliente avanca o estado.
 
 Fluxo completo:
-  (primeiro contato) -> lgpd_awaiting -> ask_sector -> done
+  (primeiro contato) -> lgpd_awaiting -> done (fila do Comercial)
+
+O menu de setores foi removido em 2026-07-24 (decisao Hubloc: todo lead novo
+entra pelo Comercial; o operador transfere de setor no CRM se preciso).
+Estados "ask_sector" ainda em voo no deploy sao honrados: escolha digitada
+roteia pro setor correspondente; entrada nao reconhecida cai no Comercial.
 
 A etapa LGPD e gerenciada pelo modulo lgpd_bot.py e atua como gate obrigatorio
 antes de qualquer coleta de dados pessoais.
@@ -43,8 +48,11 @@ HORA_INICIO = 7
 HORA_FIM = 17
 
 # =========================================================================
-# Vocabularios de classificacao de setor
+# Vocabularios de classificacao de setor (LEGADO)
 # =========================================================================
+# Usados apenas para honrar estados "ask_sector" em voo no deploy que removeu
+# o menu de setores (2026-07-24). Podem ser removidos junto com o handler
+# legado quando esses estados drenarem.
 # Obs.: todos os termos abaixo sao comparados atraves de _norm (que remove
 # acentos e normaliza espacos), portanto acentuacao aqui e irrelevante para
 # o matching — vale a forma normalizada.
@@ -171,7 +179,8 @@ _SETOR_NOMES = {
 
 # Setor do bot -> bot_key do departamento no CRM. Todos os setores roteiam para
 # um departamento real (a pool do frontend segmenta por department_id da
-# conversation). A opcao 4 ("Outros assuntos" no menu) cai no Administrativo.
+# conversation). Fluxo atual usa so o 1 (Comercial); 2-4 permanecem pelo
+# handler legado de estados "ask_sector" em voo.
 # O roteamento e por bot_key, entao renomear o departamento na UI nao quebra.
 _BOT_KEY_BY_SETOR = {1: "comercial", 2: "sac", 3: "financeiro", 4: "administrativo"}
 
@@ -241,26 +250,24 @@ def _esta_no_expediente() -> bool:
     return agora.weekday() < 5 and HORA_INICIO <= agora.hour < HORA_FIM
 
 
-MENU_SETORES = (
-    "Informe o número da opção desejada:\n\n"
-    "1 - Comercial\n"
-    "2 - Assistência técnica / troca / devolução\n"
-    "3 - Financeiro\n"
-    "4 - Outros assuntos"
+SETOR_COMERCIAL = 1
+
+_MSG_FILA_COMERCIAL = (
+    "Você já está na fila do nosso time Comercial — em breve um de "
+    "nossos atendentes fala com você por aqui."
 )
 
 
-def _msg_pedir_setor(prefixo: str = "") -> str:
-    """Monta a mensagem do menu de setores, anexando o aviso de expediente
-    quando estiver fora do horario de atendimento."""
-    texto = prefixo
+def _msg_pos_aceite(prefixo: str = "") -> str:
+    """Mensagem pos-aceite: confirma o encaminhamento pra fila do Comercial,
+    anexando o aviso de expediente quando estiver fora do horario."""
+    texto = prefixo + "\n\n" + _MSG_FILA_COMERCIAL
     if not _esta_no_expediente():
         texto += (
             "\n\nNosso expediente funciona de segunda a sexta, das 7h às 17h.\n"
             "Sua mensagem será registrada e o retorno "
             "ocorrerá no próximo horário útil."
         )
-    texto += "\n\n" + MENU_SETORES
     return texto.strip()
 
 
@@ -334,10 +341,10 @@ def process_bot_message(
 
         if lgpd_status == "accepted":
             _record_lgpd_consent(contact_id)
-            state["step"] = "ask_sector"
-            state["started_at"] = utcnow().isoformat()
-            _set_bot_state(contact_id, state)
-            return _msg_pedir_setor(lgpd_response)
+            # Sem menu de setores: o aceite ja finaliza o bot e poe o lead,
+            # sem dono, na fila do Comercial (pool "Novos Leads").
+            _finalize_bot(contact_id, state, SETOR_COMERCIAL)
+            return _msg_pos_aceite(lgpd_response)
 
         if not step:
             state["step"] = "lgpd"
@@ -346,21 +353,20 @@ def process_bot_message(
         return lgpd_response
 
     # =================================================================
-    # Fluxo principal (LGPD ja aceita): coleta direto o setor
+    # LGPD ja aceita: encaminha direto pra fila do Comercial
     # =================================================================
 
     if not step or step == "lgpd":
-        state["step"] = "ask_sector"
-        state["started_at"] = utcnow().isoformat()
-        _set_bot_state(contact_id, state)
-        return _msg_pedir_setor("Olá! Como podemos te ajudar hoje?")
+        _finalize_bot(contact_id, state, SETOR_COMERCIAL)
+        return _msg_pos_aceite("Olá!")
 
-    # -- Etapa: coletar setor --
+    # -- Legado: contatos que receberam o menu de setores (pre 2026-07-24) --
+    # Honra a escolha em voo; entrada nao reconhecida cai no Comercial.
     if step == "ask_sector":
         setor = _classificar_setor(text.strip())
         if setor is None:
-            return "Opção inválida. Digite 1, 2, 3 ou 4.\n\n" + MENU_SETORES
-
+            _finalize_bot(contact_id, state, SETOR_COMERCIAL)
+            return _msg_pos_aceite("Certo!")
         _finalize_bot(contact_id, state, setor)
         return None
 

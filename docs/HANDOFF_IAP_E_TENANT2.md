@@ -9,14 +9,17 @@
 > super-admin `castro-superadmin`) — uma 2ª camada de rede, independente da auth
 > do app, pra proteger o serviço mais sensível do sistema.
 >
-> **Status:** NÃO iniciado (a API `compute.googleapis.com` do projeto nem está
-> habilitada). Deixou de ser bloqueador de qualquer coisa em produção — ver
-> "Mudança de contexto" abaixo. É uma **hardening recomendada ANTES de criar
-> tenants de CLIENTES REAIS pelo painel B**.
+> **Status:** NÃO iniciado. Além disso, surgiu um **fork de arquitetura** (2026-07-23):
+> o gate de borda pode ser o **IAP+LB do GCP** (plano original, agora "Opção A" na
+> Seção 3) OU o **Cloudflare Access (Zero Trust)** — mais barato e sem load balancer.
+> Ver a nova seção "⚖️ Decisão de borda em aberto". Continua sendo **hardening
+> recomendada ANTES de provisionar CLIENTES REAIS pelo painel B**, não urgente.
 >
-> **Dependência crítica única:** decidir o **subdomínio/DNS** do painel
-> (sugestão: `admin.castrointelligence.com.br`, registro A sob controle da Castro).
-> Sem isso o IAP não sai do lugar.
+> **Dependência crítica única:** o DNS de `castrointelligence.com.br` já está no
+> **Cloudflare** (descoberto 2026-07-23; ver seção de decisão) — então criar o
+> subdomínio `admin.castrointelligence.com.br` é fácil em qualquer dos caminhos.
+> Falta **decidir IAP+LB vs. Cloudflare Access** e ter acesso à conta Cloudflare na
+> hora de executar.
 
 ---
 
@@ -41,6 +44,77 @@ mudou — o produto evoluiu por outro caminho:
   gate — J-3 hardening LGPD** (cripto de campo sensível, audit de leitura, TTL/
   retenção, DPA; clínica = dado de saúde), que é **separado** do IAP. Ver
   `docs/PLANO_LEAD_TEMPERATURE.md` e `docs/PLANO_TENANT_TESTE_VARIZEMED_CX.md` (J-3).
+
+---
+
+## ⚖️ Decisão de borda em aberto (NOVO 2026-07-23): IAP+LB (GCP) vs. Cloudflare Access
+
+Ao investigar "de onde vem o IP fixo", descobrimos o DNS real de vocês — e isso abriu
+um caminho mais barato que o LB. **As duas opções entregam a mesma proteção essencial**
+(só Rafael + Izael chegam no painel B); o que muda é custo, complexidade e uma
+propriedade de rede. Este doc registra as **duas posições**; a decisão segue em aberto.
+
+### Fatos de DNS descobertos (via `nslookup`, 2026-07-23)
+- **Registro do domínio:** `registro.br` (obrigatório pra `.com.br`). GitHub **não**
+  registra domínio — a confusão veio de o **site institucional estar no GitHub Pages**.
+- **DNS gerenciado no Cloudflare** (`archer.ns.cloudflare.com` / `laila.ns.cloudflare.com`).
+- `www` e raiz → **GitHub Pages** (institucional). Só vamos **adicionar** subdomínios,
+  sem tocar no site atual.
+
+### Layout de subdomínios alvo
+| Hostname | Aponta pra | Papel |
+|---|---|---|
+| `castrointelligence.com.br` / `www` | GitHub Pages | institucional (fica como está) |
+| `crm.castrointelligence.com.br` | Cloud Run `castro-crm` | app dos clientes |
+| `admin.castrointelligence.com.br` | Cloud Run `castro-superadmin` | painel super-admin |
+
+> **Correção crítica:** o gate de identidade (IAP OU Cloudflare Access) vai **SÓ no
+> `admin`**. No `crm` ele NÃO pode existir — trancaria os próprios clientes
+> (operadores da Hubloc, Varizemed…) do lado de fora. No `crm`, o Cloudflare faz só
+> **DNS + proxy + WAF/rate-limit**; quem controla o acesso continua sendo o login do
+> app (Firebase + claim de tenant).
+
+### Opção A — IAP + HTTPS Load Balancer (GCP) — o plano da Seção 3
+- **Identidade:** IAP (Google) com allowlist (Rafael + Izael).
+- **Mata a `.run.app` direta:** SIM (ingress `internal-and-cloud-load-balancing`).
+- **Custo:** ~US$20/mês (regra de encaminhamento do LB) + tráfego; IP e cert
+  gerenciado inclusos/grátis.
+- **WAF:** via Cloud Armor (config e custo à parte).
+- **Complexidade:** alta (Compute API, Serverless NEG, backend service, cert, url map,
+  forwarding rule, DNS).
+- **Webhook Meta:** no `admin` não há webhook. Se um dia aplicar o mesmo esquema no
+  `crm`, trancar o ingress **obriga a migrar o callback da Meta** (risco de derrubar o
+  WhatsApp dos clientes).
+
+### Opção B — Cloudflare Access (Zero Trust) — novo, recomendado
+- **Identidade:** Cloudflare Access com allowlist (grátis até 50 usuários).
+- **Mata a `.run.app` direta:** NÃO por padrão. Fecha-se com um **header secreto** que
+  o Cloudflare injeta e o app exige (barato, defesa em profundidade).
+- **Custo:** US$0 (Access free + WAF/rate-limit básico do Cloudflare incluído).
+- **Complexidade:** baixa/média — tudo no painel Cloudflare, sobre um DNS que **já é deles**.
+- **Webhook Meta:** **intocado** — como não se tranca o ingress, o webhook do CRM segue
+  na `.run.app` sem migração. Some o passo perigoso do plano do LB.
+
+### Em ambas, a trava real do painel B continua a mesma
+A auth do app (`require_super_admin` + MFA sempre + `check_revoked`) é o gate
+fail-closed já validado pela revisão adversarial (commit `a7cc82e`). IAP/Access é a
+**2ª camada** por cima — a diferença entre A e B é *como* se monta essa 2ª camada e se
+a `.run.app` morre no nível de rede (A) ou via header secreto (B).
+
+### Recomendação
+Como o DNS já está no Cloudflare, o custo é US$0 e o webhook fica intocado, a
+**Opção B** (Cloudflare Access no `admin`, Cloudflare proxy+WAF no `crm`) é o caminho
+mais simples e barato. A **Opção A** fica documentada como alternativa caso um dia se
+queira matar a `.run.app` no nível de rede sem header secreto, ou consolidar tudo no
+GCP. **Decisão ainda em aberto** — Rafael pediu as duas posições registradas.
+
+### Evolução: domínio personalizado por cliente (`crm.hubloc.com.br`)
+Recurso de white-label, viável via **Cloudflare for SaaS / Custom Hostnames** (TLS por
+cliente automático; camada grátis ~100 hostnames). O cliente cria um `CNAME` no DNS
+dele. **Regra de ouro LGPD:** o isolamento entre tenants **nunca** depende do hostname
+(falsificável) — segue no **claim de tenant** (fonte da verdade estrutural). O domínio
+bonito é entrada + branding (o topbar já mostra `tenant.name`). Feature de venda/plano
+premium, não urgente; Hubloc é candidata natural a piloto.
 
 ---
 
@@ -100,7 +174,11 @@ barrado no load balancer. O outlook do Rafael **é conta Google** → serve pro 
 
 ---
 
-## 3. Plano do IAP + domínio (a executar — comandos, ainda 100% válidos)
+## 3. Plano da OPÇÃO A — IAP + domínio (comandos GCP, ainda válidos)
+
+> Este é o caminho da **Opção A** (ver seção de decisão acima). Para a **Opção B
+> (Cloudflare Access)**, os passos são no painel Cloudflare + Zero Trust, não aqui —
+> a detalhar quando a decisão fechar nesse caminho.
 
 IAP no Cloud Run exige um **HTTPS Load Balancer** na frente (Serverless NEG) + IAP
 no backend service. Passos (ajustar nomes):
