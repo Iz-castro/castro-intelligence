@@ -1,5 +1,5 @@
 import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { onIdTokenChanged, signInWithEmailAndPassword, signInWithPopup, signOut, getMultiFactorResolver, TotpMultiFactorGenerator, type MultiFactorError, type MultiFactorResolver, type User } from "firebase/auth";
+import { onIdTokenChanged, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup, signOut, getMultiFactorResolver, TotpMultiFactorGenerator, type MultiFactorError, type MultiFactorResolver, type User } from "firebase/auth";
 import { collection, doc as firestoreDoc, getDocs, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
 
 import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
@@ -56,6 +56,7 @@ type CrmContextValue = {
   // Auth
   loginWithGoogle: () => Promise<void>;
   loginWithEmail: (email: string, password: string) => Promise<void>;
+  resetPassword: (email: string) => Promise<void>;
   logout: () => Promise<void>;
   // MFA (TOTP): so entra em cena quando a conta tem 2o fator enrollado.
   // Operador comum (sem MFA) nunca ve isso — o login segue direto.
@@ -1582,18 +1583,58 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return true;
   }
 
+  // setNotice("") nos dois logins: o aviso de "link de redefinicao enviado" e
+  // estado GLOBAL e sobreviveria ao login, reaparecendo dentro do CRM depois
+  // que a tela de login desmonta.
   async function loginWithGoogle() {
     if (!bundle) return;
-    try { setBusyLogin(true); setError(""); await signInWithPopup(bundle.auth, bundle.provider); }
+    try { setBusyLogin(true); setError(""); setNotice(""); await signInWithPopup(bundle.auth, bundle.provider); }
     catch (e) { if (!startMfaChallenge(e)) setError(errorText(e)); }
     finally { setBusyLogin(false); }
   }
 
   async function loginWithEmail(email: string, password: string) {
     if (!bundle) return;
-    try { setBusyLogin(true); setError(""); await signInWithEmailAndPassword(bundle.auth, email, password); }
+    try { setBusyLogin(true); setError(""); setNotice(""); await signInWithEmailAndPassword(bundle.auth, email, password); }
     catch (e) { if (!startMfaChallenge(e)) setError(errorText(e)); }
     finally { setBusyLogin(false); }
+  }
+
+  // Solucao A do ADR 0006: o proprio operador pede o link de redefinicao.
+  // Roda 100% client-side (quem envia o email e o Firebase) — sem endpoint,
+  // sem provedor transacional, sem segredo novo.
+  //
+  // A confirmacao e NEUTRA de proposito ("se este email tiver uma conta"):
+  // confirmar o envio de verdade transformaria a tela num verificador de
+  // quais emails existem no projeto. Pelo mesmo motivo, user-not-found e
+  // tratado como sucesso — so vira erro visivel o que a pessoa precisa
+  // resolver (email malformado, excesso de tentativas, rede).
+  //
+  // ATENCAO: so recupera conta que TEM provider de senha. Conta nascida do
+  // provisionamento (get_or_create_firebase_user) vem SEM senha e o link nao
+  // a resgata — por isso operador e criado com senha no Firebase Console.
+  async function resetPassword(email: string) {
+    if (!bundle) return;
+    const target = email.trim();
+    if (!target) return;
+    let failed = false;
+    try {
+      setBusyLogin(true); setError(""); setNotice("");
+      await sendPasswordResetEmail(bundle.auth, target);
+    } catch (e) {
+      if ((e as { code?: string })?.code !== "auth/user-not-found") {
+        setError(errorText(e));
+        failed = true;
+      }
+    } finally {
+      setBusyLogin(false);
+    }
+    if (!failed) {
+      setNotice(
+        "Se este email tiver uma conta, enviamos um link para você criar uma nova senha. "
+        + "Verifique também a caixa de spam.",
+      );
+    }
   }
 
   async function resolveMfaCode(code: string) {
@@ -2324,7 +2365,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     config, bundle, firebaseUser, sessionUser, tenantName, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
-    loginWithGoogle, loginWithEmail, logout, mfaPending, resolveMfaCode, cancelMfa,
+    loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,
     contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
     activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,

@@ -65,15 +65,21 @@ function BootScreen() {
   return <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Carregando Firebase e Firestore</h1></div></div>;
 }
 
+// Tela pre-autenticacao: NAO existe tenant resolvido aqui (sem claim, sem
+// contexto), entao marca e instrucao tem que ser da PLATAFORMA, nunca de um
+// cliente. Antes daqui saia "Hubloc CRM" + o dominio da env global
+// ALLOWED_FIREBASE_EMAIL_DOMAIN — todo tenant dividia a mesma tela e via a
+// marca do outro. Personalizar de verdade exigiria resolver o tenant por
+// subdominio, que e outro projeto.
 function LoginScreen() {
-  const { config, bundle, busyLogin, error, loginWithGoogle, loginWithEmail, mfaPending, resolveMfaCode, cancelMfa } = useCrm();
+  const { bundle, busyLogin, error, notice, loginWithGoogle, loginWithEmail, resetPassword, mfaPending, resolveMfaCode, cancelMfa } = useCrm();
   const [showEmailForm, setShowEmailForm] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
   if (mfaPending) {
     return (
-      <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Verificação em duas etapas</h1>
+      <div className="screen"><div className="hero-card"><p className="eyebrow">Castro Intelligence</p><h1>Verificação em duas etapas</h1>
         <p>Digite o código de 6 dígitos do seu app autenticador.</p>
         <form style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginTop: "0.8rem" }} onSubmit={(e) => { e.preventDefault(); if (mfaCode.length === 6) void resolveMfaCode(mfaCode); }}>
           <input inputMode="numeric" autoComplete="one-time-code" value={mfaCode} onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="000000" autoFocus />
@@ -85,8 +91,8 @@ function LoginScreen() {
     );
   }
   return (
-    <div className="screen"><div className="hero-card"><p className="eyebrow">Hubloc CRM</p><h1>Entrar</h1>
-      <p>{config?.allowed_email_domain ? `Use sua conta ${config.allowed_email_domain}.` : "Use uma conta Google autorizada."}</p>
+    <div className="screen"><div className="hero-card"><p className="eyebrow">Castro Intelligence</p><h1>Entrar</h1>
+      <p>Use a conta fornecida pela sua empresa.</p>
       <button className="primary" onClick={() => void loginWithGoogle()} disabled={!bundle || busyLogin}>{busyLogin ? "Conectando..." : "Entrar com Google"}</button>
       <button className="ghost" style={{ marginTop: "0.6rem" }} onClick={() => setShowEmailForm((v) => !v)}>{showEmailForm ? "Ocultar email/senha" : "Entrar com email/senha"}</button>
       {showEmailForm && (
@@ -94,9 +100,12 @@ function LoginScreen() {
           <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email" autoComplete="email" />
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="senha" autoComplete="current-password" />
           <button className="primary" type="submit" disabled={!bundle || busyLogin || !email.trim() || !password}>{busyLogin ? "Conectando..." : "Entrar"}</button>
+          {/* type="button": dentro do form, o default submeteria o login. */}
+          <button className="ghost" type="button" onClick={() => void resetPassword(email)} disabled={!bundle || busyLogin || !email.trim()}>Esqueci minha senha</button>
         </form>
       )}
       {error ? <div className="alert danger">{error}</div> : null}
+      {notice ? <div className="alert success">{notice}</div> : null}
     </div></div>
   );
 }
@@ -1540,6 +1549,19 @@ declare global {
   }
 }
 
+// Diagnostico do popup da Meta. O MESMO postMessage que traz os ids traz
+// tambem o motivo da falha/abandono — antes a gente descartava tudo isso e o
+// operador so via "signup cancelado", sem saber em que tela quebrou. Sem esses
+// campos o unico caminho era caçar log de Cloud Run e sondar a Graph API.
+type SignupDiag = {
+  event?: string;          // FINISH | FINISH_ONLY_WABA | FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING | CANCEL | ERROR
+  current_step?: string;   // tela em que o fluxo parou (ex.: PHONE_NUMBER_SETUP)
+  error_message?: string;
+  error_code?: string;
+  session_id?: string;     // a Meta pede este id no suporte
+  timestamp?: string;
+};
+
 function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "coexistence" | "standard" }) {
   const { bundle, setShowSettings } = useCrm();
   const isStandard = channelType === "standard";
@@ -1547,10 +1569,14 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
   const [signupConfig, setSignupConfig] = useState<{ app_id: string; config_id: string; graph_api_version: string } | null>(null);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [diag, setDiag] = useState<SignupDiag | null>(null);
   const fbLoaded = useRef(false);
   // Embedded Signup v4: a Meta entrega waba_id/phone_number_id na mensagem de
   // session-info (postMessage), NAO mais nos scopes do token. Capturado abaixo.
   const sessionInfoRef = useRef<{ phone_number_id?: string; waba_id?: string }>({});
+  // Espelho em ref: o callback do FB.login le o diagnostico no momento em que
+  // roda, e o state estaria defasado dentro daquele closure.
+  const diagRef = useRef<SignupDiag | null>(null);
 
   useEffect(() => {
     if (!bundle) return;
@@ -1568,11 +1594,34 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
   useEffect(() => {
     const handler = (event: MessageEvent) => {
       if (typeof event.origin === "string" && !event.origin.endsWith("facebook.com")) return;
-      let data: { type?: string; data?: { phone_number_id?: string; waba_id?: string } };
-      try { data = typeof event.data === "string" ? JSON.parse(event.data) : event.data; } catch { return; }
-      if (data && data.type === "WA_EMBEDDED_SIGNUP" && data.data) {
-        if (data.data.phone_number_id) sessionInfoRef.current.phone_number_id = String(data.data.phone_number_id);
-        if (data.data.waba_id) sessionInfoRef.current.waba_id = String(data.data.waba_id);
+      let payload: {
+        type?: string;
+        event?: string;
+        data?: {
+          phone_number_id?: string; waba_id?: string;
+          current_step?: string; error_message?: string;
+          error_code?: string | number; session_id?: string; timestamp?: string | number;
+        };
+      };
+      try { payload = typeof event.data === "string" ? JSON.parse(event.data) : event.data; } catch { return; }
+      if (!payload || payload.type !== "WA_EMBEDDED_SIGNUP") return;
+      const d = payload.data || {};
+      if (d.phone_number_id) sessionInfoRef.current.phone_number_id = String(d.phone_number_id);
+      if (d.waba_id) sessionInfoRef.current.waba_id = String(d.waba_id);
+      const next: SignupDiag = {
+        event: payload.event ? String(payload.event) : undefined,
+        current_step: d.current_step ? String(d.current_step) : undefined,
+        error_message: d.error_message ? String(d.error_message) : undefined,
+        error_code: d.error_code !== undefined ? String(d.error_code) : undefined,
+        session_id: d.session_id ? String(d.session_id) : undefined,
+        timestamp: d.timestamp !== undefined ? String(d.timestamp) : undefined,
+      };
+      diagRef.current = next;
+      setDiag(next);
+      // Fluxo que nao terminou em FINISH vai pro console tambem: o popup fecha
+      // e leva a tela junto, e o console e o unico lugar que sobrevive.
+      if (next.event && next.event !== "FINISH") {
+        console.warn("[embedded-signup]", JSON.stringify(payload));
       }
     };
     window.addEventListener("message", handler);
@@ -1600,12 +1649,30 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
 
   const launchSignup = useCallback(() => {
     if (!window.FB || !signupConfig) return;
+    // Zera o diagnostico da tentativa anterior — senao um retry bem-sucedido
+    // ainda exibiria o erro da vez passada.
+    diagRef.current = null;
+    setDiag(null);
+    // E zera os ids tambem: cada launch abre um popup novo que reenvia a
+    // session-info. Sem isso, uma tentativa que falhou DEPOIS de criar a WABA
+    // deixa o waba_id velho no ref, e o /exchange da tentativa seguinte pode
+    // trocar o code novo contra a WABA da tentativa anterior.
+    sessionInfoRef.current = {};
     setStep("signing");
     window.FB.login(
       (response) => {
         const code = response.authResponse?.code;
         if (!code) {
-          setErrorMsg("Signup cancelado ou nenhum codigo retornado.");
+          // A Meta ja mandou o motivo pelo postMessage; usa ele em vez do
+          // generico, que nao distingue "desistiu" de "quebrou na etapa X".
+          const d = diagRef.current;
+          if (d?.error_message) {
+            setErrorMsg(d.error_code ? `${d.error_message} (codigo ${d.error_code})` : d.error_message);
+          } else if (d?.current_step) {
+            setErrorMsg(`Fluxo interrompido na etapa ${d.current_step}.`);
+          } else {
+            setErrorMsg("Signup cancelado ou nenhum codigo retornado.");
+          }
           setStep("error");
           return;
         }
@@ -1638,7 +1705,26 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             <div style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 8, padding: "1rem", color: "#991b1b" }}>
               <strong>Erro:</strong> {errorMsg}
             </div>
-            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => setStep("ready")}>Tentar novamente</button>
+            {diag && (diag.event || diag.current_step || diag.error_code || diag.session_id) && (
+              <div style={{ marginTop: "0.8rem" }}>
+                <strong style={{ fontSize: "0.85rem" }}>Diagnostico do popup da Meta</strong>
+                <pre style={{ background: "#f8fafc", border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.8rem", marginTop: "0.4rem", fontSize: "0.8rem", whiteSpace: "pre-wrap", wordBreak: "break-all", userSelect: "all" }}>
+{[
+  diag.event ? `evento......: ${diag.event}` : "",
+  diag.current_step ? `etapa.......: ${diag.current_step}` : "",
+  diag.error_code ? `codigo......: ${diag.error_code}` : "",
+  diag.session_id ? `sessao......: ${diag.session_id}` : "",
+  diag.timestamp ? `timestamp...: ${diag.timestamp}` : "",
+  sessionInfoRef.current.waba_id ? `waba_id.....: ${sessionInfoRef.current.waba_id}` : "",
+  sessionInfoRef.current.phone_number_id ? `phone_id....: ${sessionInfoRef.current.phone_number_id}` : "",
+].filter(Boolean).join("\n")}
+                </pre>
+                <p style={{ fontSize: "0.78rem", color: "var(--muted, #64748b)", margin: 0 }}>
+                  Copie este bloco ao pedir suporte — a Meta identifica a tentativa pelo id de sessao.
+                </p>
+              </div>
+            )}
+            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => { setDiag(null); diagRef.current = null; setStep("ready"); }}>Tentar novamente</button>
           </div>
         )}
 
