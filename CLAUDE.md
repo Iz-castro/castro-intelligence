@@ -62,6 +62,10 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   numeração**, então a revisão nova pode ter número MENOR que as antigas → **`--to-latest` cai na
   errada**. **Sempre promova por NOME após o deploy:**
   `gcloud run services update-traffic castro-crm --region us-west1 --project project-4a851bf9-f475-418c-800 --to-revisions <REV_NOVA>=100` e confira com `describe ... status.traffic`.
+- **O NOME de revisão impresso pelo `gcloud run deploy` também pode estar ERRADO** (2026-07-29:
+  imprimiu `00066-bsm`, mas a revisão criada foi `00067-frb` → promoção errada por ~2 min). Descubra
+  a revisão nova com `gcloud run revisions list ... --sort-by "~metadata.creationTimestamp"` (a mais
+  recente por data de criação), nunca pelo texto do deploy.
 - **Smoke pós-deploy:** `GET /` → 200 e `GET /api/client-config` → 200 (confere `projectId`
   Oregon). Scaling vivo se preserva sozinho — não afirme números sem `gcloud run services describe castro-crm`.
 - **Rollback:** `gcloud run services update-traffic castro-crm --region us-west1 --project project-4a851bf9-f475-418c-800 --to-revisions <REV_ANTERIOR>=100`.
