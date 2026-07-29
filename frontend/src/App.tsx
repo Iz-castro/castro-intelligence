@@ -478,7 +478,7 @@ function LeadTemperatureDot({ temperature }: { temperature?: string }) {
 }
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs } = useCrm();
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
   // nao apenas conversas ativas). Usado no header da sidebar.
@@ -638,13 +638,16 @@ function ContactList() {
           );
         })}
         {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
-        {(renderItems.length > visibleLimit || canLoadMoreMine) ? (
-          <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && canLoadMoreMine}
+        {(renderItems.length > visibleLimit || canLoadMoreMine || canLoadMoreAll) ? (
+          <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && (canLoadMoreMine || canLoadMoreAll)}
             onClick={() => {
               const moreToReveal = renderItems.length > visibleLimit;
               setVisibleLimit((v) => v + 100);
               // So busca no Firestore quando ja revelou tudo que esta carregado.
-              if (canLoadMoreMine && !moreToReveal) void loadMoreMyConversations();
+              if (!moreToReveal) {
+                if (canLoadMoreMine) void loadMoreMyConversations();
+                else if (canLoadMoreAll) void loadMoreAllConversations();
+              }
             }}>
             {loadingMoreConvs ? "Carregando..." : renderItems.length > visibleLimit ? `Carregar mais (${renderItems.length - visibleLimit} restantes)` : "Carregar mais"}
           </button>

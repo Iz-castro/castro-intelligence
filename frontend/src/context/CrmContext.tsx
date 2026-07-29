@@ -301,6 +301,8 @@ type CrmContextValue = {
 
   loadMoreMyConversations: () => Promise<void>;
   canLoadMoreMine: boolean;
+  loadMoreAllConversations: () => Promise<void>;
+  canLoadMoreAll: boolean;
   loadingMoreConvs: boolean;
 
   refreshPollingViews: () => Promise<void>;
@@ -337,6 +339,10 @@ const DEFAULT_USER_SETTINGS: UserSettings = {
   chat_prefix_name: "",
   quick_messages: [],
 };
+
+// Janela AO VIVO do admin/supervisor (target "all") e tamanho da pagina
+// estatica do "Carregar mais" da Equipe. Mantidos iguais de proposito.
+const ADMIN_CONV_WINDOW = 300;
 
 const CONVERSATION_OPEN_DEBOUNCE_MS = 350;
 const CONVERSATION_READ_DEBOUNCE_MS = 1200;
@@ -377,6 +383,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [pagedConversations, setPagedConversations] = useState<Map<string, Conversation>>(new Map());
   const [myConvPageLimit, setMyConvPageLimit] = useState(50);
   const [myConvHasMore, setMyConvHasMore] = useState(true);
+  // Paginacao estatica da EQUIPE (admin/supervisor): mesmo padrao do "Meus",
+  // mas sobre a janela GLOBAL de 300 (ADMIN_CONV_WINDOW). Compartilha
+  // pagedConversations/loadingMoreConvs com o fluxo do operador — os dois
+  // caminhos sao mutuamente exclusivos por role+view.
+  const [allConvPageLimit, setAllConvPageLimit] = useState(ADMIN_CONV_WINDOW);
+  const [allConvHasMore, setAllConvHasMore] = useState(true);
   const [loadingMoreConvs, setLoadingMoreConvs] = useState(false);
   // Remove uma conversa das camadas ESTATICAS (fixada + paginada) — ex.: apos
   // transferir, a thread saiu das maos do operador e o ao vivo nao reentrega
@@ -697,15 +709,24 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     [conversations, sessionUser?.id, sessionUser?.firebase_uid],
   );
   const canLoadMoreMine = !canSeeAll && activeView === "meus" && myConvHasMore && myLiveCount >= 50;
-  // Limpa a paginacao estatica do "Meus" ao SAIR da view — bound na janela de
-  // staleness (thread paginada reatribuida por terceiros nao fica fantasma) e
-  // re-habilita o "Carregar mais" (hasMore=true) ao voltar.
+  // "Carregar mais" da Equipe (admin/supervisor): so pagina se a janela ao
+  // vivo global saturou os 300 (senao nao ha pagina antiga). Conta so as
+  // conversas nao-backup — o target "backup" infla `conversations` sem
+  // consumir a janela do target "all".
+  const allLiveCount = useMemo(
+    () => conversations.filter((c) => !c.is_backup).length,
+    [conversations],
+  );
+  const canLoadMoreAll = canSeeAll && activeView === "equipe" && allConvHasMore && allLiveCount >= ADMIN_CONV_WINDOW;
+  // Troca de caixa limpa a paginacao estatica ("Meus" e Equipe) — bound na
+  // janela de staleness (thread paginada reatribuida/fechada por terceiros
+  // nao fica fantasma) e re-habilita o "Carregar mais" (hasMore) ao voltar.
   useEffect(() => {
-    if (activeView !== "meus") {
-      setPagedConversations(new Map());
-      setMyConvPageLimit(50);
-      setMyConvHasMore(true);
-    }
+    setPagedConversations(new Map());
+    setMyConvPageLimit(50);
+    setMyConvHasMore(true);
+    setAllConvPageLimit(ADMIN_CONV_WINDOW);
+    setAllConvHasMore(true);
   }, [activeView]);
   // Nao qualificadas: qualification do contato e "nao_qualificado"
   const nqConversations = useMemo(() => {
@@ -948,7 +969,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // sem indice composto), cujas conversas tem last_message_at antigo e
       // cairiam fora do top-300.
       return [
-        { key: "all", ref: query(waConversations, orderBy("last_message_at", "desc"), firestoreLimit(300)) },
+        { key: "all", ref: query(waConversations, orderBy("last_message_at", "desc"), firestoreLimit(ADMIN_CONV_WINDOW)) },
         { key: "backup", ref: query(waConversations, where("is_backup", "==", true)) },
       ];
     }
@@ -1022,6 +1043,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setPagedConversations(new Map());
     setMyConvPageLimit(50);
     setMyConvHasMore(true);
+    setAllConvPageLimit(ADMIN_CONV_WINDOW);
+    setAllConvHasMore(true);
     setLoadingMoreConvs(false);
     setExtraContacts(new Map());
     fetchedExtraRef.current.clear();
@@ -2185,6 +2208,39 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // "Carregar mais" da EQUIPE (admin/supervisor): pagina ESTATICA via getDocs
+  // da janela global com limite crescente (300 -> 600 -> 900...). O listener
+  // ao vivo continua em ADMIN_CONV_WINDOW; isto e leitura UNICA (sem snapshot),
+  // orderBy single-field = indice automatico. As rules ja autorizam a query
+  // ampla pro role privilegiado (mesma shape do listener do target "all").
+  async function loadMoreAllConversations() {
+    if (!bundle?.db || !config?.firestore.collections.wa_conversations) return;
+    if (!canSeeAll) return;
+    if (loadingMoreConvs) return;
+    const nextLimit = allConvPageLimit + ADMIN_CONV_WINDOW;
+    setLoadingMoreConvs(true);
+    try {
+      const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
+      const q = query(
+        waConversations,
+        orderBy("last_message_at", "desc"),
+        firestoreLimit(nextLimit),
+      );
+      const snap = await getDocs(q);
+      const fetched = snap.docs.map((d) => normalizeConversation(d.data() as Record<string, unknown>, d.id));
+      const next = new Map<string, Conversation>();
+      fetched.forEach((c) => next.set(c.id, c));
+      setPagedConversations(next);
+      setAllConvPageLimit(nextLimit);
+      // Se voltou menos que o pedido, nao ha mais paginas.
+      setAllConvHasMore(snap.docs.length >= nextLimit);
+    } catch (e) {
+      setError(`Falha ao carregar mais conversas: ${errorText(e)}`);
+    } finally {
+      setLoadingMoreConvs(false);
+    }
+  }
+
   async function openConversationForContact(contact_id: number, channel_id?: number): Promise<string | null> {
     if (!bundle) return null;
     try {
@@ -2395,6 +2451,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
+    loadMoreAllConversations, canLoadMoreAll,
     refreshPollingViews,
   };
 
