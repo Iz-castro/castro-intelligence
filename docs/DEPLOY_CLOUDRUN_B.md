@@ -184,3 +184,7 @@ Rollback: `gcloud run services update-traffic castro-superadmin --region us-west
 ## 9. Histórico
 - Build inicial + deploy (rev `00001-4f4`) 2026-07-11.
 - Rebuild + redeploy pós-revisão adversarial (rev `00002-7pm`) 2026-07-12.
+- Editor de tenant (PATCH `/api/superadmin/tenants/{tid}` + UI) e `enterprise_ai`
+  fora do select de criação (rev `00004-c8d`) 2026-07-31, commit `c2d4f0e`.
+  Smoke ok (200/200/401 + PATCH sem token 401 + CSP). Obs.: o B serve `latest`
+  (tráfego NÃO pinado — diferente do A).
