@@ -9,7 +9,7 @@ Uso (PowerShell):
   $env:FIRESTORE_COLLECTION_PREFIX = "castro_crm"  # ou castro_crm_staging
   ./.venv/Scripts/python.exe -m scripts.set_tenant_ai --tenant varizemed-test `
       --gcp-project castro-ai --agent-id <uuid> `
-      --handoff-bot-key atendimento `
+      --handoff-bot-key sac `
       --lgpd-notice "Ola! ..." --lgpd-privacy-url https://... `
       --lgpd-policy-version varizemed-test-2026-07 `
       --core-version val-05                       # dry-run
@@ -21,6 +21,7 @@ import argparse
 import json
 import sys
 
+from database_firestore import VALID_BOT_KEYS
 from tenant_service import get_tenant, update_tenant
 
 
@@ -32,7 +33,14 @@ def main() -> int:
     p.add_argument("--location", default="global")
     p.add_argument("--environment-id", default="")
     p.add_argument("--language-code", default="pt-br")
-    p.add_argument("--handoff-bot-key", default="atendimento")
+    # required + choices: o default antigo ("atendimento") NAO existia em
+    # VALID_BOT_KEYS -> _normalize_bot_key zerava e o handoff saia SEM
+    # department_id (incidente evitado por sorte no varizemed, que usa "sac").
+    p.add_argument(
+        "--handoff-bot-key", required=True, choices=sorted(VALID_BOT_KEYS),
+        help="bot_key do departamento que recebe o handoff (tem que existir "
+             "num setor ATIVO do tenant)",
+    )
     p.add_argument("--lgpd-notice", default="")
     p.add_argument("--lgpd-privacy-url", default="")
     p.add_argument("--lgpd-policy-version", default="")
@@ -87,9 +95,14 @@ def main() -> int:
 
     current = (tenant.get("settings") or {}).get("ai") or {}
 
-    # temperature_signals: o script reescreve settings.ai INTEIRO — sem esta
-    # preservacao, um re-run sem o arg droparia um override existente.
-    # (Gap identico ja existe pro handoff_text_hints — fora de escopo aqui.)
+    # NOTA sobre o merge: update_tenant usa .set(merge=True), e o cliente
+    # Firestore gera field paths de FOLHA — o merge e PROFUNDO (desce ate
+    # settings.ai.<chave>). Consequencias: (a) chave ja gravada que este
+    # script nao manda (ex.: handoff_text_hints) SOBREVIVE ao re-run;
+    # (b) NAO existe caminho aqui para REMOVER uma chave obsoleta de
+    # settings.ai — isso exige DELETE_FIELD manual.
+    # temperature_signals: preservacao explicita mantida por clareza (com o
+    # merge profundo ela e redundante, mas documenta a intencao).
     if args.temperature_signals is not None:
         try:
             sig = json.loads(args.temperature_signals)

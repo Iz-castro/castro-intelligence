@@ -29,12 +29,16 @@ O doc original tratava o IAP como **gate pra "ligar o tenant #2 real"**. Isso
 mudou — o produto evoluiu por outro caminho:
 
 - O **tenant #2 virou a Varizemed** (clínica), atacada como **motor de bot
-  Dialogflow CX por tenant**, não via criação de tenant pelo painel B. O tenant
-  de teste **`varizemed-test` foi criado DIRETO no banco de prod** (o webhook da
-  Meta aponta pra prod; isolamento é estrutural por path), com número real DDD 71,
-  bot da Val respondendo, handoff, e a feature de **temperatura do lead**
-  (quente/morno/frio) — tudo em prod e validado. Ver memórias
-  `project_varizemed_migration`, `project_lead_temperature`.
+  Dialogflow CX por tenant**. *(Correção 2026-07-30: o audit imutável
+  `castro_crm_audit_logs_system` prova que TANTO o `varizemed-test` (14/07)
+  QUANTO o `varizemed` real (28/07) foram criados **PELO painel B**
+  (`create_tenant_attempt`/`create_tenant_ok` só existem em
+  `superadmin_main.py`) — a afirmação anterior de que foi "direto no banco"
+  estava errada.)* Número real DDD 71 no teste, bot da Val respondendo,
+  handoff, e a feature de **temperatura do lead** (quente/morno/frio) — tudo
+  em prod e validado. Em 28-29/07 o tenant **`varizemed` real** entrou em prod
+  (plan `ai_custom`, canal DDD 31 próprio, fluxo CX ponta a ponta 2x). Ver
+  memórias `project_varizemed_migration`, `project_lead_temperature`.
 - Logo, **o IAP não bloqueia mais nada do que já foi entregue.** Ele volta a ser
   o que sempre foi na essência: **endurecer o painel B** pro dia em que a Castro
   for provisionar tenants de **clientes reais** por lá (fluxo self-service do

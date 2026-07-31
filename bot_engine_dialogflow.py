@@ -99,6 +99,30 @@ def _coerce_bool(value: Any) -> bool:
     return str(value or "").strip().lower() == "true"
 
 
+def _unwrap_struct_params(parameters: dict) -> dict:
+    """Desembrulha params que o agente devolve como struct {chave: valor}.
+
+    Observado em PROD 2026-07-29 (varizemed): apos edicao no agente (que roda
+    em DRAFT), cada session param passou a chegar como {'user_name': 'Timmy'}
+    em vez do escalar 'Timmy'. Sem o unwrap, _coerce_bool/str() sujam o resumo
+    do operador e a classificacao de temperatura (estado QUENTE inalcancavel).
+    Regra conservadora: dict de UMA entrada cuja chave repete a do param, ou
+    cuja unica entrada e escalar, vira o valor interno (ate 2 niveis). Dicts
+    com 2+ entradas passam intactos.
+    """
+    out = {}
+    for key, value in parameters.items():
+        for _ in range(2):
+            if isinstance(value, dict) and len(value) == 1:
+                inner_key, inner_val = next(iter(value.items()))
+                if inner_key == key or not isinstance(inner_val, dict):
+                    value = inner_val
+                    continue
+            break
+        out[key] = value
+    return out
+
+
 def _extract_reply_text(query_result: dict) -> str:
     parts = []
     for msg in query_result.get("responseMessages", []) or []:
@@ -114,6 +138,8 @@ def _extract_reply_text(query_result: dict) -> str:
 def _normalize_response(payload: dict) -> dict:
     query_result = payload.get("queryResult") or {}
     parameters = query_result.get("parameters") or {}
+    if isinstance(parameters, dict):
+        parameters = _unwrap_struct_params(parameters)
     return {
         "ok": True,
         "reply_text": _extract_reply_text(query_result),

@@ -1633,6 +1633,39 @@ def ensure_daily_attendance(contact_id, setor=None, contact=None):
     return pid
 
 
+def set_attendance_department(contact_id, department_id, contact=None):
+    """Carimba o SETOR real no Atendimento do dia depois que o bot decide o
+    departamento (o protocolo nasce no 1o inbound, quando ainda nao ha setor
+    -> campo/sufixo "GERAL"). Relatorio por setor deve agrupar pelo CAMPO
+    `setor`/`department_id`, nunca pelo sufixo do id.
+
+    O ID do protocolo e IMUTAVEL de proposito: ele e um identificador que o
+    cliente pode ter recebido ("Seu protocolo e ...") e esta denormalizado em
+    wa_messages.protocol_id. Uma versao anterior deste fix MOVIA o doc para um
+    id novo (copy+delete+redenorm) — revisao adversarial 2026-07-30 achou 3
+    falhas reais: corrida com ensure_daily_attendance de um inbound
+    concorrente (dois protocolos no mesmo dia, doc bom orfanado), doc fantasma
+    ressuscitado por set(merge=True) quando o move falhava no meio, e TOCTOU
+    no guard protocolo_informado. Um unico merge idempotente nao tem nada
+    disso.
+
+    Idempotente e best-effort. Retorna o protocol_id atualizado ou None."""
+    if contact is None:
+        contact = _get_doc("wa_contacts", contact_id)
+    if not contact:
+        return None
+    pid = str(contact.get("attendance_protocol") or "").strip()
+    today = _today_br_str()
+    # So o Atendimento de HOJE: protocolo de dia anterior ja fechou o ciclo.
+    if not pid or not pid.startswith(today + "-"):
+        return None
+    setor = _setor_code(department_id)
+    document("attendances_daily", pid).set(
+        {"setor": setor, "department_id": department_id}, merge=True,
+    )
+    return pid
+
+
 def get_daily_attendance(protocol_id):
     """Le o Atendimento diario pelo id ou None."""
     snap = document("attendances_daily", protocol_id).get()
@@ -1823,6 +1856,20 @@ def return_contact_to_bot(contact_id, returned_by_user_id):
             "assigned_to_uid": "",
             "department_id": None,
         }, merge=True)
+    # Estado do bot CX: o contato volta pro inicio do funil, entao o ciclo
+    # anterior nao pode contaminar o proximo. Limpa SO os campos cx_*/
+    # human_active — o doc inteiro nao pode ser apagado porque guarda a prova
+    # de aceite da LGPD (lgpd_status), e o cliente tomaria o aviso de novo.
+    try:
+        document("bot_states", contact_id).set({
+            "cx_snapshot": None,
+            "cx_summary_emitted": None,
+            "cx_summary_emitted_pid": None,
+            "cx_fail_count": 0,
+            "human_active": False,
+        }, merge=True)
+    except Exception as exc:
+        logger.warning("return_contact_to_bot: falha ao limpar bot_state %s: %s", contact_id, exc)
     # Log na transfer_log
     transfer_id = next_sequence("wa_transfer_log")
     document("wa_transfer_log", transfer_id).set({

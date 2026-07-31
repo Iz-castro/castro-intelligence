@@ -85,7 +85,9 @@
     <label>Nome</label><input id="t-name" placeholder="Cliente Novo Ltda" />
     <label>CNPJ (opcional)</label><input id="t-cnpj" />
     <label>Plano</label>
-    <select id="t-plan"><option value="professional" selected>professional</option><option value="ai_custom">ai_custom (IA dedicada)</option><option value="enterprise_ai">enterprise_ai (sob consulta)</option></select>
+    <!-- enterprise_ai fora do select ate o produto existir (decisao PO
+         2026-07-30); o backend segue aceitando o valor p/ compat. -->
+    <select id="t-plan"><option value="professional" selected>professional</option><option value="ai_custom">ai_custom (IA dedicada)</option></select>
     <label>Email do admin do cliente</label><input id="t-admin" type="email" placeholder="admin@clientenovo.com.br" />
     <label>Domínios permitidos (separados por vírgula; provedor público é ignorado; vazio = domínio do email do admin)</label>
     <input id="t-domains" placeholder="clientenovo.com.br" />
@@ -93,6 +95,22 @@
     <hr />
     <h2>Tenants existentes</h2>
     <div id="tenants-list" class="sub">…</div>
+    <div id="edit-card" class="hidden" style="margin-top:1rem;border-top:1px solid #8884;padding-top:.8rem">
+      <h2 style="margin:0">Editar tenant: <span id="e-id"></span></h2>
+      <label>Nome</label><input id="e-name" />
+      <label>CNPJ (opcional)</label><input id="e-cnpj" />
+      <label>Plano</label>
+      <select id="e-plan"><option value="professional">professional</option><option value="ai_custom">ai_custom (IA dedicada)</option></select>
+      <label>Domínios permitidos (separados por vírgula; vazio = nenhum roteamento por domínio)</label>
+      <input id="e-domains" />
+      <label style="display:flex;gap:.4rem;align-items:center;cursor:pointer"><input id="e-active" type="checkbox" style="width:auto" /> Tenant ativo</label>
+      <div class="sub" style="margin-top:-.3rem">Desativar <b>silencia o bot</b> do tenant e tira o roteamento de login por domínio. <b>Não desconecta</b> quem já tem claim: operadores existentes continuam entrando. Para cortar acesso de verdade, remova os usuários.</div>
+      <div class="row" style="margin-top:.9rem">
+        <button class="primary" id="btn-save-edit">Salvar alterações</button>
+        <button id="btn-cancel-edit">Cancelar</button>
+      </div>
+      <div id="edit-msg"></div>
+    </div>
   </div>
 </div>
 
@@ -210,12 +228,70 @@ $("btn-enroll-confirm").onclick = async () => {
 $("btn-signout-1").onclick = () => signOut(auth);
 $("btn-signout-2").onclick = () => signOut(auth);
 
+let _tenants = [];
 async function loadTenants(){
   const r = await api("/api/superadmin/tenants");
   if(!r.ok){ $("tenants-list").textContent="(erro ao listar)"; return; }
-  const ts = r.body.tenants||[];
-  $("tenants-list").innerHTML = ts.length ? ts.map(t=>`• <b>${esc(t.id)}</b> — ${esc(t.name||'')} <span class="taglist">[${esc(t.plan||'?')}${t.is_active===false?' · inativo':''}] ${esc((t.allowed_email_domains||[]).join(', '))}</span>`).join("<br>") : "(nenhum)";
+  _tenants = r.body.tenants||[];
+  $("tenants-list").innerHTML = _tenants.length ? _tenants.map(t=>`• <b>${esc(t.id)}</b> — ${esc(t.name||'')} <span class="taglist">[${esc(t.plan||'?')}${t.is_active===false?' · inativo':''}] ${esc((t.allowed_email_domains||[]).join(', '))}</span> <button data-edit="${esc(t.id)}">Editar</button>`).join("<br>") : "(nenhum)";
 }
+
+// ---- EDITOR DE TENANT (PATCH) ----
+$("tenants-list").addEventListener("click", (ev) => {
+  const tid = ev.target && ev.target.getAttribute ? ev.target.getAttribute("data-edit") : null;
+  if(!tid) return;
+  const t = _tenants.find(x => x.id === tid);
+  if(!t) return;
+  $("e-id").textContent = t.id;
+  $("e-name").value = t.name || "";
+  $("e-cnpj").value = t.cnpj || "";
+  const sel = $("e-plan");
+  // Remove a opcao de compat do tenant anterior antes de avaliar este — senao
+  // ela vaza entre tenants e reintroduz um plano que o PO tirou da UI.
+  [...sel.options].filter(o => o.dataset.compat === "1").forEach(o => o.remove());
+  // Plano fora do select (ex.: enterprise_ai legado): adiciona a opcao pra
+  // NAO fazer downgrade silencioso ao salvar sem mexer no plano.
+  if(t.plan && ![...sel.options].some(o => o.value === t.plan)){
+    const o = document.createElement("option"); o.value = t.plan; o.textContent = t.plan + " (atual)"; o.dataset.compat = "1"; sel.appendChild(o);
+  }
+  sel.value = t.plan || "professional";
+  $("e-domains").value = (t.allowed_email_domains||[]).join(", ");
+  $("e-active").checked = t.is_active !== false;
+  $("edit-card").classList.remove("hidden");
+  $("edit-card").scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
+$("btn-cancel-edit").onclick = () => { $("edit-msg").innerHTML=""; $("edit-card").classList.add("hidden"); };
+// Mensagem JUNTO do botao: #global-msg fica no topo da pagina e o editor no
+// rodape, entao um erro la em cima passa despercebido depois de rolar.
+function emsg(text, kind){ $("edit-msg").innerHTML = text ? `<div class="msg ${kind||''}">${esc(text)}</div>` : ""; }
+$("btn-save-edit").onclick = async () => {
+  gmsg(""); emsg("");
+  const tid = $("e-id").textContent;
+  const domains = $("e-domains").value.split(",").map(s=>s.trim()).filter(Boolean);
+  const payload = {
+    name: $("e-name").value.trim(), cnpj: $("e-cnpj").value.trim(),
+    plan: $("e-plan").value, is_active: $("e-active").checked,
+    allowed_email_domains: domains,
+  };
+  if(!payload.name){ emsg("Nome não pode ficar vazio.", "err"); return; }
+  $("btn-save-edit").disabled = true;
+  // try/finally: sem isto, uma falha de rede no getIdToken/fetch escapa como
+  // unhandled rejection e o botao fica travado em disabled, sem mensagem.
+  try{
+    const r = await api(`/api/superadmin/tenants/${encodeURIComponent(tid)}`, { method:"PATCH", body: JSON.stringify(payload) });
+    if(r.ok){
+      gmsg(`Tenant "${tid}" atualizado.`, "ok");
+      $("edit-msg").innerHTML=""; $("edit-card").classList.add("hidden");
+      await loadTenants();
+    } else {
+      emsg("Falha ("+r.status+"): "+(r.body.detail||JSON.stringify(r.body)), "err");
+    }
+  } catch(e){
+    emsg("Falha de rede ao salvar: "+(e && (e.message||e.code) || e), "err");
+  } finally {
+    $("btn-save-edit").disabled = false;
+  }
+};
 
 $("btn-create").onclick = async () => {
   gmsg("");

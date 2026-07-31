@@ -4,8 +4,10 @@ Guia operacional do **Castro Intelligence CRM** — CRM de WhatsApp multi-tenant
 Curto e de propósito: só o que já foi verificado no código atual. Se algo aqui
 divergir do código, **o código vence** — corrija este arquivo.
 
-Cliente principal em produção: **Hubloc / Hub Loc** (locadora de equipamentos).
-Tenant #2 em migração: **Varizemed** (clínica, bot Dialogflow CX).
+Cliente principal em produção: **Hubloc / Hub Loc** (locadora de equipamentos,
+plano `professional`). Tenant #2 **operacional em prod desde 2026-07-29**:
+**Varizemed** (clínica, plano `ai_custom`, bot Dialogflow CX com temperatura de
+lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente CX).
 
 ---
 
@@ -135,8 +137,17 @@ Modelo de dados WhatsApp: `wa_contacts` (Lead único por `wa_id`) · `wa_convers
   só-de-prod dá 403 em staging.
 - `allowed_email_domains` é **soft** (guarda-corpo + roteamento de login); quem autoriza é o **claim
   `tenant_id`**. Provedores públicos (gmail/outlook) nunca roteiam/auto-provisionam tenant.
-- Hoje só **`hubloc`** é operacional; `"hubloc"` está hardcoded como fallback em vários pontos
-  (`webhook.py`, middleware, `channel_service.py`). Ligar o tenant #2 exige revisar esses fallbacks.
+- **3 tenants ativos em prod** (hubloc, varizemed, varizemed-test) desde 2026-07-28. Com >1 tenant
+  ativo, `single_active_tenant()` retorna None → login sem claim e sem domínio casado é **403**
+  (rede de transição desarmada, by design). `"hubloc"` segue hardcoded como fallback em vários
+  pontos (`webhook.py`, middleware, `channel_service.py`) — revisar antes de qualquer fluxo que
+  dependa de resolução implícita de tenant.
+- Planos: vocabulário canônico = `professional | ai_custom | enterprise_ai` (`PLAN_OPTIONS`,
+  em inglês). **Nenhum runtime gateia por plano hoje** — o agente de IA liga por
+  `settings.ai` (bot_engine/status) + `system_settings.bot_enabled` do tenant.
+- **Motor CX**: `settings.ai.environment_id` vazio = produção roda no **DRAFT** do agente
+  Dialogflow (edição no console entra em prod na hora — já causou o bug dos params em struct,
+  2026-07-29). Ver `docs/CX_AGENTE_PENDENCIAS_DEV_IA.md`.
 
 ## Convenções
 

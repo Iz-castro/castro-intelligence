@@ -184,18 +184,22 @@ _SETOR_NOMES = {
 # O roteamento e por bot_key, entao renomear o departamento na UI nao quebra.
 _BOT_KEY_BY_SETOR = {1: "comercial", 2: "sac", 3: "financeiro", 4: "administrativo"}
 
-_dept_cache = None
+# Cache POR TENANT (dict tenant_id -> mapping). Um global unico vazaria os
+# department_id do 1o tenant builtin para os demais no mesmo container.
+_dept_cache = {}
 
 
 def _get_dept_map() -> dict:
-    """Mapeia setor do bot -> department_id do CRM.
+    """Mapeia setor do bot -> department_id do CRM (cache por tenant).
 
     Preferencia: campo `bot_key` do departamento (estavel, nao quebra com rename).
     Fallback: substring match com _SETOR_NOMES quando bot_key nao esta definido.
     """
-    global _dept_cache
-    if _dept_cache is not None:
-        return _dept_cache
+    from firestore_common import get_tenant_context
+    tid = get_tenant_context() or ""
+    cached = _dept_cache.get(tid)
+    if cached is not None:
+        return cached
     depts = get_all_departments()
     mapping = {}
 
@@ -216,13 +220,13 @@ def _get_dept_map() -> dict:
             if _norm(setor_nome) in name_norm or name_norm in _norm(setor_nome):
                 mapping[setor_id] = dept.get("id")
 
-    _dept_cache = mapping
+    _dept_cache[tid] = mapping
     return mapping
 
 
 def invalidate_dept_cache():
-    global _dept_cache
-    _dept_cache = None
+    # Limpa TODOS os tenants (edicao de setor e rara; rebuild e barato).
+    _dept_cache.clear()
 
 
 # =========================================================================
@@ -409,6 +413,17 @@ def _finalize_bot(contact_id: int, state: dict, setor: int):
             if cd.get("is_backup"):
                 continue
             snap.reference.set({"department_id": dept_id}, merge=True)
+        # Carimba o setor no protocolo do dia (nasceu "GERAL" no 1o inbound).
+        # So o CAMPO — o id do protocolo e imutavel. Best-effort.
+        try:
+            from database import set_attendance_department
+            set_attendance_department(contact_id, dept_id)
+        except (ImportError, AttributeError):
+            pass  # simuladores mockam database sem esta funcao
+        except Exception:
+            logger.exception(
+                "[BOT] carimbo de setor no protocolo falhou | contato=%d", contact_id,
+            )
 
     sys_content = (
         f"Bot finalizado | {notes} | Encaminhado para {setor_nome}"
@@ -507,6 +522,27 @@ def _get_tenant_ai_config() -> dict:
     return ai_cfg if isinstance(ai_cfg, dict) else {}
 
 
+def _tenant_is_active() -> bool:
+    """False SO quando o doc do tenant diz is_active=False explicitamente.
+
+    Tenant desativado (fim de contrato/inadimplencia) nao pode seguir com o
+    bot respondendo cliente e queimando DetectIntent. Falha de leitura ou
+    campo ausente = ativo (fail-open): um blip de Firestore nao pode calar o
+    bot de quem esta em dia.
+    """
+    from firestore_common import get_tenant_context
+    from tenant_service import get_tenant
+
+    tid = get_tenant_context()
+    if not tid:
+        return True
+    try:
+        tenant = get_tenant(tid) or {}
+    except Exception:
+        return True
+    return tenant.get("is_active", True) is not False
+
+
 def _cx_policy_version(ai_cfg: dict) -> str:
     """Versao de politica LGPD do tenant para a prova de consentimento.
 
@@ -538,6 +574,12 @@ async def process_bot_message_async(
     tools/sim_bot_flow.py e chamadas legadas.
     """
     from firestore_common import get_tenant_context
+
+    if not _tenant_is_active():
+        logger.warning(
+            "[BOT] tenant %s INATIVO — bot silencioso", get_tenant_context(),
+        )
+        return None
 
     ai_cfg = _get_tenant_ai_config()
     engine = str(ai_cfg.get("bot_engine") or "").strip().lower()
@@ -595,6 +637,11 @@ async def _process_cx_message(
         return None
 
     state = _get_bot_state(contact_id)
+    # Humano conduzindo a THREAD (takeover/supervisor-takeover/picker): esses
+    # caminhos assumem so a conversation, nao o Lead, entao o gate por contato
+    # acima nao pega. Sem isto o bot responderia por cima do operador.
+    if state.get("human_active"):
+        return None
 
     # ------------------------------------------------------------------
     # Gate LGPD local — SEMPRE antes do motor. A prova de consentimento
@@ -653,6 +700,25 @@ async def _process_cx_message(
         result = await bot_engine_dialogflow.detect_intent_text(
             ai_cfg, wa_digits, turn_text, session_params
         )
+        # Re-checa o gate DEPOIS do turno (corrida real: DetectIntent leva ate
+        # 15s + retry; um assume/takeover nesse meio tempo nao pode ser
+        # atropelado por resposta/handoff atrasados do bot).
+        fresh = get_wa_contact(contact_id)
+        if not fresh or fresh.get("assigned_to") or fresh.get("bot_completed"):
+            logger.info(
+                "[BOT-CX] contato %d assumido/finalizado durante o DetectIntent "
+                "— resposta do bot descartada", contact_id,
+            )
+            return None
+        # Takeover no meio do turno assume a THREAD (nao grava no contato):
+        # re-le o bot_state pra pegar o human_active marcado nesse intervalo.
+        if _get_bot_state(contact_id).get("human_active"):
+            logger.info(
+                "[BOT-CX] humano assumiu a thread do contato %d durante o "
+                "DetectIntent — resposta do bot descartada", contact_id,
+            )
+            return None
+        contact = fresh
     else:
         logger.warning(
             "[BOT-CX] settings.ai incompleto (gcp_project_id/agent_id) "
@@ -664,23 +730,32 @@ async def _process_cx_message(
     # Falha do motor: 1a -> fallback educado; 2a consecutiva -> handoff.
     # ------------------------------------------------------------------
     if not result.get("ok"):
-        # cx_fail_count nao e atomico: 2 mensagens concorrentes durante um
-        # outage do CX podem subcontar (lost update), atrasando o handoff de 2
-        # strikes em ~1 turno. Aceito na v1 (so acontece em outage + entrega
-        # concorrente; consequencia = uma msg de desculpa extra). Se virar
-        # problema, trocar por firestore.Increment + releitura antes de decidir.
-        fails = int(state.get("cx_fail_count") or 0) + 1
+        # Increment atomico + releitura: 2 mensagens concorrentes durante um
+        # outage do CX nao subcontam mais (lost update de read-modify-write).
+        # Pode, no pior caso, disparar o handoff em ambas — _finalize e
+        # idempotente nos sets; sobra no maximo uma system message repetida.
+        from google.cloud import firestore as _gcf
+        _state_ref = document("bot_states", contact_id)
+        _state_ref.set({"cx_fail_count": _gcf.Increment(1)}, merge=True)
+        fails = int((_state_ref.get().to_dict() or {}).get("cx_fail_count") or 0)
         if fails >= _CX_MAX_CONSECUTIVE_FAILURES:
             # Sem params (motor caiu) -> temperatura classifica frio; sem
             # detalhes coletados no sumario. contact vai pro carimbo do
-            # protocolo do dia.
-            _finalize_cx_handoff(
-                contact_id, ai_cfg,
-                summary="Bot IA indisponivel (falhas consecutivas)",
-                contact=contact,
-            )
+            # protocolo do dia. Falha de persistencia aqui NAO pode calar o
+            # cliente: loga e responde mesmo assim (retry na proxima msg).
+            try:
+                _finalize_cx_handoff(
+                    contact_id, ai_cfg,
+                    summary="Bot IA indisponivel (falhas consecutivas)",
+                    contact=contact,
+                )
+            except Exception:
+                logger.exception(
+                    "[BOT-CX] persistencia do handoff-por-falha falhou | "
+                    "contato=%d (cliente respondido; re-tenta na proxima msg)",
+                    contact_id,
+                )
             return _CX_HANDOFF_FAIL_MSG
-        _set_bot_state(contact_id, {"cx_fail_count": fails})
         return _CX_FALLBACK_MSG
 
     if int(state.get("cx_fail_count") or 0):
@@ -703,16 +778,28 @@ async def _process_cx_message(
     # Detecta por parametro OU por texto (o agente nem sempre seta o param).
     # ------------------------------------------------------------------
     if _cx_is_handoff(result, ai_cfg):
-        _finalize_cx_handoff(
-            contact_id, ai_cfg,
-            summary=str(result.get("handoff_summary") or "").strip(),
-            user_name=str(result.get("user_name") or "").strip(),
-            # Params acumulados da sessao CX: unica fonte da temperatura do
-            # lead e do sumario enriquecido (calculo adiado ate aqui — zero
-            # writes por turno).
-            cx_params=result.get("parameters") or {},
-            contact=contact,
-        )
+        # Falha de persistencia NUNCA cala o cliente: a resposta de
+        # transferencia sai mesmo se o Firestore falhar aqui. Como
+        # bot_completed e o ULTIMO write do handoff (commit-point), uma falha
+        # no meio deixa o bot ativo e a proxima mensagem re-tenta o handoff
+        # inteiro (sets idempotentes). O snapshot em bot_states tambem
+        # sobrevive, entao o resumo ainda sai no assume se preciso.
+        try:
+            _finalize_cx_handoff(
+                contact_id, ai_cfg,
+                summary=str(result.get("handoff_summary") or "").strip(),
+                user_name=str(result.get("user_name") or "").strip(),
+                # Params acumulados da sessao CX: unica fonte da temperatura do
+                # lead e do sumario enriquecido (calculo adiado ate aqui — zero
+                # writes por turno).
+                cx_params=result.get("parameters") or {},
+                contact=contact,
+            )
+        except Exception:
+            logger.exception(
+                "[BOT-CX] persistencia do handoff falhou | contato=%d "
+                "(cliente respondido; re-tenta na proxima msg)", contact_id,
+            )
         # Nunca transferir em silencio (agente pode pedir handoff sem texto).
         return reply or _CX_HANDOFF_DEFAULT_MSG
 
@@ -782,14 +869,13 @@ def _persist_lead_temperature(
     `contact_extra`/`dept_id` entram no MESMO set do contato (o handoff
     aproveita pra gravar bot_completed/notes/department sem write extra).
     O carimbo em attendances_daily e IMUTAVEL por protocolo: engajamento
-    novo carimba o protocolo do SEU dia, sem apagar o historico."""
-    updates = dict(contact_extra or {})
-    updates["lead_temperature"] = temperature
-    updates["lead_temperature_at"] = utcnow()
-    if dept_id:
-        updates["department_id"] = dept_id
-    document("wa_contacts", contact_id).set(updates, merge=True)
+    novo carimba o protocolo do SEU dia, sem apagar o historico.
 
+    ORDEM IMPORTA (crash-consistency): conversations e protocolo primeiro,
+    contato POR ULTIMO — bot_completed (no contact_extra do handoff) e o
+    commit-point que silencia o bot. Falha no meio deixa o bot ativo e a
+    proxima mensagem re-tenta o handoff inteiro; o inverso (contato primeiro)
+    deixava lead com bot_completed=True e threads sem departamento."""
     for snap in collection("wa_conversations").where(
         "contact_id", "==", contact_id
     ).stream():
@@ -807,15 +893,55 @@ def _persist_lead_temperature(
             {"lead_temperature": temperature}, merge=True,
         )
 
+    updates = dict(contact_extra or {})
+    updates["lead_temperature"] = temperature
+    updates["lead_temperature_at"] = utcnow()
+    if dept_id:
+        updates["department_id"] = dept_id
+    document("wa_contacts", contact_id).set(updates, merge=True)
 
-def apply_cx_snapshot_on_assume(contact_id: int, contact: Optional[dict] = None) -> bool:
+
+def mark_human_active(contact_id: int):
+    """Sinaliza que um humano esta conduzindo a conversa NESTA sessao do bot.
+
+    Os caminhos de takeover assumem a THREAD, nao o Lead: nao gravam
+    assigned_to no contato, entao o gate do webhook (que olha so o contato)
+    deixaria o bot CX continuar respondendo por cima do operador — e ate
+    disparar handoff no meio do atendimento humano. bot_states ja e lido a
+    cada turno, entao o flag nao custa read extra. Limpo junto com o estado
+    no fim do bot (_clear_bot_state)."""
+    try:
+        _set_bot_state(contact_id, {"human_active": True})
+    except Exception:
+        logger.exception("[BOT] falha ao marcar human_active | contato=%d", contact_id)
+
+
+def apply_cx_snapshot_on_assume(
+    contact_id: int, contact: Optional[dict] = None,
+    conversation_id: Optional[str] = None,
+) -> bool:
     """Classifica + emite o resumo quando um operador ASSUME um contato que
     estava em conversa com o bot CX SEM ter chegado a handoff (lead
     self-service: resolveu no proprio bot, ex.: foi agendar online).
 
     Sem isto o lead ficava invisivel — sem badge e sem resumo — justamente
     quem o operador precisa priorizar (caso real do teste 2026-07-21).
-    Idempotente: consome o snapshot (zera) pra um 2o assume nao duplicar.
+    Idempotente por MARCADOR (snapshot ja emitido + protocolo do dia) em vez
+    de zerar o snapshot. Assim os caminhos que NAO silenciam o bot (takeover,
+    supervisor-takeover, abrir pelo picker) podem emitir o resumo sem
+    descartar dados que o bot ainda esta coletando; se a informacao mudar
+    depois, um novo acionamento emite o resumo atualizado.
+
+    O marcador e chaveado pelo PROTOCOLO do dia: sem isso, um engajamento
+    NOVO (outro dia, ou lead devolvido ao bot) que recoletasse os mesmos
+    params bateria a igualdade e ficaria SEM resumo e SEM carimbo de
+    temperatura no protocolo novo (achado da revisao 2026-07-30).
+
+    `conversation_id`: thread onde o resumo deve aparecer. Sem isso o
+    save_wa_message deriva a thread de contact.channel_id — que e gravado uma
+    unica vez na criacao do contato — e num lead multi-canal (coex) o resumo
+    cairia numa thread que o operador nem esta olhando.
+
     Retorna True se emitiu. Nunca levanta pro caller."""
     ai_cfg = _get_tenant_ai_config()
     if str(ai_cfg.get("bot_engine") or "").strip().lower() != "dialogflow_cx":
@@ -827,11 +953,18 @@ def apply_cx_snapshot_on_assume(contact_id: int, contact: Optional[dict] = None)
 
     if contact is None:
         contact = get_wa_contact(contact_id) or {}
+    pid = str((contact or {}).get("attendance_protocol") or "")
+    if (snap == (state.get("cx_summary_emitted") or {})
+            and pid == str(state.get("cx_summary_emitted_pid") or "")):
+        return False
+
     temperature = classify_lead_temperature(snap, ai_cfg.get("temperature_signals"))
     _persist_lead_temperature(contact_id, temperature, contact)
 
     sys_content = _cx_handoff_details(
-        summary="", user_name=str(snap.get("user_name") or ""),
+        # user_name sai do proprio snapshot via _s() (que desembrulha struct);
+        # str() direto aqui imprimiria o repr de um dict de snapshot antigo.
+        summary="", user_name="",
         cx_params=snap, temperature=temperature, header=_CX_ASSUME_HEADER,
     )
     save_wa_message(
@@ -842,8 +975,14 @@ def apply_cx_snapshot_on_assume(contact_id: int, contact: Optional[dict] = None)
         content=sys_content,
         status="",
         timestamp_wa=utcnow().isoformat(),
+        conversation_id=conversation_id or None,
+        # Resumo e ato do sistema, nao do lead/operador: nao pode subir o
+        # thread na sidebar (recencia inflada, mesmo padrao do auto-close).
+        advance_recency=False,
     )
-    _set_bot_state(contact_id, {"cx_snapshot": None})
+    _set_bot_state(contact_id, {
+        "cx_summary_emitted": snap, "cx_summary_emitted_pid": pid,
+    })
     logger.info(
         "[BOT-CX] Resumo emitido no assume | contato=%d | temperatura=%s",
         contact_id, temperature,
@@ -861,13 +1000,22 @@ def _cx_handoff_details(
     IMUTAVEL por caminho (tooling/sims dependem dela)."""
     params = cx_params if isinstance(cx_params, dict) else {}
 
-    def _s(key):
+    def _scalar(key):
+        # Param em struct {chave: valor} (agente pos-2026-07-29): o conector
+        # desembrulha na origem, mas snapshots antigos em bot_states podem
+        # carregar o dict cru — sem isto o resumo mostraria o repr do dict.
         v = params.get(key)
+        if isinstance(v, dict) and len(v) == 1:
+            v = next(iter(v.values()))
+        return v
+
+    def _s(key):
+        v = _scalar(key)
         v = str(v).strip() if v is not None else ""
-        return "" if v.lower() in ("null", "none") else v
+        return "" if v.lower() in ("null", "none", "{}") else v
 
     def _b(key):
-        v = params.get(key)
+        v = _scalar(key)
         if isinstance(v, bool):
             return v
         return str(v).strip().lower() in ("true", "1", "yes", "sim")
@@ -917,6 +1065,23 @@ def _finalize_cx_handoff(
     fila do dia). Handoff por falha do motor chega sem params -> frio.
     """
     dept_id = _dept_id_by_bot_key(str(ai_cfg.get("handoff_bot_key") or ""))
+    if dept_id is None:
+        # bot_key nao resolve (config errada ou setor inativado): fallback pro
+        # 1o setor ativo do tenant — lead SEM department_id ficaria fora das
+        # pools por setor do frontend. Loga alto: e misconfig a corrigir.
+        depts = get_all_departments()
+        if depts:
+            dept_id = depts[0].get("id")
+            logger.error(
+                "[BOT-CX] handoff_bot_key=%r nao resolve departamento no tenant "
+                "— fallback pro setor %s (%r). Corrija settings.ai.handoff_bot_key.",
+                ai_cfg.get("handoff_bot_key"), dept_id, depts[0].get("name"),
+            )
+        else:
+            logger.error(
+                "[BOT-CX] handoff sem departamento: tenant sem setor ativo e "
+                "handoff_bot_key=%r nao resolve", ai_cfg.get("handoff_bot_key"),
+            )
     temperature = classify_lead_temperature(
         cx_params or {}, ai_cfg.get("temperature_signals")
     )
@@ -925,12 +1090,26 @@ def _finalize_cx_handoff(
     if user_name:
         notes += f" | Nome={user_name}"
 
-    _persist_lead_temperature(
-        contact_id, temperature, contact,
-        contact_extra={"bot_completed": True, "bot_notes": notes},
-        dept_id=dept_id,
-    )
+    # Protocolo do dia nasceu no 1o inbound (fase bot, ainda sem setor ->
+    # "GERAL"). Carimba o setor REAL no campo; o ID fica imutavel de proposito
+    # (ver docstring de set_attendance_department). Best-effort.
+    if dept_id:
+        try:
+            from database import set_attendance_department
+            set_attendance_department(contact_id, dept_id, contact)
+        except (ImportError, AttributeError):
+            pass  # simuladores mockam database sem esta funcao
+        except Exception:
+            logger.exception(
+                "[BOT-CX] carimbo de setor no protocolo falhou | contato=%d", contact_id,
+            )
 
+    # ORDEM: system message ANTES do write do contato. bot_completed=True (no
+    # contact_extra) e o que silencia o bot; se ele fosse gravado antes e o
+    # save_wa_message falhasse, o lead ficaria finalizado e SEM resumo, sem
+    # retry possivel. Assim, uma falha aqui propaga com o bot ainda ativo e a
+    # proxima mensagem do cliente re-tenta o handoff inteiro. O custo e uma
+    # system message duplicada no retry — visivel e inofensiva.
     sys_content = _cx_handoff_details(summary, user_name, cx_params or {}, temperature)
     save_wa_message(
         wa_message_id="",
@@ -940,6 +1119,15 @@ def _finalize_cx_handoff(
         content=sys_content,
         status="",
         timestamp_wa=utcnow().isoformat(),
+        # Ato do sistema: nao sobe o thread na sidebar (o inbound do cliente
+        # que causou o handoff ja avancou a recencia ha segundos).
+        advance_recency=False,
+    )
+
+    _persist_lead_temperature(
+        contact_id, temperature, contact,
+        contact_extra={"bot_completed": True, "bot_notes": notes},
+        dept_id=dept_id,
     )
 
     _clear_bot_state(contact_id)

@@ -461,13 +461,15 @@ function ConflictsPanel() {
 // Data-driven: sem campo no doc (tenants sem IA) -> null, nenhum plumbing de
 // plano/modulo necessario. Gravada pelo backend UMA vez, no handoff do bot.
 const LEAD_TEMPERATURE_META: Record<string, { bg: string; border: string; label: string }> = {
-  quente: { bg: "#dc2626", border: "#dc2626", label: "Lead quente — alta intencao / SLA critico" },
+  quente: { bg: "#dc2626", border: "#dc2626", label: "Lead quente — alta intencao (priorize este atendimento)" },
   morno: { bg: "#f59e0b", border: "#f59e0b", label: "Lead morno — exploratorio" },
   frio: { bg: "#ffffff", border: "#94a3b8", label: "Lead frio — suporte generico / curiosidade" },
 };
 function LeadTemperatureDot({ temperature }: { temperature?: string }) {
-  const meta = temperature ? LEAD_TEMPERATURE_META[temperature] : undefined;
-  if (!meta) return null;
+  if (!temperature) return null;
+  // Valor fora do vocabulario (override futuro de tenant): bolinha NEUTRA
+  // cinza — o dot nunca some enquanto o chip do header mostra o texto.
+  const meta = LEAD_TEMPERATURE_META[temperature] || { bg: "#e2e8f0", border: "#94a3b8", label: `Temperatura do lead: ${temperature}` };
   return (
     <span
       title={meta.label}
@@ -476,6 +478,7 @@ function LeadTemperatureDot({ temperature }: { temperature?: string }) {
     />
   );
 }
+const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 function ContactList() {
   const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs } = useCrm();
@@ -889,7 +892,7 @@ function ChatPanel() {
               {(selectedThread?.lead_temperature || selectedContact.lead_temperature) ? (
                 <span className="chip" style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem" }}>
                   <LeadTemperatureDot temperature={selectedThread?.lead_temperature || selectedContact.lead_temperature} />
-                  {selectedThread?.lead_temperature || selectedContact.lead_temperature}
+                  {capitalizeFirst(selectedThread?.lead_temperature || selectedContact.lead_temperature || "")}
                 </span>
               ) : null}
             </div>

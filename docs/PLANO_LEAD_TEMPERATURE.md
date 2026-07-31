@@ -17,10 +17,16 @@ coletado (interna ao CRM; cliente nunca vê).
   `wants_treatment` OU `user_specialty`/`user_symptom`; FRIO = resto.
   Override por tenant em `settings.ai.temperature_signals`.
 - **EXECUÇÃO ADIADA (correção crítica do PO):** NENHUM write por turno.
-  O cálculo roda UMA vez, ESTRITAMENTE no handoff (`_finalize_cx_handoff`),
-  usando os params finais acumulados da sessão CX ("a IA já guarda o estado
-  da sessão"). Batch write único: contato + conversas + protocolo. O operador
-  só precisa da classificação consolidada quando o protocolo cai na fila
+  O cálculo roda UMA vez, no handoff (`_finalize_cx_handoff`), usando os
+  params finais acumulados da sessão CX ("a IA já guarda o estado da
+  sessão"). *(Atualização 2026-07-22, commit `c58c4f9`: existe um SEGUNDO
+  ponto de cálculo — `apply_cx_snapshot_on_assume`, para o lead self-service
+  que nunca pediu handoff; disparado no `/api/wa/assume` e, desde 2026-07-30,
+  também em takeover, supervisor-takeover e abertura pelo picker. A regra
+  "zero write por turno" segue intacta: o bot só persiste um snapshot mínimo
+  em `bot_states` quando a informação coletada muda.)* Batch write: contato +
+  conversas + protocolo. O operador só precisa da classificação consolidada
+  quando o protocolo cai na fila
   humana — sem bolinha mudando ao vivo, sem listeners disparando à toa, sem
   race condition de writes concorrentes.
 - Cada engajamento nasce limpo (1 dia = 1 protocolo): classificação sai só dos

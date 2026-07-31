@@ -13,13 +13,18 @@ Modelo do doc principal:
         ├── name: str
         ├── slug: str (alias humano, ex: "hubloc", "clinica-vida")
         ├── cnpj: str
-        ├── plan: str (starter | professional | enterprise | premium)
+        ├── plan: str (professional | ai_custom | enterprise_ai — ver
+        │     PLAN_OPTIONS; valores legados sao traduzidos NA LEITURA por
+        │     _LEGACY_PLAN_MAP)
         ├── is_active: bool
         ├── allowed_email_domains: list[str] (SOFT — guarda-corpo + roteamento
         │     de login sem claim; NUNCA autoriza acesso, so o claim autoriza.
         │     Decisao 2026-07-03, ver ROADMAP "Identidade/dominio do tenant")
-        ├── settings: dict (logo_url, brand_color, default_locale)
-        ├── billing: dict (status, next_due, ...)
+        ├── settings: dict (logo_url, brand_color, default_locale; settings.ai
+        │     = config do motor de bot por tenant, gravada por
+        │     scripts/set_tenant_ai.py)
+        ├── billing: dict (status, next_due — RESERVADO: gravado na criacao e
+        │     nao lido por nenhum runtime hoje)
         ├── created_at, updated_at: ISO datetime
 
 A coleção root tenants/ e os docs sao acessados via Admin SDK
@@ -69,8 +74,13 @@ _LEGACY_PLAN_MAP = {
 }
 
 # Modulos derivados do plano EM CODIGO (fonte unica, sem persistencia — evita
-# drift entre doc e codigo). Override por tenant, se um dia precisar, entra
-# como settings.modules_extra, nunca editando este mapa em runtime.
+# drift entre doc e codigo). Override por tenant, se um dia precisar, entraria
+# como settings.modules_extra — NAO IMPLEMENTADO: nenhum codigo le essa chave
+# hoje; e so a convencao reservada pro futuro.
+# NOTA: hoje NENHUM runtime gateia por plano/modulo — /api/session apenas
+# EXPOE plan+modules; o que liga o agente de IA e settings.ai (bot_engine/
+# status) + system_settings.bot_enabled do tenant. Gate real por plano e
+# backlog (ver docs/PLANO_MODELOS_CRM_E_PLANOS.md).
 PLAN_MODULES = {
     "professional": ("crm", "whatsapp", "bot_builtin"),
     "ai_custom": ("crm", "whatsapp", "bot_builtin", "ai_agent"),
@@ -332,6 +342,19 @@ def update_tenant(tenant_id: str, **fields: Any) -> bool:
         if collisions:
             raise ValueError(f"Dominio(s) ja em uso por outro tenant: {collisions}")
         updates["allowed_email_domains"] = domains
+    elif updates.get("is_active") is True:
+        # REATIVACAO: a checagem de colisao ignora tenants inativos, entao os
+        # dominios deste tenant podem ter sido tomados por outro enquanto ele
+        # estava desligado. Reativar sem revalidar deixaria DOIS tenants ativos
+        # com o mesmo dominio -> resolve_tenant_by_email_domain vira ambiguo e
+        # NEGA o login dos dois (achado da revisao 2026-07-30).
+        current = normalize_email_domains((get_tenant(tenant_id) or {}).get("allowed_email_domains"))
+        collisions = _domains_owned_by_other_active_tenant(current, tenant_id)
+        if collisions:
+            raise ValueError(
+                f"Nao da pra reativar: dominio(s) ja em uso por outro tenant ativo: "
+                f"{collisions}. Remova o dominio de la (ou daqui) antes de reativar."
+            )
     updates["updated_at"] = utcnow()
     tenant_doc_ref(tenant_id).set(updates, merge=True)
     refresh_tenants()

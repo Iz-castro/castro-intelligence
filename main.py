@@ -1249,6 +1249,23 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
     # original permanece. O front usa isso pra nao forjar "assigned_to=eu" na
     # entrada otimista do picker.
     conv = get_wa_conversation_by_id(conversation_id) or {}
+    # Lead self-service do bot CX aberto pelo picker: se a thread ficou deste
+    # operador (auto-assign de thread sem dono), emite o resumo/temperatura
+    # coletados pela IA (idempotente por marcador; nao-fatal). Compara int com
+    # int — assigned_to pode vir como str de docs legados.
+    try:
+        _conv_owner = int(conv.get("assigned_to")) if conv.get("assigned_to") is not None else None
+    except (TypeError, ValueError):
+        _conv_owner = None
+    if _conv_owner is not None and _conv_owner == int(current_user["id"]):
+        try:
+            from bot_service import apply_cx_snapshot_on_assume, mark_human_active
+            mark_human_active(int(contact_id))
+            apply_cx_snapshot_on_assume(
+                int(contact_id), contact, conversation_id=conversation_id,
+            )
+        except Exception:
+            logger.exception("[CONVERSATION-OPEN] resumo do bot CX falhou | contato=%s", contact_id)
     return {
         "conversation_id": conversation_id,
         "contact_id": int(contact_id),
@@ -2561,6 +2578,20 @@ async def conversation_takeover(conversation_id: str, current_user: dict = Depen
         # RBAC: dono do numero coex assumindo a propria thread.
         ensure_permission(current_user, "assumir_coex_proprio")
     set_conversation_takeover_active(conversation_id, current_user["id"])
+    # Lead self-service do bot CX: quem assume temporariamente tambem precisa
+    # do resumo/temperatura do que a IA coletou. Idempotente por marcador
+    # (nao descarta o snapshot — o bot pode seguir coletando). Nao-fatal.
+    # human_active silencia o bot: takeover assume a THREAD, nao o Lead, entao
+    # o gate por contato do webhook nao pegaria e o bot responderia por cima.
+    try:
+        from bot_service import apply_cx_snapshot_on_assume, mark_human_active
+        if conv.get("contact_id") is not None:
+            mark_human_active(int(conv["contact_id"]))
+            apply_cx_snapshot_on_assume(
+                int(conv["contact_id"]), conversation_id=conversation_id,
+            )
+    except Exception:
+        logger.exception("[TAKEOVER] resumo do bot CX falhou | conv=%s", conversation_id)
     log_audit(current_user["id"], "TAKEOVER_START", f"conv={conversation_id} lead_owner={conv.get('lead_owner_user_id')}")
     return {"status": "ok", "conversation_id": conversation_id}
 
@@ -3571,6 +3602,15 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
         conv["id"], current_user["id"], conv.get("department_id"), current_user["id"],
         reason="Assumido pela supervisao", summary="Supervisor assumiu o atendimento",
     )
+    # Lead self-service do bot CX: supervisao que assume a thread recebe o
+    # resumo/temperatura coletados pela IA (idempotente por marcador;
+    # nao-fatal). human_active silencia o bot (assume thread, nao o Lead).
+    try:
+        from bot_service import apply_cx_snapshot_on_assume, mark_human_active
+        mark_human_active(contact["id"])
+        apply_cx_snapshot_on_assume(contact["id"], contact, conversation_id=conv["id"])
+    except Exception:
+        logger.exception("[SUPERVISOR-TAKEOVER] resumo do bot CX falhou | conv=%s", conv["id"])
     # Aviso ao lead: texto livre so dentro da janela de 24h (fora, sem msg).
     within_24h = False
     li = contact.get("last_inbound_at")

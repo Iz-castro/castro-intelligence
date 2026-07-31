@@ -32,7 +32,7 @@ from super_admin import (
     get_super_admin, is_active_super_admin, log_system_audit,
     set_super_admin_mfa_enrolled,
 )
-from tenant_service import list_tenants, tenant_exists
+from tenant_service import get_tenant, list_tenants, tenant_exists, update_tenant
 
 logger = logging.getLogger("castro_crm.superadmin")
 
@@ -161,6 +161,27 @@ class CreateTenantBody(BaseModel):
         return v
 
 
+class UpdateTenantBody(BaseModel):
+    """Editor de tenant (item 9, 2026-07-30). Todos opcionais: so o que vier
+    e atualizado. settings/billing ficam FORA de proposito — settings.ai e
+    do script set_tenant_ai; crm_model (futuro) e do admin do TENANT."""
+    name: str | None = None
+    plan: str | None = None
+    cnpj: str | None = None
+    is_active: bool | None = None
+    allowed_email_domains: list[str] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_nonblank(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("name nao pode ser vazio")
+        return v
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -250,6 +271,54 @@ async def create_tenant_endpoint(body: CreateTenantBody, principal: dict = Depen
             "outro tenant, ou conta Firebase indisponivel). Verifique."
         ),
     }
+
+
+@app.patch("/api/superadmin/tenants/{tenant_id}")
+async def update_tenant_endpoint(
+    tenant_id: str, body: UpdateTenantBody,
+    principal: dict = Depends(require_super_admin),
+):
+    """Edita campos do tenant (name/plan/cnpj/is_active/dominios). Mesmo
+    padrao de auditoria do create: audit ANTES (aborta se falhar) + depois."""
+    actor = principal["uid"]
+    ip, ua = principal["ip"], principal["user_agent"]
+
+    if not tenant_exists(tenant_id):
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' nao existe")
+
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    before = get_tenant(tenant_id) or {}
+    changes = ", ".join(
+        f"{k}: {before.get(k)!r} -> {v!r}" for k, v in sorted(fields.items())
+    )
+    try:
+        log_system_audit(
+            actor, "update_tenant_attempt",
+            detail=f"tid={tenant_id} | {changes}",
+            target=tenant_id, ip=ip, user_agent=ua,
+        )
+    except Exception as exc:
+        logger.error("superadmin: audit-antes falhou, abortando update | %s", exc)
+        raise HTTPException(status_code=503, detail="Falha ao auditar; operacao abortada")
+
+    try:
+        update_tenant(tenant_id, **fields)
+    except ValueError as exc:
+        _audit_after(actor, "update_tenant_failed", detail=f"tid={tenant_id} err={exc}",
+                     target=tenant_id, ip=ip, user_agent=ua)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _audit_after(actor, "update_tenant_error", detail=f"tid={tenant_id} err={exc}",
+                     target=tenant_id, ip=ip, user_agent=ua)
+        logger.exception("superadmin: erro ao atualizar tenant %s", tenant_id)
+        raise HTTPException(status_code=500, detail="Erro ao atualizar tenant")
+
+    _audit_after(actor, "update_tenant_ok", detail=f"tid={tenant_id} | {changes}",
+                 target=tenant_id, ip=ip, user_agent=ua)
+    return {"tenant": get_tenant(tenant_id)}
 
 
 @app.post("/api/superadmin/mfa/enrolled")

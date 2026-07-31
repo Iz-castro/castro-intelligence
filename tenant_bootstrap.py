@@ -332,12 +332,16 @@ def bootstrap_tenant(
     if tenant_exists(tenant_id):
         logger.info("Tenant '%s' ja existe", tenant_id)
         # Reconciliacao duravel (nao depende de backfill manual): se o tenant
-        # existe SEM allowed_email_domains e recebemos um valor, seta agora.
-        # Torna o dominio do hubloc parte do codigo (startup passa explicito),
-        # sobrevivendo a DR/restore. Nao SOBRESCREVE dominios ja configurados.
+        # existe SEM o CAMPO allowed_email_domains e recebemos um valor, seta
+        # agora. Torna o dominio do hubloc parte do codigo (startup passa
+        # explicito), sobrevivendo a DR/restore.
+        # AUSENTE != VAZIO: lista vazia e uma decisao DELIBERADA do super-admin
+        # (ex.: cortar auto-provision por dominio pelo painel). Antes o gate
+        # era `if not existing`, entao todo boot do Cloud Run desfazia essa
+        # decisao em silencio (achado da revisao 2026-07-30).
         if domains_norm:
-            existing = normalize_email_domains((get_tenant(tenant_id) or {}).get("allowed_email_domains"))
-            if not existing:
+            existing_doc = get_tenant(tenant_id) or {}
+            if "allowed_email_domains" not in existing_doc:
                 update_tenant(tenant_id, allowed_email_domains=domains_norm)
                 logger.info("Tenant '%s': allowed_email_domains reconciliado=%s", tenant_id, domains_norm)
     else:

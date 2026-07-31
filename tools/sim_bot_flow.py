@@ -105,6 +105,7 @@ _fc.document = lambda name, doc_id: _DocRef(name, doc_id)
 _fc.collection = lambda name: _CollRef(name)
 _fc.utcnow = lambda: datetime.now(timezone.utc)
 _fc.get_firestore_client = lambda: None
+_fc.get_tenant_context = lambda: "hubloc"  # _get_dept_map cacheia por tenant
 sys.modules["firestore_common"] = _fc
 
 _DEPARTMENTS = [

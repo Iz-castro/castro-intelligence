@@ -41,18 +41,26 @@ DEFAULT_TEMPERATURE_SIGNALS = {
 
 def _truthy(value) -> bool:
     """Params do CX chegam como bool OU string ("true"/"false") — mesma
-    ambiguidade ja tratada pelo _coerce_bool do conector."""
+    ambiguidade ja tratada pelo _coerce_bool do conector. Dict = param em
+    struct {chave: valor} (agente pos-2026-07-29; o conector desembrulha,
+    mas snapshots antigos em bot_states podem carregar o dict cru)."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "sim")
     if isinstance(value, (int, float)):
         return value != 0
+    if isinstance(value, dict):
+        return any(_truthy(v) for v in value.values())
     return False
 
 
 def _filled(value) -> bool:
     """String substantiva (nao-vazia e nao um null textual)."""
+    if isinstance(value, dict):
+        # Param em struct: preenchido so se algum valor interno for
+        # substantivo (dict nao-vazio de valores nulos NAO conta).
+        return any(_filled(v) for v in value.values())
     if not isinstance(value, str):
         return bool(value)
     v = value.strip()

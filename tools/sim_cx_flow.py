@@ -72,10 +72,20 @@ class _DocRef:
 
     def set(self, data, merge=False):
         coll = STORE.setdefault(self.coll, {})
+        cur = coll.get(self.doc_id) if merge else None
+        resolved = {}
+        for k, v in data.items():
+            # Sentinela firestore.Increment (usada pelo cx_fail_count atomico):
+            # resolve em memoria pro codigo real ler o numero de volta.
+            if type(v).__name__ == "Increment":
+                base = (cur or {}).get(k) or 0
+                resolved[k] = base + getattr(v, "value", 0)
+            else:
+                resolved[k] = v
         if merge and self.doc_id in coll:
-            coll[self.doc_id].update(data)
+            coll[self.doc_id].update(resolved)
         else:
-            coll[self.doc_id] = dict(data)
+            coll[self.doc_id] = dict(resolved)
 
     def delete(self):
         STORE.get(self.coll, {}).pop(self.doc_id, None)
@@ -610,9 +620,40 @@ if _m17:
 print("\n=== o2: assume e IDEMPOTENTE (2o clique nao duplica) ===")
 _antes = len([m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17])
 emitiu2 = bot.apply_cx_snapshot_on_assume(17)
-check(emitiu2 is False, "2o assume nao reemite (snapshot consumido)")
+check(emitiu2 is False, "2o assume nao reemite (marcador cx_summary_emitted)")
 check(len([m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17]) == _antes,
       "nenhuma system message duplicada")
+# O snapshot PRECISA sobreviver: os caminhos de takeover/picker nao silenciam
+# o bot, entao ele segue coletando e um novo acionamento reemite atualizado.
+# (Se alguem voltar a "consumir" o snapshot, esta checagem quebra.)
+check(STORE["bot_states"]["17"].get("cx_snapshot"),
+      "snapshot PRESERVADO apos emitir (idempotencia e por marcador, nao por consumo)")
+check(STORE["bot_states"]["17"].get("cx_summary_emitted") == STORE["bot_states"]["17"].get("cx_snapshot"),
+      "marcador registra exatamente o snapshot emitido")
+
+print("\n=== o2b: ENGAJAMENTO NOVO com os MESMOS params -> reemite (regressao da revisao) ===")
+# Protocolo novo (outro dia / lead devolvido ao bot). Sem chavear o marcador
+# pelo protocolo, a igualdade do snapshot suprimia resumo E temperatura.
+STORE["wa_contacts"]["17"]["attendance_protocol"] = "20260730-17-GERAL"
+_antes2 = len([m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17])
+emitiu3 = bot.apply_cx_snapshot_on_assume(17)
+check(emitiu3 is True, "protocolo NOVO com params iguais -> reemite o resumo")
+check(len([m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 17]) == _antes2 + 1,
+      "exatamente 1 system message nova")
+check(STORE.get("attendances_daily", {}).get("20260730-17-GERAL", {}).get("lead_temperature") == "quente",
+      "protocolo do dia NOVO recebe o carimbo de temperatura")
+check(bot.apply_cx_snapshot_on_assume(17) is False,
+      "e volta a ser idempotente dentro do protocolo novo")
+
+print("\n=== o2c: human_active silencia o bot (takeover assume a THREAD, nao o Lead) ===")
+novo_contato(21, wa_id="5531977776666")
+STORE["bot_states"]["21"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+bot.mark_human_active(21)
+check(STORE["bot_states"]["21"].get("human_active") is True, "flag human_active gravado")
+_calls_antes = len(CX_CALLS)
+r21 = envia(21, "oi, ainda esta ai?")
+check(r21 is None, "bot NAO responde com humano conduzindo a thread")
+check(len(CX_CALLS) == _calls_antes, "DetectIntent nem e chamado")
 
 print("\n=== o3: assume de contato SEM bot CX -> no-op ===")
 novo_contato(18, wa_id="5531999997777")
@@ -630,6 +671,60 @@ print("\n=== o4: handoff normal segue com o header antigo (sem regressao) ===")
 _hdr = [m for m in MESSAGES if m.get("direction") == "system"
         and str(m.get("content", "")).startswith("Bot IA finalizado | Transferido")]
 check(len(_hdr) >= 3, "handoffs anteriores mantem o header 'Bot IA finalizado'")
+
+print("\n=== p: params em STRUCT {chave: valor} (bug real de prod 2026-07-29) ===")
+# O agente (rodando em DRAFT) passou a devolver cada param embrulhado num
+# struct. O conector desembrulha na origem; aqui o mock injeta o struct CRU
+# direto no bot_service pra provar a defesa em profundidade (_s/_b/classify).
+novo_contato(20, wa_id="5531988887777")
+STORE["bot_states"]["20"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok(
+    "Perfeito! Estou transferindo nossa conversa para a equipe de atendimento.",
+    handoff_request=True,
+    parameters={
+        "user_name": {"user_name": "Timmy"},
+        "user_symptom": {"user_symptom": "varizes na perna"},
+        "wants_appointment": {"wants_appointment": True},
+    },
+))
+envia(20, "quero agendar com atendente")
+c20 = STORE["wa_contacts"]["20"]
+check(c20.get("lead_temperature") == "quente",
+      "struct nos params NAO trava o QUENTE (wants_appointment embrulhado)")
+_m20 = [m for m in MESSAGES if m.get("direction") == "system" and m.get("contact_id") == 20]
+check(bool(_m20), "system message do handoff emitida")
+if _m20:
+    _c20 = _m20[-1]["content"]
+    check("Nome: Timmy" in _c20, "resumo desembrulha o nome (sem repr de dict)")
+    check("{'user_name'" not in _c20 and "{\"user_name\"" not in _c20,
+          "nenhum dict cru vaza no resumo")
+    check("Quer agendar: sim" in _c20, "linha 'Quer agendar: sim' alcancavel com struct")
+
+print("\n=== p2: conector REAL desembrulha struct em _normalize_response ===")
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "bot_engine_dialogflow_real", os.path.join(ROOT, "bot_engine_dialogflow.py"))
+_real = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_real)
+_norm = _real._normalize_response({
+    "queryResult": {
+        "responseMessages": [{"text": {"text": ["Ok, transferindo."]}}],
+        "parameters": {
+            "user_name": {"user_name": "Timmy"},
+            "handoff_request": {"handoff_request": "true"},
+            "wants_appointment": {"wants_appointment": True},
+            "user_insurance": "Unimed",  # escalar segue intacto
+            "composto": {"a": 1, "b": 2},  # dict de 2+ entradas passa intacto
+        },
+    },
+})
+check(_norm["user_name"] == "Timmy", "_normalize_response desembrulha user_name")
+check(_norm["handoff_request"] is True, "_normalize_response coage handoff_request de struct")
+check(_norm["parameters"].get("wants_appointment") is True,
+      "parameters propagados ja desembrulhados")
+check(_norm["parameters"].get("user_insurance") == "Unimed", "escalar preservado")
+check(_norm["parameters"].get("composto") == {"a": 1, "b": 2},
+      "dict legitimo de 2+ chaves nao e desembrulhado")
 
 print("\n" + "=" * 70)
 if FAILS:
