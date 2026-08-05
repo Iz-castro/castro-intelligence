@@ -48,6 +48,7 @@ export type PermissionKey =
   | "ver_todos_leads"
   | "enviar_mensagem_propria_thread"
   | "enviar_mensagem_qualquer_thread"
+  | "assumir_atendimento"
   | "assumir_coex_proprio"
   | "assumir_supervisor"
   | "transferir_atendimento"
@@ -299,6 +300,9 @@ export type ChatMessage = {
   sender_user_id?: number | null;
   channel_owner_user_id?: number | null;
   operator_name?: string;
+  // Autoria denormalizada no doc (ADR 0010, Modo Recepcao) — nome de quem
+  // digitou; operator_name so existe no caminho REST (join in-memory).
+  sent_by_name?: string;
   assigned_to_uid?: string;
   created_at?: string;
   timestamp_wa?: string;
@@ -375,6 +379,9 @@ export type SystemSettings = {
   alarm_sound_path: string;
   notification_sound_path: string;
   bot_enabled: boolean;
+  // Modo da fila "Novos" (ADR 0010): "legacy" = assumir pra falar;
+  // "reception" = pool compartilhada (Recepcao).
+  pool_mode: "legacy" | "reception";
 };
 
 export type UserSettings = {

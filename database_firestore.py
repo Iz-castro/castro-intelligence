@@ -1027,9 +1027,13 @@ def close_stale_attendances(max_idle_hours):
     # NOTA: docs abertos SEM o campo attendance_status (legado pre-Fase 4) nao
     # entram mais aqui — recebem o campo (e voltam a ser elegiveis) na proxima
     # mensagem via upsert_wa_conversation.
+    # Modo Recepcao (ADR 0010): threads da POOL (sem dono, bot finalizado)
+    # tambem fecham por inatividade — senao nunca fecham e o protocolo nunca
+    # sai. Thread ainda no fluxo do bot continua fora (fila/bot nao fecham).
+    _reception = is_reception_mode()
     for snap in collection("wa_conversations").where("attendance_status", "==", "aberto").stream():
         conv = snap.to_dict() or {}
-        if not conv.get("assigned_to"):
+        if not conv.get("assigned_to") and not _reception:
             continue  # so atendimentos atribuidos (fila/bot nao fecham)
         last = conv.get("last_message_at")
         if isinstance(last, str):
@@ -1044,8 +1048,17 @@ def close_stale_attendances(max_idle_hours):
         if not stale:
             continue
         cid = snap.id
+        if not conv.get("assigned_to"):
+            # Reception: so fecha thread da pool com bot ja finalizado (le o
+            # contato apenas dos candidatos stale — 1 read por candidato).
+            if conv.get("is_backup"):
+                continue
+            _ctc = _get_doc("wa_contacts", conv.get("contact_id")) if conv.get("contact_id") is not None else None
+            if not _ctc or not _ctc.get("bot_completed"):
+                continue
         # Mesma regra do fechamento manual: lead (contato) E atendimento (esta
-        # conversa) voltam p/ a dona de origem (sale_owner).
+        # conversa) voltam p/ a dona de origem (sale_owner). No Modo Recepcao o
+        # revert e no-op (lead fica na pool).
         _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
         _conv_updates = {"attendance_status": "fechado_inatividade"}
         if _owner_fields:
@@ -1811,6 +1824,11 @@ def revert_lead_to_sale_owner(contact_id):
     """
     if contact_id is None:
         return None
+    # Modo Recepcao (ADR 0010): fechamento NAO re-gruda o lead na dona de
+    # origem — a pool compartilhada e o estado normal e o proximo contato
+    # volta pra fila de todos. sale_owner fica preservado no doc (inerte).
+    if is_reception_mode():
+        return None
     contact = _get_doc("wa_contacts", contact_id)
     if not contact:
         return None
@@ -1985,7 +2003,7 @@ def insert_transfer_system_message(contact_id, content, operator_id=None,
     )
 
 
-def insert_internal_note(contact_id, content, sender_user_id, conversation_id=None, channel_id=None):
+def insert_internal_note(contact_id, content, sender_user_id, conversation_id=None, channel_id=None, sent_by_name=""):
     """Modo 1 (Sussurro): nota interna na thread. Salva como
     direction='internal' — aparece pro operador/managers no chat, NUNCA vai
     pra Meta (o save nao envia) nem conta janela 24h / unread do cliente.
@@ -2000,6 +2018,7 @@ def insert_internal_note(contact_id, content, sender_user_id, conversation_id=No
         timestamp_wa=utcnow().isoformat(),
         operator_id=sender_user_id,
         sender_user_id=sender_user_id,
+        sent_by_name=sent_by_name,
         conversation_id=conversation_id,
         channel_id=channel_id,
     )
@@ -2040,6 +2059,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     is_rating_message=False, visibility="all",
                     conversation_id=None,
                     channel_owner_user_id=None, sender_user_id=None,
+                    sent_by_name="",
                     template_category=None, media_size_bytes=0,
                     advance_recency=True, contact=None):
     """Persiste mensagem WhatsApp.
@@ -2051,6 +2071,10 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
       - `sender_user_id`: operador que efetivamente digitou/enviou (em
         outbound). None em inbound. Permite distinguir, em transferencias
         coexistence, quem digitou vs quem e o dono do numero.
+      - `sent_by_name`: display_name denormalizado de quem enviou (ADR 0010,
+        Modo Recepcao): no snapshot mode o frontend le o doc direto e nao tem
+        o join REST de operator_name — sem o nome no doc, a bolha mostra so
+        "Equipe". Vazio em inbound/bot/legado (fallback no frontend).
 
     `conversation_id` pode ser passado explicitamente (caller ja resolveu
     a thread). Caso contrario, e derivado de (channel_id, contact.wa_id).
@@ -2169,6 +2193,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "status": status or "received",
         "operator_id": operator_id,
         "sender_user_id": sender_user_id,
+        "sent_by_name": sent_by_name or "",
         "channel_owner_user_id": channel_owner_user_id,
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
@@ -2805,6 +2830,8 @@ def write_backup_message(wa_message_id, contact_id, conversation_id, direction,
 # Configuracoes do sistema e do usuario
 # ---------------------------------------------------------------------------
 
+_POOL_MODE_OPTIONS = ("legacy", "reception")
+
 _DEFAULT_SYSTEM_SETTINGS = {
     "chat_prefix_enabled": False,
     "chat_prefix_roles": ["admin", "supervisor", "operador"],
@@ -2817,6 +2844,11 @@ _DEFAULT_SYSTEM_SETTINGS = {
     "alarm_sound_path": "",
     "notification_sound_path": "",
     "bot_enabled": False,
+    # Modo da fila "Novos" (ADR 0010): "legacy" = assumir pra falar (ADR
+    # 0008); "reception" = pool compartilhada (operador comum responde thread
+    # sem dono, sem virar dono; autoria vai na mensagem). Default no READ —
+    # nunca backfill; kill-switch = PUT pool_mode=legacy (sem deploy).
+    "pool_mode": "legacy",
 }
 
 
@@ -2832,9 +2864,27 @@ def get_system_settings():
 def save_system_settings(settings: dict):
     allowed = set(_DEFAULT_SYSTEM_SETTINGS.keys())
     filtered = {k: v for k, v in settings.items() if k in allowed}
+    # pool_mode e vocabulario fechado: valor desconhecido degrada pro
+    # comportamento legado em vez de gravar lixo no doc.
+    if "pool_mode" in filtered and str(filtered.get("pool_mode") or "") not in _POOL_MODE_OPTIONS:
+        filtered["pool_mode"] = "legacy"
     filtered["updated_at"] = utcnow()
     document("system_settings", "chat").set(filtered, merge=True)
     return get_system_settings()
+
+
+def is_reception_mode() -> bool:
+    """True se o tenant atual opera a fila como pool compartilhada.
+
+    Modo Recepcao (ADR 0010): operador comum responde thread SEM dono sem
+    assumir. Fail-closed: erro de leitura degrada pro comportamento legado
+    ("assumir pra falar", ADR 0008).
+    """
+    try:
+        return get_system_settings().get("pool_mode") == "reception"
+    except Exception as exc:
+        logger.warning("is_reception_mode: leitura falhou, assumindo legacy: %s", exc)
+        return False
 
 
 def get_user_settings(user_id: int):

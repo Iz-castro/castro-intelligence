@@ -30,6 +30,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, ~44 asserts, exit 0/1). CX: `tools\sim_cx_flow.py`.
+  Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (~39 asserts).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
 
@@ -94,6 +95,14 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 - **Atribuição POR THREAD** (`assign_wa_conversation`, `assigned_to` na conversation) é **separada**
   do **Dono do Lead** (`assign_wa_contact`, `/api/admin/reassign-lead`). Revert no fechamento tem que
   gravar `assigned_to_uid` (não só `assigned_to`), senão o lead some do frontend da própria dona.
+- **Modo Recepção (ADR 0010):** `system_settings/chat.pool_mode` (`legacy`|`reception`, default no
+  READ — nunca backfill). Em `reception` (varizemed): operador comum responde thread SEM dono de
+  canal **standard** sem assumir (coex fica FORA), `conversation/open` não auto-atribui, fechamento
+  NÃO re-gruda no `sale_owner` e o cron fecha órfãs com `bot_completed`. Autoria vive NA MENSAGEM
+  (`sender_user_id` + `sent_by_name` denormalizado — campo novo em `wa_messages` exige whitelist em
+  `normalization.ts`). "Assumir pra falar" (ADR 0008) segue sendo o default de todo tenant `legacy`;
+  o toggle RBAC `assumir_atendimento` (ON por default) permite perfil "só recepção". Kill-switch sem
+  deploy: `PUT pool_mode=legacy`.
 - **Whisper cold-start:** `FEATURE_AUDIO_TRANSCRIPTION=true` só é seguro porque o modelo está
   **embutido na imagem** (`HF_HUB_OFFLINE=1`). Ligar sem o modelo embutido trava o startup probe →
   cascata 500/503/429. Mudar `WHISPER_MODEL_SIZE` **exige rebuild** da imagem.

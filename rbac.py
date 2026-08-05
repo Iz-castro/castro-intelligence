@@ -50,6 +50,7 @@ PERMISSION_CATALOG = [
     ("Visibilidade", "ver_todos_leads", "Ver todos os leads e atendimentos do tenant"),
     ("Atendimento", "enviar_mensagem_propria_thread", "Enviar mensagem em thread propria"),
     ("Atendimento", "enviar_mensagem_qualquer_thread", "Agir em qualquer thread (co-pilotagem)"),
+    ("Atendimento", "assumir_atendimento", "Assumir atendimento da fila (pool)"),
     ("Atendimento", "assumir_coex_proprio", "Assumir thread do proprio numero coexistence"),
     ("Atendimento", "assumir_supervisor", "Takeover supervisor"),
     ("Atendimento", "transferir_atendimento", "Transferir atendimento"),
@@ -129,7 +130,7 @@ SEED_PERFIS = {
             "ver_todos_leads",
             # Atendimento (tudo exceto assumir_coex_proprio — exclusivo do dono)
             "enviar_mensagem_propria_thread", "enviar_mensagem_qualquer_thread",
-            "assumir_supervisor", "transferir_atendimento",
+            "assumir_atendimento", "assumir_supervisor", "transferir_atendimento",
             "fechar_atendimento_manual", "reabrir_atendimento_manual",
             "enviar_nota_interna", "enviar_template",
             # Lead
@@ -150,7 +151,8 @@ SEED_PERFIS = {
         "role_equivalente": "operador",
         "is_system_locked": False,
         "toggles": _toggles({
-            "enviar_mensagem_propria_thread", "assumir_coex_proprio",
+            "enviar_mensagem_propria_thread", "assumir_atendimento",
+            "assumir_coex_proprio",
             "transferir_atendimento", "fechar_atendimento_manual",
             "reabrir_atendimento_manual", "enviar_template",
             "qualificar_lead", "editar_declared_name", "arquivar_lead",
@@ -343,6 +345,32 @@ def sanitize_toggles(toggles):
     return {k: bool(v) for k, v in toggles.items() if k in PERMISSION_KEYS}
 
 
+def _fill_missing_toggles(data):
+    """Completa chaves de catalogo AUSENTES no doc com o default do seed da
+    role_equivalente (fallback: operador).
+
+    Chave nova pos-seed (ex.: assumir_atendimento, ADR 0010) nao existe nos
+    docs antigos: o editor de perfis montava o draft com `=== true` (ausente
+    vira OFF na tela, enquanto o efetivo era ON pelo fallback de role) e o
+    1o PUT persistia False silenciosamente — revogacao acidental em massa; e
+    o perfil_admin travado ficava insalvavel (guard rejeita toggle False).
+    Merge SO na listagem administrativa — has_permission continua decidindo
+    pelo doc cru + fallback da role do USUARIO (semantica intacta).
+    """
+    toggles = data.get("toggles")
+    toggles = dict(toggles) if isinstance(toggles, dict) else {}
+    missing = [k for k in PERMISSION_KEYS if k not in toggles]
+    if missing:
+        seed = SEED_PERFIS.get(
+            default_perfil_for_role(data.get("role_equivalente")) or "perfil_operador"
+        )
+        base = (seed or {}).get("toggles") or {}
+        for key in missing:
+            toggles[key] = bool(base.get(key, False))
+    data["toggles"] = toggles
+    return data
+
+
 def list_perfis(tenant_id):
     """Todos os perfis do tenant, seeds primeiro, ordem estavel."""
     from firestore_common import collection
@@ -351,7 +379,7 @@ def list_perfis(tenant_id):
         for snap in collection("perfis_acesso").stream():
             data = snap.to_dict() or {}
             data.setdefault("id", snap.id)
-            rows.append(data)
+            rows.append(_fill_missing_toggles(data))
     seed_order = {pid: i for i, pid in enumerate(SEED_PERFIL_IDS)}
     rows.sort(key=lambda r: (seed_order.get(r.get("id"), len(seed_order)), str(r.get("nome") or "")))
     return rows

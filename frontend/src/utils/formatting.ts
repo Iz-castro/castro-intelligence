@@ -31,8 +31,20 @@ export function messageContentLabel(message: ChatMessage) {
   return content;
 }
 
-export function messageSenderLabel(message: ChatMessage) {
-  if (message.direction === "outbound") return message.operator_name || (message.operator_id ? "Equipe" : "Bot");
+export function messageSenderLabel(message: ChatMessage, operators?: Array<{ id: number; display_name: string }>) {
+  if (message.direction === "outbound") {
+    // Autoria por mensagem (ADR 0010): operator_name so existe no caminho
+    // REST; sent_by_name e o denormalizado no doc (snapshot mode); o mapa de
+    // operators cobre o historico anterior ao campo.
+    if (message.operator_name) return message.operator_name;
+    if (message.sent_by_name) return message.sent_by_name;
+    const senderId = message.sender_user_id ?? message.operator_id;
+    if (senderId != null && operators) {
+      const found = operators.find((item) => item.id === senderId);
+      if (found?.display_name) return found.display_name;
+    }
+    return message.operator_id || message.sender_user_id ? "Equipe" : "Bot";
+  }
   if (message.direction === "inbound") return "Cliente";
   return "Sistema";
 }

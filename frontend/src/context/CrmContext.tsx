@@ -332,6 +332,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   alarm_sound_path: "",
   notification_sound_path: "",
   bot_enabled: false,
+  pool_mode: "legacy",
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -1382,7 +1383,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!bundle || !sessionUser || !activeConversationId) return undefined;
     if (selectedContactId !== activeConversationId) return undefined;
-    const unreadCount = activeContact?.unread_count ?? activeContact?.unread ?? 0;
+    // ADR 0010 (revisado): com thread ativa, o gatilho e o unread da
+    // CONVERSATION — e o que o POST /conversation/read zera; o contador do
+    // CONTATO nunca zera pelo caminho de thread, e um valor stale dele
+    // re-dispararia o efeito em loop (1 POST/1,2s). Sem thread, cai no
+    // contador do contato (endpoint legado por contact_id).
+    const threadConv = activeThreadId ? allConversations.find((c) => c.id === activeThreadId) : null;
+    const unreadCount = activeThreadId
+      ? (threadConv?.unread_count ?? threadConv?.unread ?? 0)
+      : (activeContact?.unread_count ?? activeContact?.unread ?? 0);
     if (markingReadContactIdRef.current && markingReadContactIdRef.current !== activeConversationId) {
       markingReadContactIdRef.current = null;
     }
@@ -1420,7 +1429,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, bundle, selectedContactId, sessionUser]);
+  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, allConversations, bundle, selectedContactId, sessionUser]);
 
   // =========================================================================
   // Sound notifications

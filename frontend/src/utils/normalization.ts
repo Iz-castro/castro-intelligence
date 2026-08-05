@@ -72,6 +72,9 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     sender_user_id: record.sender_user_id == null ? null : num(record.sender_user_id),
     channel_owner_user_id: record.channel_owner_user_id == null ? null : num(record.channel_owner_user_id),
     operator_name: String(record.operator_name || ""),
+    // Autoria denormalizada (ADR 0010): em snapshot mode nao ha o join REST
+    // de operator_name — sem este campo a bolha outbound mostra so "Equipe".
+    sent_by_name: String(record.sent_by_name || ""),
     created_at: iso(record.created_at),
     timestamp_wa: iso(record.timestamp_wa),
     transcription: String(record.transcription || ""),

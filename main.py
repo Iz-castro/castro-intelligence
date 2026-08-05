@@ -1230,13 +1230,16 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
     wa_id = str(contact.get("wa_id") or "")
     if not wa_id:
         raise HTTPException(status_code=400, detail="Contato sem wa_id")
+    # Modo Recepcao (ADR 0010): abrir do picker NAO atribui a thread — o
+    # pool compartilhado fica sem dono ate alguem assumir de fato.
+    from database import is_reception_mode
     conversation_id = upsert_wa_conversation(
         contact_id=int(contact_id),
         wa_id=wa_id,
         channel_id=int(channel_id),
         source_channel_type=str(contact.get("source_channel_type", "") or ""),
         phone_number_id=str(contact.get("phone_number_id", "") or ""),
-        auto_assign_user_id=current_user["id"],
+        auto_assign_user_id=None if is_reception_mode() else current_user["id"],
         direction_for_unread=None,
     )
     log_audit(
@@ -1599,7 +1602,28 @@ def _resolve_send_target(
     return conv, ctc, ch
 
 
-def _check_conv_send_permission(conversation: dict, current_user: dict, contact: dict | None = None):
+def _reception_send_allowed(conversation: dict, channel: dict | None) -> bool:
+    """Modo Recepcao (ADR 0010) libera envio nesta thread orfa?
+
+    Coexistence fica FORA do modo recepcao (o auto-assign coex e semantico:
+    dono fisico do numero). Doc legado sem source_channel_type cai no
+    channel_type denormalizado da PROPRIA conversation (_ch_fields) e, por
+    ultimo, no canal resolvido pelo caller — callers sem canal (ex.:
+    set-attendance) ficam cobertos sem read extra. A config so e lida quando
+    o ramo orfao e atingido (1 read por envio orfao).
+    """
+    ch_type = str(conversation.get("source_channel_type") or "")
+    if not ch_type:
+        ch_type = str(conversation.get("channel_type") or "")
+    if not ch_type and channel:
+        ch_type = str(channel.get("channel_type") or "")
+    if ch_type == CHANNEL_TYPE_COEXISTENCE:
+        return False
+    from database import is_reception_mode
+    return is_reception_mode()
+
+
+def _check_conv_send_permission(conversation: dict, current_user: dict, contact: dict | None = None, channel: dict | None = None):
     """Permission check baseado na conversation (Fase 2C).
 
     Bloqueia envio se a thread esta atribuida a outro operador. Sem
@@ -1648,6 +1672,26 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
     if assigned and assigned != current_user["id"]:
         raise HTTPException(status_code=403, detail="Atendimento atribuido a outro operador")
     if not assigned:
+        # Modo Recepcao (ADR 0010): pool compartilhada por tenant — operador
+        # comum responde thread SEM dono sem assumir; a thread segue orfa e a
+        # autoria fica na mensagem (sender_user_id/sent_by_name).
+        # So vale pra POOL de verdade: thread lateral orfa de um LEAD com
+        # dono (outro operador) fica 403, espelhando o escopo de leitura
+        # (_require_contact_access — quem nao pode LER nao pode escrever).
+        if not (contact or {}).get("assigned_to") and _reception_send_allowed(conversation, channel):
+            # Contato ainda em fluxo de bot: silencia o motor (CX le
+            # human_active) — sem isso o agente responde por cima da
+            # recepcionista. Best-effort, mesmo padrao do clear de takeover.
+            if contact and not contact.get("bot_completed"):
+                try:
+                    from bot_service import mark_human_active
+                    mark_human_active(int(contact["id"]))
+                except Exception as exc:
+                    logger.warning(
+                        "reception: mark_human_active falhou p/ contato %s: %s",
+                        contact.get("id"), exc,
+                    )
+            return None
         raise HTTPException(status_code=403, detail="Assuma o atendimento antes de enviar mensagem")
     return None
 
@@ -1667,7 +1711,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user, contact)
+    _check_conv_send_permission(conv, current_user, contact, channel=channel)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
@@ -1711,6 +1755,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
             channel_id=channel["id"] if channel else conv.get("channel_id"),
             conversation_id=conv["id"],
             sender_user_id=current_user["id"],
+            sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
         )
@@ -1739,7 +1784,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    send_mode = _check_conv_send_permission(conv, current_user, contact)
+    send_mode = _check_conv_send_permission(conv, current_user, contact, channel=channel)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
@@ -1768,6 +1813,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
             channel_id=channel["id"] if channel else conv.get("channel_id"),
             conversation_id=conv["id"],
             sender_user_id=current_user["id"],
+            sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
         )
@@ -1795,7 +1841,7 @@ async def wa_send_media(
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user, contact)
+    _check_conv_send_permission(conv, current_user, contact, channel=channel)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], reply_to_message_id)
@@ -1831,6 +1877,7 @@ async def wa_send_media(
         channel_id=channel["id"] if channel else conv.get("channel_id"),
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
+        sent_by_name=str(current_user.get("display_name") or ""),
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         media_size_bytes=len(file_content),
         **reply_fields,
@@ -1858,7 +1905,7 @@ async def wa_send_audio(
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
-    _check_conv_send_permission(conv, current_user, contact)
+    _check_conv_send_permission(conv, current_user, contact, channel=channel)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], reply_to_message_id, reply_to_preview, reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], reply_to_message_id)
@@ -1901,6 +1948,7 @@ async def wa_send_audio(
         channel_id=channel["id"] if channel else conv.get("channel_id"),
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
+        sent_by_name=str(current_user.get("display_name") or ""),
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         media_size_bytes=len(converted),
         **reply_fields,
@@ -2018,7 +2066,7 @@ async def wa_send_template(
 
     conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
     ensure_permission(current_user, "enviar_template")
-    _check_conv_send_permission(conv, current_user, contact)
+    _check_conv_send_permission(conv, current_user, contact, channel=channel)
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
@@ -2113,6 +2161,7 @@ async def wa_send_template(
             channel_id=channel["id"] if channel else conv.get("channel_id"),
             conversation_id=conv["id"],
             sender_user_id=current_user["id"],
+            sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
             template_category=effective_template_category,
         )
@@ -2208,7 +2257,7 @@ async def wa_reopen_conversation(
     ultima conversa). Reusa /send-template (guard WABA + billing + persist).
     Nome/idioma do template vem do frontend (ou env default)."""
     conv, contact, channel = _resolve_send_target(conversation_id, None)
-    _check_conv_send_permission(conv, current_user, contact)
+    _check_conv_send_permission(conv, current_user, contact, channel=channel)
 
     template_name = (body.template_name if body else None) or REOPEN_TEMPLATE_NAME
     language = (body.language if body else None) or REOPEN_TEMPLATE_LANG
@@ -2322,6 +2371,9 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
         original.get("conversation_id"),
         original.get("contact_id"),
     )
+    # Mesmo gate de thread dos demais envios (era o unico caminho de texto
+    # sem ele); retorno "intervention" descartado como nos outros callers.
+    _check_conv_send_permission(conv, current_user, contact, channel=channel)
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
@@ -2360,6 +2412,7 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
         channel_id=channel["id"] if channel else conv.get("channel_id"),
         conversation_id=conv["id"],
         sender_user_id=current_user["id"],
+        sent_by_name=str(current_user.get("display_name") or ""),
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         reply_to_message_id=body.message_id,
         reply_to_preview=original_preview,
@@ -2512,6 +2565,7 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
                     status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
                     operator_id=current_user["id"],
                     sender_user_id=current_user["id"],
+                    sent_by_name=str(current_user.get("display_name") or ""),
                     channel_id=contact.get("channel_id"),
                     channel_owner_user_id=(_rating_channel or {}).get("owner_user_id"),
                     is_rating_message=True, visibility="admin_only",
@@ -3459,6 +3513,15 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
         raise HTTPException(status_code=400, detail="conversation_id ou contact_id obrigatorio")
     if not to_user_id:
         raise HTTPException(status_code=400, detail="Selecione o operador destino")
+    # ADR 0010: transferir PRA SI MESMO e assuncao disfarcada (em canal
+    # standard also_lead grava dono do lead) — exige o mesmo toggle do
+    # /api/wa/assume, senao o perfil "so recepcao" contorna o gate num POST.
+    try:
+        _self_transfer = int(to_user_id) == int(current_user["id"])
+    except (TypeError, ValueError):
+        _self_transfer = False
+    if _self_transfer:
+        ensure_permission(current_user, "assumir_atendimento")
     if not summary:
         raise HTTPException(status_code=400, detail="Resumo do atendimento e obrigatorio")
     _validate_transfer_department(to_department_id)
@@ -3580,6 +3643,7 @@ async def wa_internal_note(request: Request, current_user: dict = Depends(get_cu
         contact_id=contact["id"],
         content=content,
         sender_user_id=current_user["id"],
+        sent_by_name=str(current_user.get("display_name") or ""),
         conversation_id=conv["id"] if conv else None,
         channel_id=(channel["id"] if channel else (conv.get("channel_id") if conv else contact.get("channel_id"))),
     )
@@ -3645,6 +3709,7 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
                     timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
                     channel_id=channel["id"] if channel else conv.get("channel_id"),
                     conversation_id=conv["id"], sender_user_id=current_user["id"],
+                    sent_by_name=str(current_user.get("display_name") or ""),
                     channel_owner_user_id=(channel or {}).get("owner_user_id"),
                 )
                 announced = True
@@ -3743,7 +3808,16 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
     is_manager = (has_permission(current_user, "enviar_mensagem_qualquer_thread")
                   or has_permission(current_user, "assumir_supervisor"))
     if not is_manager and conv.get("assigned_to") != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Apenas o dono do atendimento ou admin/supervisor")
+        # Modo Recepcao (ADR 0010): thread da POOL (sem dono) pode ser
+        # fechada/reaberta por qualquer operador (o toggle RBAC da acao em
+        # si continua valendo logo abaixo). Thread de OUTRO segue 403; e
+        # orfa de LEAD com dono nao e pool (espelha o gate de envio).
+        _pool_ok = False
+        if not conv.get("assigned_to") and _reception_send_allowed(conv, None):
+            _ctc = get_wa_contact(conv.get("contact_id")) if conv.get("contact_id") is not None else None
+            _pool_ok = bool(_ctc) and not _ctc.get("assigned_to")
+        if not _pool_ok:
+            raise HTTPException(status_code=403, detail="Apenas o dono do atendimento ou admin/supervisor")
     # RBAC: toggle da acao em si (fechar/reabrir), alem do escopo acima.
     ensure_permission(
         current_user,
@@ -3788,6 +3862,9 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # RBAC: perfil "so recepcao" (pool compartilhada) tem este toggle OFF e
+    # atende sem virar dono do lead (ADR 0010). Default ON em todos os seeds.
+    ensure_permission(current_user, "assumir_atendimento")
     try:
         existing_id = int(contact.get("assigned_to") or 0) or None
         current_id = int(current_user["id"])

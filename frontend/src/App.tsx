@@ -157,6 +157,9 @@ function TopBar() {
 
 function NavBar() {
   const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, canSeeAll, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, systemSettings } = useCrm();
+  // Modo Recepcao (ADR 0010): a fila "Novos" vira "Recepcao" (pool
+  // compartilhada) — so rotulo; a chave "novos" e os filtros nao mudam.
+  const poolReception = systemSettings.pool_mode === "reception";
   return (
     <nav className="crm-nav">
       {canSeeAll && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); }} title="Contatos no bot">
@@ -164,9 +167,9 @@ function NavBar() {
         <span className="nav-label">Bot</span>
         {botUnread > 0 && <span className="nav-badge">{botUnread > 99 ? "99+" : botUnread}</span>}
       </button>}
-      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); }} title="Novos leads">
+      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); }} title={poolReception ? "Recepcao (pool compartilhada)" : "Novos leads"}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="14"/><line x1="9" y1="11" x2="15" y2="11"/></svg>
-        <span className="nav-label">Novos</span>
+        <span className="nav-label">{poolReception ? "Recepção" : "Novos"}</span>
         {novosUnread > 0 && <span className="nav-badge">{novosUnread > 99 ? "99+" : novosUnread}</span>}
       </button>
       <button className={`nav-item ${activeView === "meus" ? "active" : ""}`} onClick={() => { setActiveView("meus"); setQualificationFilter(""); }} title="Meus atendimentos">
@@ -481,7 +484,8 @@ function LeadTemperatureDot({ temperature }: { temperature?: string }) {
 const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings } = useCrm();
+  const poolReception = systemSettings.pool_mode === "reception";
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
   // nao apenas conversas ativas). Usado no header da sidebar.
@@ -498,7 +502,7 @@ function ContactList() {
     });
     return () => { disposed = true; };
   }, [countAllContacts, contactsCountNonce]);
-  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? "Novos Leads" : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
+  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? (poolReception ? "Recepção" : "Novos Leads") : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
 
   // Render incremental: com ~3k conversas, montar 1000+ itens no DOM trava a
   // coluna. Renderiza em paginas de 50 ("Carregar mais"); o contador do header
@@ -640,7 +644,7 @@ function ContactList() {
             </button>
           );
         })}
-        {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? "Nenhum lead novo na fila." : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
+        {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
         {(renderItems.length > visibleLimit || canLoadMoreMine || canLoadMoreAll) ? (
           <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && (canLoadMoreMine || canLoadMoreAll)}
             onClick={() => {
@@ -897,7 +901,7 @@ function ChatPanel() {
               ) : null}
             </div>
             <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.4rem", justifyContent: "flex-end" }}>
-              {!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={busyAssume}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}
+              {ctx.can("assumir_atendimento") && (!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id) ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={busyAssume}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}
               <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleChatSearch} aria-label="Buscar na conversa" title="Buscar na conversa">{showChatSearch ? <CloseIcon /> : <SearchIcon />}</button>
               <div ref={dotsMenuRef} style={{ position: "relative" }}>
                 <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleDotsMenu} aria-label="Mais opcoes" title="Mais opcoes"><DotsIcon /></button>
@@ -983,7 +987,7 @@ function ChatPanel() {
                     ) : null}
                   </div>
                 ) : null}
-                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.timestamp_wa || message.created_at)}</span></header>
+                <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message, operators)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.timestamp_wa || message.created_at)}</span></header>
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
                 {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
                 <MessageMedia message={message} />
@@ -2375,6 +2379,19 @@ function AdminSettingsModal() {
                   <span>Habilitar bot (coleta nome, equipamento e setor antes de encaminhar)</span>
                 </label>
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Quando desabilitado, mensagens novas caem direto para "Novos".</p>
+              </div>
+            </div>
+            <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+              <h3>Fila de novos leads</h3>
+              <div className="settings-block">
+                <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
+                  <span>Modo da fila</span>
+                  <select value={systemSettings.pool_mode} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_mode: e.target.value === "reception" ? "reception" : "legacy" }))}>
+                    <option value="legacy">Exclusivo — assumir para falar (padrão)</option>
+                    <option value="reception">Recepção — pool compartilhada</option>
+                  </select>
+                </label>
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>No modo Recepção, qualquer operador responde threads sem dono (canal Cloud API) sem assumir; a autoria fica registrada por mensagem e o fechamento devolve o lead à fila.</p>
               </div>
             </div>
             <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
