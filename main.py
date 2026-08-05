@@ -55,7 +55,7 @@ from database import (
     get_all_departments, create_department,
     get_department_by_id, update_department, deactivate_department,
     assign_wa_contact, assign_wa_conversation, get_conversations_by_contact, get_transfer_history,
-    return_contact_to_bot, get_contacts_by_assigned_user,
+    return_contact_to_bot, return_contact_to_pool, get_contacts_by_assigned_user,
     get_wa_contacts_scoped_for_user, get_wa_contacts_visible_to,
     update_user_avatar, get_user_avatar,
     update_user, deactivate_user, set_coex_authorization,
@@ -3961,6 +3961,36 @@ async def wa_return_to_bot(contact_id: int, current_user: dict = Depends(get_cur
     insert_transfer_system_message(contact_id, sys_content, current_user["id"])
     log_audit(current_user["id"], "WA_RETURN_TO_BOT", f"Contato {contact_id}")
     return {"status": "returned_to_bot"}
+
+
+@app.post("/api/wa/contact/{contact_id}/return-to-pool")
+async def wa_return_to_pool(contact_id: int, current_user: dict = Depends(get_current_user)):
+    """Devolve o lead a POOL da recepcao (ADR 0010) — acao explicita do menu.
+
+    So em pool_mode=reception. Escopo: dono do lead ou admin/supervisor
+    (mesma regra do fechar). NAO volta pro bot — o lead cai na aba Recepcao
+    de todos, com bot_completed/qualification/protocolo preservados.
+    """
+    from database import is_reception_mode
+    if not is_reception_mode():
+        raise HTTPException(status_code=409, detail="Disponivel apenas no modo Recepcao (pool compartilhada)")
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    is_manager = (has_permission(current_user, "enviar_mensagem_qualquer_thread")
+                  or has_permission(current_user, "assumir_supervisor"))
+    if not is_manager and contact.get("assigned_to") not in (None, current_user["id"]):
+        raise HTTPException(status_code=403, detail="Apenas o dono do lead ou admin/supervisor")
+    result = return_contact_to_pool(contact_id, current_user["id"])
+    if not result:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    insert_transfer_system_message(
+        contact_id,
+        f"Lead devolvido à recepção por {current_user['display_name']}.",
+        current_user["id"], advance_recency=False,
+    )
+    log_audit(current_user["id"], "WA_RETURN_TO_POOL", f"Contato {contact_id}")
+    return {"status": "returned_to_pool"}
 
 
 @app.post("/api/admin/bulk-reassign")

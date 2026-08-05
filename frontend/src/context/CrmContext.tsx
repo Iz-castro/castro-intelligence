@@ -240,6 +240,7 @@ type CrmContextValue = {
   busyAssume: boolean;
   saveQualification: () => Promise<void>;
   assumeContact: (contactId: number) => Promise<void>;
+  returnContactToPool: (contactId: number) => Promise<void>;
   transferContact: () => Promise<void>;
 
   // Admin users
@@ -2317,6 +2318,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyAssume(false); }
   }
 
+  // ADR 0010: devolve o lead a POOL da recepcao (acao explicita do menu).
+  async function returnContactToPool(contactId: number) {
+    if (!bundle) return;
+    try { setBusyAssume(true); setError(""); setNotice(""); await sendJson(bundle.auth, `/api/wa/contact/${contactId}/return-to-pool`, {}); setNotice("Lead devolvido à recepção."); if (!snapshotMode) await refreshPollingViews(); }
+    catch (e) { setError(errorText(e)); }
+    finally { setBusyAssume(false); }
+  }
+
   async function transferContact() {
     if (!bundle || !selectedContact || !toUserId || !transferSummary.trim()) return;
     try {
@@ -2446,7 +2455,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadAllContacts, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
-    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
+    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, returnContactToPool, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
     editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,

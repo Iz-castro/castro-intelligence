@@ -1056,10 +1056,13 @@ def close_stale_attendances(max_idle_hours):
             _ctc = _get_doc("wa_contacts", conv.get("contact_id")) if conv.get("contact_id") is not None else None
             if not _ctc or not _ctc.get("bot_completed"):
                 continue
-        # Mesma regra do fechamento manual: lead (contato) E atendimento (esta
-        # conversa) voltam p/ a dona de origem (sale_owner). No Modo Recepcao o
-        # revert e no-op (lead fica na pool).
-        _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
+        # Mesma regra do fechamento manual: legacy reverte pro sale_owner;
+        # reception devolve o lead ao agente de IA (release_lead_to_bot).
+        _owner_fields = None
+        if _reception:
+            _owner_fields = release_lead_to_bot(conv.get("contact_id"), cid, "fechado_inatividade")
+        if _owner_fields is None:
+            _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
         _conv_updates = {"attendance_status": "fechado_inatividade"}
         if _owner_fields:
             _conv_updates.update(_owner_fields)
@@ -1084,11 +1087,15 @@ def set_attendance_status(conversation_id, status, clear_takeover=False):
     if clear_takeover:
         updates["takeover_status"] = "none"
         updates["takeover_started_at"] = None
-    # Fechamento -> o Dono do Lead (contato) E o Dono do Atendimento (esta
-    # conversa) voltam p/ a dona de origem (sale_owner). Assim, ao reabrir no
-    # proximo contato, a conversa ja e da vendedora que assumiu (prioridade).
+    # Fechamento -> legacy: lead+conversa voltam p/ a dona de origem
+    # (sale_owner, ADR 0008). Reception (ADR 0010, PO 2026-08-05): lead
+    # volta pro AGENTE DE IA (release_lead_to_bot) — manual e cron.
     if str(status).startswith("fechado"):
-        _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
+        _owner_fields = None
+        if not conv.get("is_backup") and is_reception_mode():
+            _owner_fields = release_lead_to_bot(conv.get("contact_id"), conversation_id, status)
+        if _owner_fields is None:
+            _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
         if _owner_fields:
             updates.update(_owner_fields)
     document("wa_conversations", conversation_id).set(updates, merge=True)
@@ -1832,20 +1839,13 @@ def revert_lead_to_sale_owner(contact_id):
     """
     if contact_id is None:
         return None
-    # Modo Recepcao (ADR 0010): fechamento DEVOLVE o lead a recepcao — zera
-    # o dono do CONTATO e retorna os campos pro caller zerar tambem a
-    # conversa fechada (a caixa e compartilhada; ninguem "fica" com lead
-    # apos encerrar). sale_owner preservado no doc (inerte em reception).
-    # Coex: contato coex re-adquire o dono do numero no proximo inbound
-    # (auto-assign do webhook) — auto-corrige.
+    # Modo Recepcao (ADR 0010): fechamento NAO re-gruda o lead na dona de
+    # origem (sale_owner inerte) e tambem NAO mexe no dono atual — decisao
+    # do PO (canario 2026-08-05): fechamento, principalmente o automatico
+    # do cron, nunca muda posse. Devolver a pool e acao EXPLICITA do menu
+    # da conversa (return_contact_to_pool).
     if is_reception_mode():
-        contact = _get_doc("wa_contacts", contact_id)
-        if not contact:
-            return None
-        fields = {"assigned_to": None, "assigned_to_uid": ""}
-        if contact.get("assigned_to") is not None or contact.get("assigned_to_uid"):
-            document("wa_contacts", contact_id).set(fields, merge=True)
-        return fields
+        return None
     contact = _get_doc("wa_contacts", contact_id)
     if not contact:
         return None
@@ -1923,6 +1923,104 @@ def return_contact_to_bot(contact_id, returned_by_user_id):
         "created_at": utcnow(),
     })
     return True
+
+
+def return_contact_to_pool(contact_id, returned_by_user_id):
+    """Devolve o lead a POOL da recepcao (ADR 0010) — acao explicita do menu.
+
+    Zera o dono do contato E das threads nao-backup, e SO isso: preserva
+    bot_completed, qualification, department_id, protocolo e sale_owner
+    (inerte em reception). Diferente de return_contact_to_bot, o lead NAO
+    volta pro funil do bot — cai direto na aba Recepcao de todos.
+    """
+    current = _get_doc("wa_contacts", contact_id)
+    if not current:
+        return None
+    from_user = current.get("assigned_to")
+    document("wa_contacts", contact_id).set({
+        "assigned_to": None,
+        "assigned_to_uid": "",
+    }, merge=True)
+    for _snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        _cd = _snap.to_dict() or {}
+        if _cd.get("is_backup"):
+            continue
+        _snap.reference.set({"assigned_to": None, "assigned_to_uid": ""}, merge=True)
+    transfer_id = next_sequence("wa_transfer_log")
+    document("wa_transfer_log", transfer_id).set({
+        "id": transfer_id,
+        "contact_id": contact_id,
+        "contact_doc_id": str(contact_id),
+        "from_user_id": from_user,
+        "to_user_id": None,
+        "to_user_uid": "",
+        "from_department_id": current.get("department_id"),
+        "to_department_id": current.get("department_id"),
+        "department_id": current.get("department_id"),
+        "reason": "Devolvido a recepcao",
+        "summary": "Lead devolvido para a pool compartilhada",
+        "transferred_by": returned_by_user_id,
+        "created_at": utcnow(),
+    })
+    return True
+
+
+def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=None):
+    """Fechamento devolve o lead ao AGENTE DE IA (Fase 2 do PLANO_MODELOS,
+    antecipada com gate por pool_mode=reception — decisao do PO 2026-08-05).
+
+    NAO reusa return_contact_to_bot (clobberaria qualification/protocolo/
+    department_id). Preserva por omissao: sale_owner, lead_temperature,
+    lgpd_*, attendance_protocol/started_at, department_id, qualification.
+    Ordem commit-point: periferia primeiro, CONTATO por ultimo. Retorna os
+    campos pro caller carimbar NA CONVERSA FECHADA (sem dono + takeover
+    limpo), ou None (guards) — caller cai no revert legado.
+    """
+    contact = _get_doc("wa_contacts", contact_id)
+    if not contact or contact.get("is_backup"):
+        return None
+    # Guard J-3 (D8, forward-compatible): contato com consentimento revogado
+    # NUNCA volta pro funil do bot automaticamente.
+    if contact.get("lgpd_revoked"):
+        return None
+    # Passo 1 — bot_states: zera ciclo CX anterior + human_active (sem isso o
+    # CX ficaria mudo pra sempre — gate do human_active). Preserva lgpd_*.
+    try:
+        document("bot_states", contact_id).set({
+            "cx_snapshot": None,
+            "cx_summary_emitted": None,
+            "cx_summary_emitted_pid": None,
+            "cx_fail_count": 0,
+            "human_active": False,
+        }, merge=True)
+    except Exception as exc:
+        logger.warning("release_lead_to_bot: falha ao limpar bot_state %s: %s", contact_id, exc)
+    # Passo 2 — threads nao-backup: sem dono (mantem department_id).
+    for _snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        _cd = _snap.to_dict() or {}
+        if _cd.get("is_backup"):
+            continue
+        _snap.reference.set({"assigned_to": None, "assigned_to_uid": ""}, merge=True)
+    # Passo 3 — system message (best-effort; recencia nao infla).
+    try:
+        insert_transfer_system_message(
+            contact_id, "Atendimento devolvido ao assistente virtual.",
+            None, conversation_id=closed_conversation_id, advance_recency=False,
+        )
+    except Exception as exc:
+        logger.warning("release_lead_to_bot: system message falhou %s: %s", contact_id, exc)
+    # Passo 4 — CONTATO (commit point): bot volta a atender no proximo turno.
+    document("wa_contacts", contact_id).set({
+        "bot_completed": False,
+        "assigned_to": None,
+        "assigned_to_uid": "",
+    }, merge=True)
+    return {
+        "assigned_to": None,
+        "assigned_to_uid": "",
+        "takeover_status": "none",
+        "takeover_started_at": None,
+    }
 
 
 def get_contacts_by_assigned_user(user_id):

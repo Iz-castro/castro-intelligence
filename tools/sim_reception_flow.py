@@ -41,6 +41,7 @@ _REAL_IS_RECEPTION = dbf.is_reception_mode
 _REAL_GET_DOC = dbf._get_doc
 _REAL_DOCUMENT = dbf.document
 _REAL_COLLECTION = dbf.collection
+_REAL_NEXT_SEQUENCE = dbf.next_sequence
 
 # RBAC nunca le Firestore neste sim: doc de perfil ausente -> fallback da
 # role (dual-check real). Cenarios especificos injetam um doc fake.
@@ -153,6 +154,9 @@ class _CollRef:
                 yield _QSnap(self.coll, doc_id, data)
 
 
+_SEQ = {"n": 1000}
+
+
 def patch_store():
     STORE.clear()
     dbf._get_doc = lambda coll, doc_id: (
@@ -161,6 +165,10 @@ def patch_store():
     )
     dbf.document = lambda coll, doc_id: _DocRef(coll, doc_id)
     dbf.collection = lambda coll: _CollRef(coll)
+    def _fake_next_sequence(*a, **k):
+        _SEQ["n"] += 1
+        return _SEQ["n"]
+    dbf.next_sequence = _fake_next_sequence
 
 
 def restore_dbf():
@@ -169,6 +177,7 @@ def restore_dbf():
     dbf._get_doc = _REAL_GET_DOC
     dbf.document = _REAL_DOCUMENT
     dbf.collection = _REAL_COLLECTION
+    dbf.next_sequence = _REAL_NEXT_SEQUENCE
 
 
 # =========================================================================
@@ -282,21 +291,16 @@ def cenario_revert_sale_owner():
 
     dbf.is_reception_mode = lambda: True
     r = dbf.revert_lead_to_sale_owner(1)
-    check(r == {"assigned_to": None, "assigned_to_uid": ""},
-          "reception: revert retorna campos de DEVOLUCAO a pool")
+    check(r is None, "reception: revert NAO re-gruda e NAO mexe em posse (PO 2026-08-05)")
     check(STORE["wa_contacts"]["1"].get("assigned_to") is None,
-          "reception: contato segue sem dono apos fechamento")
-
-    # Lead COM dono (assumido/transferido): fechamento devolve a pool.
+          "reception: contato sem dono segue sem dono")
+    # A devolucao em reception e via release_lead_to_bot (cenarios 5 e 11),
+    # nunca pelo revert — fechamento automatico nao muda posse por aqui.
     STORE["wa_contacts"]["9"] = {"id": 9, "assigned_to": 3, "assigned_to_uid": "uid3",
                                  "sale_owner_user_id": 3}
     r = dbf.revert_lead_to_sale_owner(9)
-    check(r == {"assigned_to": None, "assigned_to_uid": ""}
-          and STORE["wa_contacts"]["9"].get("assigned_to") is None
-          and STORE["wa_contacts"]["9"].get("assigned_to_uid") == "",
-          "reception: lead assumido e DEVOLVIDO a pool no fechamento")
-    check(STORE["wa_contacts"]["9"].get("sale_owner_user_id") == 3,
-          "reception: sale_owner preservado (inerte)")
+    check(r is None and STORE["wa_contacts"]["9"].get("assigned_to") == 3,
+          "reception: revert nao tira o dono atual (devolucao e do release)")
 
     dbf.is_reception_mode = lambda: False
     r = dbf.revert_lead_to_sale_owner(1)
@@ -386,11 +390,92 @@ def cenario_close_stale():
     check(STORE["wa_conversations"]["B"].get("assigned_to") is None,
           "reception: fechamento nao inventa dono na orfa")
     check(STORE["wa_conversations"]["A"].get("assigned_to") is None,
-          "reception: thread ATRIBUIDA fechada e devolvida a pool")
+          "reception: thread ATRIBUIDA fechada perde o dono (release)")
+    check(STORE["wa_contacts"]["10"].get("bot_completed") is False
+          and STORE["wa_contacts"]["11"].get("bot_completed") is False,
+          "reception: fechados voltam pro AGENTE DE IA (bot_completed=False)")
+    check(STORE["wa_contacts"]["12"].get("bot_completed") is False,
+          "reception: mid-bot intacto (ja era False; conv nao fechou)")
     check(STORE["wa_conversations"]["C"].get("attendance_status") == "aberto",
           "reception: thread ainda no bot NAO fecha")
     check(STORE["wa_conversations"]["E"].get("attendance_status") == "aberto",
           "reception: backup NAO fecha")
+    restore_dbf()
+
+
+# =========================================================================
+# Cenario 11 — release_lead_to_bot (fechamento devolve ao agente de IA)
+# =========================================================================
+
+def cenario_release_to_bot():
+    titulo("CENARIO 11 — release_lead_to_bot: fechamento devolve ao agente (PO 2026-08-05)")
+    patch_store()
+    STORE["wa_contacts"] = {
+        "20": {"id": 20, "assigned_to": 3, "assigned_to_uid": "uid3",
+               "bot_completed": True, "department_id": 5, "qualification": "novo",
+               "attendance_protocol": "20260805-20-REC", "sale_owner_user_id": 3,
+               "lead_temperature": "morno"},
+        "21": {"id": 21, "assigned_to": 3, "lgpd_revoked": True},
+    }
+    STORE["wa_conversations"] = {
+        "T1": {"id": "T1", "contact_id": 20, "assigned_to": 3, "assigned_to_uid": "uid3"},
+        "T2": {"id": "T2", "contact_id": 20, "assigned_to": None,
+               "assigned_to_uid": "__backup__", "is_backup": True},
+    }
+    STORE["bot_states"] = {"20": {"lgpd_status": "accepted", "cx_snapshot": {"x": 1},
+                                  "human_active": True, "cx_fail_count": 2}}
+
+    fields = dbf.release_lead_to_bot(20, "T1", "fechado_manual")
+    c = STORE["wa_contacts"]["20"]
+    bs = STORE["bot_states"]["20"]
+    check(fields == {"assigned_to": None, "assigned_to_uid": "",
+                     "takeover_status": "none", "takeover_started_at": None},
+          "release retorna campos pro caller carimbar a conversa fechada")
+    check(c.get("bot_completed") is False and c.get("assigned_to") is None,
+          "contato: bot volta a atender (bot_completed=False, sem dono)")
+    check(c.get("department_id") == 5 and c.get("qualification") == "novo"
+          and c.get("attendance_protocol") == "20260805-20-REC"
+          and c.get("sale_owner_user_id") == 3 and c.get("lead_temperature") == "morno",
+          "contato: setor/qualificacao/protocolo/sale_owner/temperatura preservados")
+    check(STORE["wa_conversations"]["T1"].get("assigned_to") is None,
+          "thread nao-backup perde o dono")
+    check(STORE["wa_conversations"]["T2"].get("assigned_to_uid") == "__backup__",
+          "thread backup intacta")
+    check(bs.get("human_active") is False and bs.get("cx_snapshot") is None
+          and bs.get("cx_fail_count") == 0 and bs.get("lgpd_status") == "accepted",
+          "bot_states: ciclo CX zerado, prova LGPD preservada")
+    check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None,
+          "guard J-3: lgpd_revoked NAO volta pro funil (release=None)")
+    restore_dbf()
+
+
+# =========================================================================
+# Cenario 12 — return_contact_to_pool (acao explicita do menu)
+# =========================================================================
+
+def cenario_return_to_pool():
+    titulo("CENARIO 12 — Devolver a recepcao (acao explicita do menu)")
+    patch_store()
+    STORE["wa_contacts"] = {"30": {"id": 30, "assigned_to": 3, "assigned_to_uid": "uid3",
+                                   "bot_completed": True, "department_id": 5,
+                                   "qualification": "novo"}}
+    STORE["wa_conversations"] = {
+        "P1": {"id": "P1", "contact_id": 30, "assigned_to": 3, "assigned_to_uid": "uid3"},
+        "P2": {"id": "P2", "contact_id": 30, "assigned_to": None,
+               "assigned_to_uid": "__backup__", "is_backup": True},
+    }
+    r = dbf.return_contact_to_pool(30, 3)
+    c = STORE["wa_contacts"]["30"]
+    check(r is True and c.get("assigned_to") is None and c.get("assigned_to_uid") == "",
+          "lead devolvido a pool (sem dono)")
+    check(c.get("bot_completed") is True and c.get("department_id") == 5,
+          "bot_completed/setor preservados (NAO volta pro bot)")
+    check(STORE["wa_conversations"]["P1"].get("assigned_to") is None,
+          "thread nao-backup devolvida")
+    check(STORE["wa_conversations"]["P2"].get("assigned_to_uid") == "__backup__",
+          "thread backup intacta")
+    check(len(STORE.get("wa_transfer_log", {})) == 1,
+          "transfer_log registra a devolucao")
     restore_dbf()
 
 
@@ -538,6 +623,8 @@ def run():
     cenario_perfis_merge()
     cenario_set_attendance_orfa()
     cenario_contato_manual()
+    cenario_release_to_bot()
+    cenario_return_to_pool()
 
     print("\n" + "=" * 70)
     if FAILS:

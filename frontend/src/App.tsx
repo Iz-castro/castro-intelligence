@@ -911,6 +911,7 @@ function ChatPanel() {
                     <div style={{ height: 1, background: "var(--border)", margin: "0.3rem 0.5rem" }} />
                     <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }}><span>✏️</span><span>Editar apelido</span></button>
                     {selectedThreadId ? <button type="button" className="attach-option" onClick={() => { void setAttendance(selectedThreadId, attendanceClosed ? "aberto" : "fechado_manual"); closeDotsMenu(); }}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
+                    {ctx.systemSettings.pool_mode === "reception" && selectedContact.assigned_to != null ? <button type="button" className="attach-option" onClick={() => { void ctx.returnContactToPool(selectedContact.id); closeDotsMenu(); }}><span>↩️</span><span>Devolver à recepção</span></button> : null}
                     {selectedContact.attendance_protocol ? <button type="button" className="attach-option" onClick={() => { navigator.clipboard.writeText(selectedContact.attendance_protocol!).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button> : null}
                   </div>
                 ) : null}

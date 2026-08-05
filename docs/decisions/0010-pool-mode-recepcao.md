@@ -31,7 +31,8 @@ físico do número; fallback de doc legado sem `source_channel_type` cai no
 | `conversation/open` (picker) | auto-atribui a thread | não atribui |
 | Auto-close por inatividade | pula órfãs | fecha órfãs com `bot_completed` (bot/backup ficam) |
 | Fechar/reabrir manual de órfã (op. comum) | 403 | permitido (toggle RBAC da ação continua valendo) |
-| Fechamento re-gruda no `sale_owner` | sim (ADR 0008) | não — fechamento DEVOLVE o lead à pool (zera dono do contato e da conversa fechada; `sale_owner` preservado/inerte) |
+| Fechamento (manual OU cron) | re-gruda no `sale_owner` (ADR 0008) | lead volta pro **AGENTE DE IA** — `release_lead_to_bot` (Fase 2 do PLANO_MODELOS antecipada, PO 2026-08-05): `bot_completed=False` + sem dono; setor/qualificação/protocolo/temperatura/`sale_owner` preservados; prova LGPD intacta |
+| Devolver à pool SEM encerrar | n/a | ação explícita do menu "Devolver à recepção" (`return_contact_to_pool` — dono do lead ou manager; `bot_completed` fica True) |
 | Reabertura pontual (ADR 0009 D3) | volta pro "Meus" | fica na pool (emergente: lead sem dono ⇒ nada a herdar) |
 
 **Autoria desce da thread para a MENSAGEM:** `sender_user_id` (já existia,
@@ -120,10 +121,16 @@ como melhoria futura).
 **Ajustes do canário #2 (2026-08-05):** (a) carregar o CRM não abre mais
 conversa nenhuma — o auto-select legado de `allConversations[0]` exibia na
 tela uma thread que o operador nunca clicou (seleção órfã também volta pro
-placeholder em vez de pular pra 1ª); (b) fechamento em reception passou a
-DEVOLVER ativamente o lead assumido/transferido à pool (a implementação
-original só evitava o re-gruda do `sale_owner`, mas mantinha o dono atual —
-a linha da tabela acima ficava sem caminho de volta pra caixa compartilhada).
+placeholder em vez de pular pra 1ª); (b) decisão do PO sobre o fim do
+atendimento: fechamento (manual e cron) devolve o lead ao **agente de IA**
+via `release_lead_to_bot` — Fase 2 do PLANO_MODELOS antecipada com gate por
+`pool_mode` (a variante intermediária "fechar devolve à pool" foi vetada:
+fechamento automático não muda posse pra outro humano); pra devolver aos
+colegas SEM encerrar existe a ação de menu "Devolver à recepção". Fluxo
+completo: handoff → Recepção → conversa/transfer → fechar → Val; reabrir =
+picker + template (o gate de envio já silencia a Val via `mark_human_active`
+e o próximo fechamento devolve de novo). `release_lead_to_bot` nasce com o
+guard `lgpd_revoked` do J-3 (F1 só precisa gravar o campo).
 
 **7º achado (canário varizemed-test, 2026-08-05):** o picker de contato
 manual (`create_manual_wa_contact`, ramo "reabre/assume") era um TERCEIRO
