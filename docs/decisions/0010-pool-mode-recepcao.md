@@ -132,6 +132,16 @@ picker + template (o gate de envio já silencia a Val via `mark_human_active`
 e o próximo fechamento devolve de novo). `release_lead_to_bot` nasce com o
 guard `lgpd_revoked` do J-3 (F1 só precisa gravar o campo).
 
+**Ajuste do canário #3 (2026-08-05):** o retorno pós-fechamento re-perguntava
+o aviso LGPD (o `bot_states` do ciclo anterior é apagado no fim do funil e o
+`handle_lgpd` lê SÓ o state). Implementada a **hidratação da prova pelo
+CONTATO** (Fase 2 do PLANO_MODELOS, item 9, desenho literal): antes do
+`handle_lgpd`, se o state não tem veredito e o contato tem `lgpd_consent=True`
+com `lgpd_policy_version` igual à vigente (`_cx_policy_version`), hidrata
+`accepted` — sem re-chamar `_record_lgpd_consent`. Recusa no state tem
+precedência; versão divergente re-pergunta (ADR 0009 D1); `lgpd_revoked`
+nunca hidrata (J-3 D8). Cobertura: `sim_cx_flow` cenário q (7 asserts).
+
 **7º achado (canário varizemed-test, 2026-08-05):** o picker de contato
 manual (`create_manual_wa_contact`, ramo "reabre/assume") era um TERCEIRO
 bypass do gate: operadora "só recepção" abriu o número pelo "+ Nova

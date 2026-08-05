@@ -726,6 +726,35 @@ check(_norm["parameters"].get("user_insurance") == "Unimed", "escalar preservado
 check(_norm["parameters"].get("composto") == {"a": 1, "b": 2},
       "dict legitimo de 2+ chaves nao e desembrulhado")
 
+print("\n=== q: hidratacao LGPD pelo CONTATO (retorno pos-fechamento, Fase 2 item 9) ===")
+# release_lead_to_bot limpa o ciclo (bot_states sem lgpd_*), mas a prova
+# vive no contato: retorno NAO pode re-perguntar o aviso (ADR 0010/0009 D1).
+novo_contato(40, wa_id="5571944443333", lgpd_consent=True,
+             lgpd_consent_at="2026-08-05T00:00:00+00:00",
+             lgpd_policy_version="varizemed-test-2026-07")
+CX_SCRIPT.append(_cx_ok("Ola de novo! O endereco e Rua X, 100."))
+_n = len(CX_CALLS)
+r = envia(40, "qual o endereco mesmo?")
+check(isinstance(r, str) and "endereco" in r.lower(), "retorno vai DIRETO pro agente (sem aviso LGPD)")
+check(len(CX_CALLS) == _n + 1, "CX chamado no 1o turno do retorno")
+if len(CX_CALLS) > _n:
+    check(CX_CALLS[-1]["text"] == "qual o endereco mesmo?",
+          "mensagem ATUAL vai ao agente (sem replay de user_first_input)")
+_st40 = STORE.get("bot_states", {}).get("40", {})
+check(_st40.get("lgpd_consent") is True, "state hidratado persiste lgpd_consent")
+
+novo_contato(41, wa_id="5571933332222", lgpd_consent=True,
+             lgpd_policy_version="varizemed-velha-2020")
+r = envia(41, "oi de novo")
+check(isinstance(r, dict) and r.get("type") == "interactive_buttons",
+      "policy_version divergente RE-PERGUNTA (fail-closed, D1)")
+
+novo_contato(42, wa_id="5571922221111", lgpd_consent=True,
+             lgpd_policy_version="varizemed-test-2026-07", lgpd_revoked=True)
+r = envia(42, "oi")
+check(isinstance(r, dict) and r.get("type") == "interactive_buttons",
+      "lgpd_revoked NUNCA hidrata (guard J-3 D8)")
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")

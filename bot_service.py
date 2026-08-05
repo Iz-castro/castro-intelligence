@@ -643,6 +643,20 @@ async def _process_cx_message(
     if state.get("human_active"):
         return None
 
+    # Hidratacao da prova pelo CONTATO (PLANO_MODELOS Fase 2 item 9): apos o
+    # release_lead_to_bot (fechamento devolve ao agente), o bot_states do
+    # ciclo anterior ja foi limpo — sem isto o paciente re-toma o aviso LGPD
+    # a cada retorno. A prova do contato vale se a policy_version bater com
+    # a vigente (ADR 0009 D1: bump de versao re-pergunta); recusa registrada
+    # em bot_states tem precedencia (guarda is None); revogado (J-3 D8)
+    # nunca hidrata. NAO re-chama _record_lgpd_consent (prova ja existe).
+    if state.get("lgpd_consent") is None \
+            and contact.get("lgpd_consent") is True \
+            and not contact.get("lgpd_revoked") \
+            and str(contact.get("lgpd_policy_version") or "").strip() == _cx_policy_version(ai_cfg):
+        state["lgpd_consent"] = True
+        state["lgpd_status"] = "accepted"
+
     # ------------------------------------------------------------------
     # Gate LGPD local — SEMPRE antes do motor. A prova de consentimento
     # (contato + audit + versao) fica no CRM; o agente CX recebe
