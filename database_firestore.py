@@ -1339,7 +1339,8 @@ def _maybe_upsert_conversation_for_existing_contact(existing_contact, channel_id
     )
 
 
-def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_admin_override=False):
+def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_admin_override=False,
+                             auto_assume=True):
     """Cria contato manualmente pelo operador.
 
     Retorna (contact_id, error_message).
@@ -1349,8 +1350,13 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         e nao foi arquivado, retorna erro pedindo transferencia.
         allow_admin_override=True permite ignorar essa trava (admin/supervisor).
       - Se o contato pertence ao proprio user_id, ou esta sem dono
-        (assigned_to vazio), ou esta arquivado, reabre/assume e retorna
-        o id existente.
+        (assigned_to vazio), ou esta arquivado, reabre e (com auto_assume)
+        assume, retornando o id existente.
+
+    auto_assume=False (ADR 0010): NAO vira dono — reabre/cria no pool. Usado
+    em modo recepcao e para perfil sem o toggle assumir_atendimento; sem
+    isso, o picker de novo contato era um bypass do gate do /api/wa/assume
+    (lead orfao virava privado por fora, sumindo da pool dos colegas).
     """
     existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
@@ -1387,13 +1393,15 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
                 document("wa_contacts", existing["id"]).set(updates, merge=True)
             return existing["id"], None
 
-        # Contato do proprio user, sem dono ou arquivado: reabre/assume.
-        updates = {
-            "assigned_to": user_id,
-            "assigned_to_uid": user.get("firebase_uid", ""),
-            "qualification": "em_atendimento",
-            "is_archived": 0,
-        }
+        # Contato do proprio user, sem dono ou arquivado: reabre e, se o
+        # caller permitir, assume. Sem auto_assume so desarquiva (pool).
+        updates = {"is_archived": 0}
+        if auto_assume:
+            updates.update({
+                "assigned_to": user_id,
+                "assigned_to_uid": user.get("firebase_uid", ""),
+                "qualification": "em_atendimento",
+            })
         if declared_name and not existing.get("declared_name"):
             updates["declared_name"] = declared_name
             updates["display_name"] = _resolve_display_name(
@@ -1424,10 +1432,10 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         "phone_formatted": phone_formatted,
         "profile_picture_url": "",
         "contact_avatar_path": "",
-        "qualification": "em_atendimento",
+        "qualification": "em_atendimento" if auto_assume else "novo",
         "notes": "",
-        "assigned_to": user_id,
-        "assigned_to_uid": user.get("firebase_uid", ""),
+        "assigned_to": user_id if auto_assume else None,
+        "assigned_to_uid": user.get("firebase_uid", "") if auto_assume else "",
         "department_id": user.get("department_id"),
         "channel_id": channel_id,
         "phone_number_id": "",

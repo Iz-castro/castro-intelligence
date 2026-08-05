@@ -117,6 +117,16 @@ Refutados (registrados, sem ação): open auto-assign em legacy sem o toggle
 (especificado acima), reads sem cache (sugestão de eficiência — TTL 60s fica
 como melhoria futura).
 
+**7º achado (canário varizemed-test, 2026-08-05):** o picker de contato
+manual (`create_manual_wa_contact`, ramo "reabre/assume") era um TERCEIRO
+bypass do gate: operadora "só recepção" abriu o número pelo "+ Nova
+conversa" e virou Dona do Lead — lead com dono + thread órfã = invisível
+pra pool inteira (o colega perde a janela: contato 403 no lazy-fetch). Fix:
+parâmetro `auto_assume` — False quando reception OU perfil sem
+`assumir_atendimento` (reabre/cria no pool; só desarquiva). Sintoma
+diagnóstico pra reincidência: contato `em_atendimento` + `assigned_to`
+preenchido sem transfer_log.
+
 ## Validação
 
 `tools/sim_reception_flow.py` (39 asserts, código real de main/rbac/db com

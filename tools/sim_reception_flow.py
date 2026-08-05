@@ -485,6 +485,33 @@ def cenario_set_attendance_orfa():
         restore_dbf()
 
 
+def cenario_contato_manual():
+    titulo("CENARIO 10 — picker/contato manual nao assume sem permissao (fix canario)")
+    patch_store()
+    real_find = dbf._find_contact_by_wa_id_any_variant
+    STORE["wa_contacts"] = {"7": {"id": 7, "wa_id": "5531999990000", "assigned_to": None,
+                                  "assigned_to_uid": "", "is_archived": 1,
+                                  "qualification": "novo"}}
+    STORE["users"] = {"2": {"id": 2, "firebase_uid": "uid2", "department_id": 5}}
+    dbf._find_contact_by_wa_id_any_variant = lambda w: dict(STORE["wa_contacts"]["7"])
+    try:
+        cid, err = dbf.create_manual_wa_contact("Nome", "5531999990000", 6, 2, auto_assume=False)
+        doc = STORE["wa_contacts"]["7"]
+        check(cid == 7 and err is None, "auto_assume=False: reabre o contato existente")
+        check(doc.get("assigned_to") is None and doc.get("assigned_to_uid") == "",
+              "auto_assume=False: NAO vira dono (lead segue na pool)")
+        check(doc.get("is_archived") == 0, "auto_assume=False: desarquiva mesmo assim")
+        check(doc.get("qualification") == "novo", "auto_assume=False: qualification intacta")
+
+        cid, err = dbf.create_manual_wa_contact("Nome", "5531999990000", 6, 2, auto_assume=True)
+        doc = STORE["wa_contacts"]["7"]
+        check(doc.get("assigned_to") == 2 and doc.get("qualification") == "em_atendimento",
+              "auto_assume=True (legacy): reabre/assume como antes")
+    finally:
+        dbf._find_contact_by_wa_id_any_variant = real_find
+        restore_dbf()
+
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -496,6 +523,7 @@ def run():
     cenario_transfer_rbac()
     cenario_perfis_merge()
     cenario_set_attendance_orfa()
+    cenario_contato_manual()
 
     print("\n" + "=" * 70)
     if FAILS:

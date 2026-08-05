@@ -2478,12 +2478,18 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
         channel_id = default_ch["id"]
 
     allow_override = has_permission(current_user, "editar_dono_lead")
+    # ADR 0010: o picker NAO pode ser assuncao disfarcada — em reception o
+    # contato nasce/reabre no pool; perfil sem assumir_atendimento idem.
+    from database import is_reception_mode
+    _auto_assume = (has_permission(current_user, "assumir_atendimento")
+                    and not is_reception_mode())
     contact_id, error = create_manual_wa_contact(
         declared_name=body.declared_name,
         wa_id=wa_id,
         channel_id=channel_id,
         user_id=current_user["id"],
         allow_admin_override=allow_override,
+        auto_assume=_auto_assume,
     )
     if error:
         raise HTTPException(status_code=409, detail=error)
