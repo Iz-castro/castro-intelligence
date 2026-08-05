@@ -1148,23 +1148,17 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     );
   }, [bundle, config, perfil?.id, snapshotMode]);
 
-  // Auto-select primeira conversation se nada selecionado (ou seleção orfã).
-  // Excecao: apos desselecao explicita (holdEmptySelectionRef, ex.:
-  // transferencia) mantem o placeholder em vez de pular pra conversations[0].
+  // Selecao inicial: NENHUMA conversa aberta ao carregar (canario ADR 0010,
+  // 2026-08-05 — o auto-select da allConversations[0] abria na tela uma
+  // thread que o operador nunca clicou, ex. a mais recente de outro teste).
+  // Selecao orfa (a thread selecionada saiu da lista, ex.: transferida)
+  // volta pro placeholder em vez de pular pra 1a da lista.
   useEffect(() => {
-    if (selectedThreadId) {
-      // Algo selecionado -> cancela o "segurar vazio". Se a conversa saiu
-      // da lista (orfa), mantem o comportamento legado: pula pra 1a ou
-      // limpa se a lista esvaziou.
-      holdEmptySelectionRef.current = false;
-      if (!allConversations.some((c) => c.id === selectedThreadId)) {
-        setSelectedThreadId(allConversations.length ? allConversations[0].id : null);
-      }
-      return;
+    if (!selectedThreadId) return;
+    holdEmptySelectionRef.current = false;
+    if (!allConversations.some((c) => c.id === selectedThreadId)) {
+      setSelectedThreadId(null);
     }
-    if (!allConversations.length) return;
-    if (holdEmptySelectionRef.current) return;
-    setSelectedThreadId(allConversations[0].id);
   }, [allConversations, selectedThreadId]);
 
   // Track the selected conversation and restore its recent in-memory cache immediately.

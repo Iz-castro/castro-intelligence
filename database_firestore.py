@@ -1832,11 +1832,20 @@ def revert_lead_to_sale_owner(contact_id):
     """
     if contact_id is None:
         return None
-    # Modo Recepcao (ADR 0010): fechamento NAO re-gruda o lead na dona de
-    # origem — a pool compartilhada e o estado normal e o proximo contato
-    # volta pra fila de todos. sale_owner fica preservado no doc (inerte).
+    # Modo Recepcao (ADR 0010): fechamento DEVOLVE o lead a recepcao — zera
+    # o dono do CONTATO e retorna os campos pro caller zerar tambem a
+    # conversa fechada (a caixa e compartilhada; ninguem "fica" com lead
+    # apos encerrar). sale_owner preservado no doc (inerte em reception).
+    # Coex: contato coex re-adquire o dono do numero no proximo inbound
+    # (auto-assign do webhook) — auto-corrige.
     if is_reception_mode():
-        return None
+        contact = _get_doc("wa_contacts", contact_id)
+        if not contact:
+            return None
+        fields = {"assigned_to": None, "assigned_to_uid": ""}
+        if contact.get("assigned_to") is not None or contact.get("assigned_to_uid"):
+            document("wa_contacts", contact_id).set(fields, merge=True)
+        return fields
     contact = _get_doc("wa_contacts", contact_id)
     if not contact:
         return None

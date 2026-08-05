@@ -98,7 +98,8 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 - **Modo Recepção (ADR 0010):** `system_settings/chat.pool_mode` (`legacy`|`reception`, default no
   READ — nunca backfill). Em `reception` (varizemed): operador comum responde thread SEM dono de
   canal **standard** sem assumir (coex fica FORA), `conversation/open` não auto-atribui, fechamento
-  NÃO re-gruda no `sale_owner` e o cron fecha órfãs com `bot_completed`. Autoria vive NA MENSAGEM
+  DEVOLVE o lead à pool (zera dono; `sale_owner` inerte) e o cron fecha órfãs com `bot_completed`.
+  Autoria vive NA MENSAGEM
   (`sender_user_id` + `sent_by_name` denormalizado — campo novo em `wa_messages` exige whitelist em
   `normalization.ts`). "Assumir pra falar" (ADR 0008) segue sendo o default de todo tenant `legacy`;
   o toggle RBAC `assumir_atendimento` (ON por default) permite perfil "só recepção". Kill-switch sem

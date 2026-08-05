@@ -282,9 +282,21 @@ def cenario_revert_sale_owner():
 
     dbf.is_reception_mode = lambda: True
     r = dbf.revert_lead_to_sale_owner(1)
-    check(r is None, "reception: revert e no-op (lead fica na pool)")
+    check(r == {"assigned_to": None, "assigned_to_uid": ""},
+          "reception: revert retorna campos de DEVOLUCAO a pool")
     check(STORE["wa_contacts"]["1"].get("assigned_to") is None,
           "reception: contato segue sem dono apos fechamento")
+
+    # Lead COM dono (assumido/transferido): fechamento devolve a pool.
+    STORE["wa_contacts"]["9"] = {"id": 9, "assigned_to": 3, "assigned_to_uid": "uid3",
+                                 "sale_owner_user_id": 3}
+    r = dbf.revert_lead_to_sale_owner(9)
+    check(r == {"assigned_to": None, "assigned_to_uid": ""}
+          and STORE["wa_contacts"]["9"].get("assigned_to") is None
+          and STORE["wa_contacts"]["9"].get("assigned_to_uid") == "",
+          "reception: lead assumido e DEVOLVIDO a pool no fechamento")
+    check(STORE["wa_contacts"]["9"].get("sale_owner_user_id") == 3,
+          "reception: sale_owner preservado (inerte)")
 
     dbf.is_reception_mode = lambda: False
     r = dbf.revert_lead_to_sale_owner(1)
@@ -372,7 +384,9 @@ def cenario_close_stale():
     check(STORE["wa_conversations"]["B"].get("attendance_status") == "fechado_inatividade",
           "reception: thread da pool carimbada fechado_inatividade")
     check(STORE["wa_conversations"]["B"].get("assigned_to") is None,
-          "reception: fechamento nao inventa dono (revert no-op)")
+          "reception: fechamento nao inventa dono na orfa")
+    check(STORE["wa_conversations"]["A"].get("assigned_to") is None,
+          "reception: thread ATRIBUIDA fechada e devolvida a pool")
     check(STORE["wa_conversations"]["C"].get("attendance_status") == "aberto",
           "reception: thread ainda no bot NAO fecha")
     check(STORE["wa_conversations"]["E"].get("attendance_status") == "aberto",

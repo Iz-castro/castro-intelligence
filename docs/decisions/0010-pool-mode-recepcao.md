@@ -31,7 +31,7 @@ físico do número; fallback de doc legado sem `source_channel_type` cai no
 | `conversation/open` (picker) | auto-atribui a thread | não atribui |
 | Auto-close por inatividade | pula órfãs | fecha órfãs com `bot_completed` (bot/backup ficam) |
 | Fechar/reabrir manual de órfã (op. comum) | 403 | permitido (toggle RBAC da ação continua valendo) |
-| Fechamento re-gruda no `sale_owner` | sim (ADR 0008) | não — revert é no-op, lead volta pra pool |
+| Fechamento re-gruda no `sale_owner` | sim (ADR 0008) | não — fechamento DEVOLVE o lead à pool (zera dono do contato e da conversa fechada; `sale_owner` preservado/inerte) |
 | Reabertura pontual (ADR 0009 D3) | volta pro "Meus" | fica na pool (emergente: lead sem dono ⇒ nada a herdar) |
 
 **Autoria desce da thread para a MENSAGEM:** `sender_user_id` (já existia,
@@ -116,6 +116,14 @@ Refutados (registrados, sem ação): open auto-assign em legacy sem o toggle
 (pré-existente/escopo), 403 na correção da própria mensagem pós-assume
 (especificado acima), reads sem cache (sugestão de eficiência — TTL 60s fica
 como melhoria futura).
+
+**Ajustes do canário #2 (2026-08-05):** (a) carregar o CRM não abre mais
+conversa nenhuma — o auto-select legado de `allConversations[0]` exibia na
+tela uma thread que o operador nunca clicou (seleção órfã também volta pro
+placeholder em vez de pular pra 1ª); (b) fechamento em reception passou a
+DEVOLVER ativamente o lead assumido/transferido à pool (a implementação
+original só evitava o re-gruda do `sale_owner`, mas mantinha o dono atual —
+a linha da tabela acima ficava sem caminho de volta pra caixa compartilhada).
 
 **7º achado (canário varizemed-test, 2026-08-05):** o picker de contato
 manual (`create_manual_wa_contact`, ramo "reabre/assume") era um TERCEIRO
