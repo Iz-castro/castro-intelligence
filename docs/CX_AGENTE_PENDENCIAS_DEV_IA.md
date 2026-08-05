@@ -11,6 +11,14 @@ real de produção do dia 29/07 (mensagens de sistema gravadas no CRM).
 
 ## 1. Os session params passaram a sair como STRUCT (regressão de 29/07)
 
+> **⚠ STATUS 2026-07-31: mitigado no CRM; shape do agente INDETERMINADO.**
+> O handoff real de hoje saiu 100% limpo (QUENTE alcançado, linhas certas),
+> mas isso não prova que o agente voltou a mandar escalares — o unwrap do
+> conector (rev `castro-crm-00068-2kb`) normaliza os dois formatos, e por
+> LGPD o CRM não loga os params crus, então de fora não dá pra distinguir.
+> Para o CRM o assunto está encerrado; a recomendação de params escalares
+> segue valendo como higiene para futuros consumidores do agente.
+
 **O que observamos:** até 23/07 o agente devolvia cada session param como
 escalar (`user_name: "Timmy"`). Nas conversas de 29/07 no tenant `varizemed`,
 o MESMO agente passou a devolver cada param embrulhado num struct com a
@@ -40,6 +48,11 @@ generator que passou a gravar o param como objeto), porque:
 documentação do próprio Router descrevia.
 
 ## 2. O agente parou de setar `handoff_summary`
+
+> **✅ RESOLVIDO 2026-07-31.** Handoff real no tenant `varizemed` às 15:58 UTC
+> saiu com a linha `Resumo: Paciente ... Motivo da transferencia: paciente
+> pediu atendente.` — texto narrativo que só o agente pode produzir, servido
+> pelo environment pinado. Item fechado com evidência em produção.
 
 Nos handoffs de teste de 21-23/07 (`varizemed-test`), o resumo do operador
 terminava com a linha **`Resumo: <texto narrativo da Val>`** — que vem do

@@ -5,6 +5,12 @@
 
 ## O produto que o PO descreveu
 
+> **Nota (ADR 0010, 2026-08-04):** existe um TERCEIRO eixo, ortogonal e JÁ
+> IMPLEMENTADO: `system_settings/chat.pool_mode` (`legacy`|`reception`, Modo
+> Recepção — pool compartilhada da varizemed). NÃO é valor de `crm_model` e
+> não entra em `CRM_MODEL_OPTIONS`. Interações relevantes marcadas nos itens
+> 6-8 e 11 abaixo.
+
 Dois eixos INDEPENDENTES por tenant:
 
 1. **Modelo de CRM (vertical de UI)** — define COMO a interface se comporta.
@@ -190,6 +196,7 @@ if str(status).startswith("fechado"):
         updates.update(_owner_fields)
 ```
 Cobre `fechado_manual` (main.py:3752) E `fechado_cliente` (webhook.py:339) sem tocar callers. Hubloc/`equipment_rental`: byte-idêntico ao atual.
+> ⚠ **ADR 0010 (2026-08-04):** `revert_lead_to_sale_owner` ganhou guard no topo (`if is_reception_mode(): return None`) e `close_stale_attendances` ganhou o branch da pool (fecha órfãs com `bot_completed` em reception) — as âncoras de linha desta seção deslocaram. A composição do item 7 continua válida: em reception o revert já devolve `None` sozinho (pool fica pool). PRESERVAR os dois guards ao editar a região.
 
 **8. `database_firestore.py` — `close_stale_attendances` (:1049-1053):** mesmo branch, com `_to_bot = _clinic_return_active()` calculado **UMA vez antes do loop** (tenant context já setado pelo cron, main.py:3363-3367).
 
@@ -210,6 +217,7 @@ if state.get("lgpd_consent") is None \
 **10. `webhook.py` — reroute de convertido:** envolver SÓ o ramo de reroute (`webhook.py:838-854`, o "não é rating") com `if not _clinic_return_active():` (import via `database`). Ramo de rating (:821-836) fica — exige `rating_requested_at` pendente, que clínica não produz. Sem esse gate, `qualification=="convertido"` preservado reatribuiria o lead ao `original_operator_id` logo após o turno do bot.
 
 **11. `main.py` — endpoint de reopen (:2200-2262):** após envio OK do template, `if _clinic_return_active(): mark_human_active(contact_id)` (`bot_service.py:904-916`). Motivo: o envio já reabre a conversa (outbound → upsert db:757-759) e em clinic o contato está sem dono e `bot_completed=False` → sem isso, a resposta em TEXTO do cliente cai no BOT e não no operador que chamou. O gate `:643` silencia o CX; qualquer fechamento posterior zera `human_active` via hook — o silêncio nunca fica preso.
+> ⚠ **Buraco de UX descoberto + resolvido parcialmente (ADR 0010):** em clinic o contato pós-fechamento fica SEM dono → `_check_conv_send_permission` daria 403 no reopen (e na resposta) de operador comum. Com `pool_mode=reception` (caso varizemed) o gate libera órfã standard e o buraco some. Clinic com `pool_mode=legacy` AINDA tem o 403 — se algum tenant operar nessa combinação, tratar aqui na Fase 2.
 
 **12. `webhook.py` — `_handle_reopen_button` ramo RETOMAR (:354-371):** mesma chamada gated (`mark_human_active`) — idempotente com o item 11, cobre template enviado por outra instância/antes do deploy. Ramo ENCERRAR: nada a fazer — passa por `set_attendance_status("fechado_cliente")` → hook zera `human_active` → bot disponível. Consistente.
 
@@ -339,6 +347,13 @@ Sem commit/push sem pedido explícito (convenção do repo).
 ---
 
 ## (f) DECISÕES PENDENTES DO PO (registrar como ADR em `docs/decisions/`)
+
+> **D1-D3 DECIDIDAS em 2026-08-01 — ver `docs/decisions/0009-modelos-crm-d1-d3-retorno-ao-bot.md`.**
+> D1=SIM (bump manual de `lgpd_policy_version` dispara re-aceite); D2=SIM
+> (+ requisito novo: "Encerrar" do cliente vira opt-out de template de
+> retomada — campanhas devem filtrar); D3=pontual mantém comportamento
+> atual (pool "Meus" do operador), em massa exige confirmação do
+> departamento-destino no disparo. D4-D8 seguem pendentes.
 
 1. **D1 — policy_version mudou → re-perguntar LGPD (fail-closed)?** Recomendação: SIM (dado de saúde, art. 11; política nova = novo aceite com prova nova). Corolários da mesma decisão: prova builtin `"hubloc-2026-06"` em tenant CX re-pergunta; contatos com marcador `"{tid}-sem-versao"` re-perguntam 1x quando a versão real for configurada; exigir policy_version real ANTES de ligar `medical_clinic` (já embutido em script/endpoint).
 2. **D2 — `fechado_cliente` (botão Encerrar) também devolve ao bot?** Recomendação: SIM (uniforme com "QUALQUER fechamento"; o botão curto-circuita o bot no clique — sem ping-pong imediato). Alternativa: `client_requested_close` veta.
