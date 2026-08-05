@@ -234,11 +234,19 @@ def cenario_gate_envio():
     marked = []
     real_mark = bot_service.mark_human_active
     bot_service.mark_human_active = lambda cid: marked.append(cid)
+    patch_store()
+    set_reception(True)  # patch_store nao mexe no is_reception_mode patchado
+    STORE["wa_contacts"] = {
+        "42": {"id": 42, "assigned_to": None, "bot_completed": False},
+        "43": {"id": 43, "assigned_to": None, "bot_completed": True},
+    }
     try:
         contato_mid_bot = {"id": 42, "assigned_to": None, "bot_completed": False}
         r = main._check_conv_send_permission(dict(conv_orfa), OPERADOR, dict(contato_mid_bot))
         check(r is None and marked == [42],
               "reception: envio em contato mid-bot chama mark_human_active (bot nao atropela)")
+        check(STORE["wa_contacts"]["42"].get("bot_completed") is True,
+              "reception: envio na orfa mid-bot carimba bot_completed (opcao A — aparece na Recepcao)")
         marked.clear()
         contato_pos_bot = {"id": 43, "assigned_to": None, "bot_completed": True}
         r = main._check_conv_send_permission(dict(conv_orfa), OPERADOR, dict(contato_pos_bot))
@@ -246,6 +254,7 @@ def cenario_gate_envio():
               "reception: contato com bot concluido NAO grava human_active (sem write extra)")
     finally:
         bot_service.mark_human_active = real_mark
+        restore_dbf()
     set_reception(False)
 
 

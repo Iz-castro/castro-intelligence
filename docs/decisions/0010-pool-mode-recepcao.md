@@ -142,6 +142,17 @@ com `lgpd_policy_version` igual à vigente (`_cx_policy_version`), hidrata
 precedência; versão divergente re-pergunta (ADR 0009 D1); `lgpd_revoked`
 nunca hidrata (J-3 D8). Cobertura: `sim_cx_flow` cenário q (7 asserts).
 
+**Ajuste do canário #4 (2026-08-05, opção A do PO):** thread órfã aberta
+pelo picker com contato fora do funil concluído (`bot_completed=False`,
+ex.: pós-release ou contato manual novo) não casava com NENHUMA aba (Meus
+exige dono; Recepção exige `bot_completed`) — só existia no pin da sessão
+de quem abriu. Fix: o primeiro ENVIO do operador na órfã (mesmo ponto do
+`mark_human_active`) carimba `bot_completed=True` (`mark_contact_bot_done`)
+— o retorno aparece na **Recepção de todos**, sem dono ("quem reabre não
+fica dono do retorno"); o fechamento (`release`) re-arma a Val. Alternativa
+"auto-atribuir → Meus" foi rejeitada (retorno privado some da pool e
+contradiz "picker nunca é assunção disfarçada").
+
 **7º achado (canário varizemed-test, 2026-08-05):** o picker de contato
 manual (`create_manual_wa_contact`, ramo "reabre/assume") era um TERCEIRO
 bypass do gate: operadora "só recepção" abriu o número pelo "+ Nova

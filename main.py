@@ -1680,15 +1680,21 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
         # (_require_contact_access — quem nao pode LER nao pode escrever).
         if not (contact or {}).get("assigned_to") and _reception_send_allowed(conversation, channel):
             # Contato ainda em fluxo de bot: silencia o motor (CX le
-            # human_active) — sem isso o agente responde por cima da
-            # recepcionista. Best-effort, mesmo padrao do clear de takeover.
+            # human_active) E carimba bot_completed=True — engajamento
+            # humano real tira o contato do funil e faz a thread orfa
+            # APARECER na aba Recepcao de todos (o filtro exige
+            # bot_completed; sem isso o retorno aberto pelo picker ficava
+            # invisivel — canario #4). O release re-arma o bot no proximo
+            # fechamento. Best-effort, mesmo padrao do clear de takeover.
             if contact and not contact.get("bot_completed"):
                 try:
                     from bot_service import mark_human_active
+                    from database import mark_contact_bot_done
                     mark_human_active(int(contact["id"]))
+                    mark_contact_bot_done(int(contact["id"]))
                 except Exception as exc:
                     logger.warning(
-                        "reception: mark_human_active falhou p/ contato %s: %s",
+                        "reception: silenciar bot falhou p/ contato %s: %s",
                         contact.get("id"), exc,
                     )
             return None

@@ -1965,6 +1965,23 @@ def return_contact_to_pool(contact_id, returned_by_user_id):
     return True
 
 
+def mark_contact_bot_done(contact_id):
+    """Carimba bot_completed=True no contato (ADR 0010, canario #4).
+
+    Engajamento humano REAL numa orfa da pool tira o contato do funil do
+    bot: sem o carimbo, thread orfa de contato mid-bot/pos-release fica
+    INVISIVEL na aba Recepcao (o filtro exige bot_completed) — o operador
+    envia o template de reabertura e a conversa some das colegas. O
+    release_lead_to_bot re-arma o bot no proximo fechamento. Best-effort.
+    """
+    try:
+        document("wa_contacts", contact_id).set({"bot_completed": True}, merge=True)
+        return True
+    except Exception as exc:
+        logger.warning("mark_contact_bot_done: falha p/ contato %s: %s", contact_id, exc)
+        return False
+
+
 def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=None):
     """Fechamento devolve o lead ao AGENTE DE IA (Fase 2 do PLANO_MODELOS,
     antecipada com gate por pool_mode=reception — decisao do PO 2026-08-05).
