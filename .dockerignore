@@ -17,8 +17,6 @@ data/
 logs/*.log
 media/*
 *.tar.gz
-deploy.sh
-deploy.ps1
 start_tunnel.py
 test_debug.py
 README.md

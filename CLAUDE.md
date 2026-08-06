@@ -54,9 +54,10 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 3. **`CLOUDSDK_PYTHON` → Python312** (`C:\Users\izael\AppData\Local\Programs\Python\Python312\python.exe`);
    já setado no escopo User, mas shells que não herdam (ex.: Bash tool) precisam prefixar.
 
-- **NUNCA** deploiar prod com `deploy.ps1` / `deploy.sh`: usam `--env-vars-file` + `--set-secrets` +
-  scaling hardcoded e **clobberam** env/secrets/scaling de prod (perdem `META_APP_SECRET`,
-  `FEATURE_GOOGLE_CHAT`, `CRON_OIDC_*`, `EMBEDDED_SIGNUP_CONFIG_ID`...).
+- Os antigos `deploy.ps1` / `deploy.sh` foram **REMOVIDOS do repo** (2026-08-06): usavam
+  `--env-vars-file` + `--set-secrets` + scaling hardcoded e **clobberavam** env/secrets/scaling
+  de prod. Se recuperar do historico do git, NAO usar em prod; bootstrap de infra nova esta
+  documentado em `docs/deploy/RUNBOOK_CUTOVER_PROD.md` (IAM/bucket/secrets).
 - `docs/deploy/RUNBOOK_CUTOVER_PROD.md` está **STALE** (cita SP / `southamerica-east1`). O
   procedimento é útil, mas traduza projeto/região pro Oregon; não copie os `--project`/`--region` de lá.
 - **Tráfego é FIXADO por revisão** (o serviço tem tag `staging` + traffic pinado, não "serve latest").
