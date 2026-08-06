@@ -39,6 +39,8 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 Prod = projeto **`project-4a851bf9-f475-418c-800`**, região **`us-west1`** (Oregon),
 prefixo de coleção `castro_crm`, tenant default `hubloc`.
 
+**Runbook humano passo a passo** (deploy sem o agente): `docs/deploy/DEPLOY_CLOUDRUN_A.md`.
+
 **Comando de deploy de rotina** (`--source` puro **preserva** env, secrets e scaling da revisão anterior):
 
 ```powershell

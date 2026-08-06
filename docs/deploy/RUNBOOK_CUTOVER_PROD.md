@@ -1,5 +1,12 @@
 # Runbook — Cutover prod (Fase 4)
 
+> ⚠️ **STALE (marcado 2026-08-06):** escrito pra era SP (`project-26fb9c99-8ee9-4179-aef`
+> / `southamerica-east1`). Prod hoje = Oregon (`project-4a851bf9-f475-418c-800` /
+> `us-west1`) e o trafego e PINADO por revisao — deploy sobe a 0% e a frase
+> "Default sem flag = 100%" abaixo NAO vale mais. Pra deploy de rotina use
+> [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md); este doc serve so como referencia
+> do PROCEDIMENTO de cutover/wipe, traduzindo projeto/regiao.
+
 > Procedimento de cutover do tenant default em **producao** apos
 > aprovacao da Meta App Review. Apaga dados acumulados em prod (que
 > hoje sao apenas dados de Fase 1, sem coexistence) e prepara o

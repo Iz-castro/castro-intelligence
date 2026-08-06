@@ -2,13 +2,30 @@
 
 Esta pasta concentra deploy, configuracao de ambiente e operacao.
 
+## Arquivos desta pasta
+
+- [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md) — **runbook manual do deploy de rotina**
+  do CRM (`castro-crm`, Oregon). **Comece por aqui.**
+- [RUNBOOK_CUTOVER_PROD.md](RUNBOOK_CUTOVER_PROD.md) — ⚠️ STALE (era SP): procedimento
+  de cutover/wipe; util so como referencia, traduzindo projeto/regiao.
+- [MIGRACAO_GCP_OREGON_CHECKLIST.md](MIGRACAO_GCP_OREGON_CHECKLIST.md) — historico da
+  migracao SP→Oregon (parte tecnica concluida em 2026-06).
+- [env.oregon.yaml](env.oregon.yaml) — snapshot HISTORICO das envs do cutover;
+  **NAO usar em deploy** (ver aviso no proprio arquivo).
+- Deploy do Cloud Run B (`castro-superadmin`): [../DEPLOY_CLOUDRUN_B.md](../DEPLOY_CLOUDRUN_B.md)
+  — pipeline SEPARADO (nunca `--source` la).
+
 ## Premissas atuais
 
 - o runtime oficial e `Firestore + Firebase Auth`
 - o sistema suporta multi-canal (standard + coexistence) via `channel_service.py`
-- o frontend React precisa estar compilado em `frontend_dist/`
+- o frontend React e compilado DENTRO da imagem Docker (estagio Node do
+  `Dockerfile` da raiz) e servido pelo backend — nao ha passo manual de build
 - `docs/` fica fora do deploy por causa do `.gcloudignore`
-- no startup, o sistema cria automaticamente o canal default a partir das env vars
+- o bootstrap do canal default por env foi DESATIVADO em prod:
+  `WHATSAPP_PHONE_NUMBER_ID`/`WHATSAPP_WABA_ID` removidos de proposito (o
+  bootstrap clobberava o canal standard real a cada cold start — ver nota em
+  `env.oregon.yaml`); canais entram via Embedded Signup ou POST manual
 
 ## Variaveis de ambiente mais importantes
 
@@ -98,10 +115,16 @@ Google Chat:
 ## Validacao minima antes de deploy
 
 - `python -m py_compile` nos modulos principais
-- `npm run build` dentro de `frontend/`
+- simuladores mockados do bot: `tools\sim_bot_flow.py`, `tools\sim_cx_flow.py`,
+  `tools\sim_reception_flow.py` (exit 0 = ok)
+- `npm run build` dentro de `frontend/` (typecheck estrito)
+
+(lista canonica e passo a passo completo em [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md))
 
 ## Observacoes operacionais
 
-- as rules atuais do Firestore ainda sao amplas e precisam continuar alinhadas com `FIRESTORE_COLLECTION_PREFIX`
+- as rules do Firestore sao tenant-scoped ESTRITAS desde a Fase 2 (M-A4/M-B2) e
+  precisam continuar alinhadas com `FIRESTORE_COLLECTION_PREFIX` (arquivo
+  `firestore.rules` da raiz = o que esta publicado; conferido 2026-08-06)
 - o bootstrap inicial do primeiro admin depende de `BOOTSTRAP_ADMIN_EMAIL`
 - o login legado nao faz mais parte do deploy nem do runtime atual

@@ -1,5 +1,10 @@
 # Checklist de migração — GCP/Firebase para conta Castro Intelligence (Oregon / us-west1)
 
+> ✅ **HISTÓRICO (marcado 2026-08-06):** a migração TÉCNICA foi concluída — prod
+> roda no Oregon desde 2026-06. Mantido como registro. Para deploy de rotina ver
+> [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md). Os itens jurídicos/LGPD abaixo
+> têm status próprio — conferir antes de assumir que seguem pendentes.
+
 > **Decisão:** mover o projeto da conta pessoal `rafaluisc@outlook.com`
 > (projeto `project-26fb9c99-8ee9-4179-aef`, região `southamerica-east1`)
 > para a conta **`castrointelligence@gmail.com`**, em **projeto NOVO**, com
