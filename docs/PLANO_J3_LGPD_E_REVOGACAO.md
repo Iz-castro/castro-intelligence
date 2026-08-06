@@ -128,6 +128,7 @@ Staging tem grupo próprio (`castro_crm_staging_pending_webhook_events`) — pol
 **1.6 Patch da Fase 2 do PLANO_MODELOS (no MESMO patch dela, quando entrar):**
 - `release_lead_to_bot` (item 6): guard `lgpd_revoked → return None` ao lado dos guards `is_backup` (`:173` do plano) — caller cai no `revert_lead_to_sale_owner`; fechamento continua funcionando, só não devolve ao bot.
 - Hidratação (item 9, `bot_service.py` entre `:643` e `:651`): acrescentar `and not contact.get("lgpd_revoked")` à condição — cinto e suspensório sobre o `lgpd_consent is True` (protege contra prova re-gravada por corrida e contra bot_states expirado por TTL na F5).
+- ✅ **JÁ FEITO (ADR 0010, 2026-08-05):** os itens 6 e 9 foram antecipados com gate `pool_mode=reception` e AMBOS os guards acima já estão no código (`release_lead_to_bot` com `lgpd_revoked → None`; hidratação com `not contact.get("lgpd_revoked")`), cobertos por sims (`sim_reception_flow` cenário 11; `sim_cx_flow` cenário q). A F1 só precisa passar a GRAVAR o campo `lgpd_revoked` — o enforcement já herda. O caso de sim nº 8/9 desta lista tem equivalente rodando.
 
 **1.7 Frontend:**
 - `frontend/src/types.ts`: `:58` união de permissões + `lgpd_revoked?`, `lgpd_revoked_at?` no tipo Contact (~`:180`); `normalization.ts` (~`:55/:134`) normaliza os campos novos.

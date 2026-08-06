@@ -1,6 +1,9 @@
 # ADR 0010 — Modo Recepção: pool compartilhada por tenant (`pool_mode`)
 
-- **Status:** aceito (2026-08-04) — implementado no mesmo dia (F0-F3)
+- **Status:** aceito (2026-08-04) — **EM PRODUÇÃO desde 2026-08-05** (rev
+  `castro-crm-00074-zrt` promovida a 100% após canário completo no
+  `varizemed-test`; ajustes #1-#4 abaixo). Hubloc segue `legacy` (default);
+  varizemed real liga via UI quando as operadoras forem treinadas.
 - **Contexto:** a Varizemed pediu caixa compartilhada: 3 operadoras atendem
   juntas (quem está disponível responde; folga de uma é coberta pelas
   outras). O ADR 0008 registrou "assumir pra falar" como requisito do modelo
@@ -165,9 +168,14 @@ preenchido sem transfer_log.
 
 ## Validação
 
-`tools/sim_reception_flow.py` (39 asserts, código real de main/rbac/db com
-Firestore mockado): gate legacy×reception×coex×thread-de-outro×lead-com-dono,
-RBAC do assume (403/409) e do transfer-para-si, mark_human_active, revert
-no-op, coerção do `pool_mode`, auto-close da pool, fechar manual de órfã,
-merge de toggles no editor de perfis. Regressão: `tools/sim_bot_flow.py`
-44/44 intacto. Canário: `varizemed-test` antes de ligar na `varizemed` real.
+`tools/sim_reception_flow.py` (**61 asserts**, código real de main/rbac/db
+com Firestore mockado): gate legacy×reception×coex×thread-de-outro×
+lead-com-dono, RBAC do assume (403/409) e do transfer-para-si,
+mark_human_active + carimbo `bot_completed` (opção A), revert no-op,
+coerção do `pool_mode`, auto-close da pool, fechar manual de órfã, merge
+de toggles no editor de perfis, contato manual sem assume,
+`release_lead_to_bot` (devolução ao agente + guards) e
+`return_contact_to_pool`. CX: `tools/sim_cx_flow.py` **117** (cenário q =
+hidratação LGPD). Regressão: `tools/sim_bot_flow.py` 44/44 intacto.
+Canário executado no `varizemed-test` em 2026-08-04/05 (4 ajustes) antes
+da promoção; regressão Hubloc validada na staging antes do go.

@@ -30,7 +30,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, ~44 asserts, exit 0/1). CX: `tools\sim_cx_flow.py`.
-  Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (~39 asserts).
+  Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (~61 asserts).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
 
