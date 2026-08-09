@@ -166,6 +166,16 @@ TAKEOVER_TIMEOUT_HOURS = int(os.environ.get("TAKEOVER_TIMEOUT_HOURS", "3"))
 # proxima mensagem.
 ATTENDANCE_AUTOCLOSE_HOURS = int(os.environ.get("ATTENDANCE_AUTOCLOSE_HOURS", "24"))
 
+# Modo Recepcao (ADR 0010): dias que uma thread da pool pode esperar o PRIMEIRO
+# atendimento humano depois do handoff do bot. Enquanto espera, o auto-close
+# NAO fecha — fechar devolveria o lead ao agente de IA (release_lead_to_bot),
+# que zera bot_completed e some com a thread da aba Recepcao (lead de fim de
+# semana ficava invisivel na segunda). Passado o teto, o lead e dado como morto
+# e volta pro bot, senao ficaria preso em bot_completed=True pra sempre.
+# O default 7 esta espelhado em close_stale_attendances (fallback de caller
+# que nao passa o parametro, ex.: simuladores).
+RECEPTION_UNATTENDED_RELEASE_DAYS = int(os.environ.get("RECEPTION_UNATTENDED_RELEASE_DAYS", "7"))
+
 # -- Bootstrap inicial --
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 BOOTSTRAP_ADMIN_DISPLAY_NAME = os.getenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Administrador")

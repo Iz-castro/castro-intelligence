@@ -265,6 +265,10 @@ def cenario_fluxo_feliz_botoes():
           "encaminhado ao Comercial (department_id=1)")
     check(STORE["wa_conversations"]["conv1"].get("department_id") == 1,
           "thread tambem recebeu department_id=1 (pool Novos Leads/Comercial)")
+    # Marco do ciclo de espera da pool (fix 2026-08-09) — no builtin tambem,
+    # pra o Modo Recepcao funcionar em qualquer tenant, nao so nos de CX.
+    check(STORE["wa_conversations"]["conv1"].get("handoff_at") is not None,
+          "thread recebeu handoff_at (marco do ciclo da pool)")
     check("1" not in STORE.get("bot_states", {}), "bot_state limpo apos finalizar")
     check(any("Bot finalizado" in str(m.get("content", "")) for m in MESSAGES),
           "system message 'Bot finalizado' registrada")

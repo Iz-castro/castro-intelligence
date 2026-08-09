@@ -34,6 +34,7 @@ from config import (
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS, ATTENDANCE_AUTOCLOSE_HOURS,
+    RECEPTION_UNATTENDED_RELEASE_DAYS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
@@ -3447,7 +3448,9 @@ async def cron_expire_takeovers(request: Request):
                 summary.append({"tenant_id": tid, "expired": len(expired)})
             total += len(expired)
             # Fase 4: fecha atendimentos ATRIBUIDOS ociosos por inatividade.
-            closed = close_stale_attendances(ATTENDANCE_AUTOCLOSE_HOURS)
+            closed = close_stale_attendances(
+                ATTENDANCE_AUTOCLOSE_HOURS, RECEPTION_UNATTENDED_RELEASE_DAYS,
+            )
             for c in closed:
                 cc_id = c.get("contact_id")
                 if cc_id is not None:

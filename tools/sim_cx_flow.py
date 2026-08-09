@@ -336,6 +336,11 @@ check(contato1.get("assigned_to") in (None, ""),
       "handoff NAO atribui operador (fica na pool)")
 check(STORE["wa_conversations"]["c1"].get("department_id") == 10,
       "department_id propagado pra conversation")
+# Marco do ciclo de espera da pool (fix 2026-08-09): sem handoff_at na
+# conversation, o auto-close nao sabe distinguir "ninguem atendeu ainda" de
+# "atendimento terminou" e devolve o lead do fim de semana pro bot.
+check(STORE["wa_conversations"]["c1"].get("handoff_at") is not None,
+      "handoff carimba handoff_at na conversation (marco do ciclo da pool)")
 _sysmsgs = [m for m in MESSAGES if m.get("direction") == "system"]
 check(any("Paciente quer agendar" in m.get("content", "") for m in _sysmsgs),
       "system message contem o handoff_summary do agente")

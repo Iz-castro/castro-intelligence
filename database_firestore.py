@@ -679,6 +679,7 @@ def upsert_wa_conversation(
     direction_for_unread=None,
     message_at=None,
     advance_recency=True,
+    human_outbound_at=None,
 ):
     """Cria ou atualiza a conversation correspondente a (channel_id, wa_id).
 
@@ -693,6 +694,12 @@ def upsert_wa_conversation(
     backup chega horas/meses depois — sem isto a conversa "sobe" pro topo
     da sidebar com a data da gravacao. last_message_at e monotonico: so
     avanca, nunca recua.
+
+    human_outbound_at: data da mensagem quando ela foi enviada por um OPERADOR
+    (outbound com sender_user_id). Carimba last_human_outbound_at, que o
+    auto-close usa pra saber se a thread da pool ja teve resposta humana neste
+    ciclo — ver _reception_handoff_unattended. Mensagem do bot nao passa por
+    aqui (last_outbound_at sobe com bot tambem, por isso o campo separado).
 
     Normaliza o nono digito BR antes de calcular o conversation_id —
     determinismo de id depende de wa_id canonico para nao criar
@@ -754,6 +761,8 @@ def upsert_wa_conversation(
             updates["unread_count"] = int(existing.get("unread_count", 0)) + 1
         elif direction_for_unread == "outbound":
             updates["last_outbound_at"] = msg_at
+        if human_outbound_at is not None:
+            updates["last_human_outbound_at"] = human_outbound_at
         if direction_for_unread in ("inbound", "outbound"):
             # Atividade reabre um atendimento fechado (Fase 4 — ciclo de vida).
             updates["attendance_status"] = "aberto"
@@ -786,6 +795,10 @@ def upsert_wa_conversation(
         "last_message_at": msg_at,
         "last_inbound_at": msg_at if direction_for_unread == "inbound" else None,
         "last_outbound_at": msg_at if direction_for_unread == "outbound" else None,
+        # Ciclo de atendimento da pool (Modo Recepcao): handoff_at e gravado
+        # pelo bot no handoff; last_human_outbound_at, por envio de operador.
+        "handoff_at": None,
+        "last_human_outbound_at": human_outbound_at,
         **_ch_fields,
     }
     if auto_assign_user_id:
@@ -1008,11 +1021,57 @@ def expire_stale_takeovers(max_idle_hours):
     return expired
 
 
-def close_stale_attendances(max_idle_hours):
+def _reception_handoff_unattended(conv, unattended_release_days):
+    """True se a thread da pool ainda espera o PRIMEIRO atendimento humano do
+    ciclo aberto pelo handoff do bot — nesse caso o auto-close NAO fecha.
+
+    Por que: em reception, fechar devolve o lead ao agente de IA
+    (release_lead_to_bot), que zera bot_completed. O filtro da aba Recepcao
+    EXIGE bot_completed, e a aba Bot so e renderizada pra admin/supervisor —
+    entao a thread sumia da fila de quem atende. Lead que chegava no fim de
+    semana ficava invisivel na segunda e a Val o atendia do zero, como se o
+    handoff nunca tivesse acontecido (incidente 2026-08-09).
+
+    Ciclo detectado por COMPARACAO de timestamps, sem reset: um handoff novo
+    grava um handoff_at mais recente e invalida sozinho o carimbo humano do
+    ciclo anterior (lead atendido -> devolvido ao bot -> voltou a conversar ->
+    handoff de novo fica protegido). Zerar last_human_outbound_at exigiria
+    acertar TODOS os pontos de fim de ciclo (release_lead_to_bot,
+    return_contact_to_bot, bulk-reassign, fechamento manual) — esquecer um
+    seria landmine silenciosa.
+
+    Degrada pro comportamento anterior (False = pode fechar) em qualquer
+    duvida: doc legado sem handoff_at, timestamp corrompido, ou espera acima
+    do teto — lead morto nao pode ficar preso em bot_completed=True pra
+    sempre, senao o bot nunca mais responde e ninguem sabe que ele existe."""
+    handoff_at = _coerce_timestamp(conv.get("handoff_at"))
+    if not isinstance(handoff_at, datetime):
+        return False
+    human_at = _coerce_timestamp(conv.get("last_human_outbound_at"))
+    if isinstance(human_at, datetime):
+        try:
+            if human_at > handoff_at:
+                return False  # ja teve resposta humana NESTE ciclo
+        except TypeError:
+            return False  # naive vs aware: nao segura a thread por duvida
+    try:
+        if (utcnow() - handoff_at) > timedelta(days=unattended_release_days):
+            return False  # teto: espera longa demais, devolve pro bot
+    except TypeError:
+        return False
+    return True
+
+
+def close_stale_attendances(max_idle_hours, unattended_release_days=7):
     """Fecha (attendance_status='fechado_inatividade') atendimentos ATRIBUIDOS
     ociosos ha mais de max_idle_hours (sem mensagem). Reabre sozinho na proxima
     mensagem (upsert_wa_conversation). Opera no tenant_context atual. Retorna
-    lista de {conversation_id, contact_id, assigned_to}. (Fase 4.)"""
+    lista de {conversation_id, contact_id, assigned_to}. (Fase 4.)
+
+    unattended_release_days: teto da espera por atendimento humano no Modo
+    Recepcao (ver _reception_handoff_unattended). O cron passa o valor de
+    config (RECEPTION_UNATTENDED_RELEASE_DAYS); o default aqui so cobre caller
+    que nao passa (simuladores)."""
     from datetime import timedelta
     cutoff = utcnow() - timedelta(hours=max_idle_hours)
     closed = []
@@ -1055,6 +1114,11 @@ def close_stale_attendances(max_idle_hours):
                 continue
             _ctc = _get_doc("wa_contacts", conv.get("contact_id")) if conv.get("contact_id") is not None else None
             if not _ctc or not _ctc.get("bot_completed"):
+                continue
+            # Handoff que NINGUEM atendeu nao fecha: fechar devolveria o lead
+            # ao bot e sumiria com ele da aba Recepcao (ver helper). A thread
+            # segue "aberto" na pool ate alguem responder ou estourar o teto.
+            if _reception_handoff_unattended(conv, unattended_release_days):
                 continue
         # Mesma regra do fechamento manual: legacy reverte pro sale_owner;
         # reception devolve o lead ao agente de IA (release_lead_to_bot).
@@ -2381,6 +2445,17 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     auto_assign_user_id=(contact or {}).get("assigned_to"),
                     message_at=_eff_msg_at,
                     advance_recency=advance_recency,
+                    # Resposta HUMANA ao cliente: outbound com operador
+                    # identificado. Fica de fora mensagem do bot
+                    # (sender_user_id None), system message e nota interna
+                    # (direction != outbound — o cliente nem ve). E o sinal
+                    # que o auto-close usa pra nao devolver ao bot um handoff
+                    # que ninguem atendeu.
+                    human_outbound_at=(
+                        _eff_msg_at
+                        if direction == "outbound" and sender_user_id is not None
+                        else None
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Falha ao upsert conversation para msg %s: %s", message_id, exc)

@@ -405,14 +405,22 @@ def _finalize_bot(contact_id: int, state: dict, setor: int):
     # Propaga o setor para as threads do contato: a pool ("novos") do frontend
     # segmenta por department_id da CONVERSATION, nao do contato. Mantem
     # assigned_to vazio — o lead segue sem dono, na pool do setor. Pula backup.
+    # handoff_at abre o ciclo de espera por atendimento humano (Modo Recepcao,
+    # ver _reception_handoff_unattended) e por isso e gravado mesmo quando o
+    # setor nao resolveu — senao a thread ficaria sem marco de ciclo.
+    _handoff_at = utcnow()
+    for snap in collection("wa_conversations").where(
+        "contact_id", "==", contact_id
+    ).stream():
+        cd = snap.to_dict() or {}
+        if cd.get("is_backup"):
+            continue
+        conv_updates = {"handoff_at": _handoff_at}
+        if dept_id:
+            conv_updates["department_id"] = dept_id
+        snap.reference.set(conv_updates, merge=True)
+
     if dept_id:
-        for snap in collection("wa_conversations").where(
-            "contact_id", "==", contact_id
-        ).stream():
-            cd = snap.to_dict() or {}
-            if cd.get("is_backup"):
-                continue
-            snap.reference.set({"department_id": dept_id}, merge=True)
         # Carimba o setor no protocolo do dia (nasceu "GERAL" no 1o inbound).
         # So o CAMPO — o id do protocolo e imutavel. Best-effort.
         try:
@@ -876,9 +884,14 @@ def _cx_snapshot(params, signals=None) -> dict:
 
 def _persist_lead_temperature(
     contact_id: int, temperature: str, contact: Optional[dict] = None,
-    contact_extra: Optional[dict] = None, dept_id=None,
+    contact_extra: Optional[dict] = None, dept_id=None, handoff_at=None,
 ):
     """Grava a temperatura no contato + conversations + protocolo do dia.
+
+    `handoff_at`: so o HANDOFF passa (abre o ciclo de espera por atendimento
+    humano na pool — ver _reception_handoff_unattended em database_firestore).
+    O caminho de assume sem handoff (apply_cx_snapshot_on_assume) NAO passa:
+    la o humano ja esta na conversa, e carimbar abriria um ciclo falso.
 
     `contact_extra`/`dept_id` entram no MESMO set do contato (o handoff
     aproveita pra gravar bot_completed/notes/department sem write extra).
@@ -899,6 +912,8 @@ def _persist_lead_temperature(
         conv_updates = {"lead_temperature": temperature}
         if dept_id:
             conv_updates["department_id"] = dept_id
+        if handoff_at is not None:
+            conv_updates["handoff_at"] = handoff_at
         snap.reference.set(conv_updates, merge=True)
 
     protocol_id = str((contact or {}).get("attendance_protocol") or "").strip()
@@ -1142,6 +1157,9 @@ def _finalize_cx_handoff(
         contact_id, temperature, contact,
         contact_extra={"bot_completed": True, "bot_notes": notes},
         dept_id=dept_id,
+        # Abre o ciclo de espera da pool: enquanto nenhum operador responder,
+        # o auto-close nao devolve este lead ao agente de IA.
+        handoff_at=utcnow(),
     )
 
     _clear_bot_state(contact_id)

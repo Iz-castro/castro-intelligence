@@ -413,6 +413,106 @@ def cenario_close_stale():
 
 
 # =========================================================================
+# Cenario 5b — handoff sem atendimento humano NAO volta pro bot (2026-08-09)
+# =========================================================================
+
+def _ts(hours_ago):
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+def _seed_handoff_pendente():
+    """Todas stale (48h sem mensagem) e todas na pool com bot concluido —
+    o que muda entre elas e so o ciclo handoff_at x last_human_outbound_at."""
+    STORE.clear()
+    STORE["wa_conversations"] = {
+        # Handoff sabado, ninguem respondeu: NAO pode fechar.
+        "P1": _conv("P1", 40, None, hours_old=48, handoff_at=_ts(50)),
+        # Handoff e resposta humana depois: ciclo atendido, fecha.
+        "P2": _conv("P2", 41, None, hours_old=48,
+                    handoff_at=_ts(50), last_human_outbound_at=_ts(49)),
+        # Atendida no ciclo ANTIGO e devolvida; handoff NOVO ainda sem
+        # resposta: o carimbo velho nao pode liberar o fechamento.
+        "P3": _conv("P3", 42, None, hours_old=48,
+                    handoff_at=_ts(50), last_human_outbound_at=_ts(200)),
+        # Espera acima do teto (7 dias): lead morto volta pro bot.
+        "P4": _conv("P4", 43, None, hours_old=48, handoff_at=_ts(24 * 9)),
+        # Doc legado sem handoff_at: degrada pro comportamento anterior.
+        "P5": _conv("P5", 44, None, hours_old=48),
+        # Thread ATRIBUIDA: o guard e so da pool, dono continua fechando.
+        "P6": _conv("P6", 45, 7, hours_old=48, handoff_at=_ts(50)),
+    }
+    STORE["wa_contacts"] = {
+        str(cid): {"id": cid, "bot_completed": True} for cid in range(40, 46)
+    }
+
+
+def cenario_handoff_pendente():
+    titulo("CENARIO 5b — handoff sem atendimento humano nao volta pro bot")
+    patch_store()
+    dbf.is_reception_mode = lambda: True
+    _seed_handoff_pendente()
+
+    closed = dbf.close_stale_attendances(24, 7)
+    ids = sorted(c["conversation_id"] for c in closed)
+    check(ids == ["P2", "P4", "P5", "P6"], f"fecharam so os elegiveis (fechou {ids})")
+    check(STORE["wa_conversations"]["P1"].get("attendance_status") == "aberto"
+          and STORE["wa_contacts"]["40"].get("bot_completed") is True,
+          "P1 handoff sem resposta: segue aberta na pool, bot_completed intacto")
+    check(STORE["wa_contacts"]["41"].get("bot_completed") is False,
+          "P2 ciclo atendido: fecha e devolve ao agente de IA")
+    check(STORE["wa_conversations"]["P3"].get("attendance_status") == "aberto"
+          and STORE["wa_contacts"]["42"].get("bot_completed") is True,
+          "P3 carimbo humano ANTERIOR ao handoff novo nao libera fechamento")
+    check(STORE["wa_contacts"]["43"].get("bot_completed") is False,
+          "P4 teto de 7 dias: espera longa demais volta pro bot")
+    check(STORE["wa_contacts"]["44"].get("bot_completed") is False,
+          "P5 doc legado sem handoff_at: comportamento anterior preservado")
+    check(STORE["wa_contacts"]["45"].get("bot_completed") is False,
+          "P6 thread com dono fecha normal (guard e so da pool)")
+
+    # Teto configuravel: com 30 dias, nem o P4 (9 dias) e liberado.
+    _seed_handoff_pendente()
+    closed = dbf.close_stale_attendances(24, 30)
+    ids = sorted(c["conversation_id"] for c in closed)
+    check(ids == ["P2", "P5", "P6"], f"teto de 30d segura o P4 tambem (fechou {ids})")
+    restore_dbf()
+
+
+# =========================================================================
+# Cenario 5c — carimbo de resposta humana (save_wa_message -> conversation)
+# =========================================================================
+
+def cenario_carimbo_humano():
+    titulo("CENARIO 5c — last_human_outbound_at: so operador carimba")
+    patch_store()
+    STORE["wa_contacts"] = {"50": {"id": 50, "wa_id": "5531988887777",
+                                   "assigned_to": None, "source_channel_type": "standard"}}
+    STORE["wa_conversations"] = {}
+    contato = dict(STORE["wa_contacts"]["50"])
+
+    def _msg(direction, **kw):
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=50, direction=direction, msg_type="text",
+            content="x", status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
+            channel_id=6, conversation_id="6__5531988887777", contact=contato, **kw,
+        )
+        return STORE["wa_conversations"].get("6__5531988887777", {})
+
+    conv = _msg("outbound")  # bot: sem sender_user_id
+    check(conv.get("last_human_outbound_at") is None,
+          "mensagem do BOT nao carimba (sender_user_id None)")
+    conv = _msg("inbound")
+    check(conv.get("last_human_outbound_at") is None, "inbound nao carimba")
+    conv = _msg("system", sender_user_id=7)
+    check(conv.get("last_human_outbound_at") is None,
+          "system message do operador nao carimba (cliente nao ve)")
+    conv = _msg("outbound", sender_user_id=7)
+    check(conv.get("last_human_outbound_at") is not None,
+          "outbound de OPERADOR carimba last_human_outbound_at")
+    restore_dbf()
+
+
+# =========================================================================
 # Cenario 11 — release_lead_to_bot (fechamento devolve ao agente de IA)
 # =========================================================================
 
@@ -627,6 +727,8 @@ def run():
     cenario_revert_sale_owner()
     cenario_pool_mode_settings()
     cenario_close_stale()
+    cenario_handoff_pendente()
+    cenario_carimbo_humano()
     cenario_fechar_orfa()
     cenario_transfer_rbac()
     cenario_perfis_merge()
