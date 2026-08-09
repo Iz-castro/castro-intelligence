@@ -489,9 +489,19 @@ _CX_MAX_REPLY_CHARS = 4096  # limite de texto da Cloud API do WhatsApp
 # frases sao trechos das mensagens IMUTAVEIS de transferencia do playbook do
 # agente (Step 6). Comparadas via _norm (sem acento, minusculo). Sobrescrevivel
 # por tenant em settings.ai.handoff_text_hints.
+# As duas primeiras sao do val-5.0 (o que a clinica real roda). As duas
+# ultimas sao do val-5.0.1 (env 75028a25, 08/08), que reescreveu a mensagem de
+# prioridade: "Registrei sua solicitacao como prioridade no sistema. Nossa
+# equipe de atendimento humano entrara em contato...". Sem elas o fallback de
+# TEXTO nao casava mais e o handoff dependia so do parametro handoff_request —
+# que o agente ja esqueceu de setar em producao antes (conferido no
+# varizemed-test em 2026-08-09). Lista ADITIVA de proposito: as duas versoes do
+# agente convivem enquanto prod e teste apontam pra environments diferentes.
 _DEFAULT_HANDOFF_TEXT_HINTS = (
     "estou transferindo nossa conversa para a equipe de atendimento",
     "deixei sua solicitacao marcada como prioridade",
+    "registrei sua solicitacao como prioridade",
+    "equipe de atendimento humano entrara em contato",
 )
 
 

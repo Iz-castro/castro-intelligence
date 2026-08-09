@@ -76,6 +76,20 @@ for `true`, acrescentar a informação de retorno à mensagem de transferência.
 > for inevitável, avise: o CRM tem override por tenant
 > (`settings.ai.handoff_text_hints`) e a gente ajusta junto, no mesmo dia.
 
+> **Isso já aconteceu — teste do `val-5.0.1` em 09/08.** A mensagem de
+> prioridade foi reescrita de *"deixei sua solicitação marcada como
+> prioridade"* para *"Registrei sua solicitação como prioridade no sistema.
+> Nossa equipe de atendimento humano entrará em contato…"*, e **nenhum** dos
+> dois hints casava mais. O handoff do teste só funcionou porque o parâmetro
+> `handoff_request` veio setado; se ele faltasse, o lead teria ficado preso no
+> bot, sem erro nem alerta.
+>
+> Já cobrimos do nosso lado: a lista de hints virou aditiva e passou a aceitar
+> as duas redações (`registrei sua solicitacao como prioridade` e `equipe de
+> atendimento humano entrara em contato`), com teste travando o comportamento.
+> **Mas o combinado continua valendo:** ao mexer nessas frases, avise — a rede
+> só protege o que ela conhece.
+
 Sugestão de forma (mantendo a frase existente intacta):
 
 ```
@@ -102,7 +116,14 @@ Consequência prática, e é o que importa no seu fluxo:
 
 Existe um environment mais novo já publicado, `75028a25-7094-43d0-a033-9a2cb90e7988`
 (`val-5.0.1Atualização`, de 08/08), que sobe `val_greeting` v2, `val_router` v3 e
-o tool `VarizemdRouter` v2. **A produção ainda não aponta para ele.**
+o tool `VarizemdRouter` v2. **A produção ainda não aponta para ele** — em 09/08 o
+`varizemed-test` foi apontado para lá e o handoff foi validado.
+
+**Nota sobre o aviso de horário no `val-5.0.1`:** a mensagem nova já termina com
+*"assim que estiver disponível, no próximo horário de atendimento"*. É meio
+caminho do que este documento especifica — falta ela ser **condicional**
+(hoje sai também às 10h de uma terça, quando a clínica está aberta) e dizer
+**qual** é o horário, vindo de `retorno_previsto`.
 
 ## 6. Como testar
 

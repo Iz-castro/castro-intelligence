@@ -367,6 +367,24 @@ check(STORE["wa_contacts"]["12"].get("bot_completed") is True,
 check(STORE["wa_contacts"]["12"].get("department_id") == 10,
       "handoff por texto -> department Recepcao")
 
+print("\n=== e3b: handoff por TEXTO na redacao do val-5.0.1 (env 75028a25) ===")
+# O 5.0.1 reescreveu a mensagem de prioridade e nenhum dos 2 hints originais
+# casava mais — o handoff passou a depender SO do parametro. Conferido no
+# varizemed-test em 2026-08-09; texto abaixo e o real, copiado da conversa.
+novo_contato(19, wa_id="5571333334444")
+STORE["bot_states"]["19"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok(
+    "Compreendido. Registrei sua solicitacao como prioridade no sistema.\n"
+    "Nossa equipe de atendimento humano entrara em contato com voce por aqui "
+    "assim que estiver disponivel, no proximo horario de atendimento.",
+    handoff_request=False,   # a rede de texto e o unico sinal aqui
+))
+envia(19, "me passa pra equipe")
+check(STORE["wa_contacts"]["19"].get("bot_completed") is True,
+      "val-5.0.1: handoff por texto reconhecido (hints novos)")
+check(STORE["wa_contacts"]["19"].get("department_id") == 10,
+      "val-5.0.1: handoff por texto vai pro setor Recepcao")
+
 print("\n=== f: falha do conector -> fallback e depois handoff ===")
 novo_contato(2, wa_id="5571888887777")
 STORE.setdefault("bot_states", {})["2"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
