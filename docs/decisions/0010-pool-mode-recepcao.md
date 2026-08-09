@@ -166,16 +166,78 @@ parâmetro `auto_assume` — False quando reception OU perfil sem
 diagnóstico pra reincidência: contato `em_atendimento` + `assigned_to`
 preenchido sem transfer_log.
 
+## Emenda 2026-08-09 — handoff sem atendimento humano NÃO volta pro bot
+
+**Incidente (produção, varizemed).** Lead procurou a clínica no fim de semana,
+a Val fez o handoff e a thread ficou na Recepção esperando o próximo dia útil.
+O auto-close a fechou 20h depois (`ATTENDANCE_AUTOCLOSE_HOURS=20`) e o
+`release_lead_to_bot` zerou `bot_completed` — e o filtro da aba Recepção
+**exige** `bot_completed`, enquanto a aba Bot só é renderizada para
+admin/supervisor (`canSeeAll`). Resultado: **o lead sumia de todas as abas da
+operadora**. Se voltasse a escrever na segunda, a Val o atendia do zero
+(`cx_snapshot` zerado), como se o handoff nunca tivesse existido; ainda por
+cima o cliente recebia banner de fechamento e recibo de protocolo de um
+atendimento que nunca aconteceu.
+
+A linha do auto-close na tabela acima passa a valer **só quando o ciclo teve
+atendimento humano**.
+
+**Decisão.** O ciclo é detectado por COMPARAÇÃO de dois carimbos novos em
+`wa_conversations`, sem reset em lugar nenhum:
+
+| campo | quem grava |
+|---|---|
+| `handoff_at` | o handoff — `_persist_lead_temperature` (CX) e `_finalize_bot` (builtin; saiu de dentro do gate de `dept_id`, senão thread sem setor ficava sem marco) |
+| `last_human_outbound_at` | `save_wa_message`, quando o outbound tem `sender_user_id` (bot, inbound, system message e nota interna ficam de fora) |
+
+`_reception_handoff_unattended` compara: carimbo humano **mais recente** que o
+handoff ⇒ ciclo atendido ⇒ fecha e devolve como antes. Caso contrário, **não
+fecha** — a thread segue `aberto` na pool. Não fechar (em vez de "fechar sem
+devolver") é deliberado: fechar dispararia banner e recibo de protocolo para
+quem nunca foi atendido.
+
+**Por que comparação e não flag zerada:** zerar `last_human_outbound_at` no
+handoff exigiria acertar TODOS os pontos de fim de ciclo (`release_lead_to_bot`,
+`return_contact_to_bot`, `bulk-reassign`, fechamento manual) — esquecer um seria
+landmine silenciosa. Com dois timestamps, um handoff novo invalida sozinho o
+carimbo do ciclo anterior: lead atendido → devolvido à Val → volta a conversar →
+handoff novo fica protegido de novo, sem código de limpeza.
+
+**Fail-safe:** qualquer dúvida degrada para o comportamento anterior (doc legado
+sem `handoff_at`, timestamp corrompido, naive×aware). Teto
+`RECEPTION_UNATTENDED_RELEASE_DAYS` (env, default 7): passada a espera, o lead é
+dado como morto e volta pro bot — senão ficaria preso em `bot_completed=True`
+para sempre, com a Val muda e ninguém sabendo que ele existe. O guard só é
+alcançável no ramo da pool sem dono, então **legacy (Hubloc) segue intocado**.
+
+**Descartado:** subir `ATTENDANCE_AUTOCLOSE_HOURS` para 72h (proposta inicial do
+PO). O env é **global** — mexeria na Hubloc junto — e só adiaria o problema
+(feriado emendado, recesso); o buraco não era o tamanho do timer, e sim devolver
+ao bot uma thread que ninguém atendeu. Um `autoclose_hours` por tenant chegou a
+ser desenhado e foi dispensado pelo PO depois desta correção.
+
+**Produção:** rev `castro-crm-00075-dnt`, promovida por nome a 100% em
+2026-08-09. Validado com dado real: os 8 leads engolidos em 08-09/08 foram
+restaurados à Recepção (`bot_completed=True` + `handoff_at` + reabertura) e
+**sobreviveram** à rodada do cron das 22:00Z, que rodou 200 e sem log de erro.
+A metade positiva ("continua fechando o que deve", sobretudo o legacy da Hubloc)
+ainda não foi observada em produção — só nos simuladores.
+
 ## Validação
 
-`tools/sim_reception_flow.py` (**61 asserts**, código real de main/rbac/db
+`tools/sim_reception_flow.py` (**73 asserts** desde 2026-08-09; 61 na
+promoção original), código real de main/rbac/db
 com Firestore mockado): gate legacy×reception×coex×thread-de-outro×
 lead-com-dono, RBAC do assume (403/409) e do transfer-para-si,
 mark_human_active + carimbo `bot_completed` (opção A), revert no-op,
 coerção do `pool_mode`, auto-close da pool, fechar manual de órfã, merge
 de toggles no editor de perfis, contato manual sem assume,
 `release_lead_to_bot` (devolução ao agente + guards) e
-`return_contact_to_pool`. CX: `tools/sim_cx_flow.py` **117** (cenário q =
-hidratação LGPD). Regressão: `tools/sim_bot_flow.py` 44/44 intacto.
+`return_contact_to_pool`. Cenários 5b/5c (emenda 2026-08-09): os 6 casos do
+guard de handoff não atendido — inclusive carimbo humano do ciclo ANTERIOR não
+liberando fechamento — teto configurável, e o que carimba (ou não) resposta
+humana. CX: `tools/sim_cx_flow.py` **118** (cenário q = hidratação LGPD;
++1 provando que o handoff grava `handoff_at`). Regressão:
+`tools/sim_bot_flow.py` **45** (+1 pelo mesmo motivo no builtin).
 Canário executado no `varizemed-test` em 2026-08-04/05 (4 ajustes) antes
 da promoção; regressão Hubloc validada na staging antes do go.
