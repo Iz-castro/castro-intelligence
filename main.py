@@ -3747,24 +3747,30 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
 async def _close_daily_and_send_protocol(contact, conv, channel, current_user, close_status):
     """Fase 5A: no fechamento de uma thread, fecha o Atendimento DIARIO do
     contato e (se ainda nao informado) envia o protocolo ao lead como
-    "recibo". Texto livre se <=24h; fora da janela, fecha sem enviar (sem
-    template aprovado, mesma regra do Modo 3). Idempotente — a flag
+    "recibo". O CARIMBO de fechamento roda SEMPRE que o protocolo existe,
+    inclusive pra protocolo de dia anterior (fix 3a); o ENVIO segue gateado a
+    protocolo do proprio dia + janela de 24h da Meta (texto livre; fora dela
+    fecha sem enviar, mesma regra do Modo 3). Idempotente — a flag
     protocolo_informado bloqueia reenvio no retorno-zumbi.
 
     close_status: 'fechado_manual' | 'fechado_inatividade'.
     """
     pid = (contact or {}).get("attendance_protocol")
     if not pid:
-        return False  # lead sem inbound hoje -> sem Atendimento diario
-    # Garante que o pid eh de hoje BR (caso contato tenha mirror antigo)
-    today_br = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y%m%d")
-    if not pid.startswith(today_br + "-"):
-        return False
+        return False  # lead nunca teve Atendimento diario espelhado
     atendimento = get_daily_attendance(pid)
     if not atendimento:
         return False
+    # Gate de MESMO-DIA vale so pro ENVIO do recibo (a frase diz "de hoje", e
+    # o espelho no contato pode apontar protocolo de dia anterior). O CARIMBO
+    # de fechamento (fim da funcao) NAO passa por ele: com autoclose de 20h o
+    # fechamento quase sempre cruza a meia-noite BR, e o early-return antigo
+    # deixava o attendances_daily "aberto" pra sempre, sem fechado_em e sem
+    # recibo mesmo dentro da janela (fix 3a, 2026-08-10).
+    today_br = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y%m%d")
+    is_today = pid.startswith(today_br + "-")
     sender_uid = (current_user or {}).get("id")
-    if not atendimento.get("protocolo_informado"):
+    if is_today and not atendimento.get("protocolo_informado"):
         within_24h = False
         li = contact.get("last_inbound_at")
         if li:

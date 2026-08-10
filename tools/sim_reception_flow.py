@@ -720,6 +720,49 @@ def cenario_contato_manual():
         restore_dbf()
 
 
+def cenario_protocolo_dia_anterior():
+    titulo("CENARIO 13 — protocolo de dia anterior FECHA no fechamento (fix 3a)")
+    patch_store()
+    # Protocolo de ONTEM preso em "aberto": o autoclose de 20h quase sempre
+    # cruza a meia-noite BR, e o early-return antigo (pid nao e de hoje ->
+    # return False) pulava TAMBEM o carimbo de fechamento — attendances_daily
+    # ficava aberto pra sempre, sem fechado_em.
+    STORE["attendances_daily"] = {
+        "20260805-77-REC": {"id": "20260805-77-REC", "contact_id": 77,
+                            "status": "aberto", "protocolo_informado": False,
+                            "fechado_em": None},
+    }
+    contato = {"id": 77, "wa_id": "5531977770001",
+               "attendance_protocol": "20260805-77-REC",
+               "last_inbound_at": "2026-08-05T12:00:00+00:00"}
+    conv = {"id": "9__5531977770001", "contact_id": 77}
+    ok = asyncio.run(main._close_daily_and_send_protocol(
+        contato, conv, None, None, "fechado_inatividade"))
+    doc = STORE["attendances_daily"]["20260805-77-REC"]
+    check(ok is True, "nao desiste mais por protocolo de dia anterior")
+    check(doc.get("status") == "fechado_inatividade", "registro carimbado fechado")
+    check(doc.get("fechado_em") is not None, "fechado_em preenchido")
+    check(doc.get("protocolo_informado") is False,
+          "recibo NAO enviado (gate de mesmo-dia do ENVIO preservado)")
+    check(not STORE.get("wa_messages"), "nenhuma mensagem gravada pro lead")
+
+    # Regressao: protocolo de HOJE (ja informado) continua fechando normal.
+    pid_hoje = f"{dbf._today_br_str()}-78-REC"
+    STORE["attendances_daily"][pid_hoje] = {
+        "id": pid_hoje, "contact_id": 78, "status": "aberto",
+        "protocolo_informado": True, "fechado_em": None,
+    }
+    contato2 = {"id": 78, "wa_id": "5531977770002",
+                "attendance_protocol": pid_hoje}
+    ok2 = asyncio.run(main._close_daily_and_send_protocol(
+        contato2, {"id": "9__5531977770002", "contact_id": 78}, None, None,
+        "fechado_manual"))
+    check(ok2 is True
+          and STORE["attendances_daily"][pid_hoje].get("status") == "fechado_manual",
+          "protocolo de hoje segue fechando (regressao)")
+    restore_dbf()
+
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -736,6 +779,7 @@ def run():
     cenario_contato_manual()
     cenario_release_to_bot()
     cenario_return_to_pool()
+    cenario_protocolo_dia_anterior()
 
     print("\n" + "=" * 70)
     if FAILS:
