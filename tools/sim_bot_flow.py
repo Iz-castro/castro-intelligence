@@ -115,6 +115,13 @@ _DEPARTMENTS = [
     {"id": 4, "name": "Administrativo", "bot_key": "administrativo"},
 ]
 
+# tenant_service stubado: a despedida da recusa LGPD resolve tenant.name
+# (data-driven; incidente Hub Loc x varizemed de 2026-08-10).
+_ts = types.ModuleType("tenant_service")
+_ts.get_tenant = lambda tid: ({"id": "hubloc", "name": "Hub Loc"}
+                              if tid == "hubloc" else None)
+sys.modules["tenant_service"] = _ts
+
 _db = types.ModuleType("database")
 _db.get_wa_contact = lambda cid: (
     dict(STORE.get("wa_contacts", {}).get(str(cid)))
@@ -288,6 +295,8 @@ def cenario_recusa_reconsentimento():
           "recusa registrada no estado (lgpd_consent=False)")
     check(isinstance(reply, str) and "não podemos prosseguir" in reply.lower(),
           "mensagem de recusa enviada")
+    check(isinstance(reply, str) and "Hub Loc agradece o seu contato" in reply,
+          "despedida assina com o NOME do tenant (tenant.name, data-driven)")
 
     # Cliente muda de ideia e toca em Sim
     reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")

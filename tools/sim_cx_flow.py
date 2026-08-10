@@ -137,8 +137,9 @@ _AI_CFG = {
 }
 
 _TENANTS = {
-    "varizemed-test": {"id": "varizemed-test", "plan": "ai_custom", "settings": {"ai": _AI_CFG}},
-    "hubloc": {"id": "hubloc", "plan": "professional", "settings": {}},
+    "varizemed-test": {"id": "varizemed-test", "name": "Clínica Varizemed",
+                       "plan": "ai_custom", "settings": {"ai": _AI_CFG}},
+    "hubloc": {"id": "hubloc", "name": "Hub Loc", "plan": "professional", "settings": {}},
 }
 
 _CURRENT_TENANT = {"id": _TENANT_ID}
@@ -784,6 +785,18 @@ novo_contato(42, wa_id="5571922221111", lgpd_consent=True,
 r = envia(42, "oi")
 check(isinstance(r, dict) and r.get("type") == "interactive_buttons",
       "lgpd_revoked NUNCA hidrata (guard J-3 D8)")
+
+print("\n=== s: recusa LGPD assina com a marca do TENANT (incidente 10/08) ===")
+# 2 leads reais da varizemed recusaram e receberam "A Hub Loc agradece o seu
+# contato!" — a despedida era constante compartilhada. Agora resolve
+# tenant.name (padrao do topbar).
+novo_contato(43, wa_id="5571911110000")
+envia(43, "oi")  # dispara o aviso LGPD
+r = envia(43, "nao aceito")
+check(isinstance(r, str) and "Clínica Varizemed agradece o seu contato" in r,
+      "recusa no tenant CX assina 'Clínica Varizemed', nao 'Hub Loc'")
+check(isinstance(r, str) and "Hub Loc" not in r,
+      "nenhum vazamento de marca de outro tenant na recusa")
 
 print("\n=== r: horario comercial da varizemed (business_hours, datas fixas) ===")
 # 2026-08-10 = segunda. Tabela: seg-qui 08-18, sex 08-17, fds fechado.

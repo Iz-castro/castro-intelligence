@@ -130,6 +130,10 @@ _LINK_PRIVACIDADE = (
     "https://hubloc.com.br/politica-de-privacidade/"
 )
 
+# ATENCAO: aviso default com marca da Hub Loc — vale SO porque o unico tenant
+# no fluxo builtin e a hubloc (CX sempre passa settings.ai.lgpd_notice do
+# proprio tenant). Um 2o tenant builtin exigiria aviso por tenant, como a
+# despedida da recusa (_recusa_resposta) ja faz.
 _AVISO_LGPD = (
     "Olá! Que bom ter você na Hub Loc! 👷‍♂️🏗️\n\n"
     "Para falar com nosso atendimento e gerar orçamentos, "
@@ -143,12 +147,39 @@ _ACEITO_RESPOSTA = (
     "segurança e responsabilidade."
 )
 
-_RECUSA_RESPOSTA = (
-    "Entendido. Sem o seu consentimento, infelizmente "
-    "não podemos prosseguir com o atendimento por este canal.\n\n"
-    "Caso mude de ideia, é só nos enviar uma nova mensagem.\n"
-    "A Hub Loc agradece o seu contato!"
-)
+def _nome_tenant() -> str:
+    """Nome de exibicao do tenant atual (tenant.name — mesmo dado do topbar).
+    Vazio se indisponivel; nunca levanta. get_tenant e cacheado em memoria,
+    entao nao custa read por recusa."""
+    try:
+        from firestore_common import get_tenant_context
+        from tenant_service import get_tenant
+        tid = get_tenant_context()
+        if not tid:
+            return ""
+        return str((get_tenant(tid) or {}).get("name") or "").strip()
+    except Exception:
+        return ""
+
+
+def _recusa_resposta() -> str:
+    """Despedida da recusa com a marca do TENANT ATUAL, data-driven.
+
+    Era uma constante com "A Hub Loc agradece o seu contato!" hardcoded —
+    compartilhada por todos os tenants. Em 2026-08-10, 2 leads da varizemed
+    (clinica) recusaram o LGPD e receberam a despedida assinada pela Hub Loc
+    (locadora). Sem nome resolvido, degrada pra despedida neutra — nunca
+    assina com a marca de outro cliente. Sem artigo antes do nome de
+    proposito ("Hub Loc agradece", nao "A Hub Loc agradece"): artigo tem
+    genero e quebraria com tenants futuros."""
+    nome = _nome_tenant()
+    agradece = f"{nome} agradece o seu contato!" if nome else "Agradecemos o seu contato!"
+    return (
+        "Entendido. Sem o seu consentimento, infelizmente "
+        "não podemos prosseguir com o atendimento por este canal.\n\n"
+        "Caso mude de ideia, é só nos enviar uma nova mensagem.\n"
+        + agradece
+    )
 
 _RECUSA_LEMBRETE_CORPO = (
     "Você optou por não consentir com o uso dos seus dados.\n"
@@ -224,7 +255,7 @@ def handle_lgpd(
             state["lgpd_consent"] = False
             state["lgpd_status"] = "refused"
             logger.info("[LGPD] Consentimento recusado")
-            return _RECUSA_RESPOSTA
+            return _recusa_resposta()
 
         # Resposta nao reconhecida: reenviar botoes (e atualizar o replay do CX
         # com a intencao real, se o cliente digitou algo em vez de tocar botao).

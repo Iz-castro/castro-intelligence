@@ -870,6 +870,43 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                     if transcript:
                         update_wa_message_transcription(db_id, transcript)
                         logger.info("[STT] Transcricao salva | msg_id=%s | len=%d", db_id, len(transcript))
+                        # -- Bot sobre a TRANSCRICAO (2026-08-10) --
+                        # O dispatch de bot la em cima so roda pra msg_type
+                        # "text", entao lead no funil mandando AUDIO deixava a
+                        # Val muda (transcricao ficava so pro operador ler).
+                        # Mesmos gates do caminho de texto; contato RE-LIDO
+                        # aqui porque o reroute de convertido (acima) pode ter
+                        # atribuido operador nesta mesma janela. O fallback
+                        # generico (STT_FALLBACK_TEXT) NUNCA vai pro bot — nao
+                        # e fala do cliente.
+                        if (
+                            transcript.strip()
+                            and transcript != STT_FALLBACK_TEXT
+                            and not was_dup
+                        ):
+                            _ctc_pos_stt = get_wa_contact(contact_id)
+                            if (
+                                _ctc_pos_stt
+                                and not _ctc_pos_stt.get("assigned_to")
+                                and not _ctc_pos_stt.get("bot_completed")
+                            ):
+                                try:
+                                    bot_reply = await process_bot_message_async(
+                                        contact_id, transcript, contact_name,
+                                    )
+                                    if bot_reply:
+                                        _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
+                                        _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
+                                        await _send_bot_reply(
+                                            wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
+                                            channel_id=channel_id,
+                                            channel_owner_user_id=channel_owner_id,
+                                        )
+                                except Exception:
+                                    logger.exception(
+                                        "[BOT] falha ao processar transcricao do contato %s",
+                                        contact_id,
+                                    )
             except Exception as stt_exc:
                 logger.error("[STT] Falha na transcricao: %s", stt_exc, exc_info=True)
 
