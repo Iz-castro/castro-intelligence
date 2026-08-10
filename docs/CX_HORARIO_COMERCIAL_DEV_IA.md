@@ -3,10 +3,11 @@
 **Data:** 2026-08-09 · **Agente:** `5fa69ea1-bc68-445b-9d20-d72265aaaf36`
 (projeto `castro-ia`, região `us-central1`) · **Tenant:** `varizemed`
 
-> **Status:** especificação. O lado do CRM (config de horário + cálculo + envio
-> dos parâmetros) **ainda não está implementado** — este documento existe para
-> os dois lados combinarem o contrato antes. Quando o backend subir, os
-> parâmetros abaixo passam a chegar em toda chamada; até lá eles não existem.
+> **Status (10/08):** backend **implementado** (`business_hours.py`; horários
+> fixos no código nesta fase — a tela de admin com calendário de feriados é a
+> fase 2). Os dois parâmetros chegam em **toda** chamada `detectIntent` assim
+> que a revisão subir — o Rafael te confirma a hora. Seu lado (playbook) pode
+> ser feito em paralelo: parâmetro ausente numa condição CX é só "false".
 
 Complementa o `docs/CX_AGENTE_PENDENCIAS_DEV_IA.md` (pendências de 30/07).
 
@@ -36,8 +37,21 @@ Passará a mandar também:
 
 | parâmetro | tipo | exemplo | significado |
 |---|---|---|---|
-| `fora_do_expediente` | boolean | `true` | o momento da mensagem está fora do horário configurado (inclui fim de semana e feriado) |
+| `fora_do_expediente` | boolean | `true` | o momento da mensagem está fora do horário configurado (inclui fim de semana; feriados entram na fase 2) |
 | `retorno_previsto` | string | `"segunda-feira às 8h"` | texto **pronto** com o próximo horário de abertura |
+
+Valores exatos que o `retorno_previsto` produz (interpolar sem mexer):
+
+| situação (Varizemed) | `fora_do_expediente` | `retorno_previsto` |
+|---|---|---|
+| terça 10:00 (aberto) | `false` | `""` (vazio — não usar) |
+| segunda 07:32 | `true` | `"hoje às 8h"` |
+| terça 19:00 | `true` | `"amanhã às 8h"` |
+| sexta 17:30 | `true` | `"segunda-feira às 8h"` |
+| sábado / domingo | `true` | `"segunda-feira às 8h"` (domingo à noite vira `"amanhã às 8h"`) |
+
+Quando `fora_do_expediente` for `false`, o `retorno_previsto` vem **vazio** de
+propósito — a mensagem de fora-do-horário não deve existir nesse ramo.
 
 O agente **não conhece o horário** e não deve tentar deduzi-lo. Quem calcula é o
 CRM, a partir da configuração que a própria clínica edita na tela de

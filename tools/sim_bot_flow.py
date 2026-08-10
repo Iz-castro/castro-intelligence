@@ -397,6 +397,45 @@ def cenario_limites_payload():
           "msg sem interactive -> string vazia")
 
 
+def cenario_horario_comercial():
+    """business_hours (frente b): datas FIXAS pra nao depender da hora em que
+    o simulador roda. 2026-08-10 = segunda."""
+    print("\n=== CENARIO: horario comercial (business_hours, hubloc 8h-17h) ===")
+    from datetime import datetime, timedelta, timezone
+    import business_hours as bh
+
+    BR = timezone(timedelta(hours=-3))
+    seg_10h = datetime(2026, 8, 10, 10, 0, tzinfo=BR)
+    seg_0730 = datetime(2026, 8, 10, 7, 30, tzinfo=BR)
+    sex_1730 = datetime(2026, 8, 14, 17, 30, tzinfo=BR)
+    sab_10h = datetime(2026, 8, 15, 10, 0, tzinfo=BR)
+
+    check(bh.is_open("hubloc", seg_10h) is True, "segunda 10h -> aberto")
+    check(bh.is_open("hubloc", seg_0730) is False,
+          "segunda 07:30 -> FECHADO (7h hardcoded antigo dizia aberto)")
+    check(bh.retorno_previsto_text("hubloc", seg_0730) == "hoje às 8h",
+          "07:30 de segunda -> retorno 'hoje às 8h'")
+    check(bh.retorno_previsto_text("hubloc", sex_1730) == "segunda-feira às 8h",
+          "sexta 17:30 -> retorno 'segunda-feira às 8h'")
+    check(bh.retorno_previsto_text("hubloc", sab_10h) == "segunda-feira às 8h",
+          "sabado -> retorno 'segunda-feira às 8h'")
+
+    aviso = bh.builtin_expediente_notice("hubloc", sab_10h)
+    check("segunda a sexta das 8h às 17h" in aviso,
+          "aviso builtin resume a tabela real (8h, nao 7h)")
+    check("retornaremos segunda-feira às 8h" in aviso,
+          "aviso builtin interpola o retorno")
+    check(bh.builtin_expediente_notice("hubloc", seg_10h) == "",
+          "aberto -> sem aviso")
+
+    # Fail-safe: tenant sem tabela NUNCA e declarado fechado.
+    check(bh.is_open("tenant-inexistente", sab_10h) is None,
+          "sem tabela -> is_open None (nem aberto nem fechado)")
+    check(bh.cx_hours_params("tenant-inexistente", sab_10h)
+          == {"fora_do_expediente": False, "retorno_previsto": ""},
+          "sem tabela -> params neutros (nunca afirma fechado)")
+
+
 def main():
     cenario_fluxo_feliz_botoes()
     cenario_recusa_reconsentimento()
@@ -404,6 +443,7 @@ def main():
     cenario_legado_escolha_setor()
     cenario_legado_invalida_vai_comercial()
     cenario_limites_payload()
+    cenario_horario_comercial()
 
     print("\n" + "=" * 70)
     if FAILS:

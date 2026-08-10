@@ -136,6 +136,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | RBAC dinâmico por tenant | `rbac.py` |
 | Gate LGPD | `lgpd_bot.py` |
 | Bot builtin + dispatcher builtin/CX | `bot_service.py` |
+| Horário comercial por tenant (aviso builtin + params CX) | `business_hours.py` |
 | Redação de PII em logs | `pii_redaction.py` |
 | Frontend (estado central + listeners) | `frontend/src/context/CrmContext.tsx`, `App.tsx` |
 

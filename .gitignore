@@ -24,6 +24,10 @@ data/
 
 # Exports de migracao (PII — LGPD: nunca versionar; retencao curta)
 scripts/_exports/
+# Listas de numeros / relatorios de campanha (PII — LGPD). docs/ e versionado,
+# entao qualquer CSV largado la seria commitado por acidente.
+docs/*.csv
+*.xlsx
 # Backups/exports de conversas WhatsApp (PII pesada — LGPD: NUNCA versionar)
 backup*/
 *backup*/
@@ -75,3 +79,4 @@ cx/
 
 # Documentacao de referencia da Meta (WhatsApp Business Platform) baixada
 docs meta/
+docs/lista temp.md

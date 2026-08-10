@@ -36,16 +36,16 @@ from database import (
 )
 from lgpd_bot import handle_lgpd
 from lead_temperature import classify_lead_temperature, signal_keys
+from business_hours import builtin_expediente_notice, cx_hours_params
 
 logger = logging.getLogger("castro_crm.bot")
 
 # =========================================================================
-# Timezone e expediente
+# Horario comercial: business_hours.py (fonte unica por tenant, frente b).
+# As constantes EMPRESA_TZ/HORA_INICIO/HORA_FIM sairam em 2026-08-10 — o 7h
+# hardcoded ja divergia do atendimento real da Hubloc (8h) e nao valia por
+# tenant.
 # =========================================================================
-
-EMPRESA_TZ = timezone(timedelta(hours=-3))
-HORA_INICIO = 7
-HORA_FIM = 17
 
 # =========================================================================
 # Vocabularios de classificacao de setor (LEGADO)
@@ -249,11 +249,6 @@ def _clear_bot_state(contact_id: int):
     document("bot_states", contact_id).delete()
 
 
-def _esta_no_expediente() -> bool:
-    agora = datetime.now(timezone.utc).astimezone(EMPRESA_TZ)
-    return agora.weekday() < 5 and HORA_INICIO <= agora.hour < HORA_FIM
-
-
 SETOR_COMERCIAL = 1
 
 _MSG_FILA_COMERCIAL = (
@@ -264,14 +259,13 @@ _MSG_FILA_COMERCIAL = (
 
 def _msg_pos_aceite(prefixo: str = "") -> str:
     """Mensagem pos-aceite: confirma o encaminhamento pra fila do Comercial,
-    anexando o aviso de expediente quando estiver fora do horario."""
+    anexando o aviso de expediente quando fora do horario de atendimento do
+    tenant (business_hours; sem tabela = sem aviso, nunca afirma fechado)."""
+    from firestore_common import get_tenant_context
     texto = prefixo + "\n\n" + _MSG_FILA_COMERCIAL
-    if not _esta_no_expediente():
-        texto += (
-            "\n\nNosso expediente funciona de segunda a sexta, das 7h às 17h.\n"
-            "Sua mensagem será registrada e o retorno "
-            "ocorrerá no próximo horário útil."
-        )
+    # Fallback "hubloc" segue o padrao ja documentado do tenant implicito
+    # (webhook/middleware/channel_service) — builtin sem contexto e hubloc.
+    texto += builtin_expediente_notice(get_tenant_context() or "hubloc")
     return texto.strip()
 
 
@@ -728,6 +722,11 @@ async def _process_cx_message(
             "tenant_id": str(get_tenant_context() or ""),
             "lgpd_consent": True,
         }
+        # Horario comercial (frente b): SEMPRE as duas chaves, todo turno —
+        # o agente ramifica em fora_do_expediente e interpola retorno_previsto
+        # (nunca decide horario sozinho nem escreve hora no texto). Agente que
+        # ainda nao usa os params simplesmente os ignora.
+        session_params.update(cx_hours_params(get_tenant_context() or ""))
         turn_text = first_cx_text if first_cx_text is not None else text
         result = await bot_engine_dialogflow.detect_intent_text(
             ai_cfg, wa_digits, turn_text, session_params

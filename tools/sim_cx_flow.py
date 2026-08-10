@@ -307,6 +307,13 @@ if CX_CALLS:
     check(c["params"].get("user_id") == "+5571999998888", "param user_id E.164 com +")
     check(c["params"].get("tenant_id") == _TENANT_ID, "param tenant_id")
     check(c["params"].get("lgpd_consent") is True, "param lgpd_consent=True")
+    # Frente b: as duas chaves de horario vao em TODO turno. Valor depende da
+    # hora em que o sim roda -> aqui so presenca/tipo; valores deterministicos
+    # no cenario de datas fixas la no fim.
+    check(isinstance(c["params"].get("fora_do_expediente"), bool),
+          "param fora_do_expediente (bool) em todo turno")
+    check(isinstance(c["params"].get("retorno_previsto"), str),
+          "param retorno_previsto (str) em todo turno")
 check(isinstance(r2, str) and "Sou a Val" in r2,
       "resposta do agente repassada ao cliente")
 check(isinstance(r2, str) and r2.index("Sou a Val") > 0,
@@ -777,6 +784,40 @@ novo_contato(42, wa_id="5571922221111", lgpd_consent=True,
 r = envia(42, "oi")
 check(isinstance(r, dict) and r.get("type") == "interactive_buttons",
       "lgpd_revoked NUNCA hidrata (guard J-3 D8)")
+
+print("\n=== r: horario comercial da varizemed (business_hours, datas fixas) ===")
+# 2026-08-10 = segunda. Tabela: seg-qui 08-18, sex 08-17, fds fechado.
+from datetime import timedelta as _td, timezone as _tz
+import business_hours as _bh
+
+_BR = _tz(_td(hours=-3))
+_qui_1730 = datetime(2026, 8, 13, 17, 30, tzinfo=_BR)
+_sex_1730 = datetime(2026, 8, 14, 17, 30, tzinfo=_BR)
+_seg_0732 = datetime(2026, 8, 10, 7, 32, tzinfo=_BR)
+_ter_19h = datetime(2026, 8, 11, 19, 0, tzinfo=_BR)
+_dom_22h = datetime(2026, 8, 9, 22, 0, tzinfo=_BR)
+
+check(_bh.is_open("varizemed", _qui_1730) is True,
+      "quinta 17:30 -> ABERTO (18h; a Val hardcoded dizia 'ate 18h' certo aqui)")
+check(_bh.is_open("varizemed", _sex_1730) is False,
+      "sexta 17:30 -> FECHADO (17h; saudacao hardcoded do agente errava aqui)")
+_p = _bh.cx_hours_params("varizemed", _seg_0732)
+check(_p == {"fora_do_expediente": True, "retorno_previsto": "hoje às 8h"},
+      "segunda 07:32 -> 'hoje às 8h' (o caso real de 10/08 que disparou a frente)")
+check(_bh.retorno_previsto_text("varizemed", _ter_19h) == "amanhã às 8h",
+      "terca 19h -> 'amanhã às 8h'")
+check(_bh.retorno_previsto_text("varizemed", _dom_22h) == "amanhã às 8h",
+      "domingo 22h -> 'amanhã às 8h'")
+check(_bh.retorno_previsto_text("varizemed", _sex_1730) == "segunda-feira às 8h",
+      "sexta 17:30 -> 'segunda-feira às 8h'")
+check(_bh.cx_hours_params("varizemed", _qui_1730)
+      == {"fora_do_expediente": False, "retorno_previsto": ""},
+      "aberto -> False + retorno vazio (agente nao interpola nada)")
+check(_bh.get_schedule("varizemed-test") == _bh.get_schedule("varizemed"),
+      "varizemed-test espelha a tabela da clinica real")
+check(_bh.schedule_summary("varizemed")
+      == "segunda a quinta das 8h às 18h e sexta das 8h às 17h",
+      "resumo humano da tabela agrupa dias consecutivos")
 
 print("\n" + "=" * 70)
 if FAILS:

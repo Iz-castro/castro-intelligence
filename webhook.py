@@ -1124,7 +1124,8 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
 
         logger.info(
             "[SMB ECHO] %s -> %s | tipo=%s | id=%s",
-            business_phone, customer_phone, effective_msg_type, msg_id[:20],
+            redact_phone(business_phone), redact_phone(customer_phone),
+            effective_msg_type, msg_id[:20],
         )
 
         if ws_notify_callback:
