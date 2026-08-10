@@ -4,6 +4,17 @@
 desde 29/07, rodando o agente `5fa69ea1-bc68-445b-9d20-d72265aaaf36`
 (projeto `castro-ia`, região `us-central1`).
 
+> **Atualização 2026-08-10:** itens **2 e 3 estão ✅ resolvidos** (marcados no
+> corpo). O único item vivo é o **1**, como higiene: params escalares — o CRM
+> já desembrulha os dois formatos, então nada está quebrado; vale sobretudo se
+> você for mexer nos presets agora. A parte de ambientes do item 3 **evoluiu**:
+> a produção do `varizemed` roda o environment `75028a25-…` (`val-5.0.1`)
+> desde 10/08, e o tenant de teste está **temporariamente** apontado pro mesmo
+> environment (validação de 09/08) — antes de você editar o Draft, peça ao
+> Rafael pra devolver o `varizemed-test` pro Draft, senão você edita sem ter
+> onde testar. A frente nova (aviso de horário comercial) está em
+> `docs/CX_HORARIO_COMERCIAL_DEV_IA.md` — é ela que te destrava agora.
+
 Três pendências, em ordem de importância. As duas primeiras vieram de conversa
 real de produção do dia 29/07 (mensagens de sistema gravadas no CRM).
 
