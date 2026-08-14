@@ -463,6 +463,50 @@ _CX_FALLBACK_MSG = (
     "automático. Pode reenviar sua mensagem em instantes?"
 )
 
+# Frases de erro EMBUTIDAS do Dialogflow CX (built-in error event). Chegam
+# como turno "ok" (HTTP 200) — o caminho de falha por timeout/5xx nao as
+# enxerga, entao sem esta lista o lead recebia o erro EM INGLES e ficava
+# preso no funil (incidente varizemed 2026-08-14, pedido de atendimento).
+# Comparacao por IGUALDADE do texto normalizado (a frase e a resposta
+# inteira do agente) — containment pegaria resposta legitima que cite
+# "algo deu errado" no meio de uma frase maior.
+_CX_ERROR_REPLY_PHRASES = (
+    "sorry something went wrong",
+    "desculpe algo deu errado",
+)
+
+# Reenvios da MESMA mensagem do lead quando o agente devolve frase de erro
+# (transparente pro lead). No 4o erro consecutivo (1 + 3 reenvios), handoff.
+_CX_ERROR_RETRY_MAX = 3
+
+_CX_ERROR_HANDOFF_MSG = (
+    "Nosso agente virtual está indisponível no momento. "
+    "Um operador humano vai continuar o seu atendimento por aqui."
+)
+
+
+def _cx_reply_is_error(reply_text, ai_cfg: Optional[dict] = None) -> bool:
+    """True se a resposta do agente e uma frase de erro embutida do CX.
+
+    Remove TODA pontuacao antes de comparar ("Desculpe, algo deu errado."
+    tem virgula interna que o _norm preserva). Alem das frases builtin,
+    aceita frases extras POR TENANT em settings.ai.cx_error_phrases —
+    e por ai que a frase de erro customizada que o dev de IA vai definir
+    entra SEM deploy (mesmo padrao do override handoff_text_hints)."""
+    norm = re.sub(r"[^\w\s]", "", _norm(str(reply_text or "")))
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if norm in _CX_ERROR_REPLY_PHRASES:
+        return True
+    extras = (ai_cfg or {}).get("cx_error_phrases") or ()
+    if not isinstance(extras, (list, tuple)):
+        return False
+    for frase in extras:
+        f = re.sub(r"[^\w\s]", "", _norm(str(frase or "")))
+        if f and re.sub(r"\s+", " ", f).strip() == norm:
+            return True
+    return False
+
+
 _CX_HANDOFF_FAIL_MSG = (
     "Desculpe pela instabilidade. Estou te transferindo para a nossa "
     "equipe de atendimento — em breve alguém responde por aqui."
@@ -731,6 +775,24 @@ async def _process_cx_message(
         result = await bot_engine_dialogflow.detect_intent_text(
             ai_cfg, wa_digits, turn_text, session_params
         )
+        # Frase de erro embutida com HTTP 200 = falha disfarcada. Reenvia a
+        # MESMA mensagem do lead ate _CX_ERROR_RETRY_MAX vezes (transparente
+        # pro lead; PO 2026-08-14). Se algum reenvio vier limpo, o fluxo segue
+        # normal; 4 erros consecutivos caem no handoff logo abaixo.
+        _erros_seguidos = 0
+        while (
+            result.get("ok")
+            and _cx_reply_is_error(result.get("reply_text"), ai_cfg)
+            and _erros_seguidos < _CX_ERROR_RETRY_MAX
+        ):
+            _erros_seguidos += 1
+            logger.warning(
+                "[BOT-CX] frase de erro do agente — reenvio %d/%d | contato=%d",
+                _erros_seguidos, _CX_ERROR_RETRY_MAX, contact_id,
+            )
+            result = await bot_engine_dialogflow.detect_intent_text(
+                ai_cfg, wa_digits, turn_text, session_params
+            )
         # Re-checa o gate DEPOIS do turno (corrida real: DetectIntent leva ate
         # 15s + retry; um assume/takeover nesse meio tempo nao pode ser
         # atropelado por resposta/handoff atrasados do bot).
@@ -788,6 +850,30 @@ async def _process_cx_message(
                 )
             return _CX_HANDOFF_FAIL_MSG
         return _CX_FALLBACK_MSG
+
+    # ------------------------------------------------------------------
+    # Frase de erro SOBREVIVEU aos reenvios (4 erros consecutivos na mesma
+    # mensagem) -> handoff com mensagem generica (PO 2026-08-14). A frase
+    # de erro NUNCA chega ao lead.
+    # ------------------------------------------------------------------
+    if _cx_reply_is_error(result.get("reply_text"), ai_cfg):
+        logger.warning(
+            "[BOT-CX] frase de erro apos %d reenvios — handoff | contato=%d",
+            _CX_ERROR_RETRY_MAX, contact_id,
+        )
+        try:
+            _finalize_cx_handoff(
+                contact_id, ai_cfg,
+                summary="Bot IA com erro interno (4 respostas de erro consecutivas)",
+                contact=contact,
+            )
+        except Exception:
+            logger.exception(
+                "[BOT-CX] persistencia do handoff-por-erro falhou | "
+                "contato=%d (cliente respondido; re-tenta na proxima msg)",
+                contact_id,
+            )
+        return _CX_ERROR_HANDOFF_MSG
 
     if int(state.get("cx_fail_count") or 0):
         _set_bot_state(contact_id, {"cx_fail_count": 0})

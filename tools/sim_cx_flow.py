@@ -798,6 +798,74 @@ check(isinstance(r, str) and "Clínica Varizemed agradece o seu contato" in r,
 check(isinstance(r, str) and "Hub Loc" not in r,
       "nenhum vazamento de marca de outro tenant na recusa")
 
+print("\n=== t: frase de erro do CX -> reenvia 3x, handoff no 4o erro (PO 2026-08-14) ===")
+# O agente devolveu "Sorry something went wrong." com HTTP 200 e sem
+# handoff_request — falha disfarcada de sucesso: o lead recebia erro em
+# ingles e ficava preso no funil. Contrato: reenviar a MESMA mensagem do
+# lead ate 3x (transparente); 4 erros consecutivos -> handoff generico.
+
+# (a) 4 erros consecutivos -> handoff com a mensagem generica.
+novo_contato(44, wa_id="5571900001111")
+STORE["bot_states"]["44"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+for _ in range(4):
+    CX_SCRIPT.append(_cx_ok("Sorry something went wrong.", handoff_request=False))
+_n_calls = len(CX_CALLS)
+rt = envia(44, "quero falar com a equipe")
+check(len(CX_CALLS) == _n_calls + 4, "1 envio + 3 reenvios = 4 chamadas ao CX")
+check(all(c["text"] == "quero falar com a equipe" for c in CX_CALLS[-4:]),
+      "reenvios repetem a MESMA mensagem do lead")
+check(isinstance(rt, str) and "Sorry" not in rt
+      and "agente virtual" in rt.lower() and "operador humano" in rt.lower(),
+      "4o erro -> mensagem generica de indisponibilidade (nunca o erro cru)")
+check(STORE["wa_contacts"]["44"].get("bot_completed") is True,
+      "4o erro -> handoff (bot_completed=True)")
+check(STORE["wa_contacts"]["44"].get("department_id") == 10,
+      "handoff-por-erro vai pro setor configurado")
+check(any("erro interno" in m.get("content", "") for m in MESSAGES
+          if m.get("direction") == "system"),
+      "system message registra o motivo")
+
+# (b) recupera num reenvio -> lead recebe a resposta boa, sem handoff.
+novo_contato(45, wa_id="5571900002222")
+STORE["bot_states"]["45"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok("Desculpe, algo deu errado.", handoff_request=False))
+CX_SCRIPT.append(_cx_ok("Claro! Os horários de sexta estão livres a partir das 14h."))
+_n_calls = len(CX_CALLS)
+rt2 = envia(45, "tem horario sexta?")
+check(len(CX_CALLS) == _n_calls + 2, "erro + reenvio limpo = 2 chamadas")
+check(isinstance(rt2, str) and "horários de sexta" in rt2,
+      "reenvio recuperou -> lead recebe a resposta boa (transparente)")
+check(STORE["wa_contacts"]["45"].get("bot_completed") is not True,
+      "recuperado -> sem handoff")
+
+# (c) resposta LEGITIMA que cita "algo deu errado" NO MEIO nao dispara.
+novo_contato(46, wa_id="5571900003333")
+STORE["bot_states"]["46"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+CX_SCRIPT.append(_cx_ok(
+    "Se algo deu errado no seu agendamento online, me conta o que aconteceu "
+    "que eu te ajudo a corrigir.", handoff_request=False,
+))
+_n_calls = len(CX_CALLS)
+rt3 = envia(46, "deu problema no agendamento")
+check(len(CX_CALLS) == _n_calls + 1 and isinstance(rt3, str)
+      and "agendamento online" in rt3,
+      "resposta legitima contendo a expressao NO MEIO passa intacta, sem reenvio")
+
+# (d) estrutura pro dev de IA: frase custom por tenant via
+# settings.ai.cx_error_phrases, SEM deploy.
+_AI_CFG["cx_error_phrases"] = ["Assistente em manutenção, tente novamente!"]
+try:
+    novo_contato(47, wa_id="5571900004444")
+    STORE["bot_states"]["47"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    CX_SCRIPT.append(_cx_ok("Assistente em manutenção, tente novamente!"))
+    CX_SCRIPT.append(_cx_ok("Voltei! Como posso ajudar?"))
+    _n_calls = len(CX_CALLS)
+    rt4 = envia(47, "oi")
+    check(len(CX_CALLS) == _n_calls + 2 and isinstance(rt4, str) and "Voltei" in rt4,
+          "frase custom do tenant (settings.ai.cx_error_phrases) tambem reenvia")
+finally:
+    _AI_CFG.pop("cx_error_phrases", None)
+
 print("\n=== r: horario comercial da varizemed (business_hours, datas fixas) ===")
 # 2026-08-10 = segunda. Tabela: seg-qui 08-18, sex 08-17, fds fechado.
 from datetime import timedelta as _td, timezone as _tz
