@@ -1628,9 +1628,17 @@ def get_wa_contacts_visible_to(user_id, department_id=None, include_archived=Fal
 
 
 def update_wa_contact_qualification(contact_id, qualification, notes=""):
-    fields = {"qualification": qualification}
+    # Guarda: qualification vazia NAO sobrescreve a existente (o endpoint
+    # aceita "" pra "salvar so as notas"; antes gravava literalmente "" e o
+    # lead sumia do filtro por qualificacao do frontend). Nenhum caller
+    # legitimo limpa a qualificacao.
+    fields = {}
+    if qualification:
+        fields["qualification"] = qualification
     if notes is not None:
         fields["notes"] = notes
+    if not fields:
+        return
     document("wa_contacts", contact_id).set(fields, merge=True)
 
 

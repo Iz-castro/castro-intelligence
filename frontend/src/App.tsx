@@ -8,7 +8,7 @@ import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -214,6 +214,11 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
   // null = Todos; sessionUser.id = "Meus"; outro id = carteira daquele operador.
   // Client-side sobre os contatos ja carregados — sem leitura extra no Firestore.
   const [ownerFilter, setOwnerFilter] = useState<number | null>(null);
+  // Filtro por qualificacao (pedido do PO 2026-08-17): client-side sobre a
+  // agenda ja carregada — sem leitura extra. Aqui entra tambem
+  // "nao_qualificado" (a agenda e a lista completa; nao ha caixa N/Q separada
+  // como na sidebar). Vazio conta como "novo" (mesmo fallback do chip).
+  const [qualFilter, setQualFilter] = useState("");
 
   // Carrega contatos quando entra no modo list ou quando search muda (debounce).
   useEffect(() => {
@@ -249,7 +254,10 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     }
   }
 
-  const visibleContacts = ownerFilter == null ? allContacts : allContacts.filter((c) => (c.assigned_to ?? null) === ownerFilter);
+  const visibleContacts = allContacts.filter((c) =>
+    (ownerFilter == null || (c.assigned_to ?? null) === ownerFilter)
+    && (!qualFilter || (c.qualification || "novo") === qualFilter));
+  const filtersActive = ownerFilter != null || Boolean(qualFilter);
 
   if (mode === "create") {
     return (
@@ -285,15 +293,25 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" style={{ width: "min(520px, 92vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.5rem" }}>
-          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({ownerFilter == null ? total : visibleContacts.length})</p>
+          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({filtersActive ? visibleContacts.length : total})</p>
         </div>
-        <input
-          value={search}
-          onChange={(e) => setSearchLocal(e.target.value)}
-          placeholder="Buscar contato por nome ou telefone"
-          autoFocus
-          style={{ marginBottom: "0.75rem" }}
-        />
+        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
+          <input
+            value={search}
+            onChange={(e) => setSearchLocal(e.target.value)}
+            placeholder="Buscar contato por nome ou telefone"
+            autoFocus
+            style={{ flex: 1, minWidth: 0 }}
+          />
+          <select value={qualFilter} onChange={(e) => setQualFilter(e.target.value)} title="Filtrar por qualificacao" aria-label="Filtrar por qualificacao" style={{ width: "auto", flexShrink: 0 }}>
+            <option value="">Todos</option>
+            <option value="novo">Novo</option>
+            <option value="em_atendimento">Em atend.</option>
+            <option value="qualificado">Qualificado</option>
+            <option value="nao_qualificado">Nao qualificado</option>
+            <option value="convertido">Convertido</option>
+          </select>
+        </div>
         <button
           type="button"
           className="primary"
@@ -316,7 +334,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
           {loadingList && allContacts.length === 0 ? (
             <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
           ) : visibleContacts.length === 0 ? (
-            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato sincronizado."}</p>
+            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : qualFilter ? "Nenhum contato com essa qualificacao." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato sincronizado."}</p>
           ) : (
             <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
               {visibleContacts.map((c) => (
@@ -337,7 +355,10 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
                     }}
                   >
                     <div style={{ fontWeight: 500 }}>{c.display_name || c.declared_name || c.wa_id}</div>
-                    <div className="sub">{c.phone_formatted || c.wa_id}</div>
+                    <div className="sub" style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                      <span>{c.phone_formatted || c.wa_id}</span>
+                      <span className="chip" style={{ fontSize: "0.65rem" }}>{c.qualification || "novo"}</span>
+                    </div>
                   </button>
                 </li>
               ))}
@@ -483,8 +504,13 @@ function LeadTemperatureDot({ temperature }: { temperature?: string }) {
 }
 const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
+// Caixas que exibem o seletor de qualificacao na toolbar da sidebar. O filtro
+// em si (qualificationFilter -> filteredConversations) e global; aqui so decide
+// onde a caixa de selecao aparece. Trocar de caixa zera o filtro (ver CrmNav).
+const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["bot", "novos", "meus", "equipe"]);
+
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings } = useCrm();
   const poolReception = systemSettings.pool_mode === "reception";
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
@@ -582,12 +608,17 @@ function ContactList() {
       </div>
       <div className="toolbar">
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar contato" />
-        {activeView === "meus" && <>
-          <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Selecionar ou criar contato" aria-label="Selecionar contato"><AddressBookIcon /></button>
-          {myChannelOptions.length > 1 && <select className="compact" value={channelFilter} onChange={(e) => setChannelFilter(e.target.value)} title="Filtrar por canal" aria-label="Filtrar por canal">{myChannelOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</select>}
-          <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>
-        </>}
+        {/* Picker "+" (agenda): Meus e Novos/Recepcao. Na recepcao (ADR 0010) e
+            o caminho pra achar contato ja atendido e devolvido ao bot — a caixa
+            nao lista esses; o picker abre o historico sem atribuir/assumir. */}
+        {(activeView === "meus" || activeView === "novos") && <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Selecionar ou criar contato" aria-label="Selecionar contato"><AddressBookIcon /></button>}
+        {activeView === "meus" && myChannelOptions.length > 1 && <select className="compact" value={channelFilter} onChange={(e) => setChannelFilter(e.target.value)} title="Filtrar por canal" aria-label="Filtrar por canal">{myChannelOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</select>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
+        {/* Filtro por qualificacao: Bot, Novos/Recepcao, Meus e Equipe. A caixa
+            N/Q ja e um filtro por qualificacao (so nao_qualificado) e o Backup e
+            historico importado — sem seletor nelas. O match em si
+            (filteredConversations) e client-side sobre o que esta carregado. */}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar por qualificacao" aria-label="Filtrar por qualificacao"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>}
       </div>
       <div className="contact-list">
         {renderItems.slice(0, visibleLimit).map(({ contact, conversation }) => {
@@ -645,14 +676,17 @@ function ContactList() {
           );
         })}
         {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
-        {(renderItems.length > visibleLimit || canLoadMoreMine || canLoadMoreAll) ? (
-          <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && (canLoadMoreMine || canLoadMoreAll)}
+        {(renderItems.length > visibleLimit || canLoadMoreMine || canLoadMorePool || canLoadMoreAll) ? (
+          <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && (canLoadMoreMine || canLoadMorePool || canLoadMoreAll)}
             onClick={() => {
               const moreToReveal = renderItems.length > visibleLimit;
               setVisibleLimit((v) => v + 100);
               // So busca no Firestore quando ja revelou tudo que esta carregado.
+              // Meus = so as minhas (operador); Novos/Recepcao = pool sem dono
+              // (operador); Equipe/Bot/Novos = janela global (admin/supervisor).
               if (!moreToReveal) {
                 if (canLoadMoreMine) void loadMoreMyConversations();
+                else if (canLoadMorePool) void loadMorePoolConversations();
                 else if (canLoadMoreAll) void loadMoreAllConversations();
               }
             }}>

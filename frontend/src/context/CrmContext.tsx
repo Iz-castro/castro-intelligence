@@ -302,6 +302,8 @@ type CrmContextValue = {
 
   loadMoreMyConversations: () => Promise<void>;
   canLoadMoreMine: boolean;
+  loadMorePoolConversations: () => Promise<void>;
+  canLoadMorePool: boolean;
   loadMoreAllConversations: () => Promise<void>;
   canLoadMoreAll: boolean;
   loadingMoreConvs: boolean;
@@ -391,7 +393,24 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // caminhos sao mutuamente exclusivos por role+view.
   const [allConvPageLimit, setAllConvPageLimit] = useState(ADMIN_CONV_WINDOW);
   const [allConvHasMore, setAllConvHasMore] = useState(true);
+  // Paginacao estatica da POOL sem dono (operador comum em Novos/Recepcao):
+  // mesmo padrao do "Meus", sobre os targets unassigned:blank + unassigned:null
+  // (limite crescente em cada um). Pedido do PO 2026-08-17. Alcanca threads da
+  // pool que cairam fora do top-50 ao vivo; NAO lista lead ja devolvido ao bot
+  // (reception: fechamento => bot_completed=False, a caixa filtra) — pra esse
+  // caso o caminho e o picker "+" (agenda) do Meus.
+  const [poolConvPageLimit, setPoolConvPageLimit] = useState(50);
+  const [poolConvHasMore, setPoolConvHasMore] = useState(true);
+  // Algum target sem dono do listener ao vivo (unassigned:blank | :null)
+  // encheu os 50? Calculado no publish do listener — client-side nao da pra
+  // separar os dois (normalizeConversation coage null -> ""), e a SOMA
+  // enganaria (30+25 >= 50 sem nenhum target saturado = clique sem pagina).
+  const [poolLiveSaturated, setPoolLiveSaturated] = useState(false);
   const [loadingMoreConvs, setLoadingMoreConvs] = useState(false);
+  // Caixa ativa no momento em que um "Carregar mais" comecou: resposta tardia
+  // do getDocs apos trocar de caixa e descartada (senao repovoava a camada
+  // estatica que o reset de troca acabou de limpar).
+  const activeViewRef = useRef<ActiveView>("novos");
   // Remove uma conversa das camadas ESTATICAS (fixada + paginada) — ex.: apos
   // transferir, a thread saiu das maos do operador e o ao vivo nao reentrega
   // threads fora do escopo. No-op se nao estiver nas estaticas (conversa normal
@@ -467,7 +486,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     ));
     if (missing.length === 0) return;
     missing.forEach((id) => fetchedExtraRef.current.add(id));
-    void Promise.all(missing.map((id) =>
+    const fetchOne = (id: number) =>
       getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
         .then((res) => normalizeContact(res.contact, String(res.contact.id)))
         // Falha TRANSITORIA (rede/5xx/deploy) libera o id pra retry no proximo
@@ -477,8 +496,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           const st = Number((e as { status?: number })?.status ?? 0);
           if (st !== 403 && st !== 404) fetchedExtraRef.current.delete(id);
           return null;
-        }),
-    )).then((fetched) => {
+        });
+    // Concorrencia LIMITADA (lotes de 8): uma pagina do "Carregar mais" pode
+    // trazer 100-300 conversas de uma vez e o backend roda uvicorn --workers 1
+    // — 200 GETs simultaneos viram 429/503, que caem no ramo "transitorio" e
+    // repetem a rajada no proximo publish (mesmo padrao do incidente do
+    // allContactsInflightRef). Cada lote publica ao chegar (progressivo).
+    const HYDRATE_BATCH = 8;
+    const publishBatch = (fetched: (Contact | null)[]) => {
       // SEM guard de dispose: o effect re-roda a cada publish do snapshot
       // (conversations muda o tempo todo) e o cleanup descartava o batch
       // inteiro — com os ids ja marcados em fetchedExtraRef, os contatos
@@ -491,7 +516,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         valid.forEach((c) => next.set(c.id, c));
         return next;
       });
-    });
+    };
+    void (async () => {
+      for (let i = 0; i < missing.length; i += HYDRATE_BATCH) {
+        const batch = missing.slice(i, i + HYDRATE_BATCH);
+        publishBatch(await Promise.all(batch.map(fetchOne)));
+      }
+    })();
   }, [allConversations, contacts, bundle]);
 
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
@@ -550,6 +581,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // -- Detail panel --
   const [qualification, setQualification] = useState("");
   const [notes, setNotes] = useState("");
+  // Ultimo seed do form (qualificacao/notas) e pra qual contato. Permite
+  // (a) semear so quando o contato fica disponivel (pode chegar DEPOIS da
+  // selecao, via hidratacao) e (b) re-semear se o contato mudou no servidor
+  // enquanto o operador ainda nao mexeu no form — sem clobberar digitacao.
+  const detailSeedRef = useRef<{ id: number; qualification: string; notes: string } | null>(null);
   const [toUserId, setToUserId] = useState<number | "">("");
   const [toDepartmentId, setToDepartmentId] = useState<number | "">("");
   const [transferReason, setTransferReason] = useState("");
@@ -711,22 +747,33 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     [conversations, sessionUser?.id, sessionUser?.firebase_uid],
   );
   const canLoadMoreMine = !canSeeAll && activeView === "meus" && myConvHasMore && myLiveCount >= 50;
-  // "Carregar mais" da Equipe (admin/supervisor): so pagina se a janela ao
-  // vivo global saturou os 300 (senao nao ha pagina antiga). Conta so as
+  // "Carregar mais" da POOL (operador comum em Novos/Recepcao): so pagina se
+  // ALGUM target sem dono do listener ao vivo saturou os 50 (senao nao ha
+  // pagina antiga). Nota: e a pool "crua" — a caixa ainda aplica seus filtros
+  // (lead sem dono, bot_completed, setor), entao uma pagina pode nao acrescentar
+  // linhas visiveis (ex.: thread orfa de lead com dono => contato 403).
+  const canLoadMorePool = !canSeeAll && activeView === "novos" && poolConvHasMore && poolLiveSaturated;
+  // "Carregar mais" da janela GLOBAL (admin/supervisor): so pagina se a janela
+  // ao vivo saturou os 300 (senao nao ha pagina antiga). Conta so as
   // conversas nao-backup — o target "backup" infla `conversations` sem
-  // consumir a janela do target "all".
+  // consumir a janela do target "all". Vale pra Equipe, Bot e Novos/Recepcao:
+  // as tres caixas do admin derivam da mesma janela, entao a pagina estatica
+  // alimenta as tres (cada caixa filtra o seu recorte).
   const allLiveCount = useMemo(
     () => conversations.filter((c) => !c.is_backup).length,
     [conversations],
   );
-  const canLoadMoreAll = canSeeAll && activeView === "equipe" && allConvHasMore && allLiveCount >= ADMIN_CONV_WINDOW;
-  // Troca de caixa limpa a paginacao estatica ("Meus" e Equipe) — bound na
-  // janela de staleness (thread paginada reatribuida/fechada por terceiros
+  const canLoadMoreAll = canSeeAll && (activeView === "equipe" || activeView === "bot" || activeView === "novos") && allConvHasMore && allLiveCount >= ADMIN_CONV_WINDOW;
+  // Troca de caixa limpa a paginacao estatica ("Meus", pool e Equipe) — bound
+  // na janela de staleness (thread paginada reatribuida/fechada por terceiros
   // nao fica fantasma) e re-habilita o "Carregar mais" (hasMore) ao voltar.
   useEffect(() => {
+    activeViewRef.current = activeView;
     setPagedConversations(new Map());
     setMyConvPageLimit(50);
     setMyConvHasMore(true);
+    setPoolConvPageLimit(50);
+    setPoolConvHasMore(true);
     setAllConvPageLimit(ADMIN_CONV_WINDOW);
     setAllConvHasMore(true);
   }, [activeView]);
@@ -788,7 +835,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       c?.department_name || "",
       c?.assigned_name || "",
     ].join(" ").toLowerCase().includes(searchText);
-    const matchesQual = !qualificationFilter || c?.qualification === qualificationFilter;
+    // Mesmo fallback do chip da sidebar (`|| "novo"`): qualification vazia/
+    // ausente (doc legado) conta como "novo" — senao o item mostraria "novo"
+    // e sumiria de TODAS as opcoes do filtro, inclusive "Novo".
+    const matchesQual = !qualificationFilter || (c?.qualification || "novo") === qualificationFilter;
     const matchesChannel = activeView !== "meus" || !channelFilter || convChannelKey(conv) === channelFilter;
     return matchesSearch && matchesQual && matchesChannel;
   });
@@ -1045,6 +1095,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setPagedConversations(new Map());
     setMyConvPageLimit(50);
     setMyConvHasMore(true);
+    setPoolConvPageLimit(50);
+    setPoolConvHasMore(true);
+    setPoolLiveSaturated(false);
     setAllConvPageLimit(ADMIN_CONV_WINDOW);
     setAllConvHasMore(true);
     setLoadingMoreConvs(false);
@@ -1184,13 +1237,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return () => window.clearTimeout(timeoutId);
   }, [selectedThreadId]);
 
-  // Reset detail state on contact change
+  // Reset detail state on contact change (so o que NAO deriva do contato; os
+  // campos derivados — qualificacao/notas/destino — sao semeados no effect
+  // seguinte, quando o contato estiver disponivel).
   useEffect(() => {
-    const contact = contacts.find((c) => c.id === selectedContactId) || null;
-    setQualification(contact?.qualification || "");
-    setNotes(contact?.notes || "");
-    setToUserId(contact?.assigned_to || "");
-    setToDepartmentId(contact?.department_id || "");
+    detailSeedRef.current = null;
     setTransferReason("");
     setTransferSummary("");
     setReplyTarget(null);
@@ -1202,6 +1253,63 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     scrollIntentRef.current = "normal";
     discardRecording();
   }, [selectedContactId]);
+
+  // Semeia o form do painel (qualificacao/notas/destino de transferencia) a
+  // partir do contato resolvido em contactsById (ao vivo + hidratado). Antes
+  // lia so `contacts` (top-50 ao vivo): thread cujo contato veio de
+  // extraContacts (Equipe alem do top-50, "Carregar mais", picker) abria o
+  // form EM BRANCO e "Salvar" gravava qualification="" e APAGAVA as notas do
+  // lead. Qualificacao vazia e semeada como "novo" (mesmo fallback do chip da
+  // sidebar), entao um Salvar nunca persiste "".
+  useEffect(() => {
+    if (selectedContactId == null || !selectedContact) {
+      if (selectedContactId == null) detailSeedRef.current = null;
+      setQualification(""); setNotes(""); setToUserId(""); setToDepartmentId("");
+      return;
+    }
+    const seed = { qualification: selectedContact.qualification || "novo", notes: selectedContact.notes || "" };
+    const prev = detailSeedRef.current;
+    if (prev && prev.id === selectedContactId) {
+      // Ja semeado pra este contato: so re-semeia se o servidor mudou E o
+      // operador nao tocou no form (estado ainda igual ao seed anterior).
+      const untouched = qualification === prev.qualification && notes === prev.notes;
+      const changed = seed.qualification !== prev.qualification || seed.notes !== prev.notes;
+      if (!untouched || !changed) return;
+    } else {
+      setToUserId(selectedContact.assigned_to || "");
+      setToDepartmentId(selectedContact.department_id || "");
+    }
+    detailSeedRef.current = { id: selectedContactId, ...seed };
+    setQualification(seed.qualification);
+    setNotes(seed.notes);
+  }, [selectedContactId, selectedContact, qualification, notes]);
+
+  // Revalida o contato hidratado ao ABRIR a thread. extraContacts e fetch
+  // unico por sessao (nunca revalidado): sem isto o form seria semeado com
+  // qualificacao/notas de horas atras e um "Salvar" sobrescreveria a edicao de
+  // um colega; o chip/filtro da sidebar tambem ficam frescos pra thread aberta.
+  // So pra contato FORA do snapshot ao vivo (o listener cobre os demais) e ja
+  // hidratado (se ainda esta em voo, o effect de hidratacao traz fresco).
+  // Custo: 1 GET por selecao. Guard de dispose evita repovoar extraContacts
+  // depois de um logout/troca de conta (resetUserScopedState) em PC compartilhado.
+  useEffect(() => {
+    if (!bundle || selectedContactId == null) return undefined;
+    if (contacts.some((c) => c.id === selectedContactId)) return undefined;
+    if (!extraContacts.has(selectedContactId)) return undefined;
+    let disposed = false;
+    const id = selectedContactId;
+    void getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
+      .then((res) => {
+        if (disposed) return;
+        const fresh = normalizeContact(res.contact, String(res.contact.id));
+        setExtraContacts((prev) => { const next = new Map(prev); next.set(id, fresh); return next; });
+      })
+      .catch(() => { /* transitorio/403/404: fica com a copia em cache */ });
+    return () => { disposed = true; };
+    // So na troca de selecao — contacts/extraContacts sao lidos no momento
+    // da selecao de proposito (nao re-disparar a cada publish do snapshot).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundle, selectedContactId]);
 
   // Composer auto-resize
   useEffect(() => {
@@ -1283,7 +1391,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const publish = () => {
       if (disposed) return;
       const next = mergeVisibleConversations(Array.from(partialConversations.values()));
-      startTransition(() => setConversations(next));
+      // Saturacao por target da pool (gate do "Carregar mais" de Novos/Recepcao).
+      const poolSaturated = Array.from(partialConversations.entries())
+        .some(([key, list]) => key.startsWith("unassigned:") && list.length >= 50);
+      startTransition(() => { setConversations(next); setPoolLiveSaturated(poolSaturated); });
     };
 
     const unsubscribers = targets.map(({ key, ref }) => onSnapshot(
@@ -1881,7 +1992,28 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function saveQualification() {
     if (!bundle || !selectedContact) return;
-    try { setBusySave(true); setError(""); setNotice(""); await putJson(bundle.auth, `/api/wa/contact/${selectedContact.id}/qualify`, { qualification, notes }); setNotice("Qualificacao atualizada."); if (!snapshotMode) await refreshPollingViews(); }
+    const contactId = selectedContact.id;
+    try {
+      setBusySave(true); setError(""); setNotice("");
+      await putJson(bundle.auth, `/api/wa/contact/${contactId}/qualify`, { qualification, notes });
+      setNotice("Qualificacao atualizada.");
+      // Contato hidratado sob demanda (extraContacts, fora do top-50 ao vivo)
+      // e um fetch unico — sem este patch o chip e o filtro por qualificacao
+      // da sidebar ficariam com o valor antigo ate recarregar a pagina. Quem
+      // esta no snapshot ao vivo (`contacts`) e atualizado pelo listener e
+      // vence no join do contactsById, entao so mexemos na camada estatica.
+      setExtraContacts((prev) => {
+        const cur = prev.get(contactId);
+        if (!cur) return prev;
+        const next = new Map(prev);
+        next.set(contactId, { ...cur, qualification, notes });
+        return next;
+      });
+      // O que foi salvo vira o novo seed: o form volta a contar como "nao
+      // tocado" e segue acompanhando mudancas futuras do servidor.
+      detailSeedRef.current = { id: contactId, qualification, notes };
+      if (!snapshotMode) await refreshPollingViews();
+    }
     catch (e) { setError(errorText(e)); }
     finally { setBusySave(false); }
   }
@@ -2188,6 +2320,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (canSeeAll) return;
     if (loadingMoreConvs) return;
     const nextLimit = myConvPageLimit + 50;
+    const viewAtStart = activeViewRef.current;
     setLoadingMoreConvs(true);
     try {
       const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
@@ -2198,6 +2331,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         firestoreLimit(nextLimit),
       );
       const snap = await getDocs(q);
+      if (activeViewRef.current !== viewAtStart) return; // trocou de caixa: reset ja limpou
       const fetched = snap.docs.map((d) => normalizeConversation(d.data() as Record<string, unknown>, d.id));
       const next = new Map<string, Conversation>();
       fetched.forEach((c) => next.set(c.id, c));
@@ -2212,7 +2346,50 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  // "Carregar mais" da EQUIPE (admin/supervisor): pagina ESTATICA via getDocs
+  // "Carregar mais" da POOL sem dono (operador comum em Novos/Recepcao):
+  // pagina ESTATICA via getDocs dos DOIS targets sem dono (assigned_to_uid ==
+  // "" e == null) com limite crescente (50 -> 100 -> 150...) em cada um. Mesma
+  // shape das queries do listener ao vivo (que as rules ja autorizam pro
+  // operador: pool sem dono), so o limite cresce; indice composto
+  // (assigned_to_uid, last_message_at). Leitura UNICA (sem snapshot). As
+  // conversas paginadas passam pelos mesmos filtros de caixa
+  // (novosConversations: lead sem dono, bot_completed, setor...) — o contato
+  // e hidratado sob demanda pelo effect de extraContacts.
+  async function loadMorePoolConversations() {
+    if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return;
+    if (canSeeAll) return;
+    if (loadingMoreConvs) return;
+    const nextLimit = poolConvPageLimit + 50;
+    const viewAtStart = activeViewRef.current;
+    setLoadingMoreConvs(true);
+    try {
+      const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
+      const poolQuery = (uid: string | null) => query(
+        waConversations,
+        where("assigned_to_uid", "==", uid),
+        orderBy("last_message_at", "desc"),
+        firestoreLimit(nextLimit),
+      );
+      const [blankSnap, nullSnap] = await Promise.all([getDocs(poolQuery("")), getDocs(poolQuery(null))]);
+      if (activeViewRef.current !== viewAtStart) return; // trocou de caixa: reset ja limpou
+      const next = new Map<string, Conversation>();
+      for (const d of [...blankSnap.docs, ...nullSnap.docs]) {
+        const c = normalizeConversation(d.data() as Record<string, unknown>, d.id);
+        next.set(c.id, c);
+      }
+      setPagedConversations(next);
+      setPoolConvPageLimit(nextLimit);
+      // Ha mais paginas enquanto ALGUM dos targets ainda encher o limite.
+      setPoolConvHasMore(blankSnap.docs.length >= nextLimit || nullSnap.docs.length >= nextLimit);
+    } catch (e) {
+      setError(`Falha ao carregar mais conversas: ${errorText(e)}`);
+    } finally {
+      setLoadingMoreConvs(false);
+    }
+  }
+
+  // "Carregar mais" da janela GLOBAL (admin/supervisor — Equipe, Bot e
+  // Novos/Recepcao): pagina ESTATICA via getDocs
   // da janela global com limite crescente (300 -> 600 -> 900...). O listener
   // ao vivo continua em ADMIN_CONV_WINDOW; isto e leitura UNICA (sem snapshot),
   // orderBy single-field = indice automatico. As rules ja autorizam a query
@@ -2222,6 +2399,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!canSeeAll) return;
     if (loadingMoreConvs) return;
     const nextLimit = allConvPageLimit + ADMIN_CONV_WINDOW;
+    const viewAtStart = activeViewRef.current;
     setLoadingMoreConvs(true);
     try {
       const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
@@ -2231,6 +2409,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         firestoreLimit(nextLimit),
       );
       const snap = await getDocs(q);
+      if (activeViewRef.current !== viewAtStart) return; // trocou de caixa: reset ja limpou
       const fetched = snap.docs.map((d) => normalizeConversation(d.data() as Record<string, unknown>, d.id));
       const next = new Map<string, Conversation>();
       fetched.forEach((c) => next.set(c.id, c));
@@ -2463,6 +2642,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
+    loadMorePoolConversations, canLoadMorePool,
     loadMoreAllConversations, canLoadMoreAll,
     refreshPollingViews,
   };
