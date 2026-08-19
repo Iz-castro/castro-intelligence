@@ -27,7 +27,7 @@ lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente 
 
 Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os gates são:
 
-- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
+- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, ~44 asserts, exit 0/1). CX: `tools\sim_cx_flow.py`.
   Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (~61 asserts).
@@ -119,6 +119,11 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   usam `.where(...)` server-side, não full-scan de `wa_conversations`.
 - **Resolução de canal no webhook:** `phone_number_id` sem canal **ativo** vai pra pending —
   nunca cai no canal default (número coex desconectado vazaria pro standard).
+- **Reentrega da Meta:** `POST /webhook` só responde 200 **depois** do turno do bot (CX tem
+  orçamento de `CX_DETECT_TIMEOUT_SECONDS`, 60s, por TURNO; read-timeout não reenvia) e a Meta
+  **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
+  transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
+  mesmo áudio por dias (incidente 2026-08-14/18).
 
 ## Mapa de módulos (onde mexer)
 

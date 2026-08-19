@@ -23,6 +23,7 @@ from database import (
     update_wa_message_transcription,
     get_user_by_id, get_wa_message_by_wa_message_id, get_wa_contact,
     assign_wa_contact, update_wa_contact_qualification,
+    is_reception_mode,
     normalize_br_phone,
     get_wa_conversation_by_id, set_attendance_status,
     insert_transfer_system_message, get_current_protocol_id,
@@ -690,14 +691,21 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             logger.info("Tipo de mensagem nao tratado: %s", msg_type)
 
         # Guard de redelivery: a Meta reenvia o payload quando o ACK demora
-        # (o motor CX roda DetectIntent inline). save_wa_message ja deduplica
+        # (~23s sem 200 — observado 2026-08-18; o motor CX roda DetectIntent
+        # inline, ate CX_DETECT_TIMEOUT_SECONDS). save_wa_message ja deduplica
         # o DOC, mas nao sinaliza o caller — sem este check o bot rodaria (e
-        # responderia) de novo a cada retry do mesmo msg_id. So consultamos no
-        # path que roda o bot (texto): evita 1 leitura Firestore por inbound de
-        # midia/status no caminho quente de todos os tenants.
+        # responderia) de novo a cada retry do mesmo msg_id. So consultamos nos
+        # paths que rodam bot/transcricao (texto e AUDIO): evita 1 leitura
+        # Firestore por inbound de outras midias/status no caminho quente.
+        # AUDIO entrou em 2026-08-18: sem ele, cada reentrega re-transcrevia
+        # (msg 162954 do hubloc: 76 transcricoes em 4 dias, cada uma segurando
+        # o worker por dezenas de segundos -> a Meta nunca recebia o ACK a
+        # tempo e seguia reentregando) e rodava o bot de novo sobre a
+        # transcricao (varizemed 14/08: Val respondeu o endereco 2x pro mesmo
+        # audio; hubloc: contato 8190 recebeu 17x a mesma resposta).
         was_dup = (
             bool(get_wa_message_by_wa_message_id(msg_id))
-            if (msg_id and effective_msg_type == "text")
+            if (msg_id and effective_msg_type in ("text", "audio"))
             else False
         )
 
@@ -834,6 +842,18 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                             "visibility": "admin_only",
                         }, merge=True)
                     logger.info("[RATING] Contato %d avaliou com nota %d", contact_id, _rating_val)
+            elif is_reception_mode():
+                # Modo Recepcao (ADR 0010): lead NAO gruda em pessoa. Paciente
+                # convertido que volta ("qual o endereco?", "tem estacionamento?")
+                # e atendido pelo agente de IA e, se precisar, cai na pool — o
+                # reroute legado abaixo atribuia ao operador que converteu
+                # (mesmo perfil que nao pode assumir) DEPOIS de o bot ja ter
+                # respondido no mesmo turno, calando a Val nas mensagens
+                # seguintes (teste do Rafael 2026-08-18 23:25, contato 193).
+                logger.info(
+                    "[REROUTE] Lead convertido %d retornou em pool_mode=reception "
+                    "— segue com o bot/pool (sem reatribuir)", contact_id,
+                )
             else:
                 # Nao eh rating — lead convertido retornando, reatribuir ao operador original
                 _original_op = _contact_fresh.get("original_operator_id") or _contact_fresh.get("converted_by_user_id")
@@ -853,8 +873,14 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                             contact_id, _original_op, _op_user.get("display_name"),
                         )
 
-        # Transcricao de audio inbound
-        if FEATURE_AUDIO_TRANSCRIPTION and _audio_bytes_for_stt and db_id:
+        # Transcricao de audio inbound. Reentrega da Meta (was_dup) NAO
+        # re-transcreve: o request original ja esta transcrevendo (ou ja
+        # transcreveu) este mesmo doc; repetir sobrescrevia a transcricao com
+        # outra variante e segurava o worker de novo (transcribe_audio_bytes e
+        # SINCRONA — bloqueia o event loop), o que atrasava o ACK e alimentava
+        # a proxima reentrega. Trade-off aceito: se o request original morrer
+        # no meio, o audio fica sem transcricao (operador ainda ouve).
+        if FEATURE_AUDIO_TRANSCRIPTION and _audio_bytes_for_stt and db_id and not was_dup:
             try:
                 from transcription_service import get_speech_client, transcribe_audio_bytes
                 speech_client = get_speech_client()

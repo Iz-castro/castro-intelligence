@@ -139,6 +139,38 @@ STT_LANGUAGE_CODE = os.getenv("STT_LANGUAGE_CODE", "pt-BR").strip()
 STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30.0"))
 STT_FALLBACK_TEXT = os.getenv("STT_FALLBACK_TEXT", "").strip()
 
+# -- Motor Dialogflow CX (tenants com settings.ai.bot_engine=dialogflow_cx) --
+# Teto (s) que o bot espera UMA resposta do DetectIntent antes de desistir do
+# turno (1o timeout -> "instabilidade momentanea"; 2o consecutivo -> handoff).
+# Subiu de 15s pra 60s em 2026-08-18 a pedido do PO: o agente generativo da
+# Varizemed leva 10-30s com frequencia (semana 11-18/08: ~7% dos turnos
+# passaram de 15s e 7 leads receberam o fallback sem o CX estar fora).
+# Timeout de LEITURA nao reenvia a mensagem (bot_engine_dialogflow) e os
+# reenvios por frase de erro (bot_service) so usam o que SOBROU deste
+# orcamento: e o teto por TURNO, nao por chamada. Como o webhook so responde
+# a Meta depois do turno, a Meta REENTREGA o payload a cada ~23s sem ACK — o
+# guard was_dup do webhook absorve as reentregas (nao suba isto sem manter
+# aquele guard). Parse defensivo: env invalida NAO pode derrubar o startup de
+# todos os tenants — cai no default e avisa no log.
+def _float_env(key, default):
+    raw = os.getenv(key)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        value = float("nan")
+    if not (value > 0):  # NaN, zero e negativo caem aqui
+        import logging
+        logging.getLogger("castro_crm.config").warning(
+            "%s=%r invalido — usando default %s", key, raw, default,
+        )
+        return default
+    return value
+
+
+CX_DETECT_TIMEOUT_SECONDS = _float_env("CX_DETECT_TIMEOUT_SECONDS", 60.0)
+
 # -- Qualificacao de contatos --
 QUALIFICATION_OPTIONS = [
     "novo",

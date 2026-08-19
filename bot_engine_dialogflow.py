@@ -36,6 +36,7 @@ from typing import Any, Optional
 
 import httpx
 
+from config import CX_DETECT_TIMEOUT_SECONDS
 from pii_redaction import redact_phone
 
 logger = logging.getLogger("castro_crm.bot_cx")
@@ -44,7 +45,12 @@ logger = logging.getLogger("castro_crm.bot_cx")
 _MAX_INPUT_CHARS = 256      # queryInput.text.text
 _MAX_REPLY_CHARS = 4096     # limite de texto da Cloud API do WhatsApp
 
-_DETECT_TIMEOUT_SECONDS = 15.0
+# Teto de LEITURA por chamada do DetectIntent (env CX_DETECT_TIMEOUT_SECONDS,
+# default 60s desde 2026-08-18; era 15s hardcoded). Ver comentario em config.py.
+_DETECT_TIMEOUT_SECONDS = CX_DETECT_TIMEOUT_SECONDS
+# Handshake com dialogflow.googleapis.com: falha de rede aparece em segundos;
+# esperar 60s pra descobrir que nao conectou so queimaria o orcamento do turno.
+_CONNECT_TIMEOUT_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # Token ADC (cacheado; refresh sob demanda)
@@ -170,6 +176,7 @@ async def detect_intent_text(
     session_id: str,
     text: str,
     session_params: Optional[dict] = None,
+    timeout_s: Optional[float] = None,
 ) -> dict:
     """Roda um turno de DetectIntent no agente CX do tenant.
 
@@ -181,12 +188,29 @@ async def detect_intent_text(
         text: mensagem do usuario (truncada ao limite do CX).
         session_params: parametros de sessao injetados neste turno
              (user_id, tenant_id, lgpd_consent, ...).
+        timeout_s: teto de LEITURA desta chamada (default
+             CX_DETECT_TIMEOUT_SECONDS). O bot_service passa o que sobrou do
+             orcamento do turno nos reenvios por frase de erro.
 
     Returns:
         dict normalizado (ver docstring do modulo). ok=False em falha —
         o chamador decide fallback/handoff. Nunca levanta excecao de
         transporte.
+
+    Retry: 5xx, erro de rede (conexao recusada/reset, timeout de CONNECT/
+    write/pool, ADC indisponivel) tentam UMA vez mais apos 0.5s — sao
+    falhas rapidas e transitorias em que o pedido NAO chegou ao agente.
+    TIMEOUT DE LEITURA nao reenvia: o pedido chegou e depois de timeout_s o
+    agente provavelmente ja processou o turno do lado dele (repetir a
+    mensagem duplicaria o turno na sessao) e o webhook da Meta ficaria
+    preso por mais um ciclo inteiro (2x o teto). Connect tem teto curto
+    proprio (_CONNECT_TIMEOUT_SECONDS): a perna lenta e a geracao da
+    resposta, nao o handshake com o Google.
     """
+    read_timeout = float(timeout_s) if timeout_s else _DETECT_TIMEOUT_SECONDS
+    http_timeout = httpx.Timeout(
+        read_timeout, connect=min(_CONNECT_TIMEOUT_SECONDS, read_timeout),
+    )
     url = _detect_intent_url(cfg, session_id)
     body = {
         "queryInput": {
@@ -203,7 +227,7 @@ async def detect_intent_text(
     for attempt in (1, 2):
         try:
             token = await asyncio.to_thread(_get_access_token)
-            async with httpx.AsyncClient(timeout=_DETECT_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(timeout=http_timeout) as client:
                 resp = await client.post(
                     url,
                     json=body,
@@ -228,9 +252,17 @@ async def detect_intent_text(
                     last_error, redact_phone(session_id),
                 )
                 return dict(_FAILURE)
-        except httpx.TimeoutException:
-            last_error = "timeout"
+        except httpx.ReadTimeout:
+            # Sem reenvio (ver docstring): o pedido chegou ao agente.
+            logger.warning(
+                "[BOT-CX] DetectIntent timeout de leitura apos %.0fs (sem "
+                "reenvio) | sessao=%s | tentativa=%d",
+                read_timeout, redact_phone(session_id), attempt,
+            )
+            return dict(_FAILURE)
         except httpx.HTTPError as exc:
+            # Inclui ConnectTimeout/WriteTimeout/PoolTimeout (subclasses de
+            # TimeoutException, que e HTTPError): o pedido NAO chegou -> retry.
             last_error = type(exc).__name__
         except Exception as exc:  # credencial ADC indisponivel etc.
             last_error = type(exc).__name__

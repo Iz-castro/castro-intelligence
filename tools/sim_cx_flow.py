@@ -214,12 +214,13 @@ _CX_FAIL = {
 }
 
 
-async def _fake_detect_intent(cfg, session_id, text, session_params=None):
+async def _fake_detect_intent(cfg, session_id, text, session_params=None, timeout_s=None):
     CX_CALLS.append({
         "cfg": dict(cfg),
         "session_id": session_id,
         "text": text,
         "params": dict(session_params or {}),
+        "timeout_s": timeout_s,
     })
     if CX_SCRIPT:
         return CX_SCRIPT.pop(0)
@@ -899,6 +900,188 @@ check(_bh.get_schedule("varizemed-test") == _bh.get_schedule("varizemed"),
 check(_bh.schedule_summary("varizemed")
       == "segunda a quinta das 8h às 18h e sexta das 8h às 17h",
       "resumo humano da tabela agrupa dias consecutivos")
+
+print("\n=== u: conector REAL — read-timeout NAO reenvia; 5xx/connect reenviam 1x; teto vem do config (2026-08-18) ===")
+# Incidente varizemed 18/08 13:02: lead aceitou a LGPD e o DetectIntent
+# estourou 15s duas vezes (2 tentativas x 15s = 31s) -> "instabilidade
+# momentanea" sem o CX estar fora, so lento. PO subiu o teto pra 60s. Pra o
+# lead nao esperar 2 min (e a Meta nao reentregar 5x), timeout de LEITURA nao
+# reenvia (o pedido chegou ao agente). 5xx/rede/connect seguem com o retry.
+import httpx as _httpx
+
+_real._get_access_token = lambda: "tok-fake"
+_HTTP_CALLS = []
+
+
+class _FakeResp:
+    def __init__(self, status, payload=None):
+        self.status_code = status
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+def _fake_httpx(script):
+    """Substitui o modulo httpx DENTRO do conector: AsyncClient roteirizado
+    (excecao ou resposta por chamada POST), excecoes reais do httpx
+    preservadas. Conta CHAMADAS (post), nao construcoes de client."""
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            self._timeout = kw.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            _HTTP_CALLS.append({"timeout": self._timeout, "text": json["queryInput"]["text"]["text"]})
+            step = script.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            return step
+
+    return types.SimpleNamespace(
+        AsyncClient=_FakeClient,
+        Timeout=_httpx.Timeout,
+        TimeoutException=_httpx.TimeoutException,
+        ReadTimeout=_httpx.ReadTimeout,
+        HTTPError=_httpx.HTTPError,
+    )
+
+
+_cfg_u = {"gcp_project_id": "p", "agent_id": "a", "location": "global"}
+_ok_payload = {"queryResult": {"responseMessages": [{"text": {"text": ["Oi!"]}}]}}
+
+# (a) read-timeout -> UMA chamada, ok=False (sem reenvio).
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_httpx.ReadTimeout("lento")])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is False, "read-timeout -> ok=False (chamador cai no fallback/handoff)")
+check(len(_HTTP_CALLS) == 1, "read-timeout NAO reenvia: exatamente 1 POST ao CX")
+_t0 = _HTTP_CALLS[0]["timeout"] if _HTTP_CALLS else None
+check(isinstance(_t0, _httpx.Timeout) and _t0.read == _real._DETECT_TIMEOUT_SECONDS
+      == _real.CX_DETECT_TIMEOUT_SECONDS,
+      "read do httpx.Timeout e o CX_DETECT_TIMEOUT_SECONDS do config (env-driven)")
+check(isinstance(_t0, _httpx.Timeout) and _t0.connect == _real._CONNECT_TIMEOUT_SECONDS < _t0.read,
+      "connect tem teto curto proprio (nao herda os 60s)")
+check(os.getenv("CX_DETECT_TIMEOUT_SECONDS") or _real.CX_DETECT_TIMEOUT_SECONDS == 60.0,
+      "default do teto = 60s (pedido do PO 2026-08-18)")
+
+# (b) 5xx transitorio -> reenvia 1x e passa.
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_FakeResp(503), _FakeResp(200, _ok_payload)])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is True and _ru["reply_text"] == "Oi!" and len(_HTTP_CALLS) == 2,
+      "5xx -> retry rapido 1x -> turno ok")
+
+# (c) 5xx e depois read-timeout -> para no timeout (2 chamadas, ok=False).
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_FakeResp(500), _httpx.ReadTimeout("lento")])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is False and len(_HTTP_CALLS) == 2,
+      "5xx + read-timeout -> 2 chamadas e desiste (timeout nunca gera 3a chamada)")
+
+# (d) 4xx (config/permissao) -> sem retry.
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_FakeResp(403)])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is False and len(_HTTP_CALLS) == 1, "4xx -> falha sem retry (config errada)")
+
+# (e) erro de rede (conexao) e CONNECT-timeout -> retry 1x (pedido nao chegou).
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_httpx.ConnectError("reset"), _FakeResp(200, _ok_payload)])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is True and len(_HTTP_CALLS) == 2, "erro de rede -> retry 1x -> turno ok")
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_httpx.ConnectTimeout("dns"), _FakeResp(200, _ok_payload)])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is True and len(_HTTP_CALLS) == 2,
+      "connect-timeout -> retry 1x (so o READ-timeout e 'sem reenvio')")
+
+# (f) timeout_s explicito (orcamento restante do turno) vence o default.
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_FakeResp(200, _ok_payload)])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}, timeout_s=7.5))
+check(_HTTP_CALLS and _HTTP_CALLS[0]["timeout"].read == 7.5
+      and _HTTP_CALLS[0]["timeout"].connect == 7.5,
+      "timeout_s=7.5 -> read=7.5 e connect nao passa do read")
+
+# (g) a env CX_DETECT_TIMEOUT_SECONDS chega de verdade no conector (recarrega
+# config + modulo real com a env setada), e valor invalido cai no default.
+_env_bak = os.environ.get("CX_DETECT_TIMEOUT_SECONDS")
+try:
+    import importlib as _il
+    import config as _cfgmod
+    os.environ["CX_DETECT_TIMEOUT_SECONDS"] = "42.5"
+    _il.reload(_cfgmod)
+    check(_cfgmod.CX_DETECT_TIMEOUT_SECONDS == 42.5, "config le CX_DETECT_TIMEOUT_SECONDS da env")
+    _spec2 = _ilu.spec_from_file_location(
+        "bot_engine_dialogflow_env", os.path.join(ROOT, "bot_engine_dialogflow.py"))
+    _real2 = _ilu.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_real2)
+    check(_real2._DETECT_TIMEOUT_SECONDS == 42.5, "conector recarregado usa o valor da env (42.5)")
+    for _bad in ("abc", "0", "-3", ""):
+        os.environ["CX_DETECT_TIMEOUT_SECONDS"] = _bad
+        _il.reload(_cfgmod)
+        check(_cfgmod.CX_DETECT_TIMEOUT_SECONDS == 60.0,
+              f"env invalida {_bad!r} nao derruba o import: cai no default 60")
+finally:
+    if _env_bak is None:
+        os.environ.pop("CX_DETECT_TIMEOUT_SECONDS", None)
+    else:
+        os.environ["CX_DETECT_TIMEOUT_SECONDS"] = _env_bak
+    _il.reload(_cfgmod)
+
+# (h) orcamento por TURNO no bot_service: reenvios por frase de erro so usam o
+# que sobrou dos 60s; esgotado -> para de reenviar e cai no handoff generico.
+# Relogio falso: cada chamada ao CX "gasta" 25s.
+_clock = {"t": 1000.0}
+
+
+def _fake_monotonic():
+    return _clock["t"]
+
+
+async def _fake_detect_slow(cfg, session_id, text, session_params=None, timeout_s=None):
+    r = await _fake_detect_intent(cfg, session_id, text, session_params, timeout_s)
+    _clock["t"] += 25.0
+    return r
+
+
+_mono_bak = bot._monotonic
+_det_bak = _cx.detect_intent_text
+bot._monotonic = _fake_monotonic
+_cx.detect_intent_text = _fake_detect_slow
+try:
+    novo_contato(48, wa_id="5571900005555")
+    STORE["bot_states"]["48"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    for _ in range(4):
+        CX_SCRIPT.append(_cx_ok("Sorry something went wrong.", handoff_request=False))
+    _n_calls = len(CX_CALLS)
+    _clock["t"] = 1000.0
+    rh = envia(48, "quero agendar")
+    _calls_h = CX_CALLS[_n_calls:]
+    # t=0 1a chamada (60s de teto) -> t=25 reenvio 1 (35s restantes) -> t=50
+    # reenvio 2 (10s restantes) -> t=75: restam -15s < 5s -> para.
+    check(len(_calls_h) == 3, "orcamento de 60s: 1 chamada + 2 reenvios (o 3o nao cabe)")
+    check(_calls_h[0]["timeout_s"] is None, "1a chamada usa o teto inteiro (default do conector)")
+    check(len(_calls_h) > 1 and _calls_h[1]["timeout_s"] is not None
+          and abs(_calls_h[1]["timeout_s"] - 35.0) < 0.01,
+          "reenvio 1 recebe o que sobrou (35s)")
+    check(len(_calls_h) > 2 and abs(_calls_h[2]["timeout_s"] - 10.0) < 0.01,
+          "reenvio 2 recebe o que sobrou (10s)")
+    check(isinstance(rh, str) and "Sorry" not in rh and "operador humano" in rh.lower(),
+          "orcamento esgotado com frase de erro -> handoff generico (nunca o erro cru)")
+    check(STORE["wa_contacts"]["48"].get("bot_completed") is True,
+          "orcamento esgotado -> handoff (bot_completed=True)")
+    CX_SCRIPT.clear()
+finally:
+    bot._monotonic = _mono_bak
+    _cx.detect_intent_text = _det_bak
+    _real.httpx = _httpx  # restaura o modulo real no conector carregado por spec
 
 print("\n" + "=" * 70)
 if FAILS:

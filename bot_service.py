@@ -25,10 +25,12 @@ Retorno de process_bot_message:
 
 import re
 import logging
+import time
 import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Union
 
+from config import CX_DETECT_TIMEOUT_SECONDS
 from firestore_common import document, utcnow, collection
 from database import (
     get_wa_contact, get_system_settings, get_all_departments,
@@ -478,6 +480,13 @@ _CX_ERROR_REPLY_PHRASES = (
 # Reenvios da MESMA mensagem do lead quando o agente devolve frase de erro
 # (transparente pro lead). No 4o erro consecutivo (1 + 3 reenvios), handoff.
 _CX_ERROR_RETRY_MAX = 3
+# Reenvio so vale a pena se sobrar pelo menos isto do orcamento do turno
+# (CX_DETECT_TIMEOUT_SECONDS): menos que isso e timeout certo — vira handoff
+# generico direto em vez de mais uma chamada fadada a falhar.
+_CX_RESEND_MIN_SECONDS = 5.0
+# Relogio monotonico do orcamento do turno (indirecao pra os simuladores
+# avancarem o tempo sem dormir).
+_monotonic = time.monotonic
 
 _CX_ERROR_HANDOFF_MSG = (
     "Nosso agente virtual está indisponível no momento. "
@@ -772,29 +781,48 @@ async def _process_cx_message(
         # ainda nao usa os params simplesmente os ignora.
         session_params.update(cx_hours_params(get_tenant_context() or ""))
         turn_text = first_cx_text if first_cx_text is not None else text
+        # Orcamento do TURNO (CX_DETECT_TIMEOUT_SECONDS, 60s): a 1a chamada
+        # tem o teto inteiro; os reenvios por frase de erro abaixo so usam o
+        # que sobrou. Sem isto o pior caso era 4 x 60s = 4 min de espera do
+        # lead (e ~10 reentregas da Meta) — a promessa "espera no maximo ~1
+        # min por turno" tem que valer no caminho todo, nao so na 1a chamada.
+        _turn_deadline = _monotonic() + CX_DETECT_TIMEOUT_SECONDS
         result = await bot_engine_dialogflow.detect_intent_text(
             ai_cfg, wa_digits, turn_text, session_params
         )
         # Frase de erro embutida com HTTP 200 = falha disfarcada. Reenvia a
         # MESMA mensagem do lead ate _CX_ERROR_RETRY_MAX vezes (transparente
         # pro lead; PO 2026-08-14). Se algum reenvio vier limpo, o fluxo segue
-        # normal; 4 erros consecutivos caem no handoff logo abaixo.
+        # normal; 4 erros consecutivos caem no handoff logo abaixo. Orcamento
+        # esgotado interrompe os reenvios (frase de erro sobrevive -> mesmo
+        # handoff generico do 4o erro).
         _erros_seguidos = 0
         while (
             result.get("ok")
             and _cx_reply_is_error(result.get("reply_text"), ai_cfg)
             and _erros_seguidos < _CX_ERROR_RETRY_MAX
         ):
+            _restante = _turn_deadline - _monotonic()
+            if _restante < _CX_RESEND_MIN_SECONDS:
+                logger.warning(
+                    "[BOT-CX] frase de erro do agente — orcamento do turno "
+                    "esgotado apos %d reenvio(s) | contato=%d",
+                    _erros_seguidos, contact_id,
+                )
+                break
             _erros_seguidos += 1
             logger.warning(
-                "[BOT-CX] frase de erro do agente — reenvio %d/%d | contato=%d",
-                _erros_seguidos, _CX_ERROR_RETRY_MAX, contact_id,
+                "[BOT-CX] frase de erro do agente — reenvio %d/%d (%.0fs "
+                "restantes) | contato=%d",
+                _erros_seguidos, _CX_ERROR_RETRY_MAX, _restante, contact_id,
             )
             result = await bot_engine_dialogflow.detect_intent_text(
-                ai_cfg, wa_digits, turn_text, session_params
+                ai_cfg, wa_digits, turn_text, session_params,
+                timeout_s=_restante,
             )
         # Re-checa o gate DEPOIS do turno (corrida real: DetectIntent leva ate
-        # 15s + retry; um assume/takeover nesse meio tempo nao pode ser
+        # CX_DETECT_TIMEOUT_SECONDS (60s) por chamada, e os reenvios por frase
+        # de erro acima somam; um assume/takeover nesse meio tempo nao pode ser
         # atropelado por resposta/handoff atrasados do bot).
         fresh = get_wa_contact(contact_id)
         if not fresh or fresh.get("assigned_to") or fresh.get("bot_completed"):
