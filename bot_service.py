@@ -784,8 +784,11 @@ async def _process_cx_message(
         # Orcamento do TURNO (CX_DETECT_TIMEOUT_SECONDS, 60s): a 1a chamada
         # tem o teto inteiro; os reenvios por frase de erro abaixo so usam o
         # que sobrou. Sem isto o pior caso era 4 x 60s = 4 min de espera do
-        # lead (e ~10 reentregas da Meta) — a promessa "espera no maximo ~1
-        # min por turno" tem que valer no caminho todo, nao so na 1a chamada.
+        # lead (e ~10 reentregas da Meta). Excecao unica ao teto: a 1a
+        # chamada pode reenviar 1x em READ-timeout dentro do conector
+        # (CX_READ_TIMEOUT_RETRY, PO 2026-08-20) -> pior caso ~2x o teto;
+        # nesse caso o orcamento ja era e os reenvios por frase de erro
+        # abaixo simplesmente nao rodam (_restante negativo).
         _turn_deadline = _monotonic() + CX_DETECT_TIMEOUT_SECONDS
         result = await bot_engine_dialogflow.detect_intent_text(
             ai_cfg, wa_digits, turn_text, session_params

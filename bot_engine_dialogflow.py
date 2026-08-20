@@ -36,7 +36,7 @@ from typing import Any, Optional
 
 import httpx
 
-from config import CX_DETECT_TIMEOUT_SECONDS
+from config import CX_DETECT_TIMEOUT_SECONDS, CX_READ_TIMEOUT_RETRY
 from pii_redaction import redact_phone
 
 logger = logging.getLogger("castro_crm.bot_cx")
@@ -200,12 +200,17 @@ async def detect_intent_text(
     Retry: 5xx, erro de rede (conexao recusada/reset, timeout de CONNECT/
     write/pool, ADC indisponivel) tentam UMA vez mais apos 0.5s — sao
     falhas rapidas e transitorias em que o pedido NAO chegou ao agente.
-    TIMEOUT DE LEITURA nao reenvia: o pedido chegou e depois de timeout_s o
-    agente provavelmente ja processou o turno do lado dele (repetir a
-    mensagem duplicaria o turno na sessao) e o webhook da Meta ficaria
-    preso por mais um ciclo inteiro (2x o teto). Connect tem teto curto
-    proprio (_CONNECT_TIMEOUT_SECONDS): a perna lenta e a geracao da
-    resposta, nao o handshake com o Google.
+    TIMEOUT DE LEITURA na chamada PRINCIPAL (timeout_s=None) tambem reenvia
+    UMA vez, com o teto inteiro de novo (CX_READ_TIMEOUT_RETRY, default
+    true; PO 2026-08-20: turno real do agente passou de 109s e o proprio
+    Dialogflow pede "Resend the request with a higher deadline"). Pior caso
+    ~2x o teto de espera; a Meta reentrega o webhook nesse meio tempo e o
+    was_dup absorve. Risco assumido: se a 1a chamada completar no agente
+    depois do nosso timeout, o reenvio duplica o turno na sessao. Com
+    timeout_s explicito (reenvio por frase de erro, que ja roda na SOBRA do
+    orcamento) read-timeout NAO reenvia — comportamento antigo. Connect tem
+    teto curto proprio (_CONNECT_TIMEOUT_SECONDS): a perna lenta e a
+    geracao da resposta, nao o handshake com o Google.
     """
     read_timeout = float(timeout_s) if timeout_s else _DETECT_TIMEOUT_SECONDS
     http_timeout = httpx.Timeout(
@@ -253,13 +258,23 @@ async def detect_intent_text(
                 )
                 return dict(_FAILURE)
         except httpx.ReadTimeout:
-            # Sem reenvio (ver docstring): o pedido chegou ao agente.
-            logger.warning(
-                "[BOT-CX] DetectIntent timeout de leitura apos %.0fs (sem "
-                "reenvio) | sessao=%s | tentativa=%d",
-                read_timeout, redact_phone(session_id), attempt,
-            )
-            return dict(_FAILURE)
+            # Chamada principal reenvia 1x com o teto inteiro (ver docstring);
+            # chamada com timeout_s explicito ou flag off: desiste na hora.
+            if attempt == 1 and timeout_s is None and CX_READ_TIMEOUT_RETRY:
+                last_error = "ReadTimeout"
+                logger.warning(
+                    "[BOT-CX] DetectIntent timeout de leitura apos %.0fs — "
+                    "reenviando a mensagem 1x (CX_READ_TIMEOUT_RETRY) | "
+                    "sessao=%s",
+                    read_timeout, redact_phone(session_id),
+                )
+            else:
+                logger.warning(
+                    "[BOT-CX] DetectIntent timeout de leitura apos %.0fs (sem "
+                    "reenvio) | sessao=%s | tentativa=%d",
+                    read_timeout, redact_phone(session_id), attempt,
+                )
+                return dict(_FAILURE)
         except httpx.HTTPError as exc:
             # Inclui ConnectTimeout/WriteTimeout/PoolTimeout (subclasses de
             # TimeoutException, que e HTTPError): o pedido NAO chegou -> retry.

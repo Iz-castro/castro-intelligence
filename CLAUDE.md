@@ -123,7 +123,8 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 - **Resolução de canal no webhook:** `phone_number_id` sem canal **ativo** vai pra pending —
   nunca cai no canal default (número coex desconectado vazaria pro standard).
 - **Reentrega da Meta:** `POST /webhook` só responde 200 **depois** do turno do bot (CX tem
-  orçamento de `CX_DETECT_TIMEOUT_SECONDS`, 60s, por TURNO; read-timeout não reenvia) e a Meta
+  orçamento de `CX_DETECT_TIMEOUT_SECONDS`, 60s, por TURNO; read-timeout da chamada principal
+  reenvia 1x com o teto inteiro — `CX_READ_TIMEOUT_RETRY`, default true, pior caso ~2min) e a Meta
   **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
   transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
   mesmo áudio por dias (incidente 2026-08-14/18).

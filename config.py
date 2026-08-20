@@ -171,6 +171,18 @@ def _float_env(key, default):
 
 CX_DETECT_TIMEOUT_SECONDS = _float_env("CX_DETECT_TIMEOUT_SECONDS", 60.0)
 
+# Read-timeout da chamada PRINCIPAL do turno reenvia a mensagem 1x antes do
+# fallback "instabilidade momentanea" (pedido do PO 2026-08-20: lead real
+# aceitou a LGPD, o agente levou >109s e morreu em DEADLINE_EXCEEDED — o
+# proprio Dialogflow loga "Resend the request with a higher deadline").
+# Trade-off aceito pelo PO: pior caso o lead espera ~2x o teto (120s) e a
+# Meta reentrega o webhook mais vezes (was_dup absorve). O reenvio pode
+# duplicar o turno na sessao do agente se a 1a chamada tiver completado la
+# depois do nosso timeout — beneficio (lead atendido) > risco. So vale pra
+# chamada com orcamento inteiro; reenvios por frase de erro (que ja usam
+# sobra de orcamento) NAO fazem read-retry. Kill-switch sem deploy: false.
+CX_READ_TIMEOUT_RETRY = _bool_env("CX_READ_TIMEOUT_RETRY", "true")
+
 # -- Qualificacao de contatos --
 QUALIFICATION_OPTIONS = [
     "novo",

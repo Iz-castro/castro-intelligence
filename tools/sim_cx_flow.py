@@ -901,12 +901,16 @@ check(_bh.schedule_summary("varizemed")
       == "segunda a quinta das 8h às 18h e sexta das 8h às 17h",
       "resumo humano da tabela agrupa dias consecutivos")
 
-print("\n=== u: conector REAL — read-timeout NAO reenvia; 5xx/connect reenviam 1x; teto vem do config (2026-08-18) ===")
-# Incidente varizemed 18/08 13:02: lead aceitou a LGPD e o DetectIntent
-# estourou 15s duas vezes (2 tentativas x 15s = 31s) -> "instabilidade
-# momentanea" sem o CX estar fora, so lento. PO subiu o teto pra 60s. Pra o
-# lead nao esperar 2 min (e a Meta nao reentregar 5x), timeout de LEITURA nao
-# reenvia (o pedido chegou ao agente). 5xx/rede/connect seguem com o retry.
+print("\n=== u: conector REAL — read-timeout da chamada principal reenvia 1x; 5xx/connect reenviam 1x; teto vem do config ===")
+# Historico: 18/08 o PO subiu o teto de 15s pra 60s e read-timeout passou a
+# NAO reenviar (lead nao esperava 2 min). 20/08 o pendulo voltou: lead real
+# aceitou a LGPD, o turno do agente passou de 109s (DEADLINE_EXCEEDED no
+# proprio Dialogflow, que loga "Resend the request with a higher deadline")
+# e o lead ficou no vacuo. PO decidiu: read-timeout da chamada PRINCIPAL
+# (timeout_s=None) reenvia 1x com o teto inteiro antes do fallback
+# (CX_READ_TIMEOUT_RETRY, default true; pior caso ~2x o teto). Reenvio por
+# frase de erro (timeout_s explicito, roda na sobra do orcamento) segue sem
+# read-retry. 5xx/rede/connect seguem com o retry rapido de sempre.
 import httpx as _httpx
 
 _real._get_access_token = lambda: "tok-fake"
@@ -955,12 +959,16 @@ def _fake_httpx(script):
 _cfg_u = {"gcp_project_id": "p", "agent_id": "a", "location": "global"}
 _ok_payload = {"queryResult": {"responseMessages": [{"text": {"text": ["Oi!"]}}]}}
 
-# (a) read-timeout -> UMA chamada, ok=False (sem reenvio).
+# (a) read-timeout 2x na chamada principal -> 2 POSTs (reenvio 1x), ok=False.
 _HTTP_CALLS.clear()
-_real.httpx = _fake_httpx([_httpx.ReadTimeout("lento")])
+_real.httpx = _fake_httpx([_httpx.ReadTimeout("lento"), _httpx.ReadTimeout("lento de novo")])
 _ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
-check(_ru["ok"] is False, "read-timeout -> ok=False (chamador cai no fallback/handoff)")
-check(len(_HTTP_CALLS) == 1, "read-timeout NAO reenvia: exatamente 1 POST ao CX")
+check(_ru["ok"] is False, "read-timeout 2x -> ok=False (chamador cai no fallback/handoff)")
+check(len(_HTTP_CALLS) == 2, "read-timeout na chamada principal reenvia 1x: 2 POSTs ao CX")
+check(len(_HTTP_CALLS) == 2 and _HTTP_CALLS[1]["timeout"].read == _real._DETECT_TIMEOUT_SECONDS,
+      "o reenvio espera o teto INTEIRO de novo (nao a sobra)")
+check(len(_HTTP_CALLS) == 2 and _HTTP_CALLS[1]["text"] == "oi",
+      "o reenvio repete a MESMA mensagem do lead")
 _t0 = _HTTP_CALLS[0]["timeout"] if _HTTP_CALLS else None
 check(isinstance(_t0, _httpx.Timeout) and _t0.read == _real._DETECT_TIMEOUT_SECONDS
       == _real.CX_DETECT_TIMEOUT_SECONDS,
@@ -969,6 +977,21 @@ check(isinstance(_t0, _httpx.Timeout) and _t0.connect == _real._CONNECT_TIMEOUT_
       "connect tem teto curto proprio (nao herda os 60s)")
 check(os.getenv("CX_DETECT_TIMEOUT_SECONDS") or _real.CX_DETECT_TIMEOUT_SECONDS == 60.0,
       "default do teto = 60s (pedido do PO 2026-08-18)")
+
+# (a2) read-timeout no 1o e 200 no reenvio -> turno ok (o retry salvou).
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_httpx.ReadTimeout("lento"), _FakeResp(200, _ok_payload)])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+check(_ru["ok"] is True and _ru["reply_text"] == "Oi!" and len(_HTTP_CALLS) == 2,
+      "read-timeout + 200 no reenvio -> turno ok (lead nem ve instabilidade)")
+
+# (a3) timeout_s explicito (reenvio por frase de erro, sobra do orcamento):
+# read-timeout NAO reenvia — comportamento antigo preservado.
+_HTTP_CALLS.clear()
+_real.httpx = _fake_httpx([_httpx.ReadTimeout("lento")])
+_ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}, timeout_s=20.0))
+check(_ru["ok"] is False and len(_HTTP_CALLS) == 1,
+      "read-timeout com timeout_s explicito -> 1 POST, sem reenvio (sobra do orcamento)")
 
 # (b) 5xx transitorio -> reenvia 1x e passa.
 _HTTP_CALLS.clear()
@@ -999,7 +1022,7 @@ _HTTP_CALLS.clear()
 _real.httpx = _fake_httpx([_httpx.ConnectTimeout("dns"), _FakeResp(200, _ok_payload)])
 _ru = asyncio.run(_real.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
 check(_ru["ok"] is True and len(_HTTP_CALLS) == 2,
-      "connect-timeout -> retry 1x (so o READ-timeout e 'sem reenvio')")
+      "connect-timeout -> retry 1x (pedido nao chegou; nao consome o read-retry)")
 
 # (f) timeout_s explicito (orcamento restante do turno) vence o default.
 _HTTP_CALLS.clear()
@@ -1033,6 +1056,30 @@ finally:
         os.environ.pop("CX_DETECT_TIMEOUT_SECONDS", None)
     else:
         os.environ["CX_DETECT_TIMEOUT_SECONDS"] = _env_bak
+    _il.reload(_cfgmod)
+
+# (g2) kill-switch do read-retry: CX_READ_TIMEOUT_RETRY=false volta ao
+# comportamento pre-2026-08-20 (read-timeout da chamada principal desiste
+# na hora, 1 POST) — religavel/desligavel por env, sem deploy.
+_env_bak = os.environ.get("CX_READ_TIMEOUT_RETRY")
+try:
+    os.environ["CX_READ_TIMEOUT_RETRY"] = "false"
+    _il.reload(_cfgmod)
+    _spec3 = _ilu.spec_from_file_location(
+        "bot_engine_dialogflow_noretry", os.path.join(ROOT, "bot_engine_dialogflow.py"))
+    _real3 = _ilu.module_from_spec(_spec3)
+    _spec3.loader.exec_module(_real3)
+    _real3._get_access_token = lambda: "tok-fake"
+    _HTTP_CALLS.clear()
+    _real3.httpx = _fake_httpx([_httpx.ReadTimeout("lento")])
+    _ru = asyncio.run(_real3.detect_intent_text(_cfg_u, "5531999990000", "oi", {}))
+    check(_ru["ok"] is False and len(_HTTP_CALLS) == 1,
+          "CX_READ_TIMEOUT_RETRY=false -> read-timeout desiste na 1a chamada (kill-switch)")
+finally:
+    if _env_bak is None:
+        os.environ.pop("CX_READ_TIMEOUT_RETRY", None)
+    else:
+        os.environ["CX_READ_TIMEOUT_RETRY"] = _env_bak
     _il.reload(_cfgmod)
 
 # (h) orcamento por TURNO no bot_service: reenvios por frase de erro so usam o
