@@ -92,7 +92,10 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 - **Isolamento do operador (LGPD) = 3 camadas em sincronia** (backend `get_wa_contacts_scoped_for_user`,
   frontend snapshot targets, `firestore.rules`). Operador comum vê **só próprios** (`assigned_to_uid==uid`)
   **+ pool sem dono** — **NUNCA por department_id** (query por depto vazava agenda coex pessoal pros colegas).
-  `is_backup` só admin/supervisor.
+  `is_backup` só admin/supervisor. **4ª camada (2026-08-19):** o frontend fecha o chat quando a thread
+  aberta **muda de dono** pra outro usuário (watcher + listener do doc da thread, `CrmContext.tsx`) e
+  `/api/wa/assume` carimba o dono em **todas** as threads órfãs do contato; `/conversation/open` só
+  auto-atribui thread de lead **já meu** — não regrida (B via picker/admin continuava vendo a conversa de A).
 - **IDOR:** endpoints por `contact_id`/`message_id` chamam `_require_contact_access` (ex.:
   `/api/wa/conversation/open`). Sem isso, operador abre/auto-atribui lead alheio por id enumerável.
 - **Atribuição POR THREAD** (`assign_wa_conversation`, `assigned_to` na conversation) é **separada**

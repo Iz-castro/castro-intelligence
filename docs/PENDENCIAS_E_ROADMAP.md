@@ -77,6 +77,12 @@ Batch: a modularização já mexe no `App.tsx` (monolito 2581 linhas) — aprove
       `audit_logs_system`, impersonate read-only (M-B3), Cloud Armor/rate-limit.
 - [ ] **Decommission** do projeto GCP antigo (SP). Quota `cpu_allocation`.
 - [ ] Fase 5 do RBAC (remover fallback de role, pós-bake-in).
+- [ ] **Follow-ups da revisão do fix de visibilidade pós-assume (2026-08-19)** —
+      lista priorizada P1–P10 no diário `docs/internal/2026-08-19-visibilidade-pos-assume.md`.
+      Destaques: **P1** `GET /media/{...}` sem auth (URL assinada; `<img src>` não
+      manda header); **P2** `_require_contact_access` em
+      `/conversation/{id}/read|takeover|return` (IDOR por id determinístico);
+      **P3** endurecer rules de `wa_messages` (decisão de produto + backfill).
 
 ---
 

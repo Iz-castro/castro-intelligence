@@ -273,7 +273,7 @@ def cenario_assume_rbac():
         _PERFIL_DOC["value"] = {"toggles": {"assumir_atendimento": False,
                                             "enviar_mensagem_propria_thread": True}}
         rbac.invalidate_perfil_cache()
-        expect_http(lambda: asyncio.run(main.wa_assume_contact(1, current_user=dict(OPERADOR))),
+        expect_http(lambda: asyncio.run(main.wa_assume_contact(1, _FakeRequest({}), current_user=dict(OPERADOR))),
                     403, "toggle OFF -> assume bloqueado (403)")
 
         # Fallback da role (perfil sem doc): seed do operador tem o toggle ON,
@@ -281,7 +281,7 @@ def cenario_assume_rbac():
         reset_rbac()
         contato_de_outro = {"id": 1, "assigned_to": 99, "department_id": None}
         main.get_wa_contact = lambda cid: dict(contato_de_outro)
-        expect_http(lambda: asyncio.run(main.wa_assume_contact(1, current_user=dict(OPERADOR))),
+        expect_http(lambda: asyncio.run(main.wa_assume_contact(1, _FakeRequest({}), current_user=dict(OPERADOR))),
                     409, "toggle ON (fallback role) -> passa RBAC e cai no 409")
     finally:
         main.get_wa_contact = main_get_wa_contact
@@ -763,6 +763,87 @@ def cenario_protocolo_dia_anterior():
     restore_dbf()
 
 
+def cenario_assume_carimba_threads_orfas():
+    titulo("CENARIO 14 — assume carimba dono nas threads ORFAS do contato (fix 2026-08-19)")
+    patch_store()
+    # Lead multi-canal: thread da pool (standard, orfa — a que A e B estao
+    # olhando), thread coex JA de outro operador (nao pode ser roubada) e uma
+    # thread de backup (nunca graduada por aqui). Antes do fix, o assume so
+    # carimbava a thread derivada de contact.channel_id (efeito colateral da
+    # system message) -> a thread da pool podia continuar orfa e visivel a todos.
+    STORE["users"] = {"5": {"id": 5, "is_active": 1, "firebase_uid": "uidA", "department_id": 2}}
+    STORE["wa_contacts"] = {"40": {"id": 40, "wa_id": "5531940000000", "channel_id": 2, "assigned_to": 5}}
+    STORE["wa_conversations"] = {
+        "4__5531940000000": {"id": "4__5531940000000", "contact_id": 40, "assigned_to": None, "assigned_to_uid": ""},
+        "1__5531940000000": {"id": "1__5531940000000", "contact_id": 40, "assigned_to": 9, "assigned_to_uid": "uidB"},
+        "2__5531940000000": {"id": "2__5531940000000", "contact_id": 40, "assigned_to": None, "assigned_to_uid": "",
+                             "is_backup": True},
+        "4__5531999999999": {"id": "4__5531999999999", "contact_id": 41, "assigned_to": None, "assigned_to_uid": ""},
+    }
+    n = dbf.assign_orphan_threads_to_lead_owner(40, 5)
+    check(n == 1, "carimbou exatamente 1 thread (a orfa nao-backup do contato)")
+    pool = STORE["wa_conversations"]["4__5531940000000"]
+    check(pool.get("assigned_to") == 5 and pool.get("assigned_to_uid") == "uidA",
+          "thread da pool herdou dono + uid do operador")
+    check(pool.get("department_id") == 2, "setor do operador herdado (thread sem setor)")
+    coex = STORE["wa_conversations"]["1__5531940000000"]
+    check(coex.get("assigned_to") == 9 and coex.get("assigned_to_uid") == "uidB",
+          "thread coex de OUTRO operador intacta (nao rouba)")
+    check(STORE["wa_conversations"]["2__5531940000000"].get("assigned_to") is None, "thread backup intacta")
+    check(STORE["wa_conversations"]["4__5531999999999"].get("assigned_to") is None,
+          "thread de outro contato intacta")
+    # Idempotente + usuario inexistente = no-op
+    check(dbf.assign_orphan_threads_to_lead_owner(40, 5) == 0, "segunda chamada: nada a carimbar")
+    check(dbf.assign_orphan_threads_to_lead_owner(40, 777) == 0, "usuario inexistente: no-op")
+    restore_dbf()
+
+
+def cenario_open_picker_nao_rouba_pool():
+    titulo("CENARIO 15 — /conversation/open (picker) nao atribui thread de lead da POOL (fix 2026-08-19)")
+    patch_store()
+    calls = []
+    real_upsert = database.upsert_wa_conversation
+    real_get_contact = main.get_wa_contact
+    real_get_conv = main.get_wa_conversation_by_id
+    real_audit = main.log_audit
+    database.upsert_wa_conversation = lambda **kw: calls.append(kw) or "4__5531950000000"
+    main.get_wa_conversation_by_id = lambda cid: {"id": cid, "contact_id": 50, "assigned_to": None, "assigned_to_uid": ""}
+    main.log_audit = lambda *a, **k: None
+    try:
+        # Lead da POOL (sem dono), legacy: abrir NAO carimba a thread.
+        set_reception(False)
+        main.get_wa_contact = lambda cid: {"id": 50, "wa_id": "5531950000000", "channel_id": 4,
+                                           "assigned_to": None, "assigned_to_uid": ""}
+        res = asyncio.run(main.wa_conversation_open(_FakeRequest({"contact_id": 50}), current_user=dict(OPERADOR)))
+        check(calls and calls[-1].get("auto_assign_user_id") is None,
+              "legacy + lead da pool: open NAO auto-atribui a thread (fica orfa ate o Assumir)")
+        check(res.get("assigned_to") is None, "resposta devolve dono real (nenhum)")
+        # Lead MEU, legacy: abrir carimba a thread em mim (thread do proprio lead).
+        main.get_wa_contact = lambda cid: {"id": 50, "wa_id": "5531950000000", "channel_id": 4,
+                                           "assigned_to": 7, "assigned_to_uid": "uid7"}
+        asyncio.run(main.wa_conversation_open(_FakeRequest({"contact_id": 50}), current_user=dict(OPERADOR)))
+        check(calls[-1].get("auto_assign_user_id") == 7, "legacy + lead MEU: open auto-atribui a thread a mim")
+        # Lead de OUTRO: _require_contact_access barra (403) antes do upsert.
+        main.get_wa_contact = lambda cid: {"id": 50, "wa_id": "5531950000000", "channel_id": 4,
+                                           "assigned_to": 99, "assigned_to_uid": "uid99"}
+        n_before = len(calls)
+        expect_http(lambda: asyncio.run(main.wa_conversation_open(_FakeRequest({"contact_id": 50}), current_user=dict(OPERADOR))),
+                    403, "lead de outro operador: 403")
+        check(len(calls) == n_before, "nenhum upsert no 403")
+        # Reception: mesmo lead MEU nao auto-atribui (ADR 0010 preservado).
+        set_reception(True)
+        main.get_wa_contact = lambda cid: {"id": 50, "wa_id": "5531950000000", "channel_id": 4,
+                                           "assigned_to": 7, "assigned_to_uid": "uid7"}
+        asyncio.run(main.wa_conversation_open(_FakeRequest({"contact_id": 50}), current_user=dict(OPERADOR)))
+        check(calls[-1].get("auto_assign_user_id") is None, "reception: open nunca auto-atribui (ADR 0010)")
+    finally:
+        database.upsert_wa_conversation = real_upsert
+        main.get_wa_contact = real_get_contact
+        main.get_wa_conversation_by_id = real_get_conv
+        main.log_audit = real_audit
+        restore_dbf()
+
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -780,6 +861,8 @@ def run():
     cenario_release_to_bot()
     cenario_return_to_pool()
     cenario_protocolo_dia_anterior()
+    cenario_assume_carimba_threads_orfas()
+    cenario_open_picker_nao_rouba_pool()
 
     print("\n" + "=" * 70)
     if FAILS:

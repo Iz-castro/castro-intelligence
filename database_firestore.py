@@ -1883,6 +1883,34 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
     return {"from_user_id": from_user, "to_user_id": to_user_id}
 
 
+def assign_orphan_threads_to_lead_owner(contact_id, user_id):
+    """Apos o assume: toda thread NAO-backup do contato que esta SEM dono herda
+    o Dono do Lead — mesma invariante do auto-assign em upsert_wa_conversation
+    (via save_wa_message), so que EXPLICITA: aquele caminho so alcanca a thread
+    derivada de contact.channel_id (grudado no 1o canal) e roda dentro de um
+    try/except que engole falha, entao um lead multi-canal podia ficar com a
+    thread da pool orfa depois do assume (visivel pra todo operador). Threads
+    que JA tem dono (coex de outro operador, takeover) NAO sao tocadas.
+    Idempotente. Retorna a quantidade de threads carimbadas."""
+    if contact_id is None or not user_id:
+        return 0
+    user = _get_doc("users", user_id)
+    if not user:
+        return 0
+    owner_uid = user.get("firebase_uid", "")
+    count = 0
+    for snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        data = snap.to_dict() or {}
+        if data.get("is_backup") or data.get("assigned_to"):
+            continue
+        updates = {"assigned_to": user_id, "assigned_to_uid": owner_uid}
+        if not data.get("department_id") and user.get("department_id"):
+            updates["department_id"] = user["department_id"]
+        snap.reference.set(updates, merge=True)
+        count += 1
+    return count
+
+
 def set_sale_owner(contact_id, user_id):
     """Define/atualiza a 'dona de origem' (sale_owner) do lead — a vendedora a
     quem o lead 'gruda'. Gravada na 1a assuncao; handoff entre operadores NAO

@@ -56,6 +56,7 @@ from database import (
     get_all_departments, create_department,
     get_department_by_id, update_department, deactivate_department,
     assign_wa_contact, assign_wa_conversation, get_conversations_by_contact, get_transfer_history,
+    assign_orphan_threads_to_lead_owner,
     return_contact_to_bot, return_contact_to_pool, get_contacts_by_assigned_user,
     get_wa_contacts_scoped_for_user, get_wa_contacts_visible_to,
     update_user_avatar, get_user_avatar,
@@ -1233,14 +1234,25 @@ async def wa_conversation_open(request: Request, current_user: dict = Depends(ge
         raise HTTPException(status_code=400, detail="Contato sem wa_id")
     # Modo Recepcao (ADR 0010): abrir do picker NAO atribui a thread — o
     # pool compartilhado fica sem dono ate alguem assumir de fato.
+    # Legacy: a thread so e auto-atribuida a quem abre se o LEAD ja e dele
+    # (thread do proprio lead, mesma heranca que save_wa_message faz). Lead da
+    # POOL (sem dono) aberto pelo picker fica orfao ate o "Assumir atendimento"
+    # explicito — antes o open carimbava a thread no operador SEM tocar o
+    # contato (nem RBAC, nem 409, nem audit/system message): o lead sumia de
+    # "Novos" de todo mundo, o colega que assumia ficava com contato=A e
+    # thread=B, e B seguia vendo a conversa inteira (fix 2026-08-19).
     from database import is_reception_mode
+    try:
+        _my_lead = contact.get("assigned_to") is not None and int(contact.get("assigned_to")) == int(current_user["id"])
+    except (TypeError, ValueError):
+        _my_lead = False
     conversation_id = upsert_wa_conversation(
         contact_id=int(contact_id),
         wa_id=wa_id,
         channel_id=int(channel_id),
         source_channel_type=str(contact.get("source_channel_type", "") or ""),
         phone_number_id=str(contact.get("phone_number_id", "") or ""),
-        auto_assign_user_id=None if is_reception_mode() else current_user["id"],
+        auto_assign_user_id=current_user["id"] if (_my_lead and not is_reception_mode()) else None,
         direction_for_unread=None,
     )
     log_audit(
@@ -3612,6 +3624,16 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
     # Admin/supervisor trocando o Dono do Lead -> a dona de origem (sale_owner)
     # ACOMPANHA: futuros fechamentos revertem p/ o novo dono.
     set_sale_owner(contact_id, to_user_id)
+    # Threads ORFAS do contato acompanham o novo dono (mesmo carimbo explicito
+    # do /api/wa/assume; nao move thread que JA tem dono — "reatribui o Lead
+    # SEM mover os atendimentos" continua valendo pra thread com dono). Sem
+    # isto, num lead multi-canal a thread orfa continuava na pool, legivel por
+    # todo operador (mesmo vetor do fix 2026-08-19 pelo caminho do admin).
+    try:
+        _n_threads = assign_orphan_threads_to_lead_owner(contact_id, to_user_id)
+    except Exception:
+        _n_threads = -1
+        logger.exception("[REASSIGN-LEAD] carimbar threads orfas falhou | contato=%s", contact_id)
     # Reatribuir o Lead reconcilia o takeover das threads: se o novo dono ja e o
     # handler (dono do numero), o conflito acabou -> limpa o takeover stale (senao
     # o PROPRIO dono do Lead veria "Assumir atendimento"). Threads que seguem em
@@ -3634,7 +3656,7 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
         + (f" | Motivo: {reason}" if reason else ""),
         current_user["id"],
     )
-    log_audit(current_user["id"], "WA_REASSIGN_LEAD", f"Contato {contact_id} -> {to_name}: {reason}")
+    log_audit(current_user["id"], "WA_REASSIGN_LEAD", f"Contato {contact_id} -> {to_name}: {reason} | threads={_n_threads}")
     await broadcast_to_operators({
         "event": "wa_contact_reassigned",
         "data": {"contact_id": contact_id, "assigned_to": to_user_id, "assigned_name": to_name},
@@ -3878,11 +3900,36 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
 
 
 @app.post("/api/wa/assume/{contact_id}")
-async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_current_user)):
-    """Operador assume o atendimento de um contato nao atribuido."""
+async def wa_assume_contact(contact_id: int, request: Request, current_user: dict = Depends(get_current_user)):
+    """Operador assume o atendimento de um contato nao atribuido.
+
+    Body opcional: { conversation_id } = a thread que o operador esta olhando.
+    Quando vem (e pertence ao contato), a system message do assume e gravada
+    NELA (e nao na thread derivada de contact.channel_id, que pode ser outro
+    canal num lead multi-canal). Independente do body, todas as threads orfas
+    do contato herdam o dono (assign_orphan_threads_to_lead_owner).
+    """
     contact = get_wa_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    conversation_id = str((body or {}).get("conversation_id") or "").strip() or None
+    conv_channel_id = None
+    if conversation_id:
+        _conv = get_wa_conversation_by_id(conversation_id)
+        try:
+            _conv_contact = int(_conv.get("contact_id")) if _conv and _conv.get("contact_id") is not None else None
+        except (TypeError, ValueError):
+            _conv_contact = None
+        if _conv_contact != int(contact_id):
+            conversation_id = None  # thread de outro contato / inexistente: ignora, cai no legado
+        else:
+            # channel_id junto: save_wa_message deriva a thread do upsert
+            # (recencia/dono) de channel+wa_id, nao do conversation_id.
+            conv_channel_id = _conv.get("channel_id")
     # RBAC: perfil "so recepcao" (pool compartilhada) tem este toggle OFF e
     # atende sem virar dono do lead (ADR 0010). Default ON em todos os seeds.
     ensure_permission(current_user, "assumir_atendimento")
@@ -3905,6 +3952,16 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     result = assign_wa_contact(contact_id, current_user["id"], contact.get("department_id"), current_user["id"], reason="Assumido pelo operador", summary="Assumido pelo operador")
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    # Dono do Atendimento: carimba EXPLICITAMENTE o operador em toda thread
+    # orfa do contato. Antes a thread so herdava o dono pelo efeito colateral
+    # da system message abaixo (upsert em save_wa_message), que alcanca uma
+    # unica thread e engole falha — a thread da pool podia continuar orfa e
+    # visivel (listener + rules) pra todos os operadores depois do assume.
+    try:
+        _n_threads = assign_orphan_threads_to_lead_owner(contact_id, current_user["id"])
+    except Exception:
+        _n_threads = -1
+        logger.exception("[ASSUME] carimbar dono nas threads falhou | contato=%s", contact_id)
     if FEATURE_ASSUME_COUNTER:
         # Decrementar contador e marcar contato como pendente de resposta
         decrement_assume_counter(current_user["id"])
@@ -3932,8 +3989,15 @@ async def wa_assume_contact(contact_id: int, current_user: dict = Depends(get_cu
     except Exception:
         logger.exception("[ASSUME] resumo do bot CX falhou | contato=%s", contact_id)
     sys_content = f"Atendimento assumido por {current_user['display_name']}" + (f" | Protocolo: {protocol}" if protocol else "")
-    insert_transfer_system_message(contact_id, sys_content, current_user["id"])
-    log_audit(current_user["id"], "WA_ASSUME", f"Contato {contact_id}" + (f" | Protocolo {protocol}" if protocol else ""))
+    insert_transfer_system_message(
+        contact_id, sys_content, current_user["id"],
+        conversation_id=conversation_id, channel_id=conv_channel_id,
+    )
+    log_audit(
+        current_user["id"], "WA_ASSUME",
+        f"Contato {contact_id}" + (f" | Protocolo {protocol}" if protocol else "")
+        + (f" | conv={conversation_id}" if conversation_id else "") + f" | threads={_n_threads}",
+    )
     await broadcast_to_operators({
         "event": "wa_contact_reassigned",
         "data": {"contact_id": contact_id, "assigned_to": current_user["id"], "assigned_name": current_user["display_name"]},

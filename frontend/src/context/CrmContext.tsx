@@ -1215,6 +1215,84 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }, [allConversations, selectedThreadId]);
 
+  // Thread aberta MUDOU de dono pra OUTRO usuario (ex.: colega clicou
+  // "Assumir atendimento" num lead da pool que eu tambem estava olhando):
+  // fecha o chat, limpa as camadas estaticas e avisa. O guard de selecao orfa
+  // acima so fecha quando a thread SOME da lista — e ela nao some quando (a)
+  // sou admin/supervisor (janela global continua entregando o doc), (b) a
+  // thread esta numa copia estatica (fixada pelo picker / "Carregar mais"),
+  // que o listener de lista nunca atualiza. Reage so a MUDANCA enquanto a
+  // mesma thread esta aberta: abrir uma thread que JA e de outro (Equipe,
+  // intervencao de supervisao) nao fecha. Nao fecha se o dono novo sou eu
+  // (assumi / recebi transferencia), se sou o Dono do LEAD (coex: thread no
+  // numero de outro operador) nem se sou o handler do takeover.
+  const selectedOwnerRef = useRef<{ id: string; uid: string; user: number | null } | null>(null);
+  useEffect(() => {
+    if (!selectedThreadId || !selectedConversation || !sessionUser) {
+      selectedOwnerRef.current = null;
+      return;
+    }
+    const ownerUid = selectedConversation.assigned_to_uid || "";
+    const ownerId = selectedConversation.assigned_to ?? null;
+    const prev = selectedOwnerRef.current;
+    selectedOwnerRef.current = { id: selectedThreadId, uid: ownerUid, user: ownerId };
+    if (!ownerUid && ownerId == null) return;                       // voltou pra pool: nada a fazer
+    const mine = (!!ownerUid && ownerUid === sessionUser.firebase_uid) || (ownerId != null && ownerId === sessionUser.id);
+    if (mine) return;
+    if (selectedContact?.assigned_to != null && selectedContact.assigned_to === sessionUser.id) return;
+    if (selectedConversation.takeover_handler_user_id != null && selectedConversation.takeover_handler_user_id === sessionUser.id) return;
+    if (!prev || prev.id !== selectedThreadId) return;                // acabou de abrir: registra e observa
+    if (prev.uid === ownerUid && prev.user === ownerId) return;       // sem mudanca de dono
+    const ownerName = operators.find((o) => o.id === ownerId)?.display_name || "outro operador";
+    const fromPool = !prev.uid && prev.user == null;
+    holdEmptySelectionRef.current = true;
+    removeExtraConversation(selectedThreadId);
+    setSelectedThreadId(null);
+    setNotice(fromPool ? `Atendimento assumido por ${ownerName}.` : `Atendimento transferido para ${ownerName}.`);
+  }, [selectedThreadId, selectedConversation, selectedContact?.assigned_to, sessionUser, operators, removeExtraConversation]);
+
+  // Observa o DOC da thread selecionada (1 listener por selecao). Duas
+  // funcoes: (a) manter fresca a copia das camadas ESTATICAS (fixada pelo
+  // picker / "Carregar mais") — o listener de lista nao reentrega thread fora
+  // do escopo do operador, entao a copia congelada ficaria com dono velho pra
+  // sempre e o effect acima nunca veria a mudanca; (b) detectar PERDA DE
+  // ESCOPO: quando o dono vira outro operador, as rules (canSeeContactScoped)
+  // negam a leitura do doc e o listener cai com permission-denied — esse erro
+  // e o sinal pra fechar o chat mesmo que nenhuma lista tenha reentregado
+  // nada. Admin/supervisor nunca recebe permission-denied (caem no caso (a) +
+  // effect acima). So em snapshot mode; polling ja recarrega a lista.
+  useEffect(() => {
+    const path = config?.firestore.collections.wa_conversations;
+    if (!bundle?.db || !snapshotMode || !selectedThreadId || !path) return undefined;
+    const id = selectedThreadId;
+    let disposed = false;
+    const unsubscribe = onSnapshot(
+      firestoreDoc(bundle.db, path, id),
+      (snap) => {
+        if (disposed || !snap.exists()) return;
+        const fresh = normalizeConversation(snap.data() as Record<string, unknown>, snap.id);
+        const refresh = (prev: Map<string, Conversation>) => {
+          if (!prev.has(id)) return prev;
+          const next = new Map(prev);
+          next.set(id, fresh);
+          return next;
+        };
+        setExtraConversations(refresh);
+        setPagedConversations(refresh);
+      },
+      (e) => {
+        if (disposed) return;
+        if ((e as { code?: string })?.code !== "permission-denied") return;
+        holdEmptySelectionRef.current = true;
+        removeExtraConversation(id);
+        setSelectedThreadId(null);
+        setNotice("Este atendimento foi assumido por outro operador.");
+      },
+    );
+    return () => { disposed = true; unsubscribe(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundle, snapshotMode, selectedThreadId, config?.firestore.collections.wa_conversations]);
+
   // Track the selected conversation and restore its recent in-memory cache immediately.
   useEffect(() => {
     selectedContactIdRef.current = selectedContactId;
@@ -1304,7 +1382,22 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         const fresh = normalizeContact(res.contact, String(res.contact.id));
         setExtraContacts((prev) => { const next = new Map(prev); next.set(id, fresh); return next; });
       })
-      .catch(() => { /* transitorio/403/404: fica com a copia em cache */ });
+      .catch((e) => {
+        if (disposed) return;
+        // 403/404 = o backend diz que este contato NAO e mais meu/pool
+        // (ex.: colega assumiu o lead, contato apagado): DESPEJA a copia —
+        // manter a copia velha renderizava nome/telefone/notas do lead de
+        // outro operador (e segurava o ChatPanel aberto) pelo resto da
+        // sessao. Transitorio (rede/5xx): fica com a copia em cache.
+        const st = Number((e as { status?: number })?.status ?? 0);
+        if (st !== 403 && st !== 404) return;
+        setExtraContacts((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Map(prev);
+          next.delete(id);
+          return next;
+        });
+      });
     return () => { disposed = true; };
     // So na troca de selecao — contacts/extraContacts sao lidos no momento
     // da selecao de proposito (nao re-disparar a cada publish do snapshot).
@@ -2492,7 +2585,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function assumeContact(contactId: number) {
     if (!bundle) return;
-    try { setBusyAssume(true); setError(""); setNotice(""); await sendJson(bundle.auth, `/api/wa/assume/${contactId}`, {}); setNotice("Atendimento assumido."); if (!snapshotMode) await refreshPollingViews(); }
+    // Manda a thread ABERTA: o backend carimba o dono nela (e nas demais
+    // threads orfas do contato) explicitamente e grava a system message do
+    // assume nessa thread — antes dependia do efeito colateral da system
+    // message na thread do contact.channel_id, que pode nao ser a que o
+    // operador esta olhando (lead multi-canal).
+    const threadId = selectedConversation?.contact_id === contactId ? selectedConversation.id : null;
+    try { setBusyAssume(true); setError(""); setNotice(""); await sendJson(bundle.auth, `/api/wa/assume/${contactId}`, threadId ? { conversation_id: threadId } : {}); setNotice("Atendimento assumido."); if (!snapshotMode) await refreshPollingViews(); }
     catch (e) { setError(errorText(e)); }
     finally { setBusyAssume(false); }
   }

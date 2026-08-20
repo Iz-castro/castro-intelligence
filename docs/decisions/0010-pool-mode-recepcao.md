@@ -31,7 +31,7 @@ físico do número; fallback de doc legado sem `source_channel_type` cai no
 | Responder órfã de LEAD com dono (thread lateral) | 403 | 403 — não é pool; espelha `_require_contact_access` |
 | Responder órfã coex | 403 | 403 |
 | Thread de OUTRO operador | 403 | 403 (inalterado) |
-| `conversation/open` (picker) | auto-atribui a thread | não atribui |
+| `conversation/open` (picker) | ~~auto-atribui a thread~~ **emenda 2026-08-19: só auto-atribui se o LEAD já é do operador**; lead da pool fica órfão até o "Assumir" explícito (fecha o assume silencioso sem RBAC/409/audit — ver diário 2026-08-19) | não atribui |
 | Auto-close por inatividade | pula órfãs | fecha órfãs com `bot_completed` (bot/backup ficam) |
 | Fechar/reabrir manual de órfã (op. comum) | 403 | permitido (toggle RBAC da ação continua valendo) |
 | Fechamento (manual OU cron) | re-gruda no `sale_owner` (ADR 0008) | lead volta pro **AGENTE DE IA** — `release_lead_to_bot` (Fase 2 do PLANO_MODELOS antecipada, PO 2026-08-05): `bot_completed=False` + sem dono; setor/qualificação/protocolo/temperatura/`sale_owner` preservados; prova LGPD intacta |
