@@ -1,3 +1,13 @@
+> **Status em 2026-08-21 — arquivo HISTORICO (lista solta de 2026-05/06, pre-cutover
+> pra Oregon). Nao rode o comando do item 1:** ele aponta pro projeto/regiao ANTIGOS de
+> Sao Paulo (`project-26fb9c99-8ee9-4179-aef` / `southamerica-east1`). Prod hoje =
+> `project-4a851bf9-f475-418c-800` / `us-west1`. Mapa vivo das frentes:
+> [`docs/PENDENCIAS_E_ROADMAP.md`](../PENDENCIAS_E_ROADMAP.md).
+> Ja resolvido desta lista: **item 1** (as envs `WHATSAPP_PHONE_NUMBER_ID` /
+> `WHATSAPP_WABA_ID` foram removidas de prod de proposito — ver `docs/deploy/README.md`)
+> e **item 3** (`.env` esta no `.gitignore`). Os demais nao foram reconferidos hoje —
+> trate como rascunho, nao como pendencia confirmada.
+
 vO que falta fazer — em ordem de prioridade
 🔥 Higiene rápida (baixo esforço, alto valor)
 1 Limpar env vars do Cloud Run prod pra parar de recriar o canal #2 standard a cada deploy:

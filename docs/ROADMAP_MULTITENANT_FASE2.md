@@ -3,9 +3,20 @@
 > **Decisões D1-D6 FECHADAS em 2026-07-01. Execução iniciada.**
 > Documento vivo — atualizar conforme os milestones forem entregues.
 
+> **Status em 2026-08-21:** o caminho do tenant #2 FECHOU. **Pré-#2 100% em prod**
+> (M-A1, M-A2, M-A4, M-A4b, M-B2 RBAC, login tenant-aware, storage) e o **Cloud Run B
+> (`castro-superadmin`) está em prod desde 2026-07-11/12** — foi por ele que nasceram
+> `varizemed-test` (14/07) e o **tenant #2 real `varizemed`** (28/07, plano `ai_custom`),
+> hoje com bot Dialogflow CX e Modo Recepção (ADR 0010) em produção. São **3 tenants
+> ativos** (`hubloc`, `varizemed`, `varizemed-test`). Continuam ABERTOS: **M-B1** (ADR 0007
+> Fase 2), a proteção de borda do painel B (IAP+LB vs Cloudflare Access — decisão em
+> aberto, `docs/HANDOFF_IAP_E_TENANT2.md`), a Fase 5 do RBAC (pós-bake-in) e o
+> decommission do projeto antigo de SP. Execução/deploy do B:
+> `docs/PLANO_OPERACAO_CLOUDRUN_B.md` + `docs/DEPLOY_CLOUDRUN_B.md`.
+
 ## Contexto
 
-O CRM (FastAPI + Firestore + React, Cloud Run Oregon) opera hoje **single-tenant**
+O CRM (FastAPI + Firestore + React, Cloud Run Oregon) operava **single-tenant** em 2026-07-01
 (só `hubloc`). Objetivo: habilitar **multi-tenant** para onboarding de novos clientes sob
 a mesma infra, no modelo **managed billing** (Castro fronta a Meta e re-fatura — CLAUDE.md §1).
 
@@ -208,23 +219,42 @@ staging; bloqueia go-live em prod.
      fallback hubloc no _resolve_tenant, claim churn zerado p/ usuários pré-M-B2, cache
      curto de falha de leitura (anti retry-storm; fallback de role cobre a janela).
 
+0i. CLOUD RUN B — FASE B (painel super-admin) ✅ EM PROD 2026-07-11/12 — serviço
+     `castro-superadmin` com imagem/SA/auth separados (rev 00001-4f4 em 11/07; rev
+     00002-7pm em 12/07 com o hardening pós-revisão adversarial, 25 achados, commit
+     a7cc82e). Login Firebase + TOTP obrigatório NA SESSÃO + audit-antes-da-ação +
+     kill-switch por script. Editor de tenant (PATCH) na rev 00004-c8d (2026-07-31,
+     commit c2d4f0e). Pipeline reproduzível: docs/DEPLOY_CLOUDRUN_B.md. DEFERIDOS:
+     sessão-cookie 15min, domínio próprio, sink BigQuery, impersonate, IAP/borda.
+
+0j. TENANT #2 LIGADO ✅ — `varizemed-test` (14/07) e o real `varizemed` (28/07, plano
+     ai_custom) foram criados PELO painel B (prova no audit imutável audit_logs_system);
+     fluxo CX ponta a ponta em prod desde 29/07 e Modo Recepção (ADR 0010) desde 06/08.
+     Com 3 tenants ativos, single_active_tenant() retorna None => login sem claim e sem
+     domínio casado é 403 (rede de transição desarmada, by design).
+
 PRÉ-#2 (tudo validado no hubloc antes de ligar o cliente novo):
   A. Isolamento de canais
-     M-A1  ADR 0007 Fase 1 (filtro lógico + id UUID na fila)   [S, baixo risco]  ← COMEÇANDO
+     M-A1  ADR 0007 Fase 1 (filtro lógico + id UUID na fila)   [S, baixo risco]  ✅ EM PROD
      M-B1  ADR 0007 Fase 2 (migração estrutural dos 4 canais)  [L, alto risco]   (D2)
+           ⚠ ABERTO em 2026-08-21 — reavaliar antes de executar: hoje `channels` é
+           invariante GLOBAL (_GLOBAL_COLLECTIONS, ver CLAUDE.md); tirar de lá já
+           causou perda crônica de inbound (fix em prod rev 00065-zif, 2026-07-16).
   B. Onboarding
-     M-A2  bootstrap_tenant(tid) + claim atômico (D6)          [M]
-     Sprint 0 RBAC/super-admin (§6 PLANO_RBAC — fundação)      [S]
-     Cloud Run B mínimo (só criar tenant, D3)                  [L, front-load segurança]
+     M-A2  bootstrap_tenant(tid) + claim atômico (D6)          [M]  ✅ EM PROD
+     Sprint 0 RBAC/super-admin (§6 PLANO_RBAC — fundação)      [S]  ✅ 2026-07-07 (0h)
+     Cloud Run B mínimo (só criar tenant, D3)                  [L]  ✅ EM PROD (0i)
   C. RBAC dinâmico no hubloc (D4 — antes do #2)
      M-B2  ✅ EM PROD 2026-07-06 (ver bloco 0e)
   D. Rules + gate
      M-A4  ✅ FEITO 2026-07-03 — removido emailAllowed() do ownsTenant (isolar por
            claim tenant_id). Publicado + canário OK. Ver bloco 0c. Falta: endurecer
            rules de STAGING (espelhar PROD) — pendente, baixo risco (staging vazio em Oregon).
-     M-A5  ensaio de onboarding + auditoria de vazamento (GATE)
+     M-A5  ensaio de onboarding + auditoria de vazamento (GATE) — ensaio FEITO no
+           painel B (tenant de ensaio criado/limpo + isolamento, 07/2026) e o #2 real
+           nasceu por lá em 28/07. Auditoria formal de vazamento: ⚠ verificar.
 
-LIGAR TENANT #2 (standard) pela UI do Cloud Run B.
+LIGAR TENANT #2 pela UI do Cloud Run B.  ✅ FEITO — ver blocos 0i/0j.
 
 PÓS-#2:
   M-B3 (crescer Cloud Run B: impersonate/analytics/kill-switch)
@@ -323,11 +353,11 @@ sai pela WABA do outro tenant; (3) colisão de `event_id` na fila. **Bloqueante,
 
 | Milestone | O quê | Esforço | Arquivos |
 |---|---|---|---|
-| **M-A1** | ADR 0007 Fase 1: filtro por `get_tenant_context()` em `get_all_active_channels`/`get_channels_for_user`; `_default_channel_id` vira `dict[tid]`; UUID em `enqueue_pending_event`. | S | `channel_service.py`, `pending_events.py`, `main.py` |
-| **M-A2** | `bootstrap_tenant(tid)`: `create_tenant` + `bootstrap_departments` + admin com `set_tenant_claims`+`revokeRefreshTokens` na criação (D6). Refatorar startup do hubloc pra usar. | M | `main.py`, `tenant_service.py`, `firebase_admin_client.py` |
-| **M-B2** | RBAC dinâmico (D4, antes do #2): `perfis_acesso` por tenant, 3 seed = comportamento atual, `require_permission`/`useCan` dual-check, ondas, UI toggles. | L | backend + rules + frontend (PLANO_RBAC §3) |
-| **Cloud Run B** | Sprint 0 (§6) + serviço mínimo com criação de tenant (D3). | L | novo serviço |
-| **M-B1** | ADR 0007 Fase 2: migrar canais → `tenants/{tid}/channels`, cache por tenant, backfill `phone_routing`, preservar `channel_id`. | L | `channel_service.py` |
+| **M-A1** | ✅ EM PROD — ADR 0007 Fase 1: filtro por `get_tenant_context()` em `get_all_active_channels`/`get_channels_for_user`; `_default_channel_id` vira `dict[tid]`; UUID em `enqueue_pending_event`. | S | `channel_service.py`, `pending_events.py`, `main.py` |
+| **M-A2** | ✅ EM PROD — `bootstrap_tenant(tid)`: `create_tenant` + `bootstrap_departments` + admin com `set_tenant_claims`+`revokeRefreshTokens` na criação (D6). Refatorar startup do hubloc pra usar. | M | `main.py`, `tenant_service.py`, `firebase_admin_client.py` |
+| **M-B2** | ✅ EM PROD 2026-07-06 — RBAC dinâmico (D4, antes do #2): `perfis_acesso` por tenant, 3 seed = comportamento atual, `require_permission`/`useCan` dual-check, ondas, UI toggles. | L | backend + rules + frontend (PLANO_RBAC §3) |
+| **Cloud Run B** | ✅ EM PROD 2026-07-11/12 (`castro-superadmin`) — Sprint 0 (§6) + serviço mínimo com criação de tenant (D3). | L | novo serviço |
+| **M-B1** | ⚠ **ABERTO** (reavaliar: `channels` é hoje invariante global) — ADR 0007 Fase 2: migrar canais → `tenants/{tid}/channels`, cache por tenant, backfill `phone_routing`, preservar `channel_id`. | L | `channel_service.py` |
 | **M-A4/A5** | ✅ **M-A4 FEITO (2026-07-03):** removido `emailAllowed()` do `ownsTenant` (isolar por claim `tenant_id`) — publicado em prod, canário OK, veredito de revisão SHIP (ver bloco 0c + 4 follow-ups pré-#2). Pendente: endurecer rules de STAGING (espelhar PROD, baixo risco); M-A5 ensaio de onboarding (GATE). | M | `firestore.rules` |
 
 ---
@@ -335,10 +365,10 @@ sai pela WABA do outro tenant; (3) colisão de `event_id` na fila. **Bloqueante,
 # PARTE 2 — INVENTÁRIO DE OUTRAS PENDÊNCIAS (fora do caminho do #2)
 
 ### LGPD / Segurança
-- **Rules de `wa_messages` por dono** (denormalizar `assigned_to_uid` + backfill) — camada mais fraca; verificar escopo atual.
+- **Rules de `wa_messages` por dono** (denormalizar `assigned_to_uid` + backfill) — camada mais fraca; virou a **fase F4** do `docs/PLANO_J3_LGPD_E_REVOGACAO.md`.
 - Backfill de conversas órfãs coex — parcial, monitorar.
 - **ADR 0001** — evitar Embedded Signup duplicado (409 + transferir posse) — proposto.
-- **Oregon LGPD** — DPA/SCCs + RoPA/RIPD (Brasil→EUA) — pendente.
+- **Oregon LGPD** — DPA/SCCs + RoPA/RIPD (Brasil→EUA) — pendente (o DPA entrou como frente do `docs/PLANO_J3_LGPD_E_REVOGACAO.md`).
 
 ### Custo Firestore (write-side)
 - Unificar 2× `.set` em `wa_contacts`; `skip_metrics` p/ `direction='system'`; coalescing de `update_wa_message_status`.
@@ -351,7 +381,7 @@ sai pela WABA do outro tenant; (3) colisão de `event_id` na fila. **Bloqueante,
 - `<TenantHealthBanner/>` completo; página `/setup`; modal 402; card "Uso este mês".
 
 ### Canais / Embedded Signup
-- 2º número standard (3351-7604) — bloqueado em hardware; Método B (signup standard na UI); import real do Backup (~500 JSONs).
+- 2º número standard — bloqueado em hardware. Método B (signup standard na UI) ✅ em prod; import real do Backup ✅ (`scripts/import_backup_hubloc.py`, aba Caixa Backup em prod).
 
 ### Infra / Tech-debt
 - Google Chat; Python 3.8 EOL (2026-10-04); re-submeter screencast App Review; pinning de tráfego Oregon (`update-traffic` manual).

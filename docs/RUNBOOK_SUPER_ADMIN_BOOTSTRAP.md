@@ -10,6 +10,13 @@ MFA" (PLANO_RBAC §4.5).
 > só pelo claim — o Cloud Run B revalida doc ativo **+ MFA-na-sessão** a cada
 > request (Fase B).
 
+> **Status em 2026-08-21:** os passos 1-4 **já foram executados em prod** — seed dos 2
+> founders (2026-07-07), upgrade pra Identity Platform + TOTP habilitado, painel B
+> (`castro-superadmin`) no ar desde 2026-07-11/12 e founders com o claim `super_admin`
+> (ver `docs/HANDOFF_IAP_E_TENANT2.md` §1; ⚠ confirmar se o Izael já enrollou o TOTP).
+> O runbook segue valendo para **provisionar um super-admin #3** e para o **kill
+> switch**. Operação do painel: `docs/PLANO_OPERACAO_CLOUDRUN_B.md`.
+
 ---
 
 ## Pré-requisitos
@@ -85,7 +92,7 @@ Registra `kill_super_admin` em `audit_logs_system`.
 
 `isSuperAdmin()` + os matches de `castro_crm_super_admins/*` e
 `castro_crm_audit_logs_system/*` já estão em `firestore.rules` (leitura só
-super-admin; escrita sempre backend). Publicar junto com o deploy do Sprint 0.
+super-admin; escrita sempre backend). ✅ **Publicado** — ruleset `cb1bd995` (2026-07-07).
 
 ## Provisionar super-admin #3 no futuro
 

@@ -10,6 +10,9 @@ Esta pasta concentra deploy, configuracao de ambiente e operacao.
   de cutover/wipe; util so como referencia, traduzindo projeto/regiao.
 - [MIGRACAO_GCP_OREGON_CHECKLIST.md](MIGRACAO_GCP_OREGON_CHECKLIST.md) — historico da
   migracao SP→Oregon (parte tecnica concluida em 2026-06).
+- [TROCAR_ENVIRONMENT_VAL.md](TROCAR_ENVIRONMENT_VAL.md) — runbook do PO pra trocar o
+  `environment_id` do agente CX da Val (varizemed) + historico das trocas; usa
+  `scripts/set_cx_environment.py` (commit `80073b1`, 2026-08-16).
 - [env.oregon.yaml](env.oregon.yaml) — snapshot HISTORICO das envs do cutover;
   **NAO usar em deploy** (ver aviso no proprio arquivo).
 - Deploy do Cloud Run B (`castro-superadmin`): [../DEPLOY_CLOUDRUN_B.md](../DEPLOY_CLOUDRUN_B.md)

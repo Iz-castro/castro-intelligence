@@ -5,8 +5,29 @@
 - **Autores:** Rafa + Claude (analise inicial)
 - **Relacionado:** [CLAUDE.md §2 (Compliance LGPD)](../../CLAUDE.md),
   [ADR 0001](0001-prevenir-coex-signup-duplicado.md),
-  `_check_conv_send_permission` em [main.py:1136](../../main.py#L1136),
+  `_check_conv_send_permission` em [main.py:1639](../../main.py#L1639)
+  (ancora conferida em 2026-08-21),
   modelo `channel_owner_user_id` vs `sender_user_id` em `wa_messages`.
+
+> **Status em 2026-08-21 (as 4 frentes, uma a uma):**
+> - **#1 assinatura automatica quando `sender != owner`: NAO implementada.** Nao ha
+>   assinatura no envio; o que existe e o prepend `[Supervisao - {1o nome}]:` do Modo 2
+>   ([ADR 0003](0003-refactor-lead-atendimento.md)), que cobre supervisao, nao coex.
+> - **#2 mensagem visivel ao titular na troca de operador: parcial.** O Modo 3
+>   (supervisor-takeover, ADR 0003) avisa o lead quando dentro da janela de 24h; a
+>   transferencia comum segue com mensagem de sistema (`insert_transfer_system_message`,
+>   hoje em `database_firestore.py:2261`).
+> - **#4 rules estritas: EM PROD para contato/conversa** — `firestore.rules` isola por
+>   `canSeeContactScoped` (proprios + pool sem dono, nunca por departamento; ver a
+>   Atualizacao 2026-06-03 abaixo). **Continua aberto** o recorte de `wa_messages`, cuja
+>   leitura segue ampla dentro do tenant (F4 de `../PLANO_J3_LGPD_E_REVOGACAO.md`,
+>   decisao J5).
+> - **#5 audit de leitura e #6 `access-report`: migraram para o plano J-3** (F2 e J8) e
+>   seguem **nao implementados**.
+> - **3a/3b (politica de privacidade + clausula contratual): seguem pendencias
+>   juridicas** — continuam sendo pre-requisito pra escalar coex compartilhado.
+>
+> As ancoras `arquivo:linha` do corpo sao de 2026-05-11 e nao valem mais.
 
 > **Atualizacao 2026-06-03:** a visibilidade por `department_id` foi **removida**
 > do isolamento (commit `ddcfb69`). O operador comum agora ve **apenas** contatos/

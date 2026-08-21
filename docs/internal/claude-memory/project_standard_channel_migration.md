@@ -1,6 +1,6 @@
 ---
 name: project-standard-channel-migration
-description: Migracao do numero da empresa para canal STANDARD (Cloud API) padrao; Embedded Signup e coex-only; decisoes e plano multi-empresa
+description: Migracao do numero para canal STANDARD (Cloud API); Embedded Signup standard FEITO+PROVADO (botao Cloud API, config 2342621062931210, 7195-7758 conectado E2E); decisoes e plano multi-empresa
 metadata: 
   node_type: memory
   type: project
@@ -39,8 +39,16 @@ poucos. Decisoes tomadas:
 1. ADR 0007 Fase 2 — `channels` → `tenants/{tid}/channels` + **default por
    tenant** (hoje `_default_channel_id` e o 1o standard global, channel_service.py:83-84).
 2. Gargalo do **secret global** do standard (acima) — registrar no ADR 0007.
-3. **Metodo B** — Embedded Signup standard (2a config na Meta Cloud API + botao
-   no front mandando channel_type=standard). Onboarding self-service.
+3. **Metodo B — FEITO e PROVADO (2026-06-05).** (A nota "COEX-ONLY" no topo deste
+   arquivo esta DESATUALIZADA.) Embedded Signup standard esta LIVE: botao "☁️ Conectar
+   numero (Cloud API)" (App.tsx:119 -> whatsapp-standard -> WhatsAppSignupModal
+   channelType=standard, App.tsx:1730); endpoint `/api/admin/embedded-signup/config?type=standard`
+   (admin/sup) devolve EMBEDDED_SIGNUP_CONFIG_ID_STANDARD=2342621062931210 (PLUGADO em prod,
+   confirmado no env do Cloud Run 2026-07-01); `exchange` recebe channel_type=standard;
+   `create_channel` (channel_service.py:238-241) carimba `tenant_id` do CONTEXTO atual + grava
+   phone_routing -> serve pro tenant #2 self-service. Numero 7195-7758 foi conectado E2E por
+   esse fluxo. Standard exige verificacao SMS/ligacao (chip) + `POST /{phone_id}/register` com
+   PIN (rodado pelo CRM, Castro = Tech Provider).
 
 **BLOQUEADO na Meta (2026-06-04):** ao tentar migrar o numero 3351-7604
 (WABA Central Loc - Comercial) pro standard via Embedded Signup, a conta

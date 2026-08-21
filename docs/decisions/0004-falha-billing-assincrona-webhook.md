@@ -3,9 +3,12 @@
 - **Status:** Proposed (ideia registrada, aguardando priorizacao)
 - **Data:** 2026-06-03
 - **Autores:** Rafa + Claude (analise inicial)
-- **Relacionado:** `_process_statuses` em [webhook.py:689](../../webhook.py#L689),
-  guard de billing sincrono em [main.py:1743](../../main.py#L1743),
-  `update_wa_message_status` em [database_firestore.py:1916](../../database_firestore.py#L1916).
+- **Relacionado:** `_process_statuses` em [webhook.py:961](../../webhook.py#L961),
+  guard de billing sincrono em [main.py:2190](../../main.py#L2190),
+  `update_wa_message_status` em [database_firestore.py:2630](../../database_firestore.py#L2630).
+  (Ancoras reconferidas em 2026-08-21; as do corpo, abaixo, sao de 2026-06-03. Nada
+  desta ADR foi implementado ate aqui: o webhook segue sem tratar `131042` e o
+  `update_wa_message_status` nao persiste `error_code`/`error_title`.)
 
 ## Contexto
 

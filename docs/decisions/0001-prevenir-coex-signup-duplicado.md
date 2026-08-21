@@ -1,11 +1,23 @@
 # ADR 0001 — Prevenir Embedded Signup duplicado pro mesmo numero coexistence
 
-- **Status:** Proposed (aguardando discussao com a equipe)
+- **Status:** Proposed (aguardando discussao com a equipe) — **SUPERADO na pratica
+  pela Fase 1 da [ADR 0003](0003-refactor-lead-atendimento.md)** (ver banner)
 - **Data:** 2026-05-11
 - **Autores:** Rafa + Claude (analise inicial)
-- **Relacionado:** `embedded_signup_exchange` em [main.py:3042](../../main.py#L3042),
-  `create_channel` em [channel_service.py:208](../../channel_service.py#L208),
-  `upsert_phone_routing` em [tenant_service.py:219](../../tenant_service.py#L219).
+- **Relacionado:** `embedded_signup_exchange` em [main.py:4537](../../main.py#L4537),
+  `create_channel` em [channel_service.py:233](../../channel_service.py#L233),
+  `upsert_phone_routing` em [tenant_service.py:426](../../tenant_service.py#L426)
+  (ancoras conferidas em 2026-08-21).
+
+> **Status em 2026-08-21:** o problema foi resolvido por outro desenho, nao pelo 409
+> proposto aqui. Hoje o re-onboarding do MESMO numero faz **rebind do canal existente**
+> (detecta por `phone_number_id` lendo o Firestore direto e da UPDATE, preservando
+> `channel_id` e as threads `{channel_id}__{wa_id}`) — Fase 1 da ADR 0003. O **409 ficou
+> so como guard de autoria**: operador nao-privilegiado tentando re-signup de canal de
+> OUTRO dono e bloqueado; admin/supervisor pode reatribuir. Nao ha endpoint dedicado de
+> transferencia de ownership. Contexto relacionado: colisao de `channel_id` entre tenants
+> (incidente 2026-07-16, fix `next_sequence(tenant_id="")`) e [ADR
+> 0007](0007-isolamento-channels-pending-events.md) (`channels` flat/global).
 
 ## Contexto
 

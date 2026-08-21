@@ -3,6 +3,15 @@
 **Data:** 2026-08-14 · **Agente:** `5fa69ea1-bc68-445b-9d20-d72265aaaf36`
 (projeto `castro-ia`, `us-central1`) · **Tenant afetado:** `varizemed` (clínica real)
 
+> **Atualização 2026-08-21:** resolvido do lado do agente — o environment
+> `834d5241-5337-4848-91a5-1479c6fcdc9b` (`val-5.0.12`, "correção do erro
+> 'Sorry something went wrong'") entrou em 14/08 13:40 BRT. A produção hoje roda
+> `22390163-6bbc-47b5-a25a-e53eb3363d8f` (`val-5.0.3`, 21/08 15:50 BRT) —
+> histórico das trocas em `docs/deploy/TROCAR_ENVIRONMENT_VAL.md`. A blindagem
+> descrita no §5 (reenvia 3× e handoff no 4º) está em produção (commit
+> `4bc5d79`); o convite do fim do §5 continua de pé: se você definir uma frase
+> de erro customizada, manda a frase EXATA.
+
 **Resumo em uma linha:** hoje de manhã o agente está instável e, no pedido de
 atendimento humano, respondeu ao lead a frase de erro embutida do Dialogflow —
 **"Sorry something went wrong."**, em inglês — sem setar `handoff_request`. O

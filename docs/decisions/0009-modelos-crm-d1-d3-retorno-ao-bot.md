@@ -1,5 +1,23 @@
 # ADR 0009 — Modelos de CRM: decisões D1-D3 do retorno-ao-bot (clínica)
 
+> **Status em 2026-08-21:** o retorno-ao-bot **está em produção**, mas ligado pelo
+> `pool_mode=reception` ([ADR 0010](0010-pool-mode-recepcao.md) — Fase 2 do
+> PLANO_MODELOS antecipada em 2026-08-05, commits `095661d`/`ee1e4cc`), **não** pelo
+> `crm_model`: esse eixo ainda NÃO existe no código (só aparece como "futuro" num
+> comentário de `superadmin_main.py`).
+> **D1 — FEITA:** a hidratação da prova pelo CONTATO compara
+> `contact.lgpd_policy_version` com a vigente (`_cx_policy_version`) e re-pergunta
+> quando diverge; recusa no `bot_states` tem precedência e `lgpd_revoked` nunca
+> hidrata (`bot_service._process_cx_message`).
+> **D2 — PARCIAL:** o botão "Encerrar" fecha o atendimento e grava
+> `reopen_response`/`client_requested_close` **na conversation** (`webhook.py`),
+> mas nenhum disparo consome esse opt-out — o envio em lote
+> (`scripts/send_template_bulk.py`) não filtra hoje. Requisito do motor de
+> campanhas segue ABERTO.
+> **D3 — atenção:** desde a emenda de 2026-08-19 do ADR 0010 (commit `3aa9d05`),
+> abrir pelo picker só auto-atribui a thread se o LEAD já for do operador — a
+> retomada pontual só cai no "Meus" de quem já é dono.
+
 - **Status:** aceito (PO, 2026-08-01)
 - **Contexto:** `docs/PLANO_MODELOS_CRM_E_PLANOS.md` (Fases 1+2 — modelo
   `medical_clinic` devolve o lead ao agente de IA após QUALQUER fechamento,

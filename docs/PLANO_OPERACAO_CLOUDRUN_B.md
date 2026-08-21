@@ -7,6 +7,16 @@
 > Este doc é autossuficiente: dá pra retomar a Fase B só com ele + o
 > `docs/RUNBOOK_SUPER_ADMIN_BOOTSTRAP.md` + `docs/PLANO_RBAC_E_SUPER_ADMIN.md`.
 
+> **Status em 2026-08-21: Fase B CONCLUÍDA.** O serviço `castro-superadmin` está em prod
+> desde 2026-07-11 (rev `00001-4f4`), endurecido em 12/07 pós-revisão adversarial (25
+> achados, commit `a7cc82e`, rev `00002-7pm`) e com editor de tenant desde 31/07 (rev
+> `00004-c8d`). Foi por ele que nasceram `varizemed-test` (14/07) e o **tenant #2 real
+> `varizemed`** (28/07) — ambos em prod. Build/deploy reproduzível:
+> `docs/DEPLOY_CLOUDRUN_B.md`. Segue ABERTO o §5: proteção de borda (IAP+LB vs
+> Cloudflare Access — decisão em aberto, `docs/HANDOFF_IAP_E_TENANT2.md`), sessão-cookie
+> de 15min, domínio próprio, sink BigQuery, impersonate e o decommission do projeto
+> antigo de SP.
+
 ---
 
 ## 1. Estado atual (o que já está pronto)
@@ -54,7 +64,7 @@ storage). E a **Fase A / Sprint 0** (fundação super-admin) — commit `537fcf2
 
 ---
 
-## 3. Blocos de construção (a fazer)
+## 3. Blocos de construção (✅ FEITOS em 2026-07-11/12 — histórico em `docs/DEPLOY_CLOUDRUN_B.md` §9)
 
 ### Bloco 1 — Backend do serviço B (`superadmin_main.py`)
 - App FastAPI enxuto, **separado** do `main.py`.
@@ -64,7 +74,7 @@ storage). E a **Fase A / Sprint 0** (fundação super-admin) — commit `537fcf2
   3. doc `super_admins/{uid}` existe + `is_active` (`is_active_super_admin`);
   4. **MFA-na-sessão**: no ID token do Firebase, checar `decoded["firebase"]["sign_in_second_factor"]`
      não-vazio (ex.: `"totp"`). *(PLANO_RBAC §4.5 fala em `amr`; no Firebase o campo real é
-     `firebase.sign_in_second_factor` — confirmar no token real ao construir.)*
+     `firebase.sign_in_second_factor` — CONFIRMADO: é o que o `superadmin_main.py` checa.)*
   → falhar qualquer etapa = 403.
 - `POST /api/superadmin/tenants` — body: `tenant_id/slug, name, cnpj, plan, admin_email,
   allowed_email_domains`. Valida → `log_system_audit(actor, "create_tenant", ...)` **ANTES** →

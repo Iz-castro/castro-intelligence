@@ -4,6 +4,11 @@
 > Serviço SEPARADO do CRM (Cloud Run A), no mesmo projeto GCP e mesmo git.
 > Projeto: `project-4a851bf9-f475-418c-800` · região `us-west1`.
 
+> **Status em 2026-08-21:** pipeline **inalterado** desde 2026-07-31 (rev `00004-c8d`,
+> commit `c2d4f0e`) — o que está abaixo continua sendo o jeito de buildar e subir o B.
+> A proteção de borda do serviço (IAP+LB vs Cloudflare Access) segue **em aberto**:
+> `docs/HANDOFF_IAP_E_TENANT2.md`.
+
 ---
 
 ## Visão geral (por que assim)

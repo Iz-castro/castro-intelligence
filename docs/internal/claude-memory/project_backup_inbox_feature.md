@@ -34,8 +34,8 @@ SO a admin/supervisor.
   -> **precisa do canal STANDARD do 3351-7604 EXISTIR** (pos-embed) p/ o import
   real; senao usa um canal de teste. (No teste usei 7195-7758/canal 2.)
 - `normalize_br_phone` canoniza o wa_id (nono digito) nos DOIS lados (import e
-  webhook) -> msg ao vivo de `983440484` casa com backup `83440484` (vira
-  `5531983440484`). conversation_id deterministico `{channel_id}__{wa_id}`.
+  webhook) -> msg ao vivo de `9XXXXXXXX` casa com backup `XXXXXXXX` (vira
+  `55319XXXXXXXX`). conversation_id deterministico `{channel_id}__{wa_id}`.
 - Idempotente (dedup por "backup_"+Message Id). Preserva timestamps (ordem) e o
   prefixo `*Nome Operador:*` (a supervisora ve quem atendeu).
 
@@ -46,7 +46,7 @@ SO a admin/supervisor.
    MENSAGENS de backup (Vetor B) ficam legiveis por operador via query direta.
 3. `./.venv/Scripts/python.exe -m scripts.import_backup_hubloc --dir "backup hubloc" --confirm`
    (rodar --dry-run antes p/ ver contagens + colisoes).
-4. Limpar o backup de TESTE antes (contato/conversa do 83440484 / "98344-0484").
+4. Limpar o backup de TESTE antes (contato/conversa do numero de teste (mascarado)).
 
 **Gotcha:** o frontend remonta Conversation com lista fixa de campos
 (`normalizeConversation`, normalization.ts) — campo novo (is_backup, channel_active)

@@ -4,6 +4,19 @@
 > **Método:** auditoria multi-agente (finders paralelos → verificação adversarial de cada achado → crítico de completude). 2 achados foram **refutados** na verificação (ver §5).
 > **Links:** `file:line` relativos à raiz do repo.
 
+> **Atualização 2026-08-21 — o que do §4 já está no código:** item **1 FEITO**
+> (`close_stale_attendances` e `expire_stale_takeovers` filtram server-side com
+> `.where(...)`, sem full-scan); item **2 FEITO** (`auth.py` tem cache in-memory por
+> `(tenant, firebase_uid)` + cache de auth de 45 s, que limita indiretamente o `update_last_login`); item **4 parcial**
+> (`increment_audit_metrics` usa `firestore.Increment` e zero reads, mas o *skip* de
+> métricas em mensagens `system`/`internal` **não** existe); item **6 parcial** (os
+> targets do operador em `wa_conversations` já têm `orderBy+limit(50)`; o target
+> `backup` do admin **continua sem limite**). Fora da tabela: o full-scan de
+> `/api/wa/contacts/all` que a sidebar disparava virou `count_only=1` (aggregate
+> `count()`). Segue **ABERTO** o item **3** — `gc_messages` ainda lê as 100 últimas
+> de *todas* as conversas, sem `where("conversation_id")` (custo + vazamento entre
+> spaces + conversa vazia). Itens 5/7/8: ⚠ verificar caso a caso.
+
 ---
 
 ## Resumo executivo

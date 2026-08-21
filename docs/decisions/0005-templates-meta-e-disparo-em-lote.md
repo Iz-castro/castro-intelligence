@@ -4,11 +4,24 @@
 - **Data:** 2026-06-03
 - **Autores:** Rafa + Gemini (estudo) + Claude (registro e ancoragem no codigo)
 - **Relacionado:** envio de template em `/api/wa/send-template`
-  ([main.py:1609](../../main.py#L1609), guard de billing em
-  [main.py:1743](../../main.py#L1743)); protocolo de atendimento (Fase 5A)
-  em [database_firestore.py:1364](../../database_firestore.py#L1364);
+  ([main.py:2060](../../main.py#L2060), guard de billing em
+  [main.py:2190](../../main.py#L2190)); protocolo de atendimento (Fase 5A)
+  em [database_firestore.py:1730](../../database_firestore.py#L1730);
   ADR [0004](0004-falha-billing-assincrona-webhook.md) (falha de billing
-  assincrona).
+  assincrona). (Ancoras reconferidas em 2026-08-21.)
+
+> **Status em 2026-08-21:** a **Parte 2 (disparo em lote) saiu do papel por um caminho
+> diferente** do desenhado aqui. Existe hoje um script CLI versionado (commit
+> `51ff640`): `scripts/send_template_bulk.py` — dry-run por default (so envia com
+> `--yes`), ritmo por `--sleep` + pausa entre lotes, retomada pelo relatorio em
+> `scripts/_exports/` e **nao escreve nada no Firestore** (quem responder ao template
+> entra pelo webhook normal e vira lead pelo funil de sempre) — mais
+> `scripts/wa_phone_norm.py` (normalizacao/dedup dos numeros). Seguem **NAO
+> implementados**: colecao `campaigns`, worker/Cloud Tasks (Regras 1-2 como infra),
+> **campo `opt_out_marketing` no `wa_contacts` (Regra 3 — o script NAO checa opt-out)**,
+> captura do opt-out pelo botao do template, UI de campanha e `log_audit` de campanha.
+> A Parte 1 (padronizacao de templates) segue como estudo. ⚠ A revisao adversarial do
+> script esta incompleta (faltam as frentes de seguranca e de politica da Meta).
 
 ## Contexto
 
@@ -22,12 +35,13 @@ Estado atual no codigo:
 - O envio unitario de template ja existe (`/api/wa/send-template`).
 - A regra "1 dia = 1 protocolo" **ja esta implementada** (Fase 5A,
   colecao `attendances_daily`, granularidade dia no fuso BR — funcoes
-  `get_or_create_daily_attendance`, `mark_protocol_informed`,
+  `ensure_daily_attendance`, `mark_protocol_informed`,
   `get_current_protocol_id`).
 - **Nao existe** infra de disparo em lote: sem colecao de campanha, sem
   fila/worker, sem Cloud Tasks. O unico `bulk` hoje e
-  `/api/admin/bulk-reassign` ([main.py:3302](../../main.py#L3302)), que
-  reatribui contatos e nada tem a ver com envio de mensagens.
+  `/api/admin/bulk-reassign` ([main.py:4101](../../main.py#L4101)), que
+  reatribui contatos e nada tem a ver com envio de mensagens. (Ver o banner
+  de status: o disparo em lote existe hoje como script CLI fora do backend.)
 - **Nao existe** flag de opt-out de marketing no `wa_contacts` — e
   pre-requisito da Regra 3 abaixo.
 
@@ -112,8 +126,8 @@ nao corromper o banco nem banir o numero na Meta.
   do atendimento (ja regida pela Fase 5A).
 - **Solucao:** no disparo, o worker checa se o lead ja tem thread/atendimento
   do dia. Se nao houver, aplica *deferred execution*: cria um protocolo
-  silencioso (reusar `get_or_create_daily_attendance`,
-  [database_firestore.py:1402](../../database_firestore.py#L1402)) para
+  silencioso (reusar `ensure_daily_attendance`,
+  [database_firestore.py:1730](../../database_firestore.py#L1730)) para
   atrelar a mensagem de lote. Se o lead responder ao template, a conversa
   volta a caixa de "Novos" associada ao **mesmo** protocolo valido (a
   logica de retorno-zumbi do Fase 5A ja cobre reabertura sem duplicar

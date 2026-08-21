@@ -8,6 +8,18 @@
 - **Versão:** 1.0 — **Data:** 2026-05-15
 - **Encarregado (DPO) da Castro Intelligence:** `[ENCARREGADO_CASTRO]` — `[contato]`
 
+> **Status em 2026-08-21 — não anexar a contrato/DPA sem revisar.** Este texto é a
+> versão 1.0 (2026-05-15) e está desatualizado em dois pontos materiais:
+> **(i) residência dos dados** — a produção migrou para o projeto GCP em `us-west1`
+> (Oregon, **EUA**) no cutover de 2026-06-10, de modo que as menções a
+> `southamerica-east1` / "dados no Brasil" (itens 2.3, 3.2, 6.1, 6.2 e os fluxos de
+> 6.3) não descrevem mais o ambiente atual; a residência definitiva é decisão em
+> aberto (J10 de `../PLANO_J3_LGPD_E_REVOGACAO.md`);
+> **(ii) dados sensíveis** — há tenant de clínica em produção desde 2026-07-29, e os
+> controles reforçados citados no item 4 (criptografia de campo, registro de acesso,
+> retenção específica) **ainda não estão implementados** — plano, fases e status em
+> `../PLANO_J3_LGPD_E_REVOGACAO.md`.
+
 > **Propósito deste documento.** Apoiar a empresa-cliente, na qualidade de
 > Controladora, a montar seu próprio Registro de Operações de Tratamento (RoPA),
 > seu Relatório de Impacto (RIPD) e a cláusula de suboperadores do contrato,

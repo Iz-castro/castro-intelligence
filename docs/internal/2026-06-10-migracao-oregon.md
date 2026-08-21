@@ -1,5 +1,17 @@
 # Diário 2026-06-10 — Migração GCP → Oregon (conta Castro)
 
+> **Atualização 2026-08-21:** cutover **concluído** — Oregon
+> (`project-4a851bf9-f475-418c-800` / `us-west1`) é prod e o `CLAUDE.md` já reflete
+> isso. ⚠ **Não reuse o comando de deploy de "Comandos úteis"**: `--env-vars-file` +
+> `--set-secrets` + flags de scaling **clobberam** a env/secrets/scaling vivos (o
+> próprio `docs/deploy/env.oregon.yaml` já está marcado como snapshot histórico).
+> Deploy de rotina hoje = `gcloud run deploy castro-crm --source <caminho absoluto>
+> --region us-west1 --project project-4a851bf9-f475-418c-800 --quiet`, e o tráfego é
+> **pinado por revisão** (a revisão nova sobe a 0%; promover por NOME) — runbook em
+> `docs/deploy/DEPLOY_CLOUDRUN_A.md`. Dos "próximos passos": o canal standard bogus
+> foi resolvido (as envs `WHATSAPP_PHONE_NUMBER_ID`/`WABA_ID` foram removidas de
+> propósito) e o **decommission do projeto antigo de SP segue pendente**.
+
 ## Resumo
 
 Migramos toda a infra do CRM da **conta pessoal** `rafaluisc@outlook.com`

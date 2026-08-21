@@ -2,6 +2,14 @@
 
 Atualizado em: 2026-06-03
 
+> **Status em 2026-08-21:** o modelo geral continua valido, mas este doc e de junho
+> e nao cobre o que entrou depois: multi-tenant REAL em prod (3 tenants ativos
+> desde 2026-07-28 — `hubloc`, `varizemed`, `varizemed-test`), RBAC dinamico por
+> tenant, agente de IA (builtin + Dialogflow CX), Modo Recepcao (ADR 0010) e
+> `wa_contacts.unread_count` DERIVADO das threads (ADR 0011, 2026-08-21). As
+> correcoes pontuais estao marcadas em linha abaixo com "⚠️"; o mapa de modulos e
+> as invariantes vivas ficam no [CLAUDE.md](../../CLAUDE.md) e em `docs/decisions/`.
+
 ## Modelo atual
 
 O CRM esta consolidado em um unico runtime:
@@ -138,19 +146,29 @@ Subcolecoes do tenant — sao isoladas pelas Firestore rules (path-based).
 - `health_status/current` — Fase 2.10.3: snapshot do estado de billing/canal escrito pelo cron diario.
 - `system_settings`, `user_settings` — configuracoes globais e por-usuario.
 - `gc_conversations`, `gc_messages` — Google Chat (`space_id`, mensagens, anexos).
+- `bot_states` — estado por contato do bot builtin / gate LGPD / sessao CX (`bot_service.py`).
+- `perfis_acesso` — perfis do RBAC dinamico por tenant (M-B2, em prod).
+- `media_assets` — metadados/referencias de blob (⚠️ tenant-scoped; a secao abaixo listava como global ate 2026-08-21).
 
 ### Flat / global (fora de `tenants/`)
 
-- `channels` — registry de canais WhatsApp (standard + coexistence). Compartilhado entre tenants enquanto o sistema for single-tenant operacional.
+- `channels` — registry de canais WhatsApp (standard + coexistence). ⚠️ **Global por decisao (ADR 0007)**, nao "enquanto for single-tenant": vive em `_GLOBAL_COLLECTIONS` e continua flat com os 3 tenants ativos, porque o webhook precisa resolver canal ANTES de saber o tenant. `channel_id` vem do contador GLOBAL — `next_sequence("channels", tenant_id="")` com string VAZIA (`None` colide ids entre tenants; incidente 2026-07-16).
 - `phone_routing/{phone_number_id}` — indice global que mapeia `phone_number_id` da Meta para `{tenant_id, channel_id}`. Webhook resolve tenant em O(1) sem varrer canais.
 - `pending_webhook_events` — fila de webhooks da Meta nao processados imediatamente (canal nao indexado durante onboarding, exception). Garante zero perda.
 - `tenants` — lista flat de tenants (root).
-- `media_assets` — metadados/referencias de blob.
+- `super_admins` — cadastro de super-admin (Cloud Run B).
+- `audit_logs_system` — auditoria cross-tenant do super-admin.
 - `_meta` — counters cross-tenant.
+
+⚠️ **Correcao (2026-08-21):** a lista viva e `_GLOBAL_COLLECTIONS` em
+`firestore_common.py` = `_meta`, `tenants`, `phone_routing`, `channels`,
+`super_admins`, `audit_logs_system`, `pending_webhook_events`. `media_assets`
+**nao** e global — roteia pro tenant como qualquer outra colecao (`media.py`,
+bloco `tenants/{tid}/media_assets` em `firestore.rules`).
 
 ### Indices e contadores
 
-- `firestore.indexes.json` foi reduzido a indices COLLECTION_GROUP ativos para `wa_conversations`, `wa_messages`, `wa_contacts`, `wa_transfer_log`.
+- `firestore.indexes.json` foi reduzido a indices COLLECTION_GROUP ativos para `wa_conversations`, `wa_messages`, `wa_contacts`, `wa_transfer_log`. ⚠️ **Atualizado 2026-08-21 (ADR 0011):** entraram tambem 2 indices de escopo **COLLECTION** em `wa_conversations` — `(assigned_to_uid ASC, unread_count DESC, last_message_at DESC)` e `(unread_count DESC, last_message_at DESC)` — que servem o filtro "Nao lidas" da sidebar.
 - `_meta/counters` (sequencias atomicas) **NAO** e mais usado no caminho quente de auditoria — `log_audit` usa doc-id auto-gerado desde a remediacao do hotspot (2026-05-25). Reservado para entidades que precisam mesmo de id int sequencial.
 
 ## Colecoes lidas pelo React
@@ -191,6 +209,7 @@ Regras atuais:
 - acesso pode ser restringido por `ALLOWED_FIREBASE_EMAIL_DOMAIN` e `ALLOWED_FIREBASE_EMAILS`
 - `AUTO_PROVISION_FIREBASE_USERS` pode provisionar automaticamente usuarios permitidos
 - `BOOTSTRAP_ADMIN_EMAIL` continua sendo o caminho de bootstrap inicial para o primeiro admin
+- ⚠️ **(2026-07-06) o login e tenant-aware:** quem autoriza e o claim `tenant_id` do JWT; `allowed_email_domains` do tenant e apenas guarda-corpo + roteamento de login (soft), e provedor publico (gmail/outlook) nunca roteia nem auto-provisiona tenant
 
 ## Fluxos operacionais
 
@@ -309,12 +328,13 @@ Estado atual das rules (2026-05-28):
 - claim `tenant_id` + `role` no JWT (custom claims do Firebase Auth) sao a fonte de autorizacao
 - backend valida `tenant_id` e role em todo endpoint mutador (cross-check com rules)
 - snapshots Firestore para o operador comum: escopados a `assigned_to == self` ou sem dono (pool/fila). A visibilidade por `department_id` foi **removida em 2026-06-03** (isolamento LGPD, commit `ddcfb69`) — vazava a agenda coex de um operador para os colegas do mesmo departamento. admin/supervisor seguem vendo tudo.
+- ⚠️ **4a camada (2026-08-19, commit `3aa9d05`):** o frontend FECHA o chat aberto quando a thread muda de dono pra outro usuario (`CrmContext.tsx`) e `/api/wa/assume` carimba o dono em TODAS as threads orfas do contato; `/conversation/open` so auto-atribui thread de lead ja proprio.
 
 Conclusao:
 
 - o ciclo de seguranca de rules + claims esta fechado em prod
 - isolamento e auditoria sao defensaveis (vide `docs/compliance/LGPD_RoPA_RIPD_INTERNO.md`)
-- pendencia menor: ainda nao ha multi-tenant operacional (a `castro_crm_tenants` so contem `hubloc`); quando o cliente #2 fechar, validar isolamento end-to-end com 2+ tenants em paralelo
+- ⚠️ ~~pendencia menor: ainda nao ha multi-tenant operacional (a `castro_crm_tenants` so contem `hubloc`)~~ — **SUPERADO (2026-07-28):** ha 3 tenants ativos em prod (`hubloc`, `varizemed`, `varizemed-test`). Com >1 tenant ativo, login sem claim e sem dominio casado da **403** (by design)
 
 ## Rotas de referencia
 

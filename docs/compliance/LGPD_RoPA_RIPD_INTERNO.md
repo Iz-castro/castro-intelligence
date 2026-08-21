@@ -19,6 +19,27 @@
 > 11-14 em §1.4 abaixo refletem o estado atualizado. Não houve nova
 > categoria de **titular** nem novo **suboperador**.
 
+> **Status em 2026-08-21 — o que este diagnóstico já não descreve:**
+> - **Residência dos dados:** a produção migrou para `us-west1` (Oregon, **EUA**) no
+>   cutover de 2026-06-10. Toda menção a `southamerica-east1`, "dados no Brasil" e ao
+>   projeto `project-26fb9c99-8ee9-4179-aef` (§0, §2.5, §3.1, §3.2, §3.4 e os
+>   diagramas) descreve o ambiente **ANTIGO de São Paulo**. A residência definitiva é
+>   decisão em aberto (J10 de `../PLANO_J3_LGPD_E_REVOGACAO.md`); R-12 (região do
+>   bucket de mídia) precisa ser reverificado no projeto novo.
+> - **Marco bloqueante ultrapassado pelos fatos:** a §2.7 condiciona onboardar clínica
+>   ao fechamento de R-10/R-6, mas o tenant `varizemed` está **em produção com dado de
+>   saúde desde 2026-07-29** — J-3 deixou de ser gate pré-go-live e virou remediação
+>   viva (`../PLANO_J3_LGPD_E_REVOGACAO.md`, ainda **não implementado**).
+> - **R-6 (rules):** as rules por tenant já estão em prod — `firestore.rules` isola
+>   contato/conversa em `canSeeContactScoped` (atribuído a si ou pool sem dono, nunca
+>   por departamento). Continua aberto o recorte de `wa_messages`, cuja leitura segue
+>   ampla dentro do tenant (F4 do J-3, decisão J5).
+> - **R-13 (consentimento):** tenants com agente de IA ganharam gate LGPD com prova no
+>   contato (`lgpd_consent`, `lgpd_consent_at`, `lgpd_policy_version` — `lgpd_bot.py` /
+>   `bot_service.py`). A **revogação (D8) ainda não existe** no código.
+> - **R-7, R-8, R-9, R-10 seguem abertos**; R-11 segue pendência jurídica. Estado
+>   atual das decisões arquiteturais: ADRs 0007-0011 em `../decisions/`.
+
 ---
 
 ## 0. Sumário executivo

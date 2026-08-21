@@ -52,7 +52,7 @@ imagem com o `Dockerfile` da raiz:
 
 ```powershell
 # Backend compila
-.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py
+.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py
 
 # Simuladores do bot (mockados; exit 0 = ok)
 .venv\Scripts\python.exe tools\sim_bot_flow.py
@@ -179,15 +179,21 @@ gcloud run services update castro-crm --region $R --project $P --update-env-vars
 | `WHISPER_MODEL_SIZE` | mudar exige REBUILD da imagem (é `ARG` do Dockerfile); `FEATURE_AUDIO_TRANSCRIPTION=true` só é seguro com o modelo embutido |
 | Cloud Run B (`castro-superadmin`) | pipeline SEPARADO — nunca `--source` lá; ver [../DEPLOY_CLOUDRUN_B.md](../DEPLOY_CLOUDRUN_B.md) |
 | Desligar Modo Recepção | NÃO precisa de deploy: `PUT pool_mode=legacy` em `system_settings/chat` (ADR 0010) |
+| Trocar environment da Val (CX) | NÃO precisa de deploy: `scripts/set_cx_environment.py` + [TROCAR_ENVIRONMENT_VAL.md](TROCAR_ENVIRONMENT_VAL.md) |
 | Scaling/env/secrets | não mexer no deploy; pra consultar valores vivos: `gcloud run services describe castro-crm --region $R --project $P` |
 
 ---
 
-## 11. Estado de referência (2026-08-06)
+## 11. Estado de referência (atualizado 2026-08-21)
 
 - URL prod: `https://castro-crm-jdznvidcxq-uw.a.run.app`
-- 100% do tráfego em `castro-crm-00074-zrt` (Modo Recepção, promovida 2026-08-05);
-  tag `staging` apontando pra mesma revisão.
+- 100% do tráfego em `castro-crm-00088-tc9` (2026-08-21).
+- A tag `staging` continua em `castro-crm-00074-zrt` (2026-08-05): **tag e
+  tráfego NÃO andam juntos** — a tag só serve pro canário do passo 5; quem
+  serve o cliente é o que aparecer em `status.traffic` (passo 6).
+- ⚠️ `castro-crm-00086-fwt` e `castro-crm-00085-vcr` aparecem no histórico
+  recente como **rollbacks** — não confunda com "a revisão nova" ao escolher
+  o alvo dos passos 6/8.
 - [RUNBOOK_CUTOVER_PROD.md](RUNBOOK_CUTOVER_PROD.md) é STALE (cita SP /
   `southamerica-east1`) — serve só como referência de bootstrap de infra
   (IAM/bucket/secrets).

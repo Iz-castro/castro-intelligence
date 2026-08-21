@@ -1,6 +1,33 @@
 # Plano: modelos de CRM por vertical + gating real por plano
 
-**Status:** PROPOSTA (PO descreveu o produto em 2026-07-30; nada implementado).
+> **Status em 2026-08-21 — o que JÁ ESTÁ EM PRODUÇÃO (por outra porta, não por este plano):**
+> - **`pool_mode` (Modo Recepção, [ADR 0010](decisions/0010-pool-mode-recepcao.md))** —
+>   eixo ortogonal ao `crm_model`; `reception` ativo na varizemed real desde
+>   2026-08-06 e no `varizemed-test`. Hubloc segue `legacy`.
+> - **Item 6 — `release_lead_to_bot`**: fechamento (manual E cron) devolve o lead ao
+>   agente de IA preservando `sale_owner`/setor/protocolo/temperatura/prova LGPD —
+>   `database_firestore.py`, commit `095661d` (2026-08-05). **Gateado por
+>   `is_reception_mode()`**, não por `crm_model`.
+> - **Item 9 — hidratação da prova LGPD pelo CONTATO** em `_process_cx_message`
+>   (com guard `lgpd_revoked`), mesmo canário de 2026-08-05.
+> - **"Devolver à recepção"** (`return_contact_to_pool`) — devolve à pool SEM
+>   encerrar; nasceu no ADR 0010, não estava neste plano.
+> - **Horário comercial por tenant, FASE 1** (`business_hours.py`: params CX pra Val +
+>   aviso do builtin), commit `5854c2c`, 2026-08-10 — **fase 2 (UI/feriados) pendente**.
+>
+> **O que deste plano continua NÃO implementado:** a Fase 1 inteira
+> (`settings.crm_model`, `CRM_MODEL_OPTIONS`, `crm_model_from_doc`, `crm_model` no
+> `/api/session`, `scripts/set_tenant_crm_model.py`) — `crm_model` só aparece hoje
+> num comentário de `superadmin_main.py`; `FEATURE_CLINIC_RETURN_TO_BOT` /
+> `_clinic_return_active`; item 10 (reroute de convertido gateado por modelo);
+> itens 11-12 (parcialmente cobertos pelo gate de envio do reception, que já chama
+> `mark_human_active`); item 14 (`scripts/rollback_clinic_return.py`); **Fase 3**
+> (UI por modelo) e **Fase 4** (gating real por plano — nenhum runtime gateia por
+> plano até hoje).
+> ⚠ As âncoras de linha citadas adiante estão defasadas (o ADR 0010 reescreveu a
+> região de `revert_lead_to_sale_owner`/`close_stale_attendances`) — confira no código.
+
+**Status:** PROPOSTA de 2026-07-30, **parcialmente superada pela execução** — ver banner acima.
 **Dono:** PO (Rafael) · **Execução:** CRM.
 
 ## O produto que o PO descreveu
@@ -45,6 +72,8 @@ Dois eixos INDEPENDENTES por tenant:
   `close_stale_attendances` mantêm `bot_completed=True` e revertem o dono pro
   `sale_owner`; o gate do bot no webhook exige contato sem dono E sem
   `bot_completed`. Ou seja, hoje NENHUM tenant tem o comportamento "clínica".
+  (⚠ Superado em 2026-08-05: com `pool_mode=reception` o fechamento chama
+  `release_lead_to_bot` e o lead volta pro agente de IA — ADR 0010 / banner acima.)
 
 ## Execução proposta (fases pequenas, cada uma deployável)
 

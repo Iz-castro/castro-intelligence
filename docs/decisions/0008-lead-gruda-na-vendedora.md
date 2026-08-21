@@ -1,5 +1,22 @@
 # ADR 0008 — Lead "gruda" na vendedora (dona de origem + revert no fechamento)
 
+> **Status em 2026-08-21:** vigente e inalterado nos tenants em `pool_mode=legacy`
+> (Hubloc). **Supersedido POR TENANT** onde o Modo Recepcao esta ligado
+> (`pool_mode=reception`, [ADR 0010](0010-pool-mode-recepcao.md), em producao):
+> la o "assumir pra falar" cai (operador comum responde orfa standard sem assumir)
+> e o revert do fechamento e invertido — `revert_lead_to_sale_owner` retorna `None`
+> em reception e o fechamento devolve o lead ao **agente de IA**
+> (`release_lead_to_bot`, commit `095661d`, 2026-08-05), preservando
+> `sale_owner_*`/setor/protocolo. O `sale_owner` continua gravado (fica inerte
+> enquanto o tenant estiver em reception).
+> **Numeros desatualizados no texto abaixo:** `ATTENDANCE_AUTOCLOSE_HOURS=6` nao
+> vale mais — o default do codigo hoje e **24** ([config.py](../../config.py)) e a
+> emenda de 2026-08-09 do ADR 0010 registra **20** em prod; confira o env do Cloud
+> Run antes de citar numero. As revisoes `castro-crm-00146`/`00148` da secao
+> Implementacao sao do projeto ANTIGO de Sao Paulo — prod migrou para o Oregon
+> (`project-4a851bf9-f475-418c-800` / `us-west1`) em 2026-06 e a numeracao
+> recomecou.
+
 - **Status:** Accepted (implementado e validado em producao 2026-06-05)
 - **Data:** 2026-06-05
 - **Autores:** Rafa (regra de negocio) + Claude (mapeamento do codigo + implementacao)

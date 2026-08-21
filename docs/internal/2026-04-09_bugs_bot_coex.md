@@ -1,5 +1,12 @@
 # 09/04/2026 - Bug Fixes + Bot + Coexistence
 
+> Atualizacao 2026-08-21: (1) o filtro de visibilidade por "mesmo departamento" foi
+> REVERTIDO — operador comum ve so proprios + pool sem dono, NUNCA por `department_id`
+> (CLAUDE.md > Invariantes); (2) a liberacao do Embedded Signup/coexistence para todos
+> os operadores foi revertida em 12/04/2026, voltando a admin/supervisor (ver
+> `2026-04-12.md` §3); (3) o MENU de setores do bot builtin foi removido em
+> 2026-07-24 (o estado legado `ask_sector` segue honrado no codigo).
+
 ## Bug Fixes
 
 ### 1. Race condition no assume counter (CORRIGIDO)

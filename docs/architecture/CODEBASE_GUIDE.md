@@ -2,6 +2,15 @@
 
 Guia rapido para entender o repositorio sem depender de arquivos locais de contexto.
 
+> **Status em 2026-08-21:** as "Verdades do runtime" abaixo seguem valendo, mas o
+> guia e anterior a varias frentes que hoje estao EM PROD: multi-tenant real
+> (tenants `hubloc`, `varizemed`, `varizemed-test`), RBAC dinamico por tenant
+> (`rbac.py`), agente de IA (builtin `bot_service.py` + Dialogflow CX
+> `bot_engine_dialogflow.py`), gate LGPD (`lgpd_bot.py`), horario comercial por
+> tenant (`business_hours.py`), Modo Recepcao (ADR 0010) e `unread_count` do
+> contato derivado das threads (ADR 0011). O mapa de modulos autoritativo hoje
+> esta no [CLAUDE.md](../../CLAUDE.md) e as decisoes em `docs/decisions/`.
+
 ## Verdades do runtime
 
 Assuma estas premissas ao ler ou alterar o sistema:
@@ -38,6 +47,12 @@ Assuma estas premissas ao ler ou alterar o sistema:
 - `channel_service.py`: registry de canais WhatsApp (lookup por id/phone_id; cache so-ativos), `create_channel` / `update_channel` / `rebind_channel` (Fase 1) e `deactivate_channel`
 - `pending_events.py`: fila `pending_webhook_events` (zero perda de webhook da Meta quando canal nao indexado ou exception no processamento)
 - `pii_redaction.py`: utilitarios `redact_phone` / `redact_name` para logs (LGPD)
+- `rbac.py`: RBAC dinamico por tenant (perfis de acesso + toggles por chave)
+- `bot_service.py`: bot builtin + dispatcher builtin/CX; `bot_engine_dialogflow.py`: conector do Dialogflow CX
+- `lgpd_bot.py`: gate de consentimento LGPD antes do atendimento humano
+- `business_hours.py`: horario comercial por tenant (aviso do builtin + params pro CX)
+- `lead_temperature.py`: classificacao quente/morno/frio a partir dos params de sessao do CX (modulo puro)
+- `super_admin.py` / `superadmin_main.py`: painel super-admin, servico Cloud Run B separado (ver `docs/DEPLOY_CLOUDRUN_B.md`)
 - `bootstrap_data.py`: departamentos padrao
 - `init_db.py`: bootstrap do Firestore e provisionamento inicial do admin
 - `seed_gchat.py`: seed manual de Google Chat para teste
@@ -128,6 +143,9 @@ Ponto de atencao:
 
 - `python -m py_compile` nos modulos principais do backend
 - `npm run build` em `frontend/`
+- simuladores mockados do bot (exit 0/1): `tools/sim_bot_flow.py`,
+  `tools/sim_cx_flow.py`, `tools/sim_reception_flow.py`
+  (⚠️ `tools/cx_smoke.py` NAO e mockado — bate no agente Dialogflow CX real)
 
 Observacao:
 

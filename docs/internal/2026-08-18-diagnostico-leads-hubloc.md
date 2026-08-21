@@ -1,5 +1,10 @@
 # Diagnóstico — "não está chegando lead no bot" (Hubloc)
 
+> **Atualização 2026-08-21:** relatório de um dia — a revisão citada na seção 2
+> (`castro-crm-00081-swz`) era a que servia em 18/08; hoje serve `castro-crm-00088-tc9`. As duas
+> pendências da seção 6 (nome de exibição do canal 4 `DECLINED`; canal 1 de coexistência
+> inacessível pelo Graph) continuam **abertas**.
+
 **Data:** 18/08/2026, 09h–10h (BRT) · **Pedido por:** Rafael · **Executado por:** Claude (Castro Intelligence)
 **Escopo:** descartar falha do CRM/bot antes de atribuir a queda ao marketing. Toda a verificação foi **somente leitura** em produção (Cloud Run `castro-crm`, projeto Oregon, Firestore `castro_crm`), exceto o item 7 (limpeza de dois números de teste, a pedido).
 

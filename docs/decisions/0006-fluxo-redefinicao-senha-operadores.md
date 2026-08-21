@@ -1,14 +1,27 @@
 # ADR 0006 — Fluxo de redefinicao de senha para operadores
 
-- **Status:** Proposed (aguardando priorizacao)
+- **Status:** Proposed (aguardando priorizacao) — **Solucao A implementada em
+  2026-07-29**; Solucao B segue pendente (ver banner)
 - **Data:** 2026-06-03
 - **Autores:** Rafa + Claude (ancoragem no codigo e na estrutura real do Firestore)
 - **Relacionado:** Firebase Admin SDK em
   [firebase_admin_client.py](../../firebase_admin_client.py); endpoints admin
   `/api/admin/users` em [main.py:677](../../main.py#L677); colecao `users` via
   [firestore_common.py:94](../../firestore_common.py#L94); login no frontend em
-  [CrmContext.tsx:1315](../../frontend/src/CrmContext.tsx#L1315) e
+  [context/CrmContext.tsx](../../frontend/src/context/CrmContext.tsx) e
   `LoginScreen` em [App.tsx:67](../../frontend/src/App.tsx#L67).
+
+> **Status em 2026-08-21:** a **Solucao A (self-service) esta entregue** — commit
+> `9bbf51f` (2026-07-29) adicionou o botao "Esqueci minha senha" no `LoginScreen`
+> (`frontend/src/App.tsx`) chamando `resetPassword(email)` do `CrmContext`, que usa
+> `sendPasswordResetEmail` do Firebase Client SDK (sem backend, sem provedor de e-mail),
+> exatamente como proposto no item 4. **Nao foram feitos:** a Solucao B (endpoint
+> `POST /api/admin/users/{user_id}/password-reset` + wrapper
+> `generate_password_reset_link` no `firebase_admin_client.py` + acao na UI de equipe +
+> audit `USER_PASSWORD_RESET_SENT`), o **rate limiting** do self-service e o gate de
+> dominio antes do disparo (secao 8). ⚠ O arquivo do contexto do frontend mudou de lugar
+> desde esta ADR: hoje e `frontend/src/context/CrmContext.tsx` — as ancoras
+> `CrmContext.tsx:1315`, `App.tsx:67`, `main.py:677` e demais citadas no corpo nao valem mais (reancorar antes de usar).
 
 ## 1. O problema
 

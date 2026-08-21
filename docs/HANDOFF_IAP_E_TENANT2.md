@@ -21,6 +21,18 @@
 > Falta **decidir IAP+LB vs. Cloudflare Access** e ter acesso à conta Cloudflare na
 > hora de executar.
 
+> **Status em 2026-08-21:** a decisão de borda **continua em aberto e nada foi montado**
+> (sem Compute API/LB, sem Cloudflare Access) — o painel B segue internet-facing, com a
+> auth do app (`require_super_admin` + MFA) como única camada. Dois avisos pra quem
+> retomar: (1) os **números de revisão da Seção 1 são de 2026-07-23 e não valem mais** —
+> o tráfego do `castro-crm` é PINADO por revisão e a numeração é bagunçada pelo fluxo
+> staging+promote, então descubra a revisão viva com
+> `gcloud run revisions list --sort-by "~metadata.creationTimestamp"`, nunca pelo texto
+> do deploy; (2) a **Varizemed real já está em produção com dado de paciente desde
+> 2026-07-29** (Modo Recepção / ADR 0010 desde 06/08), então o **J-3 deixou de ser gate
+> pré-go-live e virou remediação viva** — plano e status em
+> `docs/PLANO_J3_LGPD_E_REVOGACAO.md`.
+
 ---
 
 ## 0. Mudança de contexto desde 2026-07-12 (LEIA ISTO)
@@ -48,6 +60,9 @@ mudou — o produto evoluiu por outro caminho:
   gate — J-3 hardening LGPD** (cripto de campo sensível, audit de leitura, TTL/
   retenção, DPA; clínica = dado de saúde), que é **separado** do IAP. Ver
   `docs/PLANO_LEAD_TEMPERATURE.md` e `docs/PLANO_TENANT_TESTE_VARIZEMED_CX.md` (J-3).
+  **Atualização 2026-08-21:** o go-live aconteceu em 29/07 **antes** do J-3 — o plano
+  consolidado (e o status vivo) estão em `docs/PLANO_J3_LGPD_E_REVOGACAO.md`, que já
+  trata o J-3 como remediação, não como gate.
 
 ---
 
@@ -131,13 +146,15 @@ projeto ANTIGO (SP) — passar `--project` explícito sempre
 (ver `project_oregon_prod_cutover`).
 
 **Cloud Run A (CRM operacional):** serviço `castro-crm` · URL
-`https://castro-crm-jdznvidcxq-uw.a.run.app` · **rev atual `castro-crm-00096-ray`**
+`https://castro-crm-jdznvidcxq-uw.a.run.app` · **rev em 2026-07-23: `castro-crm-00096-ray`**
+(⚠ número histórico; a numeração de revisões não é cronológica — ver banner)
 (saltou de 00047 em 12/07 — CX bot engine, recuperação do incidente de colisão de
 canal, fix channels-global, dieta de reads, temperatura do lead, branding topbar).
 minScale=1. NÃO é alvo do IAP (é o app dos operadores, internet-facing por design).
 
 **Cloud Run B (painel super-admin) — ALVO DO IAP:** serviço `castro-superadmin` ·
-URL `https://castro-superadmin-jdznvidcxq-uw.a.run.app` · **rev `castro-superadmin-00003-lsw`**.
+URL `https://castro-superadmin-jdznvidcxq-uw.a.run.app` · **rev `castro-superadmin-00003-lsw`**
+(desde 2026-07-31 o B está na rev `00004-c8d` — histórico em `docs/DEPLOY_CLOUDRUN_B.md` §9).
 Deploy: imagem `.../cloud-run-source-deploy/castro-superadmin:latest`, buildada por
 `cloudbuild-superadmin.yaml` + `Dockerfile.superadmin` (imagem mínima). SA dedicada
 `castro-superadmin-sa@project-4a851bf9-f475-418c-800.iam.gserviceaccount.com`
@@ -222,8 +239,9 @@ no backend service. Passos (ajustar nomes):
 
 ## 4. Depois do IAP — criar tenant de CLIENTE REAL pelo painel B
 
-(Fluxo self-service do super-admin. Distinto do `varizemed-test`, que foi criado
-direto no banco por script.)
+(Fluxo self-service do super-admin. ⚠ **Correção 2026-07-30:** o `varizemed-test` NÃO
+foi criado direto no banco — o audit imutável prova que ele e o `varizemed` real saíram
+do painel B, como já registrado na Seção 0.)
 
 1. (Se ainda não) Izael enrolla o TOTP no painel B.
 2. No painel B: criar o tenant com dados reais (slug, nome, CNPJ, plano, email do

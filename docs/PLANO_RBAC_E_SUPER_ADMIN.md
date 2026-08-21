@@ -13,6 +13,16 @@
 > PLANO_LEAD_ATENDIMENTO_E_REGRAS (regras de Lead/Atendimento continuam
 > válidas; modos supervisor continuam funcionando e vão migrar pra
 > toggles RBAC quando este plano rodar).
+>
+> **Status em 2026-08-21:** o **RBAC dinâmico (§3) está EM PROD desde 2026-07-06**
+> (rev `castro-crm-00045-xim`) — o catálogo real vive em `rbac.py`, ver §3.4.1. A
+> **Fase A / Sprint 0 (§6)** saiu em 2026-07-07 e o **Cloud Run B (§4) está em prod
+> desde 2026-07-11/12** (`castro-superadmin`; MFA-na-sessão + audit + kill-switch por
+> script) — operação em `docs/PLANO_OPERACAO_CLOUDRUN_B.md`, build/deploy em
+> `docs/DEPLOY_CLOUDRUN_B.md`, bootstrap em `docs/RUNBOOK_SUPER_ADMIN_BOOTSTRAP.md`.
+> **NÃO implementados** (seguem como plano): impersonate read-only (§5), sessão-cookie
+> de 15min (§4.7), domínio próprio, sink BigQuery (§4.6) e a Fase 5 do §3.8 (remover o
+> fallback de role).
 
 ---
 
@@ -31,6 +41,9 @@
 | 2026-07-04 | §10.1 resolvida: catálogo de toggles é FIXO da plataforma; admin escolhe perfis/valores | aprovado |
 | 2026-07-04 | Catálogo enxuto: só toggles com enforcement real no código (ver §3.4.1) | aprovado |
 | 2026-07-04 | **M-B2 IMPLEMENTADO** (fases 1–4 do §3.8 de uma vez, dual-check ativo; fase 5 pendente). Código: `rbac.py` + migração `main.py`/`App.tsx`/`CrmContext.tsx` + rules `perfis_acesso` + UI master-detail. Pendente: staging → prod. | implementado |
+| 2026-07-06 | **M-B2 EM PROD** — rev `castro-crm-00045-xim`, rules ruleset `21cf3d0c`; lock do perfil de sistema endurecido pós-canário (§3.4.1) | em prod |
+| 2026-07-07 | **Sprint 0 (§6) FEITO** — `super_admin.py`, `scripts/grant_super_admin.py`, `isSuperAdmin()` + rules root (ruleset `cb1bd995`), runbook de bootstrap | em prod |
+| 2026-07-11/12 | **Cloud Run B (§4) NO AR** — `castro-superadmin` (imagem/SA/auth separados) + hardening pós-revisão adversarial (25 achados, commit `a7cc82e`) | em prod |
 
 Decisões em aberto listadas em §10.
 
@@ -449,8 +462,10 @@ Fases ordenadas. Cada uma é um deploy independente reversível:
    migrados, `require_permission` para de olhar `role`. `role` vira
    só rótulo de UI.
 
-Cada onda valida em staging antes de prod (gate atual:
-`gcloud run deploy castro-crm-staging ... && ... castro-crm ...`).
+Cada onda valida em staging antes de prod. **Correção 2026-08-21:** não existe serviço
+`castro-crm-staging` na infra atual — staging é uma **revisão tagged** (`--tag staging
+--no-traffic`) do próprio `castro-crm`, e prod vem depois, promovendo a revisão por NOME
+com `update-traffic` (ver CLAUDE.md, seção Deploy).
 
 ### 3.9. Audit de mudanças de perfil
 
@@ -577,6 +592,12 @@ operações). Custo zero — são só 2 docs.
 
 #### Procedimento de bootstrap (manual, executado 1x)
 
+> **Executado de fato em 07/2026 por um caminho um pouco diferente:** seed via
+> `scripts/grant_super_admin.py --seed` (com `mfa_enrolled=false`, claim ainda NÃO
+> concedido) → upgrade do projeto pra Identity Platform + TOTP habilitado → enrollment
+> do TOTP no próprio painel B → `--grant`. O passo a passo vivo é
+> `docs/RUNBOOK_SUPER_ADMIN_BOOTSTRAP.md`.
+
 Como o Cloud Run B ainda não existe na hora do bootstrap, todo passo é
 **manual via gcloud/Firebase Console**:
 
@@ -640,7 +661,7 @@ quando o login envolve segundo fator.
 **Setup BigQuery export (1x, post-Sprint 0):**
 
 ```
-1. Criar dataset BQ "audit_imutavel" região southamerica-east1
+1. Criar dataset BQ "audit_imutavel" região us-west1 (prod é Oregon desde 06/2026)
 2. Configurar log sink: logName=projects/.../logs/super_admin_audit
    → dataset BQ
 3. No log_system_audit() do backend, emitir também via
@@ -1023,7 +1044,7 @@ atenção LGPD além do que CLAUDE.md §2 já cobre:
 
 | # | Decisão | Notas |
 |---|---|---|
-| 1 | Catálogo de toggles é editável pelo admin do tenant ou fixo da plataforma? | Recomendação: fixo da plataforma (toggles são contrato com o código). Admin escolhe **quais perfis e quais valores**, não inventa toggle novo. Confirmar antes de Sprint 1. |
+| 1 | Catálogo de toggles é editável pelo admin do tenant ou fixo da plataforma? | Recomendação: fixo da plataforma (toggles são contrato com o código). Admin escolhe **quais perfis e quais valores**, não inventa toggle novo. **RESOLVIDA 2026-07-04: fixo da plataforma** (§0 e §3.4.1). |
 | 2 | BigQuery sink ativa no Sprint 0 ou quando Cloud Run B nascer? | Recomendação: quando B nascer. Sprint 0 só Firestore. |
 | 3 | Cookie de sessão Cloud Run B auto-renova com motivo ou força re-MFA total a cada 15min? | Recomendação: re-MFA total (mais seguro; pouca fricção pra 2-3 humanos). |
 | 4 | Endpoint LGPD "histórico de impersonate na minha conta" — Cloud Run A ou B? | Recomendação: A (operador acessa). B só **escreve**; A faz query do `audit_logs_system` filtrado pelo `target_uid == self`. |

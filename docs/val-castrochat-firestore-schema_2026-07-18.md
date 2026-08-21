@@ -4,6 +4,23 @@
 Dados disponíveis hoje no Firestore para qualificação de leads (quente / morno / frio) no Castro Chat
 Belo Horizonte, MG — 18 de julho de 2026 · v01
 
+> **Status em 2026-08-21:** a **seção 4** (`session_parameters` / `RELEVANT_KEYS`)
+> continua sendo fonte VIVA — `lead_temperature.py` usa exatamente esses nomes como
+> sinais default e cita este documento. O resto descreve a arquitetura ANTERIOR da Val
+> (banco `val-4` + tools VarizemedRouter/VarizemedMemory): desde 2026-07-28/29 a
+> Varizemed roda como **tenant do próprio Castro CRM** (Dialogflow CX via
+> `bot_engine_dialogflow.py`), e a temperatura do lead é calculada **uma única vez, no
+> handoff**, sobre os params da sessão do DetectIntent
+> (`bot_service._finalize_cx_handoff`) e gravada em
+> `wa_contacts`/`wa_conversations.lead_temperature` — o backend do CRM **não lê** o banco
+> `val-4` (o código das tools da Val vive em `cx/valmr/`). A seção 6 vale como referência
+> de raciocínio, não como o desenho implementado (ver `docs/PLANO_LEAD_TEMPERATURE.md`).
+>
+> ⚠️ Desde 2026-07-29 o agente pode devolver params **em struct** (`{chave: valor}`) em
+> vez de escalar — o conector desembrulha, mas snapshots antigos em `bot_states` podem
+> carregar o dict cru (ver `lead_temperature._truthy` e
+> `docs/CX_AGENTE_PENDENCIAS_DEV_IA.md`).
+
 ---
 
 ## 1. Resumo executivo

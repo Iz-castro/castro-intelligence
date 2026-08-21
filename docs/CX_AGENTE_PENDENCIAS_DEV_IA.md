@@ -14,6 +14,12 @@ desde 29/07, rodando o agente `5fa69ea1-bc68-445b-9d20-d72265aaaf36`
 > Rafael pra devolver o `varizemed-test` pro Draft, senão você edita sem ter
 > onde testar. A frente nova (aviso de horário comercial) está em
 > `docs/CX_HORARIO_COMERCIAL_DEV_IA.md` — é ela que te destrava agora.
+>
+> **Atualização 2026-08-21:** a produção do `varizemed` roda hoje o environment
+> `22390163-6bbc-47b5-a25a-e53eb3363d8f` (rótulo `val-5.0.3`, trocado 21/08
+> 15:50 BRT) — não mais o `75028a25-…`. Histórico completo das trocas em
+> `docs/deploy/TROCAR_ENVIRONMENT_VAL.md`. O `varizemed-test` deve estar de volta
+> no **Draft** (é onde você edita e testa). O item **1** segue sendo o único vivo.
 
 Três pendências, em ordem de importância. As duas primeiras vieram de conversa
 real de produção do dia 29/07 (mensagens de sistema gravadas no CRM).

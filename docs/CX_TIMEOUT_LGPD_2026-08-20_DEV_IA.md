@@ -3,6 +3,16 @@
 **Data:** 2026-08-20 · **Agente:** `5fa69ea1-bc68-445b-9d20-d72265aaaf36`
 (projeto `castro-ia`, `us-central1`) · **Tenant afetado:** `varizemed` (clínica real)
 
+> **Atualização 2026-08-21 (lado CRM e ambiente):** o §1 mudou — desde 20/08 o
+> read-timeout da **chamada principal** do DetectIntent **reenvia 1×** com o teto
+> inteiro, em vez de desistir no primeiro estouro (`CX_READ_TIMEOUT_RETRY`,
+> ligado por default; pior caso ~2min por turno). Os 60s de orçamento por
+> chamada continuam. Commit `3c05457`, em produção. E a produção trocou de
+> environment: hoje é `22390163-6bbc-47b5-a25a-e53eb3363d8f` (`val-5.0.3`,
+> 21/08 15:50 BRT), não mais o `05267e69-…` citado no §1 — histórico em
+> `docs/deploy/TROCAR_ENVIRONMENT_VAL.md`. O pedido dos §4/§6 (diagnóstico da
+> latência do turno e meta de latência) continua **de pé**.
+
 **Resumo em uma linha:** hoje 14:02 BRT um lead REAL aceitou a LGPD e a
 primeira pergunta dele **chegou ao agente** (log do próprio Dialogflow), mas o
 turno levou **78s até o primeiro sinal do tool `val-memory`** e morreu em

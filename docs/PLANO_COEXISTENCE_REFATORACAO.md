@@ -1,5 +1,25 @@
 # Plano: Embed Signup Coexistence + Multi-Tenant + Sub-Threads por Canal
 
+> **Status em 2026-08-21:** a **Fase 2 foi executada e está em produção** — 3
+> tenants ativos (`hubloc`, `varizemed`, `varizemed-test`) desde 28/07/2026,
+> tenant context resolvido pelo claim do JWT, `wa_conversations` por
+> canal+wa_id (`{channel_id}__{wa_id}`), `phone_routing` global e o bloco 2.10
+> no backend (`GET /api/wa/channel/{id}/billing-status`,
+> `tenants/{tid}/health_status/current`, `audit_metrics/usage_{YYYY_MM}`).
+> Três pontos deste plano que **não** valem mais como escrito:
+> **(1)** `channels` NÃO vive em `tenants/{id}/channels` — ficou **flat/global**
+> (`_GLOBAL_COLLECTIONS`, ADR 0007); mexer nisso quebra a resolução de canal do
+> webhook. **(2)** O **wipe do Firestore** (pré-condição da Fase 2 e passo 4 da
+> Fase 4) está **SUPERADO**: a prod tem dados reais de 3 clientes desde o
+> cutover pro Oregon — `scripts/wipe_all_collections.py` não pode rodar lá.
+> **(3)** Deploy/prod: projeto `project-4a851bf9-f475-418c-800`, região
+> `us-west1`, `gcloud run deploy castro-crm --source <caminho absoluto> ...`
+> com **promoção de tráfego por NOME** (ver CLAUDE.md e
+> `docs/deploy/DEPLOY_CLOUDRUN_A.md`).
+> Seguem abertos: ADR 0007 Fase 2 / Método B (multi-empresa no canal standard),
+> a página `/setup` e o dashboard de uso da Fase 3.5 (o banner/alerta de billing
+> já existe no `App.tsx`).
+
 > Plano arquitetural unificado. Fase 1 (embed signup fixes) já foi entregue
 > em produção. As demais fases ficam pausadas até aprovação do App Review
 > da Meta. Quando o sinal verde chegar, tudo é executado num único refator

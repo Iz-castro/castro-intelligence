@@ -8,6 +8,14 @@
 > fase 2). Os dois parâmetros chegam em **toda** chamada `detectIntent` assim
 > que a revisão subir — o Rafael te confirma a hora. Seu lado (playbook) pode
 > ser feito em paralelo: parâmetro ausente numa condição CX é só "false".
+>
+> **Status (21/08):** a fase 1 está **em produção** desde 10/08 — os dois
+> parâmetros vão em **toda** chamada `detectIntent`. A fase 2 (tela de admin com
+> feriados) continua pendente. ⚠ A tabela de ambientes do §5 envelheceu: a
+> clínica real (`varizemed`) roda hoje o environment
+> `22390163-6bbc-47b5-a25a-e53eb3363d8f` (`val-5.0.3`, 21/08 15:50 BRT) e o
+> `varizemed-test` deve estar no **Draft** — histórico das trocas em
+> `docs/deploy/TROCAR_ENVIRONMENT_VAL.md`.
 
 Complementa o `docs/CX_AGENTE_PENDENCIAS_DEV_IA.md` (pendências de 30/07).
 

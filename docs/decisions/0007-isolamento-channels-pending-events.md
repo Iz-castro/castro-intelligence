@@ -1,5 +1,22 @@
 # ADR 0007 — Isolamento multi-tenant de `channels` e `pending_webhook_events`
 
+> **Status em 2026-08-21:** **Fase 1 FEITA** (commit `c6ba72f`, 2026-07-01): filtro
+> por tenant em `get_all_active_channels`/`get_channels_for_user`,
+> `_default_channel_id` virou `dict[tenant_id, channel_id]`
+> ([channel_service.py:53](../../channel_service.py#L53)) e `enqueue_pending_event`
+> passou a usar **auto-id do Firestore** ([pending_events.py:60-66](../../pending_events.py#L60))
+> — riscos 1, 2 e 3 fechados. Prod roda com **3 tenants** desde 2026-07-28.
+> **Fase 2 (migrar `channels` para `tenants/{tid}/channels`) NÃO foi feita e hoje
+> colide com um invariante:** `channels` e `pending_webhook_events` passaram a
+> integrar `_GLOBAL_COLLECTIONS` (commits `073e1d0` e `c233ed1`, 2026-07-16) —
+> tirar `channels` de lá foi a **causa raiz** da perda crônica de mensagens (refresh
+> sob contexto de tenant montava cache vazio → `no_channel` por ~60s). Reabrir a
+> Fase 2 exige desenho novo que preserve a resolução do webhook ANTES de o tenant
+> ser conhecido (⚠ decisão do PO). O item "auditar consumidores de `channel_id`
+> global" virou incidente real em 2026-07-16 (colisão de `channel_id` entre
+> tenants): o contador agora é `next_sequence("channels", tenant_id="")` — string
+> **vazia**, nunca `None`.
+
 - **Status:** Proposed (aguardando priorizacao — recomendado resolver antes do 2o tenant)
 - **Data:** 2026-06-03
 - **Autores:** Rafa + Claude (investigacao do codigo + travessia do Firestore de producao)
@@ -29,6 +46,8 @@ Nota de roteamento: nenhuma das duas esta em
 ([firestore_common.py:41](../../firestore_common.py#L41)) — elas ficam flat
 por **import explicito** de `_flat_collection`/`global_collection`, nao por
 serem marcadas como globais.
+(⚠ Estado de 2026-06-03. Desde 2026-07-16 **ambas estao** em
+`_GLOBAL_COLLECTIONS`, junto de `super_admins` e `audit_logs_system` — ver banner.)
 
 ## Veredito por colecao
 

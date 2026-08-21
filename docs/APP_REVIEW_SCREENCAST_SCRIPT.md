@@ -1,5 +1,17 @@
 # Roteiro do Screencast — App Review da Meta (2ª resubmissão)
 
+> **Status em 2026-08-21:** a URL e a região citadas neste roteiro são do
+> **projeto ANTIGO de São Paulo** (`southamerica-east1`) e induzem erro se
+> copiadas. A produção hoje é o projeto `project-4a851bf9-f475-418c-800` na
+> região **`us-west1` (Oregon)**. Antes de gravar: pegue a URL vigente com
+> `gcloud run services describe castro-crm --region us-west1 --project
+> project-4a851bf9-f475-418c-800` e substitua as duas ocorrências de
+> `castro-crm-286866630844.southamerica-east1.run.app` (§1.1 e slide da Seção 5),
+> além da menção a `southamerica-east1` no slide da Seção 0. O login de teste
+> (`teste1@centralloc.com.br`) também precisa ser reconferido no tenant `hubloc`
+> antes da gravação. ⚠ Não há registro aqui de que o re-screencast tenha sido
+> gravado/submetido — verificar com o PO.
+
 **Projeto:** Castro Intelligence CRM (Hubloc)
 **App ID:** 1434723791183375
 **Business ID:** 877897608035564 (Tech Provider verificado)

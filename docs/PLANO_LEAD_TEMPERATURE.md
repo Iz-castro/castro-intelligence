@@ -1,5 +1,21 @@
 # Plano — Temperatura do lead (motor CX / castro-ia) — v2 pós-revisão do PO
 
+> **Status em 2026-08-21: ENTREGUE E EM PRODUÇÃO.** Commit `b1d6348` (2026-07-21):
+> `lead_temperature.py`, bolinha na sidebar/header e handoff enriquecido; commit
+> `c58c4f9` (2026-07-22): segundo ponto de cálculo no assume do lead self-service
+> (`apply_cx_snapshot_on_assume`, hoje também em takeover, supervisor-takeover e
+> abertura pelo picker) — a regra "zero write por turno" segue intacta.
+> **Correção posterior obrigatória:** o agente CX passou a devolver parâmetros em
+> struct (`{chave: valor}`), o que sujava o resumo do operador e tornava o estado
+> QUENTE inalcançável — unwrap dos params em `c2d4f0e` (2026-07-31). A regressão
+> entrou sem aviso porque `settings.ai.environment_id` vazio faz a produção bater no
+> **DRAFT** do agente; desde 2026-08-16 existem script + runbook para fixar o
+> environment (`docs/deploy/TROCAR_ENVIRONMENT_VAL.md`, commit `80073b1`).
+> ℹ Revisão registrada na memória do agente: `castro-crm-00092-vib` (2026-07-21). A numeração do Cloud Run
+> fica fora de ordem pelo fluxo staging+promote (ver CLAUDE.md) — confira sempre por `creationTimestamp`.
+> Segue **pendente** o que o próprio plano deixou fora do v1 (override manual do
+> operador, temperatura no builtin, badge ao vivo durante o bot).
+
 > Passo 0 da execução: salvar este plano em `docs/PLANO_LEAD_TEMPERATURE.md`
 > e referenciá-lo no commit.
 

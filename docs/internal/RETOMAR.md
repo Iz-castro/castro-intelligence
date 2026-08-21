@@ -1,5 +1,33 @@
 # Contexto pra retomar — refactor Lead/Atendimento concluido (Fases 1-5A em prod)
 
+> **Status em 2026-08-21 — este arquivo e HISTORICO. Nao rode nada daqui.**
+> O "estado atual" logo abaixo e de **2026-06-03**, ANTES do cutover pra Oregon:
+> os comandos `gcloud` deste arquivo apontam pro projeto/regiao ANTIGOS de Sao Paulo
+> (`project-26fb9c99-8ee9-4179-aef` / `southamerica-east1`) e o quick start usa um
+> caminho de repo que nao existe mais (`c:\Projetos\Hubloc\castro-intelligence`).
+> Hoje: prod = **`project-4a851bf9-f475-418c-800` / `us-west1`**, repo em
+> `C:\Rafael\castro-intelligence`, deploy pelo runbook
+> [`docs/deploy/DEPLOY_CLOUDRUN_A.md`](../deploy/DEPLOY_CLOUDRUN_A.md) (trafego PINADO:
+> a revisao nova sobe a 0% e a promocao e manual, pelo NOME da revisao). Os numeros de
+> revisao citados abaixo (`00090`, `00124`, `00137`...) sao do projeto ANTIGO — nao
+> compare com os de hoje.
+>
+> **Onde cada frente esta** (mapa vivo em [`docs/PENDENCIAS_E_ROADMAP.md`](../PENDENCIAS_E_ROADMAP.md)):
+>
+> | Frente | Status em 2026-08-21 |
+> |---|---|
+> | Coexistence (Fases 1-4) | concluida, exceto itens da 3.5 (`/setup`, dashboard de uso) (`docs/PLANO_COEXISTENCE_REFATORACAO.md`) |
+> | Lead/Atendimento — Fases 1, 2a, 3, 4, 5A | em prod ([ADR 0003](../decisions/0003-refactor-lead-atendimento.md)) |
+> | Lead/Atendimento — Fases 2b, 5B, 5C | **pendentes** desde 05/2026 |
+> | Isolamento LGPD do operador | em prod; 4a camada (pos-assume) em 2026-08-20, commit `3aa9d05` |
+> | Round de rules estritas de `wa_messages` | **ainda pendente** — P3 dos follow-ups em [`2026-08-19-visibilidade-pos-assume.md`](2026-08-19-visibilidade-pos-assume.md) |
+> | Multi-tenant Fase 2 / RBAC / Cloud Run B | em prod (`docs/ROADMAP_MULTITENANT_FASE2.md`) |
+> | Tenant #2 Varizemed (motor CX, Val) | em prod desde 2026-07-28 |
+> | Modo Recepcao (pool compartilhada) | em prod desde 2026-08-05 — varizemed real desde 2026-08-06 ([ADR 0010](../decisions/0010-pool-mode-recepcao.md)) |
+> | Nao-lido derivado das threads / sons por caixa | em prod em 2026-08-21 ([ADR 0011](../decisions/0011-unread-derivado-das-threads-e-sons-por-caixa.md)) |
+> | Cron de health-check de billing em prod | ⚠ verificar (na epoca so existia em staging) |
+> | Re-screencast do App Review | ⚠ verificar (sem urgencia operacional na epoca) |
+
 > **Estado atual (2026-06-03).** Revisao prod ativa: **`castro-crm-00137-v7t`**.
 > Dia denso — detalhe completo em [2026-06-03.md](2026-06-03.md). Resumo:
 > - **Incidente Whisper resolvido:** `FEATURE_AUDIO_TRANSCRIPTION=true` baixava o

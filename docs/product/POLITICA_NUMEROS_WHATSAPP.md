@@ -4,6 +4,14 @@
 **Aplica-se a:** todos os clientes (tenants) do Castro Intelligence CRM
 **Tenant de referência atual:** Hubloc
 
+> **Status em 2026-08-21:** a regra geral abaixo continua valendo, mas o texto foi
+> escrito quando a Hubloc era o único cliente — hoje há **3 tenants ativos em prod**
+> (hubloc, varizemed e o interno varizemed-test), então leia "Hubloc" como "a empresa
+> dona da WABA". O procedimento de onboarding (passo 4) descreve só o Embedded Signup;
+> canal **standard** também pode ser criado pelo caminho manual (`POST
+> /api/admin/channels` + `scripts/register_phone.py`, que registra o número na Cloud
+> API com PIN 2FA e assina o app na WABA).
+
 ---
 
 ## Regra geral

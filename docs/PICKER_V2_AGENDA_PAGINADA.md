@@ -1,5 +1,23 @@
 # Picker v2 — agenda paginada com busca indexada
 
+> **Status em 2026-08-21: NÃO IMPLEMENTADO** (desenho segue válido). No código de
+> hoje não existem `sort_key`, `wa_id_reversed`, `name_tokens` nem o endpoint
+> `GET /api/wa/contacts/picker`; o `NewContactModal` continua chamando
+> `loadAllContacts(search)` → `ensureAllContactsLoaded()` → `GET /api/wa/contacts/all?limit=10000`
+> ([CrmContext.tsx](../frontend/src/context/CrmContext.tsx) ~2515), ou seja, o full
+> scan por sessão permanece.
+> ⚠ **O gate recomendado abaixo foi PERDIDO:** a Varizemed real entrou em produção
+> em 2026-07-28/29, então o full scan já roda no tenant novo — a premissa "entregar
+> antes do go-live" virou dívida, não bloqueio.
+> **Mudanças no picker desde o desenho (não substituem o v2):** filtro de
+> qualificação na sidebar e no picker + "carregar mais" na pool/bot (commit
+> `bb668f2`, 2026-08-17); `/api/wa/conversation/open` passou a exigir
+> `_require_contact_access` e **só auto-atribui thread de lead que já é do operador**
+> (emenda do ADR 0010, commit `3aa9d05`, 2026-08-19/20) — "picker não é assunção
+> disfarçada"; o contador da sidebar segue no `count_only=1` (aggregate) e não pode
+> regredir. O ADR 0011 (2026-08-21) já publicou índices compostos novos em
+> `wa_contacts` — a ordem de deploy "índice READY ANTES do código" da §3 vale igual.
+
 > **Status:** desenho aprovado pelo PO em 2026-07-18; implementação agendada.
 > **Motivação:** [docs/INVESTIGACAO_READS_FIRESTORE_2026-07.md](INVESTIGACAO_READS_FIRESTORE_2026-07.md)
 > (o Fix #1 — contador via aggregate count, commit `f8f2b03`, rev `00077-xer` —

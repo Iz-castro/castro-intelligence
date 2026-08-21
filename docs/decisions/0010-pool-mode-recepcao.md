@@ -1,5 +1,13 @@
 # ADR 0010 — Modo Recepção: pool compartilhada por tenant (`pool_mode`)
 
+> **Status em 2026-08-21:** vigente e EM PRODUÇÃO. `pool_mode=reception` está ativo
+> no tenant **varizemed real** desde 2026-08-06 (além do `varizemed-test`); Hubloc
+> segue `legacy`. Emendas posteriores ao texto original: handoff não atendido
+> (2026-08-09, nesta própria ADR), isolamento pós-assume (2026-08-19/20, commit
+> `3aa9d05` — já refletido na linha do `conversation/open` da tabela) e **ADR 0011
+> (2026-08-21)**, que resolve a limitação de unread deste v1 — ver as notas em
+> "Limitações aceitas no v1" e no achado 1 da revisão adversarial.
+
 - **Status:** aceito (2026-08-04) — **EM PRODUÇÃO desde 2026-08-05** (rev
   `castro-crm-00074-zrt` promovida a 100% após canário completo no
   `varizemed-test`; ajustes #1-#4 abaixo). Hubloc segue `legacy` (default);
@@ -83,6 +91,12 @@ dona de lead.
 - **Unread é global por thread:** o primeiro operador que abre zera o badge
   para o time inteiro. (Fix do gatilho de mark-read por CONVERSATION
   incluído; contador por operador fica pra depois se doer.)
+  **Atualização 2026-08-21 (ADR 0011):** `wa_contacts.unread_count` passou a ser
+  DERIVADO das threads (`recompute_wa_contact_unread` no read por thread +
+  backfill aplicado), o beep/alarme só considera Novos+Meus visíveis e há filtro
+  "Não lidas" — o badge do contato não fica mais preso quando só a thread é lida.
+  O contador **por operador** continua não existindo (unread segue global por
+  thread). Diário: `docs/internal/2026-08-21-diagnostico-alarme-sonoro.md`.
 - **Sem typing indicator:** risco de resposta dupla aceito (equipe de 3).
   RTDB não existe no projeto; v2 avaliará alternativa barata (campo na
   conversation via backend com debounce) antes de considerar RTDB.
@@ -96,7 +110,9 @@ Workflow de 15 agentes (3 dimensões + refutação por achado) sobre o diff:
 1. **Loop de mark-read (crítico, frontend):** o gatilho por `Math.max` com o
    unread do CONTATO (que nunca zera pelo caminho de thread) + dep nova
    re-disparava 1 POST/1,2s. Fix: com thread ativa o gatilho é o unread da
-   CONVERSATION; contato só no fallback sem thread.
+   CONVERSATION; contato só no fallback sem thread. (⚠ 2026-08-21: a premissa
+   "o unread do CONTATO nunca zera pelo caminho de thread" deixou de valer — o
+   ADR 0011 tornou `wa_contacts.unread_count` derivado das threads.)
 2. **Editor de perfis revogava `assumir_atendimento` em silêncio (major):**
    chave nova pós-seed ausente nos docs → draft `=== true` → 1º PUT persistia
    False (e `perfil_admin` travado ficava insalvável). Fix:

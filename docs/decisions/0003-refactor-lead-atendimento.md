@@ -4,6 +4,16 @@
 - **Status:** ✅ Implementado em prod (revisao `castro-crm-00124-298`)
 - **Relacionado:** [PLANO_LEAD_ATENDIMENTO_E_REGRAS.md](../PLANO_LEAD_ATENDIMENTO_E_REGRAS.md), [ADR 0001](0001-prevenir-coex-signup-duplicado.md), [ADR 0002](0002-lgpd-canal-coex-compartilhado.md), dailies [2026-05-27](../internal/2026-05-27.md) + [2026-05-28](../internal/2026-05-28.md)
 
+> **Status em 2026-08-21:** segue vigente, mas **emendado** por ADRs posteriores — leia
+> junto com: [ADR 0008](0008-lead-gruda-na-vendedora.md) (dona de origem + revert no
+> fechamento), [ADR 0009](0009-modelos-crm-d1-d3-retorno-ao-bot.md) e
+> [ADR 0010](0010-pool-mode-recepcao.md) (Modo Recepcao: em tenant
+> `pool_mode=reception` o fechamento do atendimento **devolve o lead ao agente de IA**
+> em vez de so encerrar, e ha "Devolver a recepcao"). ⚠ As revisoes `castro-crm-001xx`
+> da tabela no fim deste ADR sao do **projeto ANTIGO de Sao Paulo** — a prod migrou pro
+> projeto de Oregon (`us-west1`) no cutover de 2026-06-10 e a numeracao do servico
+> recomecou; nao procurar essas revisoes no ambiente atual.
+
 ## Contexto
 
 Conforme o produto avancou para coexistence multi-operador, sintomas reais

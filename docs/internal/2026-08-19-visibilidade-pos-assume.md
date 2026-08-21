@@ -1,5 +1,11 @@
 # Fix — operador B continua vendo a conversa depois que A assume (Hubloc)
 
+> **Atualização 2026-08-21:** o fix descrito aqui foi entregue no commit `3aa9d05` (20/08) — a
+> "seção final" de deploy citada abaixo não existe neste documento. Dos follow-ups P1–P10, só o
+> **P2 saiu em parte**: `POST /api/wa/conversation/{id}/read` ganhou autorização (thread minha /
+> pool / takeover meu, senão `_require_contact_access`) na Fase 1 do ADR 0011 (21/08); `/takeover`
+> e `/return` continuam sem o guard. P1 e P3–P10 seguem abertos.
+
 **Data:** 19/08/2026 · **Pedido por:** Rafael · **Executado por:** Claude (Castro Intelligence)
 **Relato do PO:** no hubloc, operador A abre uma conversa em "Novos Leads", operador B abre a
 mesma, A clica "Assumir atendimento" e **B continua vendo toda a conversa de A**. Esperado: fechar pra B.

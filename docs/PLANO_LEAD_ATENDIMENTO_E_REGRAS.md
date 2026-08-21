@@ -1,5 +1,23 @@
 # Plano: Lead × Atendimento × Mensagem + Regras de Negócio (híbrido WABA + Coexistence)
 
+> **Status em 2026-08-21 — o que deste plano já entrou:** **Fase 1 (re-login coex =
+> rebind por `phone_number_id`) FEITA** — `rebind_channel` +
+> `get_channel_by_phone_id_from_db` em `channel_service.py` (commit `0a13d62`,
+> 2026-05-27); Fases 2a, 3 e 4 concluídas e Fase 5A (protocolo diário) em produção,
+> como já marcado no §5. **Continuam pendentes:** Fase 2b (abas por atendimento),
+> §3.4 sticky routing com TTL, **5B** (tipificação obrigatória no fechamento), **5C**
+> (resumo por IA/Vertex — exige update de RoPA/RIPD) e o read-only do operador
+> antigo após takeover de supervisor.
+> **Contexto que mudou desde o desenho:** o CRM roda multi-tenant com 3 tenants em
+> produção e `channels` virou coleção **GLOBAL** (`_GLOBAL_COLLECTIONS`, ver
+> [ADR 0007](decisions/0007-isolamento-channels-pending-events.md)); o
+> [ADR 0008](decisions/0008-lead-gruda-na-vendedora.md) fixou "o lead gruda na
+> vendedora" e o [ADR 0010](decisions/0010-pool-mode-recepcao.md) (Modo Recepção)
+> **inverte isso por tenant** — na varizemed o fechamento devolve o lead ao agente
+> de IA em vez de reverter pro `sale_owner`. E o isolamento do operador comum é
+> **por dono + pool sem dono, NUNCA por departamento** — considerar isso antes de
+> implementar §3.8 (agenda por operador) e o Painel de Conflitos.
+
 > **Status:** rascunho de design/ação para executar em sessão futura.
 > **Origem:** análise de regras de negócio do Rafal (2026-05-27) + resposta do PO,
 > motivados por bugs reais de produção (mesmo `wa_id` em várias threads,
@@ -276,7 +294,9 @@ configurado".
   reabre em qualquer mensagem (inbound ou outbound); `close_stale_attendances`
   plugado no **cron `*/30` existente** (auto-close de atendimentos
   ATRIBUÍDOS ociosos > `ATTENDANCE_AUTOCLOSE_HOURS`, **6h em prod** — encaixa
-  no fechamento operacional 17h da Hubloc); endpoint
+  no fechamento operacional 17h da Hubloc; ⚠ número desatualizado: o default do
+  código hoje é **24** (`config.py`) e a emenda de 2026-08-09 do ADR 0010 registra
+  **20** em prod — o env é GLOBAL, vale pra todos os tenants); endpoint
   `POST /api/wa/conversation/{id}/set-attendance` p/ fechar/reabrir manual
   (zera takeover no fechar). UI: badge "fechado" na faixa + item
   "Fechar/Reabrir atendimento" no menu ⋮. **Pendente:** sticky routing TTL
@@ -290,8 +310,12 @@ configurado".
   configurável por tenant) e **5C** resumo IA Vertex em background (exige update
   RoPA/RIPD por LGPD).
 
-Cada fase: staging→prod no mesmo gate usado hoje
-(`gcloud run deploy castro-crm-staging … && … castro-crm …`), com health check.
+Cada fase: staging→prod, mas o gate MUDOU — **não existe serviço
+`castro-crm-staging`**: staging é uma **tag** do próprio `castro-crm` e o tráfego é
+**pinado por revisão**, então `gcloud run deploy` sobe a revisão nova a 0% e a
+promoção é **por NOME**
+(`gcloud run services update-traffic castro-crm --region us-west1 --project project-4a851bf9-f475-418c-800 --to-revisions <REV_NOVA>=100`),
+com health check. Runbook: [deploy/DEPLOY_CLOUDRUN_A.md](deploy/DEPLOY_CLOUDRUN_A.md).
 
 ---
 
@@ -318,8 +342,9 @@ Cada fase: staging→prod no mesmo gate usado hoje
    compartilhada do Lead? (impacto LGPD).
 4. **Sticky routing TTL:** N dias (sugestão 30)? Como detectar dono
    offline/férias (precisa de `last_seen`/flag de ausência)?
-5. **`attendance_status`:** novo campo no `wa_conversations`? Fechar zera takeover
-   também?
+5. ~~**`attendance_status`:** novo campo no `wa_conversations`? Fechar zera takeover
+   também?~~ **RESPONDIDA pela Fase 4 (em prod):** o campo existe em
+   `wa_conversations` e o fechamento zera o takeover (`clear_takeover`).
 6. **Tipificação:** catálogo fixo ou configurável por tenant? Onde editar?
 
 ---

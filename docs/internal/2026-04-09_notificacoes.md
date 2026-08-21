@@ -1,5 +1,11 @@
 # 09/04/2026 - Notificacoes Sonoras
 
+> Atualizacao 2026-08-21: este e o comportamento ORIGINAL do som. Hoje o beep/alarme
+> so toca sobre as caixas Novos+Meus visiveis (camada ao vivo, unread da THREAD) e
+> `wa_contacts.unread_count` passou a ser DERIVADO das threads — ver
+> `docs/decisions/0011-unread-derivado-das-threads-e-sons-por-caixa.md` e
+> `docs/internal/2026-08-21-diagnostico-alarme-sonoro.md`.
+
 ## Funcionalidades implementadas
 
 ### 1. Beep de nova mensagem (todos os usuarios)

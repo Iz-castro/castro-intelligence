@@ -1,5 +1,14 @@
 # Docs
 
+> **Status em 2026-08-21:** o mapa vivo das frentes (o que esta feito, o que esta em
+> prod e o que continua pendente) e [PENDENCIAS_E_ROADMAP.md](PENDENCIAS_E_ROADMAP.md).
+> Deploy de rotina do CRM = [deploy/DEPLOY_CLOUDRUN_A.md](deploy/DEPLOY_CLOUDRUN_A.md)
+> (prod = projeto `project-4a851bf9-f475-418c-800`, regiao `us-west1`; trafego PINADO
+> por revisao). Ultimo ADR: [0011](decisions/0011-unread-derivado-das-threads-e-sons-por-caixa.md);
+> diario mais recente: [internal/2026-08-21-diagnostico-alarme-sonoro.md](internal/2026-08-21-diagnostico-alarme-sonoro.md).
+> `internal/RETOMAR.md` e `internal/resumo.md` sao HISTORICO pre-cutover de Oregon —
+> nao rode os comandos `gcloud` de la (apontam pro projeto/regiao antigos de SP).
+
 Documentacao principal do projeto.
 
 ## Fonte de verdade
@@ -38,9 +47,11 @@ A leitura recomendada agora e:
 - [Produto](product/README.md)
 - [Politica de Numeros WhatsApp](product/POLITICA_NUMEROS_WHATSAPP.md)
 - [Deploy e Operacao](deploy/README.md)
-- [Runbook de Cutover Prod](deploy/RUNBOOK_CUTOVER_PROD.md)
+- [Runbook de deploy do Cloud Run A](deploy/DEPLOY_CLOUDRUN_A.md) — deploy de rotina do `castro-crm` (comece por aqui)
+- [Runbook de Cutover Prod](deploy/RUNBOOK_CUTOVER_PROD.md) — ⚠️ STALE (cita SP/`southamerica-east1`); so referencia historica
 
 ### Planos e refactors
+- [Pendencias e Roadmap](PENDENCIAS_E_ROADMAP.md) — estado por frente (revisado em 2026-08-21)
 - [Plano Coexistence — refactor](PLANO_COEXISTENCE_REFATORACAO.md) (Fases 1-4 concluidas)
 - [Plano Lead/Atendimento/Mensagem + regras coex hibrido](PLANO_LEAD_ATENDIMENTO_E_REGRAS.md) (Fases 1, 2a, 3, 4 e 5A em prod; 2b, 5B, 5C pendentes)
 

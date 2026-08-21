@@ -7,6 +7,23 @@
 > Retomar o workflow: `Workflow({scriptPath: <script salvo da sessão>, resumeFromRunId: "wf_0d37b47a-d8f"})`
 > — os 31 agentes concluídos voltam do cache instantaneamente.
 
+> **Status em 2026-08-21 — o que já foi aplicado:**
+>
+> - **Fix #1 (a causa raiz) FEITO** — commit `f8f2b03` (2026-07-18): a sidebar usa
+>   `GET /api/wa/contacts/all?count_only=1` (aggregate `count()`) e a agenda completa
+>   só carrega quando o picker `+` é aberto; `loadAllContacts` tem single-flight
+>   (`allContactsInflightRef`) contra o loop de retry citado no item 4.
+> - **Item 2 FEITO** — `refreshPollingViews` retorna cedo em `snapshotMode`
+>   (`frontend/src/context/CrmContext.tsx`, "dieta de reads 2026-07-20").
+> - **Item 3 PENDENTE** — `GET /api/admin/conflicts` ainda faz full-scan
+>   (`fs_coll("wa_conversations").stream()` + `get_all_wa_contacts()` em `main.py`) e
+>   o listener da caixa `backup` continua sem limite.
+> - ⚠️ Os números abaixo são de julho: a sidebar mudou de novo em 2026-08-21
+>   (ADR 0011 — `unread_count` derivado das threads, buscas `getDocs` além da janela
+>   e 2 índices novos). Ver `docs/internal/2026-08-21-diagnostico-alarme-sonoro.md`
+>   antes de reusar qualquer estimativa.
+> - O `resumeFromRunId` acima é de uma sessão de 17/07 — não conte com o cache.
+
 ## O problema
 
 Após os fixes do incidente de 16/07, os reads do Firestore continuavam altos:

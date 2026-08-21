@@ -1,5 +1,20 @@
 # Retomar — Integração CX Varizemed (estado em 2026-07-14)
 
+> **Status em 2026-08-21: SUPERADO — mantido como histórico.** Tudo o que estava
+> pendente aqui foi concluído: staging validado, código em prod, tenant
+> `varizemed-test` criado, tenant real `varizemed` criado e o número embedado —
+> o CX roda ponta a ponta em produção desde 29/07/2026, hoje com Modo Recepção
+> (ADR 0010). As revisões e o estado de ambientes citados abaixo são de 14/07.
+> ⚠ **Não copie o comando da seção "Depois do staging OK"**: `--source .`
+> (caminho relativo) é proibido — o deploy de rotina é
+> `gcloud run deploy castro-crm --source C:\Rafael\castro-intelligence --region
+> us-west1 --project project-4a851bf9-f475-418c-800 --quiet` (o `--source` puro
+> preserva env, secrets e scaling) e o **tráfego é pinado por revisão**, então a
+> revisão nova sobe a 0% e precisa ser promovida **por NOME**
+> (`update-traffic --to-revisions <REV_NOVA>=100`). Ver CLAUDE.md e
+> `docs/deploy/DEPLOY_CLOUDRUN_A.md`. Troca de versão da Val:
+> `docs/deploy/TROCAR_ENVIRONMENT_VAL.md`.
+
 > Doc de retomada. Autossuficiente com `docs/PLANO_TENANT_TESTE_VARIZEMED_CX.md`
 > (contrato completo das 2 trilhas). Sem valores de secret aqui.
 

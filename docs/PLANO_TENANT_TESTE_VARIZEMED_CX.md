@@ -1,5 +1,21 @@
 # Plano — Tenant de teste "Varizemed" + motor de IA Dialogflow CX por tenant
 
+> **Status em 2026-08-21:** plano **executado**. O `varizemed-test` e o tenant
+> real `varizemed` estão em produção (CX ponta a ponta desde 29/07/2026, hoje
+> com Modo Recepção — ADR 0010). Dois acertos de fato no corpo abaixo:
+> o handoff usa **`bot_key=sac`** (corrigido nas duas ocorrências — `atendimento`
+> NÃO é bot_key válido: `VALID_BOT_KEYS = {comercial, financeiro,
+> administrativo, sac}` em `database_firestore.py`), e a location do agente é
+> **`us-central1`** (vale a tabela do CONTRATO; o JSON de exemplo e a URL do
+> DetectIntent mais abaixo ainda dizem `global`).
+> ⚠ A "pegadinha do deploy" logo abaixo está desatualizada: `--source .`
+> (caminho relativo) é proibido — use caminho **absoluto** — e o tráfego é
+> **pinado por revisão**, então a revisão nova sobe a 0% e precisa ser promovida
+> **por NOME** (`update-traffic --to-revisions <REV>=100`). Ver CLAUDE.md e
+> `docs/deploy/DEPLOY_CLOUDRUN_A.md`. Troca de versão da Val:
+> `docs/deploy/TROCAR_ENVIRONMENT_VAL.md` (hoje environment
+> `22390163-6bbc-47b5-a25a-e53eb3363d8f`, `val-5.0.3`).
+
 > Data: 2026-07-13 · Aprovado pelo PO. Organização: **2 trilhas paralelas**
 > (Dev IA e Dev CRM) com contrato compartilhado. Este doc é a fonte única do
 > contrato entre as trilhas — mudou algo aqui, avisa o outro dev.
@@ -64,7 +80,7 @@ pelo agente CX via novo motor de bot por tenant. O banco do agente fica em
   "agent_id": "<AGENT_ID do restore>",
   "environment_id": "",
   "language_code": "pt-br",
-  "handoff_bot_key": "atendimento",
+  "handoff_bot_key": "sac",
   "lgpd_notice": "<aviso LGPD da clinica>",
   "lgpd_privacy_url": "https://...",
   "lgpd_policy_version": "varizemed-test-2026-07",
@@ -243,7 +259,7 @@ com os patches de log/CORS commitados. `docs/valmr/` vira artefato histórico.
 ## FASE CONJUNTA (após SYNC-1)
 
 1. Tenant `varizemed-test` (plano `ai_custom`) via painel super-admin.
-2. Setor "Recepção" com `bot_key=atendimento`.
+2. Setor "Recepção" com `bot_key=sac`.
 3. `scripts/set_tenant_ai.py` grava `settings.ai`; ligar `bot_enabled` do tenant.
 4. **Gate staging**: canal fake + webhook simulado → DetectIntent real → resposta
    da Val gravada (envio Meta falha por token fake — esperado).

@@ -4,6 +4,10 @@
 > roda no Oregon desde 2026-06. Mantido como registro. Para deploy de rotina ver
 > [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md). Os itens jurídicos/LGPD abaixo
 > têm status próprio — conferir antes de assumir que seguem pendentes.
+>
+> ⚠️ **Status em 2026-08-21:** todo item que cita `deploy.ps1`/`deploy.sh` ou
+> flags de scaling no deploy está **SUPERADO** (Fases 8 e 9) — os scripts foram
+> removidos do repo em 2026-08-06 e o deploy de rotina é `--source` puro.
 
 > **Decisão:** mover o projeto da conta pessoal `rafaluisc@outlook.com`
 > (projeto `project-26fb9c99-8ee9-4179-aef`, região `southamerica-east1`)
@@ -161,8 +165,10 @@ projeto (Fase 3). `INTERNAL_CRON_SECRET` não é necessário (prod usa OIDC).
       `BOOTSTRAP_ADMIN_EMAIL`, `CORS_ORIGINS` (nova URL),
       `CRON_OIDC_AUDIENCE` (nova URL), `CRON_OIDC_SERVICE_ACCOUNT` (novo SA),
       `GOOGLE_CHAT_PROJECT_NUMBER` (novo).
-- [ ] Atualizar **região default** em `deploy.sh` / `deploy.ps1`
-      (`southamerica-east1` → `us-west1`).
+- [x] ~~Atualizar **região default** em `deploy.sh` / `deploy.ps1`~~ —
+      **SUPERADO (2026-08-06):** os dois scripts foram **REMOVIDOS do repo**
+      (clobberavam env/secrets/scaling de prod). Deploy hoje = `gcloud run deploy
+      --source <caminho absoluto>` puro → [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md).
 - [ ] Atualizar scripts e2e/diag com nova URL/project
       (`scripts/e2e_test_staging.py`, `check_whatsapp_coexistence.py`).
 
@@ -178,6 +184,10 @@ projeto (Fase 3). `INTERNAL_CRON_SECRET` não é necessário (prod usa OIDC).
       instance" na abertura do CRM. Prod live = **2Gi / cpu 2 / max 5 / conc 8 /
       cpu-boost / 300s**. Corrigido na rev `00004-9w5`. Deploy futuro DEVE incluir
       `--memory=2Gi --cpu=2 --concurrency=8 --min-instances=1 --max-instances=5 --cpu-boost`.
+      ⚠️ **SUPERADO (2026-08-06) só a última frase:** deploy de ROTINA não leva
+      flag nenhuma de scaling/env/secret — `--source` puro **preserva** a config
+      da revisão anterior, e repassar as flags é justamente o que clobbera prod.
+      As flags acima valem apenas pra **bootstrap de um serviço novo**.
 - [x] **URL nova:** `https://castro-crm-28179318848.us-west1.run.app`
 - [x] Health-check OK: `GET /` 200, `GET /api/client-config` 200 (env e
       firebase_web_config do projeto novo carregados, prefixo castro_crm).
@@ -259,10 +269,13 @@ projeto (Fase 3). `INTERNAL_CRON_SECRET` não é necessário (prod usa OIDC).
 
 ## 📝 Fase 17 — Docs & housekeeping
 
-- [ ] Atualizar [CLAUDE.md](../../CLAUDE.md) (região, project), runbooks,
-      `.env.example`, scripts.
+- [x] Atualizar [CLAUDE.md](../../CLAUDE.md) (região, project) e runbooks —
+      **FEITO**; o runbook de deploy vigente é
+      [DEPLOY_CLOUDRUN_A.md](DEPLOY_CLOUDRUN_A.md) (2026-08-06).
+      ⚠ `.env.example` / scripts: verificar caso a caso.
 - [ ] Reescrever/atualizar [RUNBOOK_CUTOVER_PROD.md](RUNBOOK_CUTOVER_PROD.md)
-      com novo project/região.
+      com novo project/região — **não reescrito**; recebeu banner **STALE** em
+      2026-08-06 e no dia a dia foi substituído por DEPLOY_CLOUDRUN_A.md.
 - [ ] Diário de migração em `docs/internal/`.
 
 ---

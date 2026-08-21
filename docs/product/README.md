@@ -1,5 +1,18 @@
 # Product Docs
 
+> **Status em 2026-08-21:** este doc ainda descreve o CRM de um tenant so. Hoje ele e
+> **multi-tenant** (3 tenants ativos em prod) e o atendimento tem **dois modos por
+> tenant**: "assumir pra falar" (`pool_mode=legacy`, Hubloc —
+> [ADR 0008](../decisions/0008-lead-gruda-na-vendedora.md)) e **Modo Recepcao** (pool
+> compartilhada, varizemed — [ADR 0010](../decisions/0010-pool-mode-recepcao.md)).
+> Ha agente de IA por tenant (bot builtin no Hubloc, Dialogflow CX "Val" na varizemed),
+> gate LGPD antes do bot e horario comercial por tenant (fase 1). Desde 2026-08-21 o
+> nao-lido do contato e derivado das threads e o som toca so sobre o que a caixa mostra
+> ([ADR 0011](../decisions/0011-unread-derivado-das-threads-e-sons-por-caixa.md)).
+> As views da sidebar hoje sao `novos`, `meus`, `nao_qualificados`, `equipe`, `bot` e
+> `backup` (`frontend/src/types.ts`), com filtro de qualificacao e filtro "Nao lidas".
+> Estado por frente: [`docs/PENDENCIAS_E_ROADMAP.md`](../PENDENCIAS_E_ROADMAP.md).
+
 Visao funcional do CRM hoje.
 
 ## Objetivo do produto
