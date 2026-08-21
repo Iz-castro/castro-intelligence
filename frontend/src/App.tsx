@@ -510,7 +510,7 @@ const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(
 const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["bot", "novos", "meus", "equipe"]);
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
   const poolReception = systemSettings.pool_mode === "reception";
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
@@ -618,7 +618,15 @@ function ContactList() {
             N/Q ja e um filtro por qualificacao (so nao_qualificado) e o Backup e
             historico importado — sem seletor nelas. O match em si
             (filteredConversations) e client-side sobre o que esta carregado. */}
-        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar por qualificacao" aria-label="Filtrar por qualificacao"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option></select>}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_lidos">Não lidas</option></select>}
+        {/* "So espiar" (admin/supervisor): abrir conversa sem marcar como lida
+            — badge e alarme continuam ate alguem tratar. Lembrado por navegador. */}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && canPeek && (
+          <label className="peek-toggle" title="Abrir a conversa sem marcar como lida (o badge e o alarme continuam)">
+            <input type="checkbox" checked={peekMode} onChange={(e) => setPeekMode(e.target.checked)} />
+            <span>Só espiar</span>
+          </label>
+        )}
       </div>
       <div className="contact-list">
         {renderItems.slice(0, visibleLimit).map(({ contact, conversation }) => {
@@ -675,24 +683,41 @@ function ContactList() {
             </button>
           );
         })}
-        {!renderItems.length ? <div className="empty">{activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
-        {(renderItems.length > visibleLimit || canLoadMoreMine || canLoadMorePool || canLoadMoreAll) ? (
-          <button type="button" className="ghost" style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && (canLoadMoreMine || canLoadMorePool || canLoadMoreAll)}
-            onClick={() => {
-              const moreToReveal = renderItems.length > visibleLimit;
-              setVisibleLimit((v) => v + 100);
-              // So busca no Firestore quando ja revelou tudo que esta carregado.
-              // Meus = so as minhas (operador); Novos/Recepcao = pool sem dono
-              // (operador); Equipe/Bot/Novos = janela global (admin/supervisor).
-              if (!moreToReveal) {
-                if (canLoadMoreMine) void loadMoreMyConversations();
-                else if (canLoadMorePool) void loadMorePoolConversations();
-                else if (canLoadMoreAll) void loadMoreAllConversations();
-              }
-            }}>
-            {loadingMoreConvs ? "Carregando..." : renderItems.length > visibleLimit ? `Carregar mais (${renderItems.length - visibleLimit} restantes)` : "Carregar mais"}
-          </button>
-        ) : null}
+        {!renderItems.length ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
+        {(() => {
+          // Dois papeis no mesmo botao: (1) REVELAR itens ja carregados alem dos
+          // 100 mostrados ("Mostrar mais"); (2) BUSCAR no Firestore alem da
+          // janela de recencia ("Buscar conversas mais antigas" — Meus = minhas,
+          // Novos/Recepcao/Bot = pool, Equipe = janela global do admin). No
+          // filtro "Nao lidas" a busca e a de nao lidas ("Buscar mais nao
+          // lidas") e o botao pisca em vermelho pra chamar a operadora.
+          const moreToReveal = renderItems.length > visibleLimit;
+          const canFetch = unreadMode ? canLoadMoreUnread : (canLoadMoreMine || canLoadMorePool || canLoadMoreAll);
+          if (!moreToReveal && !canFetch) return null;
+          // Pisca so quando ha linhas visiveis (lista vazia + botao vermelho
+          // confundiria: a pool crua pode trazer threads que a caixa esconde).
+          const attention = unreadMode && !moreToReveal && canLoadMoreUnread && renderItems.length > 0;
+          const label = loadingMoreConvs && !moreToReveal
+            ? "Carregando..."
+            : moreToReveal
+              ? `Mostrar mais (${renderItems.length - visibleLimit} restantes)`
+              : unreadMode ? "Buscar mais não lidas" : "Buscar conversas mais antigas";
+          return (
+            <button type="button" className={`ghost load-more${attention ? " attention" : ""}`} style={{ margin: "0.5rem auto", display: "block" }} disabled={loadingMoreConvs && !moreToReveal}
+              onClick={() => {
+                setVisibleLimit((v) => v + 100);
+                // So busca no Firestore quando ja revelou tudo que esta carregado.
+                if (!moreToReveal) {
+                  if (unreadMode) void loadUnreadConversations();
+                  else if (canLoadMoreMine) void loadMoreMyConversations();
+                  else if (canLoadMorePool) void loadMorePoolConversations();
+                  else if (canLoadMoreAll) void loadMoreAllConversations();
+                }
+              }}>
+              {label}
+            </button>
+          );
+        })()}
       </div>
       {showNewContact && <NewContactModal onClose={() => setShowNewContact(false)} />}
     </aside>
@@ -2578,7 +2603,7 @@ function NotificationsTab() {
     <>
       <div className="settings-section">
         <h3>Notificacao de nova mensagem</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Todos os usuarios ouvem um beep quando chega uma nova mensagem.</p>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Todos os usuarios ouvem um beep quando chega mensagem nova numa conversa das caixas Novos/Recepcao ou Meus. Equipe, Bot, Backup e Nao qualificados nao fazem som.</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.notification_sound_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, notification_sound_enabled: e.target.checked }))} />
@@ -2600,7 +2625,7 @@ function NotificationsTab() {
 
       <div className="settings-section" style={{ marginTop: "1.2rem" }}>
         <h3>Alarme de mensagens sem resposta</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Alarme sonoro repetitivo para operadores dos departamentos selecionados quando ha mensagens sem visualizar.</p>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Alarme sonoro para usuarios dos departamentos selecionados: toca ao entrar e depois a cada 30 s enquanto houver conversa nas caixas Novos/Recepcao ou Meus com mensagem nao lida cuja ultima mensagem do cliente tem mais tempo que o limite abaixo. Para quando a conversa e aberta (exceto com "So espiar" ligado, modo de admin/supervisor que nao marca como lida).</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.alarm_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_enabled: e.target.checked }))} />

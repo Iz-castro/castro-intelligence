@@ -307,6 +307,13 @@ type CrmContextValue = {
   loadMoreAllConversations: () => Promise<void>;
   canLoadMoreAll: boolean;
   loadingMoreConvs: boolean;
+  // Filtro "Nao lidas" (busca alem da janela) e modo "So espiar" (admin/supervisor).
+  loadUnreadConversations: (reset?: boolean) => Promise<void>;
+  canLoadMoreUnread: boolean;
+  unreadMode: boolean;
+  peekMode: boolean;
+  setPeekMode: (v: boolean) => void;
+  canPeek: boolean;
 
   refreshPollingViews: () => Promise<void>;
 };
@@ -350,6 +357,11 @@ const ADMIN_CONV_WINDOW = 300;
 
 const CONVERSATION_OPEN_DEBOUNCE_MS = 350;
 const CONVERSATION_READ_DEBOUNCE_MS = 1200;
+// Filtro "Nao lidas" do select de qualificacao (valor do option), pagina da
+// busca de nao lidas e chave do modo "So espiar" (localStorage, por navegador).
+const UNREAD_FILTER = "nao_lidos";
+const UNREAD_PAGE = 50;
+const PEEK_STORAGE_KEY = "castro_crm.peek_mode";
 const RECENT_CONVERSATION_CACHE_LIMIT = 12;
 
 // ---------------------------------------------------------------------------
@@ -542,6 +554,33 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [activeView, setActiveView] = useState<ActiveView>("novos");
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
   const [qualificationFilter, setQualificationFilter] = useState("");
+  // "Nao lidas" (select de qualificacao): alem de filtrar o carregado, busca
+  // no Firestore as threads com unread_count>0 do escopo da caixa, fora da
+  // janela de recencia (mensagem de fim de semana some do top-50 e a operadora
+  // nao deveria ter que paginar as cegas). Resultado vai pra camada estatica.
+  const unreadMode = qualificationFilter === UNREAD_FILTER;
+  const [unreadPageLimit, setUnreadPageLimit] = useState(UNREAD_PAGE);
+  const [unreadHasMore, setUnreadHasMore] = useState(false);
+  // Guardas da busca assincrona: resposta tardia depois de SAIR do modo (ou
+  // de outra busca mais nova) e descartada — senao repovoava a camada
+  // estatica ja limpa.
+  const unreadModeRef = useRef(false);
+  const unreadReqRef = useRef(0);
+  useEffect(() => { unreadModeRef.current = unreadMode; }, [unreadMode]);
+  // "So espiar" (admin/supervisor): abrir conversa NAO marca como lida.
+  // Lembrado por navegador e POR USUARIO (uid) — em PC compartilhado o proximo
+  // gestor nao herda; nunca vale pra operador comum (canPeek).
+  const [peekMode, setPeekModeState] = useState(false);
+  const peekKey = sessionUser?.firebase_uid ? `${PEEK_STORAGE_KEY}.${sessionUser.firebase_uid}` : "";
+  useEffect(() => {
+    if (!peekKey) { setPeekModeState(false); return; }
+    try { setPeekModeState(window.localStorage.getItem(peekKey) === "1"); } catch { setPeekModeState(false); }
+  }, [peekKey]);
+  const setPeekMode = useCallback((v: boolean) => {
+    setPeekModeState(v);
+    if (!peekKey) return;
+    try { window.localStorage.setItem(peekKey, v ? "1" : "0"); } catch { /* storage indisponivel: vale so na sessao */ }
+  }, [peekKey]);
   const [channelFilter, setChannelFilter] = useState("");
   const searchText = useDeferredValue(search.trim().toLowerCase());
 
@@ -611,6 +650,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // -- Settings --
   const [showSettings, setShowSettings] = useState<SettingsPage>(false);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>(DEFAULT_SYSTEM_SETTINGS);
+  // true depois que /api/settings/system respondeu na sessao atual. Os efeitos
+  // de som so armam com isso true: os DEFAULTS do frontend (beep ON, alarme ON)
+  // nao podem valer enquanto as settings reais do tenant nao chegaram.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [userSettings, setUserSettings] = useState<UserSettings>(DEFAULT_USER_SETTINGS);
   const [busySettings, setBusySettings] = useState(false);
 
@@ -752,18 +795,25 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // pagina antiga). Nota: e a pool "crua" — a caixa ainda aplica seus filtros
   // (lead sem dono, bot_completed, setor), entao uma pagina pode nao acrescentar
   // linhas visiveis (ex.: thread orfa de lead com dono => contato 403).
-  const canLoadMorePool = !canSeeAll && activeView === "novos" && poolConvHasMore && poolLiveSaturated;
+  // Pool sem dono pagina por target proprio pra todo perfil (Novos/Recepcao;
+  // pra admin tambem a caixa Bot, que deriva da mesma pool).
+  const canLoadMorePool = (activeView === "novos" || (canSeeAll && activeView === "bot")) && poolConvHasMore && poolLiveSaturated;
   // "Carregar mais" da janela GLOBAL (admin/supervisor): so pagina se a janela
   // ao vivo saturou os 300 (senao nao ha pagina antiga). Conta so as
   // conversas nao-backup — o target "backup" infla `conversations` sem
   // consumir a janela do target "all". Vale pra Equipe, Bot e Novos/Recepcao:
-  // as tres caixas do admin derivam da mesma janela, entao a pagina estatica
-  // alimenta as tres (cada caixa filtra o seu recorte).
+  // a caixa Equipe do admin deriva da janela global (Novos/Bot agora vem dos
+  // targets da pool, com paginacao propria); a pagina estatica alimenta Equipe.
   const allLiveCount = useMemo(
     () => conversations.filter((c) => !c.is_backup).length,
     [conversations],
   );
-  const canLoadMoreAll = canSeeAll && (activeView === "equipe" || activeView === "bot" || activeView === "novos") && allConvHasMore && allLiveCount >= ADMIN_CONV_WINDOW;
+  // Janela GLOBAL so alimenta Equipe (Novos/Bot agora vem da pool acima).
+  const canLoadMoreAll = canSeeAll && activeView === "equipe" && allConvHasMore && allLiveCount >= ADMIN_CONV_WINDOW;
+  // "Nao lidas": ha mais pagina da busca de nao lidas (independe das janelas acima).
+  const canLoadMoreUnread = unreadMode && unreadHasMore;
+  // "So espiar" so existe pra admin/supervisor (role); operador sempre marca lida.
+  const canPeek = isManagerRole;
   // Troca de caixa limpa a paginacao estatica ("Meus", pool e Equipe) — bound
   // na janela de staleness (thread paginada reatribuida/fechada por terceiros
   // nao fica fantasma) e re-habilita o "Carregar mais" (hasMore) ao voltar.
@@ -776,7 +826,37 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setPoolConvHasMore(true);
     setAllConvPageLimit(ADMIN_CONV_WINDOW);
     setAllConvHasMore(true);
+    setUnreadPageLimit(UNREAD_PAGE);
+    setUnreadHasMore(false);
   }, [activeView]);
+  // Entrar no modo "Nao lidas" dispara a busca (pagina 1); sair limpa a camada
+  // estatica que ela preencheu (senao threads antigas ficariam em "Todos").
+  useEffect(() => {
+    if (unreadMode) {
+      void loadUnreadConversations(true);
+    } else {
+      // Preserva a thread SELECIONADA se ela so vivia na camada estatica —
+      // senao o guard de selecao orfa fecha o chat que o usuario esta lendo.
+      const keepId = selectedThreadId;
+      setPagedConversations((prev) => {
+        const next = new Map<string, Conversation>();
+        const keep = keepId ? prev.get(keepId) : undefined;
+        if (keepId && keep) next.set(keepId, keep);
+        return next;
+      });
+      setUnreadPageLimit(UNREAD_PAGE);
+      setUnreadHasMore(false);
+      // As outras paginacoes perderam a pagina (camada limpa): reseta os
+      // cursores pra o "Buscar conversas mais antigas" refazer do inicio.
+      setMyConvPageLimit(50);
+      setMyConvHasMore(true);
+      setPoolConvPageLimit(50);
+      setPoolConvHasMore(true);
+      setAllConvPageLimit(ADMIN_CONV_WINDOW);
+      setAllConvHasMore(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unreadMode, activeView]);
   // Nao qualificadas: qualification do contato e "nao_qualificado"
   const nqConversations = useMemo(() => {
     return allConversations.filter((conv) => {
@@ -838,7 +918,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // Mesmo fallback do chip da sidebar (`|| "novo"`): qualification vazia/
     // ausente (doc legado) conta como "novo" — senao o item mostraria "novo"
     // e sumiria de TODAS as opcoes do filtro, inclusive "Novo".
-    const matchesQual = !qualificationFilter || (c?.qualification || "novo") === qualificationFilter;
+    // "Nao lidas" e um filtro por THREAD (badge), nao por qualificacao do contato.
+    // A thread SELECIONADA fica isenta do filtro "Nao lidas": abrir marca lida e
+    // ela sumiria debaixo do cursor.
+    const matchesQual = !qualificationFilter
+      || (qualificationFilter === UNREAD_FILTER
+        ? ((conv.unread_count ?? conv.unread ?? 0) > 0 || conv.id === selectedThreadId)
+        : (c?.qualification || "novo") === qualificationFilter);
     const matchesChannel = activeView !== "meus" || !channelFilter || convChannelKey(conv) === channelFilter;
     return matchesSearch && matchesQual && matchesChannel;
   });
@@ -964,14 +1050,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // canSeeAll = toggle ver_todos_leads E role privilegiada — as rules
     // autorizam a query ampla pelo claim role, entao um perfil operador
     // "ampliado" nao pode receber o target "all" (rules negariam o snapshot).
-    if (canSeeAll) {
-      return [{ key: "all", ref: query(waContacts, ...baseConstraints) }];
-    }
-
+    // Pool sem dono (Novos/Recepcao + Bot) e "minhas" sao targets PROPRIOS
+    // pra todo perfil — admin incluso: a janela global do admin (top-50
+    // contatos / top-300 threads por recencia) nao alcanca lead velho parado
+    // na pool, e a caixa Bot vinha vazia exigindo "Carregar mais" as cegas
+    // (PO 2026-08-21).
     const targets: { key: string; ref: ReturnType<typeof query> }[] = [
       { key: "unassigned:blank", ref: query(waContacts, where("assigned_to_uid", "==", ""), ...baseConstraints) },
       { key: "unassigned:null", ref: query(waContacts, where("assigned_to_uid", "==", null), ...baseConstraints) },
     ];
+    if (canSeeAll) {
+      targets.push({ key: "all", ref: query(waContacts, ...baseConstraints) });
+    }
 
     if (sessionUser.firebase_uid) {
       targets.push({
@@ -988,7 +1078,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return targets;
   }
 
-  function mergeVisibleContacts(groups: Contact[][]) {
+  // `cap`: admin/supervisor tem mais targets (pool + minhas + all) e o corte
+  // em 50 descartaria os contatos da pool mais velhos que a janela global.
+  function mergeVisibleContacts(groups: Contact[][], cap = 50) {
     const merged = new Map<number, Contact>();
     for (const group of groups) {
       for (const contact of group) {
@@ -997,7 +1089,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
     return Array.from(merged.values())
       .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""))
-      .slice(0, 50);
+      .slice(0, cap);
   }
 
   // Escopo de conversations por operador — espelha buildContactSnapshotTargets.
@@ -1013,27 +1105,30 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
     const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
 
+    // Top-50 por recencia em cada target. Exige o indice composto
+    // (assigned_to_uid, last_message_at). mergeVisibleConversations junta/ordena
+    // os targets client-side. Pool sem dono (Novos/Recepcao + Bot) e target
+    // PROPRIO pra todo perfil — admin incluso: a janela global top-300 nao
+    // alcancava lead velho parado na pool (caixa Bot vazia + "Carregar mais"
+    // as cegas; PO 2026-08-21).
+    const opConstraints = [orderBy("last_message_at", "desc"), firestoreLimit(50)] as const;
+    const targets: { key: string; ref: ReturnType<typeof query> }[] = [
+      { key: "unassigned:blank", ref: query(waConversations, where("assigned_to_uid", "==", ""), ...opConstraints) },
+      { key: "unassigned:null", ref: query(waConversations, where("assigned_to_uid", "==", null), ...opConstraints) },
+    ];
+
     if (canSeeAll) {
       // Corte de leitura: a colecao cresceu (~3k conversas) e o snapshot sem
       // limite custava ~3k reads por sessao e 1000+ itens em memoria/DOM.
       // Admin ouve as 300 mais recentes (orderBy single-field = indice
       // automatico) + um target dedicado pra caixa Backup (igualdade simples,
       // sem indice composto), cujas conversas tem last_message_at antigo e
-      // cairiam fora do top-300.
-      return [
+      // cairiam fora do top-300. Equipe e Nao qualificados derivam desta janela.
+      targets.push(
         { key: "all", ref: query(waConversations, orderBy("last_message_at", "desc"), firestoreLimit(ADMIN_CONV_WINDOW)) },
         { key: "backup", ref: query(waConversations, where("is_backup", "==", true)) },
-      ];
+      );
     }
-
-    // Mesmo corte dos contatos: top-50 por recencia em cada target. Exige o
-    // indice composto (assigned_to_uid, last_message_at). mergeVisibleConversations
-    // junta/ordena os targets client-side.
-    const opConstraints = [orderBy("last_message_at", "desc"), firestoreLimit(50)] as const;
-    const targets: { key: string; ref: ReturnType<typeof query> }[] = [
-      { key: "unassigned:blank", ref: query(waConversations, where("assigned_to_uid", "==", ""), ...opConstraints) },
-      { key: "unassigned:null", ref: query(waConversations, where("assigned_to_uid", "==", null), ...opConstraints) },
-    ];
 
     if (sessionUser.firebase_uid) {
       targets.push({
@@ -1088,6 +1183,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // ate um hard refresh (vazamento LGPD em PC compartilhado).
   function resetUserScopedState() {
     setPerfil(null);
+    setSettingsLoaded(false);
+    // Settings sao POR TENANT: nao deixar bot_enabled/pool_mode/alarme do
+    // usuario anterior regerem as caixas do proximo (PC compartilhado).
+    setSystemSettings(DEFAULT_SYSTEM_SETTINGS);
+    setUserSettings(DEFAULT_USER_SETTINGS);
     setTenantName("");
     setContacts([]);
     setConversations([]);
@@ -1172,10 +1272,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
             },
           } : prev);
         }
-        Promise.all([
-          getJson<SystemSettings>(bundle.auth, "/api/settings/system"),
-          getJson<UserSettings>(bundle.auth, "/api/settings/user"),
-        ]).then(([sys, usr]) => { setSystemSettings(sys); setUserSettings(usr); }).catch(() => {});
+        // Fetches SEPARADOS: o gate de som (settingsLoaded) depende so de
+        // /api/settings/system — falha do /user nao pode calar o tenant. Em
+        // falha, os sons ficam desarmados ate o proximo refresh de token
+        // (~1h, que re-executa este handler) ou ate abrir Configuracoes.
+        getJson<SystemSettings>(bundle.auth, "/api/settings/system")
+          .then((sys) => { setSystemSettings(sys); setSettingsLoaded(true); })
+          .catch((e) => { console.warn("settings/system indisponivel — sons desarmados:", errorText(e)); });
+        getJson<UserSettings>(bundle.auth, "/api/settings/user").then((usr) => setUserSettings(usr)).catch(() => {});
       } catch (e) { setError(errorText(e)); await signOut(bundle.auth); }
     });
   }, [bundle]);
@@ -1446,7 +1550,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
     const publish = () => {
       if (disposed) return;
-      const nextContacts = mergeVisibleContacts(Array.from(partialContacts.values()));
+      const nextContacts = mergeVisibleContacts(Array.from(partialContacts.values()), canSeeAll ? 50 * targets.length : 50);
       startTransition(() => setContacts(nextContacts));
     };
 
@@ -1582,6 +1686,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!bundle || !sessionUser || !activeConversationId) return undefined;
     if (selectedContactId !== activeConversationId) return undefined;
+    // "So espiar" (admin/supervisor): abrir NAO marca como lida — badge fica e
+    // a thread segue contando como nao lida (inclusive no alarme do setor).
+    if (canPeek && peekMode) return undefined;
     // ADR 0010 (revisado): com thread ativa, o gatilho e o unread da
     // CONVERSATION — e o que o POST /conversation/read zera; o contador do
     // CONTATO nunca zera pelo caminho de thread, e um valor stale dele
@@ -1628,32 +1735,91 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, allConversations, bundle, selectedContactId, sessionUser]);
+  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, allConversations, bundle, selectedContactId, sessionUser, canPeek, peekMode]);
 
   // =========================================================================
   // Sound notifications
   // =========================================================================
 
-  const prevTotalUnreadRef = useRef<number | null>(null);
-  const alarmIntervalRef = useRef<number | null>(null);
+  // Beep: baseline por thread (id -> unread) + instante da ultima avaliacao.
+  const beepBaselineRef = useRef<Map<string, number> | null>(null);
+  const beepLastEvalRef = useRef<number>(0);
+  // Alarme: instante do ultimo toque (dedupe entre o effect (a) e o tick).
+  const lastAlarmRingAtRef = useRef<number>(0);
   const alarmAudioRef = useRef<HTMLAudioElement | null>(null);
+  const alarmAudioPathRef = useRef<string>("");
+  // Ids das threads "atrasadas" no ultimo calculo: toca na hora SO quando uma
+  // thread nova entra no conjunto; o tick de 30 s cobre a repeticao.
+  const overdueIdsRef = useRef<Set<string>>(new Set());
+  const soundConversationsRef = useRef<Conversation[]>([]);
 
   // Destrava o Web Audio no primeiro gesto do usuario — Chrome bloqueia o
   // AudioContext antes de qualquer interacao (warning "was not allowed to start").
   useEffect(() => { installAudioUnlock(); }, []);
 
-  // Beep for all users when total unread increases
+  // Conjunto que alimenta beep e alarme = SO as threads que o usuario VE nas
+  // caixas Novos + Meus (ja filtradas por bot_completed, setor, backup, dono e
+  // pool_mode). Antes os efeitos liam o array cru `contacts` (janela de
+  // wa_contacts: pool sem dono de QUALQUER setor, inclusive lead em fase de
+  // bot), que nao corresponde a nada na sidebar do operador comum — o alarme
+  // tocava sem nada na tela (diagnostico 2026-08-21). Contador = unread_count
+  // da THREAD (o mesmo do badge), nao o do contato.
+  // So a camada AO VIVO (`conversations`): as camadas estaticas ("Carregar
+  // mais" e fixada pelo picker) trazem threads antigas que nao sao atividade
+  // nova e nao sao atualizadas por terceiros (copia congelada) — entrariam no
+  // som sem mensagem nova e so sairiam trocando de caixa.
+  const soundConversations = useMemo(() => {
+    const live = new Set(conversations.map((c) => c.id));
+    const seen = new Set<string>();
+    const out: Conversation[] = [];
+    for (const conv of [...novosConversations, ...meusConversations]) {
+      if (seen.has(conv.id) || !live.has(conv.id)) continue;
+      seen.add(conv.id);
+      out.push(conv);
+    }
+    return out;
+  }, [novosConversations, meusConversations, conversations]);
+  useEffect(() => { soundConversationsRef.current = soundConversations; }, [soundConversations]);
+  const convUnread = (c: Conversation) => c.unread_count ?? c.unread ?? 0;
+  const convTime = (iso?: string | null) => {
+    const t = iso ? new Date(iso).getTime() : NaN;
+    return isNaN(t) ? null : t;
+  };
+
+  // Beep (todos os usuarios) quando chega mensagem NOVA numa thread visivel:
+  // baseline por thread (ref) — bipa se uma thread ja conhecida teve o
+  // unread AUMENTADO, ou se uma thread nova aparece com mensagem posterior a
+  // ultima avaliacao. Thread que entra no conjunto com mensagem antiga
+  // (hidratacao de contato, rotacao da janela) e absorvida sem som. So arma
+  // com as settings reais do tenant carregadas.
+  const beepEnabled = Boolean(sessionUser) && settingsLoaded && systemSettings.notification_sound_enabled;
   useEffect(() => {
-    if (!sessionUser || !systemSettings.notification_sound_enabled) {
-      prevTotalUnreadRef.current = null;
+    if (!beepEnabled) {
+      beepBaselineRef.current = null;
       return;
     }
-    const totalUnread = contacts.reduce((s, c) => s + (c.unread || 0), 0);
-    const prev = prevTotalUnreadRef.current;
-    prevTotalUnreadRef.current = totalUnread;
-    if (prev === null) return; // first load, don't beep
-    if (totalUnread > prev) {
-      // New message arrived — play notification beep
+    const now = Date.now();
+    const next = new Map<string, number>();
+    soundConversations.forEach((c) => next.set(c.id, convUnread(c)));
+    const prev = beepBaselineRef.current;
+    const lastEval = beepLastEvalRef.current;
+    beepBaselineRef.current = next;
+    beepLastEvalRef.current = now;
+    if (prev === null) return; // primeiro calculo da sessao: nao bipa
+    let ring = false;
+    for (const c of soundConversations) {
+      const u = convUnread(c);
+      if (u <= 0) continue;
+      const before = prev.get(c.id);
+      if (before === undefined) {
+        const t = convTime(c.last_message_at);
+        if (t !== null && t >= lastEval - 5_000) ring = true;
+      } else if (u > before) {
+        ring = true;
+      }
+      if (ring) break;
+    }
+    if (ring) {
       if (systemSettings.notification_sound_path) {
         const audio = new Audio(systemSettings.notification_sound_path);
         audio.volume = 0.5;
@@ -1662,72 +1828,99 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         playBeep({ freq: 880, type: "sine", gain: 0.3, duration: 0.3 });
       }
     }
-  }, [contacts, sessionUser, systemSettings.notification_sound_enabled, systemSettings.notification_sound_path]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [soundConversations, beepEnabled, systemSettings.notification_sound_path]);
 
-  // Repeating alarm for configured departments when messages unread > threshold
-  useEffect(() => {
-    if (alarmIntervalRef.current) {
-      window.clearInterval(alarmIntervalRef.current);
-      alarmIntervalRef.current = null;
+  // Alarme repetitivo (departamentos configurados): thread visivel com
+  // unread>0 e last_message_at mais velho que o limiar. Toca IMEDIATAMENTE
+  // quando uma thread nova entra no conjunto atrasado e a cada 30 s enquanto
+  // houver alguma. Deps PRIMITIVAS + refs: o effect antigo tinha `contacts`,
+  // `sessionUser` e o array de departamentos nas deps e chamava checkAlarm()
+  // a cada re-arme — tocava a cada publish do snapshot, refresh de token e ao
+  // abrir Configuracoes (identidade nova de array/objeto), nao so a cada 30 s.
+  const alarmDeptKey = (systemSettings.alarm_department_ids || []).map(String).join(",");
+  const userDeptKey = sessionUser?.department_id != null ? String(sessionUser.department_id) : "";
+  const alarmActive = Boolean(sessionUser) && settingsLoaded && systemSettings.alarm_enabled
+    && alarmDeptKey.length > 0 && userDeptKey !== "" && alarmDeptKey.split(",").includes(userDeptKey);
+  const alarmThresholdMs = (systemSettings.alarm_threshold_minutes || 5) * 60 * 1000;
+  const alarmSoundPath = systemSettings.alarm_sound_path || "";
+
+  // "Atrasada" = unread>0 e a ultima mensagem DO CLIENTE (last_inbound_at;
+  // fallback last_message_at em doc legado) mais velha que o limiar. Ancorar
+  // em last_message_at deixava outbound do bot / banner de sistema "resetar"
+  // o relogio do cliente que esta esperando.
+  const computeOverdueIds = (list: Conversation[], thresholdMs: number): Set<string> => {
+    const now = Date.now();
+    const ids = new Set<string>();
+    for (const conv of list) {
+      if (convUnread(conv) <= 0) continue;
+      const t = convTime(conv.last_inbound_at) ?? convTime(conv.last_message_at);
+      if (t !== null && (now - t) >= thresholdMs) ids.add(conv.id);
     }
-    if (alarmAudioRef.current) {
-      alarmAudioRef.current.pause();
-      alarmAudioRef.current = null;
-    }
-    if (!sessionUser || !systemSettings.alarm_enabled) return undefined;
-    // Check if user's department is in the alarm list
-    const userDeptId = sessionUser.department_id;
-    const alarmDepts = systemSettings.alarm_department_ids || [];
-    if (alarmDepts.length > 0 && (!userDeptId || !alarmDepts.includes(userDeptId))) return undefined;
-    // Only active if there are alarm departments configured (empty = disabled for dept filter)
-    if (alarmDepts.length === 0) return undefined;
-
-    const thresholdMs = (systemSettings.alarm_threshold_minutes || 5) * 60 * 1000;
-
-    const checkAlarm = () => {
-      const now = Date.now();
-      // Check contacts assigned to this user (or unassigned in "novos") that have unread messages
-      const hasOverdueUnread = contacts.some((c) => {
-        if ((c.unread || 0) <= 0) return false;
-        // Only alarm for contacts assigned to this user or unassigned (novos)
-        if (c.assigned_to && c.assigned_to !== sessionUser.id) return false;
-        // Check if last_message_at is older than threshold
-        if (!c.last_message_at) return false;
-        const msgTime = new Date(c.last_message_at).getTime();
-        return !isNaN(msgTime) && (now - msgTime) >= thresholdMs;
-      });
-
-      if (hasOverdueUnread) {
-        if (systemSettings.alarm_sound_path) {
-          if (!alarmAudioRef.current) {
-            alarmAudioRef.current = new Audio(systemSettings.alarm_sound_path);
-            alarmAudioRef.current.volume = 0.6;
-          }
-          alarmAudioRef.current.currentTime = 0;
-          alarmAudioRef.current.play().catch(() => {});
-        } else {
-          playBeep({
-            freq: 660, type: "square", gain: 0.25, duration: 0.6,
-            steps: [{ freq: 880, at: 0.15 }, { freq: 660, at: 0.3 }, { freq: 880, at: 0.45 }],
-          });
-        }
-      } else {
-        // No overdue messages — stop alarm audio if playing
-        if (alarmAudioRef.current) {
-          alarmAudioRef.current.pause();
-          alarmAudioRef.current = null;
-        }
+    return ids;
+  };
+  const stopAlarmAudio = () => {
+    if (alarmAudioRef.current) { alarmAudioRef.current.pause(); alarmAudioRef.current = null; }
+    alarmAudioPathRef.current = "";
+  };
+  const playAlarmSound = (path: string) => {
+    // Dedupe: o effect (a) e o tick de 30 s sao caminhos independentes —
+    // nunca toca 2x em menos de 5 s.
+    const now = Date.now();
+    if (now - lastAlarmRingAtRef.current < 5_000) return;
+    lastAlarmRingAtRef.current = now;
+    if (path) {
+      if (!alarmAudioRef.current || alarmAudioPathRef.current !== path) {
+        stopAlarmAudio();
+        alarmAudioRef.current = new Audio(path);
+        alarmAudioRef.current.volume = 0.6;
+        alarmAudioPathRef.current = path;
       }
-    };
+      alarmAudioRef.current.currentTime = 0;
+      alarmAudioRef.current.play().catch(() => {});
+    } else {
+      playBeep({
+        freq: 660, type: "square", gain: 0.25, duration: 0.6,
+        steps: [{ freq: 880, at: 0.15 }, { freq: 660, at: 0.3 }, { freq: 880, at: 0.45 }],
+      });
+    }
+  };
 
-    // Check immediately and then every 30 seconds
-    checkAlarm();
-    alarmIntervalRef.current = window.setInterval(checkAlarm, 30_000);
-    return () => {
-      if (alarmIntervalRef.current) window.clearInterval(alarmIntervalRef.current);
-      if (alarmAudioRef.current) { alarmAudioRef.current.pause(); alarmAudioRef.current = null; }
+  // (a) reacao a mudanca do conjunto visivel: toca na hora so se ENTROU thread
+  // nova no atrasado; limpa o estado quando o alarme esta inativo.
+  useEffect(() => {
+    if (!alarmActive) {
+      overdueIdsRef.current = new Set();
+      stopAlarmAudio();
+      return;
+    }
+    const next = computeOverdueIds(soundConversations, alarmThresholdMs);
+    const prev = overdueIdsRef.current;
+    let hasNew = false;
+    next.forEach((id) => { if (!prev.has(id)) hasNew = true; });
+    overdueIdsRef.current = next;
+    if (next.size === 0) stopAlarmAudio();
+    else if (hasNew) playAlarmSound(alarmSoundPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [soundConversations, alarmActive, alarmThresholdMs, alarmSoundPath]);
+
+  // (b) tick de 30 s: repete enquanto houver thread atrasada (le o conjunto
+  // atual pela ref — NAO re-arma o intervalo a cada publish).
+  useEffect(() => {
+    if (!alarmActive) return undefined;
+    const tick = () => {
+      const next = computeOverdueIds(soundConversationsRef.current, alarmThresholdMs);
+      overdueIdsRef.current = next;
+      if (next.size > 0) playAlarmSound(alarmSoundPath);
+      else stopAlarmAudio();
     };
-  }, [contacts, sessionUser, systemSettings.alarm_enabled, systemSettings.alarm_threshold_minutes, systemSettings.alarm_department_ids, systemSettings.alarm_sound_path]);
+    const intervalId = window.setInterval(tick, 30_000);
+    return () => {
+      window.clearInterval(intervalId);
+      stopAlarmAudio();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alarmActive, alarmThresholdMs, alarmSoundPath]);
 
   // =========================================================================
   // Actions
@@ -2408,6 +2601,72 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // mine com limite crescente (50 -> 100 -> 150...). O listener ao vivo continua
   // em 50; isto e leitura UNICA (sem snapshot). Usa o indice composto
   // (assigned_to_uid, last_message_at). Admin/supervisor ja ouvem 300 ao vivo.
+  // Busca de NAO LIDAS (filtro "Nao lidas" do select de qualificacao): getDocs
+  // por escopo da caixa com unread_count>0, ordenado por unread_count desc +
+  // recencia (Firestore exige o primeiro orderBy no campo da desigualdade); o
+  // cliente reordena por recencia. Indices em firestore.indexes.json:
+  // (assigned_to_uid, unread_count desc, last_message_at desc) e
+  // (unread_count desc, last_message_at desc). Mesmo escopo/rules das janelas
+  // ao vivo: operador = minhas ou pool; admin em Equipe = tenant inteiro.
+  // Pagina crescente (100, 200...). Resultado vai pra camada estatica
+  // (pagedConversations); contato hidrata sob demanda (extraContacts).
+  async function loadUnreadConversations(reset = false) {
+    if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return;
+    if (loadingMoreConvs && !reset) return;
+    const limit = reset ? UNREAD_PAGE : unreadPageLimit + UNREAD_PAGE;
+    const viewAtStart = activeViewRef.current;
+    const reqId = ++unreadReqRef.current;
+    const keepId = selectedThreadId;
+    const waConversations = collection(bundle.db, config.firestore.collections.wa_conversations);
+    const tail = [
+      where("unread_count", ">", 0),
+      orderBy("unread_count", "desc"),
+      orderBy("last_message_at", "desc"),
+      firestoreLimit(limit),
+    ] as const;
+    const scopes: ReturnType<typeof query>[] = [];
+    if (viewAtStart === "meus") {
+      if (sessionUser.firebase_uid) scopes.push(query(waConversations, where("assigned_to_uid", "==", sessionUser.firebase_uid), ...tail));
+    } else if (viewAtStart === "novos" || viewAtStart === "bot") {
+      scopes.push(query(waConversations, where("assigned_to_uid", "==", ""), ...tail));
+      scopes.push(query(waConversations, where("assigned_to_uid", "==", null), ...tail));
+    } else if (viewAtStart === "equipe" && canSeeAll) {
+      scopes.push(query(waConversations, ...tail));
+    }
+    if (!scopes.length) { setUnreadHasMore(false); return; }
+    setLoadingMoreConvs(true);
+    try {
+      const snaps = await Promise.all(scopes.map((q) => getDocs(q)));
+      // Resposta tardia: trocou de caixa, saiu do modo ou ja ha busca mais nova.
+      if (activeViewRef.current !== viewAtStart || !unreadModeRef.current || unreadReqRef.current !== reqId) return;
+      const next = new Map<string, Conversation>();
+      for (const snap of snaps) {
+        for (const d of snap.docs) {
+          const c = normalizeConversation(d.data() as Record<string, unknown>, d.id);
+          next.set(c.id, c);
+        }
+      }
+      // Preserva a thread selecionada que so vivia na camada estatica (senao o
+      // chat aberto fecha ao paginar).
+      setPagedConversations((prev) => {
+        const keep = keepId ? prev.get(keepId) : undefined;
+        if (keepId && keep && !next.has(keepId)) next.set(keepId, keep);
+        return next;
+      });
+      setUnreadPageLimit(limit);
+      // Ha mais pagina enquanto ALGUM escopo encher o limite.
+      setUnreadHasMore(snaps.some((s) => s.docs.length >= limit));
+    } catch (e) {
+      // Indice ainda construindo / rules: degrada pro filtro client-side (so o
+      // que ja esta carregado) sem travar a caixa — aviso como ERRO, nao sucesso.
+      console.warn("busca de nao lidas indisponivel:", errorText(e));
+      setError("Busca de não lidas indisponível no momento — mostrando só as conversas já carregadas.");
+      setUnreadHasMore(false);
+    } finally {
+      setLoadingMoreConvs(false);
+    }
+  }
+
   async function loadMoreMyConversations() {
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser?.firebase_uid) return;
     if (canSeeAll) return;
@@ -2450,7 +2709,6 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // e hidratado sob demanda pelo effect de extraContacts.
   async function loadMorePoolConversations() {
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return;
-    if (canSeeAll) return;
     if (loadingMoreConvs) return;
     const nextLimit = poolConvPageLimit + 50;
     const viewAtStart = activeViewRef.current;
@@ -2684,14 +2942,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusySettings(true);
       const [sys, usr] = await Promise.all([getJson<SystemSettings>(bundle.auth, "/api/settings/system"), getJson<UserSettings>(bundle.auth, "/api/settings/user")]);
-      setSystemSettings(sys); setUserSettings(usr); setShowSettings(page);
+      setSystemSettings(sys); setUserSettings(usr); setSettingsLoaded(true); setShowSettings(page);
     } catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
 
   async function saveSystemSettingsAction() {
     if (!bundle) return;
-    try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setNotice("Configuracoes do sistema salvas."); }
+    try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
     catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
@@ -2743,6 +3001,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
     loadMorePoolConversations, canLoadMorePool,
     loadMoreAllConversations, canLoadMoreAll,
+    loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek,
     refreshPollingViews,
   };
 

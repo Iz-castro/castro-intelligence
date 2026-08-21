@@ -50,7 +50,7 @@ from config import (
 from database import (
     init_database, get_user_by_id, get_user_raw_by_id, get_all_users,
     get_all_wa_contacts, get_wa_conversation,
-    mark_wa_conversation_read, mark_wa_conversation_read_by_id,
+    mark_wa_conversation_read, mark_wa_conversation_read_by_id, recompute_wa_contact_unread,
     save_wa_message, get_wa_contact,
     log_audit, normalize_br_phone,
     get_all_departments, create_department,
@@ -2635,9 +2635,35 @@ async def mark_conversation_read(conversation_id: str, current_user: dict = Depe
     conv = get_wa_conversation_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation nao encontrada")
+    # Autorizacao (IDOR horizontal): conversation_id e deterministico
+    # ("{channel_id}__{wa_id}"), entao qualquer usuario do tenant poderia zerar
+    # o nao-lido da thread de outro operador. Atalhos baratos primeiro (thread
+    # minha / pool / takeover meu); senao a regra geral do contato (dono, pool,
+    # thread propria, privilegiado).
+    contact_id = conv.get("contact_id")
+    contact = get_wa_contact(int(contact_id)) if contact_id is not None else None
+    _uid = str(current_user.get("firebase_uid") or "")
+    _conv_uid = str(conv.get("assigned_to_uid") or "")
+    _thread_mine = bool(_uid) and _conv_uid == _uid
+    _thread_pool = (not _conv_uid) and not conv.get("is_backup")
+    try:
+        _takeover_mine = conv.get("takeover_handler_user_id") is not None and \
+            int(conv.get("takeover_handler_user_id")) == int(current_user["id"])
+    except (TypeError, ValueError):
+        _takeover_mine = False
+    if not (_thread_mine or _thread_pool or _takeover_mine):
+        _require_contact_access(contact or {}, current_user)
     if int(conv.get("unread_count", 0) or 0) <= 0:
+        # Thread ja lida: rede de seguranca pro contador do CONTATO (drift
+        # anterior ao ADR 0011 — so a thread zerava). O estoque antigo e
+        # corrigido pelo backfill (scripts/backfill_contact_unread_from_threads.py);
+        # o frontend normalmente nem chama aqui com a thread em 0.
+        if contact and int(contact.get("unread_count", 0) or 0) > 0:
+            recompute_wa_contact_unread(int(contact_id), current=int(contact.get("unread_count", 0) or 0))
         return {"status": "ok", "updated_count": 0}
-    updated_count = mark_wa_conversation_read_by_id(conversation_id)
+    updated_count = mark_wa_conversation_read_by_id(
+        conversation_id, contact_id=int(contact_id) if contact_id is not None else None,
+    )
     return {"status": "ok", "updated_count": updated_count}
 
 

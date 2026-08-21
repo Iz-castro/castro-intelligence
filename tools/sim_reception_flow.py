@@ -844,6 +844,36 @@ def cenario_open_picker_nao_rouba_pool():
         restore_dbf()
 
 
+
+# =========================================================================
+# Cenario — ADR 0011: wa_contacts.unread_count derivado das threads
+# =========================================================================
+
+def cenario_unread_sync():
+    titulo("CENARIO — ADR 0011: recompute_wa_contact_unread (contato = soma das threads)")
+    patch_store()
+    STORE["wa_contacts"] = {"50": {"id": 50, "unread_count": 7}, "51": {"id": 51, "unread_count": 3}}
+    STORE["wa_conversations"] = {
+        "1__a": {"id": "1__a", "contact_id": 50, "unread_count": 3},
+        "2__a": {"id": "2__a", "contact_id": 50, "unread_count": 0},
+        "1__b": {"id": "1__b", "contact_id": 51, "unread_count": 0},
+        "1__c": {"id": "1__c", "contact_id": 52, "unread_count": 2},  # contato inexistente
+    }
+    total = dbf.recompute_wa_contact_unread(50)
+    check(total == 3 and STORE["wa_contacts"]["50"]["unread_count"] == 3,
+          "2 threads (3 + 0) -> contato grava 3 (era 7)")
+    total = dbf.recompute_wa_contact_unread(51)
+    check(total == 0 and STORE["wa_contacts"]["51"]["unread_count"] == 0,
+          "todas as threads em 0 -> contato zera (o drift do incidente 2026-08-21)")
+    total = dbf.recompute_wa_contact_unread(52)
+    check(total == 2 and "52" not in STORE["wa_contacts"],
+          "conversa de contato inexistente -> soma sem criar contato fantasma")
+    STORE["wa_contacts"]["50"] = {"id": 50, "unread_count": 3, "marker": "x"}
+    dbf.recompute_wa_contact_unread(50, current=3)
+    check(STORE["wa_contacts"]["50"] == {"id": 50, "unread_count": 3, "marker": "x"},
+          "valor igual -> nenhuma escrita (idempotente)")
+    restore_dbf()
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -863,6 +893,7 @@ def run():
     cenario_protocolo_dia_anterior()
     cenario_assume_carimba_threads_orfas()
     cenario_open_picker_nao_rouba_pool()
+    cenario_unread_sync()
 
     print("\n" + "=" * 70)
     if FAILS:

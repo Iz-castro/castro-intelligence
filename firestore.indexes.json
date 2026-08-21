@@ -26,6 +26,23 @@
       ]
     },
     {
+      "collectionGroup": "wa_conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "unread_count", "order": "DESCENDING" },
+        { "fieldPath": "last_message_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "unread_count", "order": "DESCENDING" },
+        { "fieldPath": "last_message_at", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "wa_messages",
       "queryScope": "COLLECTION_GROUP",
       "fields": [

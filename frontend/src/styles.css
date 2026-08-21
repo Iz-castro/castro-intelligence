@@ -299,6 +299,13 @@ button { cursor: pointer; }
 .toolbar { align-items: stretch; flex-wrap: wrap; }
 .toolbar.right { justify-content: flex-end; }
 .toolbar select.compact { width: auto; min-width: 0; padding: 0.6rem 0.7rem; font-size: 0.82rem; }
+/* "So espiar" (admin/supervisor): abrir sem marcar como lida. */
+.toolbar .peek-toggle { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.78rem; color: var(--muted, #6b7280); white-space: nowrap; cursor: pointer; user-select: none; }
+.toolbar .peek-toggle input { margin: 0; cursor: pointer; }
+/* "Buscar mais nao lidas": pisca devagar em vermelho pra chamar a operadora. */
+@keyframes load-more-attention { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.load-more.attention { color: var(--danger, #c0392b); border-color: var(--danger, #c0392b); font-weight: 600; animation: load-more-attention 1.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .load-more.attention { animation: none; } }
 
 input,
 select,

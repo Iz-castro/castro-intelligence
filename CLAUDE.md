@@ -120,6 +120,11 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 - **Não regrida os fixes de custo:** header da sidebar usa `count_only=1` (aggregate), não o
   full-scan de `/api/wa/contacts/all`; os crons (`close_stale_attendances`, `expire_stale_takeovers`)
   usam `.where(...)` server-side, não full-scan de `wa_conversations`.
+- **Não-lido: a THREAD é a fonte da verdade (ADR 0011).** `wa_contacts.unread_count` é DERIVADO
+  (soma das threads; `recompute_wa_contact_unread`, chamado no read por thread). Beep/alarme do
+  frontend avaliam só `novosConversations + meusConversations` (o que a caixa mostra) e o
+  `unread_count` da thread — nunca o array cru `contacts` (incidente 2026-08-21: alarme perpétuo por
+  lead em fase de bot invisível ao operador). Não reintroduza zeramento só da thread.
 - **Resolução de canal no webhook:** `phone_number_id` sem canal **ativo** vai pra pending —
   nunca cai no canal default (número coex desconectado vazaria pro standard).
 - **Reentrega da Meta:** `POST /webhook` só responde 200 **depois** do turno do bot (CX tem

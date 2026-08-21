@@ -1166,10 +1166,11 @@ def set_attendance_status(conversation_id, status, clear_takeover=False):
     return get_wa_conversation_by_id(conversation_id)
 
 
-def mark_wa_conversation_read_by_id(conversation_id):
+def mark_wa_conversation_read_by_id(conversation_id, contact_id=None):
     """Marca como lidas as mensagens inbound de uma conversation especifica.
     Usa filtro por conversation_id (Fase 2C) — nao colide entre threads do
-    mesmo contato em canais diferentes."""
+    mesmo contato em canais diferentes. `contact_id` (opcional) evita reler
+    o doc da conversa so pra achar o contato (ADR 0011: resync do contato)."""
     q = (
         collection("wa_messages")
         .where("conversation_id", "==", conversation_id)
@@ -1190,7 +1191,48 @@ def mark_wa_conversation_read_by_id(conversation_id):
     if count > 0:
         batch.commit()
     document("wa_conversations", conversation_id).set({"unread_count": 0}, merge=True)
+    # Contador do CONTATO e DERIVADO das threads: re-sincroniza aqui. Antes so
+    # a conversation zerava e wa_contacts.unread_count ficava preso pra sempre
+    # (so o endpoint legado por contato zerava) — beep/alarme do frontend liam
+    # esse campo e tocavam sem nada na tela (diagnostico 2026-08-21, 1.691
+    # contatos presos no hubloc). Nao-fatal: o read da thread ja valeu.
+    try:
+        if contact_id is None:
+            conv = _get_doc("wa_conversations", conversation_id)
+            contact_id = (conv or {}).get("contact_id")
+        if contact_id is not None:
+            recompute_wa_contact_unread(int(contact_id))
+    except Exception as exc:
+        # Sem conversation_id no log: ele embute o wa_id (telefone) do cliente.
+        logger.warning("mark_wa_conversation_read_by_id: resync do contato falhou contact_id=%s: %s", contact_id, exc)
     return total_updated
+
+
+def recompute_wa_contact_unread(contact_id, current=None):
+    """Recalcula wa_contacts.unread_count como a SOMA do unread_count das
+    threads (wa_conversations) do contato e grava se mudou (ADR 0011).
+
+    Fonte da verdade do nao-lido = THREAD (e o que o badge da sidebar le).
+    O campo do contato existe por compat (resposta de /api/wa/contacts,
+    endpoint legado por contato) e NAO pode divergir das threads: inbound
+    incrementa os dois, read por thread zera a thread e chama isto.
+    `current` = valor atual ja conhecido pelo chamador (evita 1 read).
+    Contato inexistente: nao cria doc fantasma. Retorna o total calculado.
+    """
+    total = 0
+    for snapshot in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        row = snapshot.to_dict() or {}
+        total += int(row.get("unread_count", 0) or 0)
+    if current is None:
+        doc = _get_doc("wa_contacts", contact_id)
+        if not doc:
+            return total
+        current = int(doc.get("unread_count", 0) or 0)
+    if int(current) != total:
+        # Write so quando muda: write custa ~3x read e re-publica o doc em
+        # todo listener cujo target casa (pool = todos os operadores).
+        document("wa_contacts", contact_id).set({"unread_count": total}, merge=True)
+    return total
 
 
 def upsert_wa_contact(wa_id, display_name="", channel_id=None,
@@ -2635,6 +2677,12 @@ def mark_wa_conversation_read(contact_id):
             count = 0
     if count > 0:
         batch.commit()
+    # ADR 0011: a THREAD e a fonte da verdade — este endpoint e cross-canal
+    # por definicao, entao zera tambem todas as threads do contato (senao a
+    # soma das threads volta a divergir do contato no proximo recompute).
+    for snapshot in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
+        if int((snapshot.to_dict() or {}).get("unread_count", 0) or 0) > 0:
+            snapshot.reference.set({"unread_count": 0}, merge=True)
     document("wa_contacts", contact_id).set({"unread_count": 0}, merge=True)
     return total_updated
 

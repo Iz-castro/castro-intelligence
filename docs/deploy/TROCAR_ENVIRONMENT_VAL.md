@@ -112,7 +112,8 @@ no Draft: qualquer edição do Izael no console entraria em produção na hora.
 | 10/08 12:20 | `75028a25-7094-43d0-a033-9a2cb90e7988` | val-5.0.1 | reescreveu msg de transferência (CRM ajustou hints) |
 | 10/08 16:35 | `39408565-9cb8-4cdd-8e5c-2c5493b2ab6f` | val-5.0.11 | correção de texto |
 | 14/08 13:40 | `834d5241-5337-4848-91a5-1479c6fcdc9b` | val-5.0.12 | correção do erro "Sorry something went wrong" |
-| 16/08 23:35 | `05267e69-9632-444c-b009-b6069a7474e2` | **val-5.0.21** | greeting v3, router v7, tool v3 — **atual** |
+| 16/08 23:35 | `05267e69-9632-444c-b009-b6069a7474e2` | val-5.0.21 | greeting v3, router v7, tool v3 |
+| 21/08 15:50 | `22390163-6bbc-47b5-a25a-e53eb3363d8f` | **val-5.0.3** | rótulo informado pelo Izael; aplicado com 1 contato na janela de 60 min (decisão do PO) — **atual** |
 
 Atualize esta tabela a cada troca (é a memória de quem vier depois).
 
