@@ -1,6 +1,7 @@
 # Docs
 
-> **Status em 2026-08-21:** o mapa vivo das frentes (o que esta feito, o que esta em
+> **Status em 2026-08-22:** para retomar qualquer frente, comece por
+> [COMO_RETOMAR.md](COMO_RETOMAR.md); o mapa vivo das frentes (o que esta feito, o que esta em
 > prod e o que continua pendente) e [PENDENCIAS_E_ROADMAP.md](PENDENCIAS_E_ROADMAP.md).
 > Deploy de rotina do CRM = [deploy/DEPLOY_CLOUDRUN_A.md](deploy/DEPLOY_CLOUDRUN_A.md)
 > (prod = projeto `project-4a851bf9-f475-418c-800`, regiao `us-west1`; trafego PINADO

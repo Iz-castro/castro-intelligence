@@ -55,11 +55,17 @@ Decisão do PO: só liga a Varizemed de verdade quando estes gates fecharem.
       de leitura, máscara de PII nos logs das 2 Cloud Functions.
       Continua **aberto** — plano em `docs/PLANO_J3_LGPD_E_REVOGACAO.md`; decisões
       D1-D3 já aceitas no [ADR 0009](decisions/0009-modelos-crm-d1-d3-retorno-ao-bot.md).
-- [ ] **Migração do histórico:** importar conversas + **re-hospedar a mídia**
-      (hoje em URLs do Twilio com auth) ANTES de desligar o Twilio.
-- [ ] Aviso LGPD + política + versão + DPA da própria clínica (hoje placeholder).
-- [ ] Residência de dados: avaliar agente CX + banco em `southamerica-east1`.
-- [ ] Limites da Meta: tier do número novo + quality rating.
+- [x] **Migração do histórico:** importar conversas + **re-hospedar a mídia**
+      (hoje em URLs do Twilio com auth) ANTES de desligar o Twilio. — **Concluído**
+      (PO 2026-08-22: Twilio desligado, servidor migrado).
+- [x] Aviso LGPD + política + versão + DPA da própria clínica (hoje placeholder). —
+      fechado segundo o PO (2026-08-22); texto vigente em `settings.ai.lgpd_notice`,
+      `lgpd_policy_version=varizemed-2026-07`.
+- [x] Residência de dados: avaliar agente CX + banco em `southamerica-east1`. —
+      decidido/fechado (PO 2026-08-22): agente CX em `us-central1` (projeto `castro-ia`),
+      banco/Cloud Run em `us-west1` (Oregon).
+- [x] Limites da Meta: tier do número novo + quality rating. — fechado segundo o PO
+      (2026-08-22); acompanhar pelo Business Manager quando a campanha de templates rodar.
 - [x] Decidir: `varizemed-test` vira o real ou cria tenant novo limpo? —
       **RESOLVIDO em 2026-07-28:** tenant novo e limpo (`varizemed`); o
       `varizemed-test` foi mantido ativo (mesmo agente CX, no DRAFT).
@@ -153,11 +159,21 @@ Batch: a modularização já mexe no `App.tsx` (monolito 2581 linhas) — aprove
 
 ## 🧹 HOUSEKEEPING DO TESTE (rápido)
 
-- [ ] Desativar o canal de teste `+1 555-484-7272` do `varizemed-test`.
-- [ ] Trocar a senha do admin `contato@castrointelligence.com.br`.
+- [x] Desativar o canal de teste `+1 555-484-7272` do `varizemed-test`. — feito: em
+      2026-08-22 o registry `channels` do `varizemed-test` só tem o canal 6 (standard,
+      +55 31 …7758); o número de teste da Meta não existe mais lá.
+- [x] Trocar a senha do admin `contato@castrointelligence.com.br`. — PO 2026-08-22: trocada.
 - [ ] Apagar tenant sintético `varizemed-cxtest` (prefixo `castro_crm_staging`) +
       canal fake; apagar doc de smoke `conversations/+5571900000001` no `castro-ia`.
+      — **fica pra outra frente** (PO 2026-08-22: quer fazer pelo superadmin). Hoje o
+      painel B só EDITA tenant (`PATCH /api/superadmin/tenants/{id}`: name/plan/cnpj/
+      is_active/domínios) — dá pra **desativar**; apagar os dados exige script.
 - [ ] Dois setores com `bot_key=sac` (Recepção + Suporte) — decidir taxonomia.
+      — Só no `varizemed-test`: setores 3 "Suporte" e 5 "Recepção" têm ambos
+      `bot_key=sac`; o handoff da Val (`handoff_bot_key=sac`) resolve o setor por esse
+      campo e pega o PRIMEIRO que achar → lead pode cair em "Suporte". Correção: trocar o
+      `bot_key` de um deles pela UI de setores. No `varizemed` REAL está certo (só
+      "Recepção" ativa com `sac`; "Recepção (antiga)" inativa). Conferido em 2026-08-22.
 
 ---
 
@@ -206,3 +222,7 @@ Uma linha por frente, pra não perder o fio quando o dia a dia interromper.
   fechamento e resumo por IA ao fechar.
 - ⛔ **ADR 0007 Fase 2** (`channels` → `tenants/{tid}/channels`) — pendência congelada, reabrível só com desenho novo; o **Método B** (signup standard na UI) foi FEITO e PROVADO em 2026-06-05 (commit `817e730`). Multi-empresa no canal standard (plano ainda não
   iniciado).
+- 🟡 **Parceria Meta / billing:** o cron de health-check de billing teve problema; para
+  operar billing/limites como parceiro é preciso virar **Meta Partner** (hoje somos
+  **Tech Provider**; App Review de Tech Provider FEITO; possivelmente um novo App Review
+  para parceria). PO 2026-08-22. Ver `internal/RETOMAR.md` (tabela) e ADR 0004.

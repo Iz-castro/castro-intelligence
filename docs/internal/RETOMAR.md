@@ -25,8 +25,8 @@
 > | Tenant #2 Varizemed (motor CX, Val) | em prod desde 2026-07-28 |
 > | Modo Recepcao (pool compartilhada) | em prod desde 2026-08-05 — varizemed real desde 2026-08-06 ([ADR 0010](../decisions/0010-pool-mode-recepcao.md)) |
 > | Nao-lido derivado das threads / sons por caixa | em prod em 2026-08-21 ([ADR 0011](../decisions/0011-unread-derivado-das-threads-e-sons-por-caixa.md)) |
-> | Cron de health-check de billing em prod | ⚠ verificar (na epoca so existia em staging) |
-> | Re-screencast do App Review | ⚠ verificar (sem urgencia operacional na epoca) |
+> | Cron de health-check de billing em prod | teve problema (PO 2026-08-22); depende de virar Meta Partner — hoje Tech Provider (App Review TP feito; talvez novo review) — ver PENDENCIAS_E_ROADMAP "Parceria Meta / billing" |
+> | Re-screencast do App Review | App Review de Tech Provider FEITO (PO 2026-08-22); eventual novo review so se for pedir parceria Meta |
 
 > **Estado atual (2026-06-03).** Revisao prod ativa: **`castro-crm-00137-v7t`**.
 > Dia denso — detalhe completo em [2026-06-03.md](2026-06-03.md). Resumo:
