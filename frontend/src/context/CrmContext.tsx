@@ -123,6 +123,8 @@ type CrmContextValue = {
   busyAudio: boolean;
   quickSuggestions: { shortcut: string; message: string }[];
   setQuickSuggestions: React.Dispatch<React.SetStateAction<{ shortcut: string; message: string }[]>>;
+  // Item da lista de mensagens rapidas destacado pelo teclado (-1 = nenhum).
+  quickSelectedIndex: number;
   sendTextMessage: () => Promise<void>;
   submitText: (e: FormEvent<HTMLFormElement>) => void;
   submitMedia: (file: File) => Promise<void>;
@@ -589,6 +591,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [replyTarget, setReplyTarget] = useState<MessageReplyReference | null>(null);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [quickSuggestions, setQuickSuggestions] = useState<{ shortcut: string; message: string }[]>([]);
+  // Item da lista de sugestoes destacado pelo teclado (-1 = nenhum). Reseta
+  // sempre que a lista muda (digitacao) ou fecha.
+  const [quickSelectedIndex, setQuickSelectedIndex] = useState(-1);
   const [busySend, setBusySend] = useState(false);
   const [busyUpload, setBusyUpload] = useState(false);
   const [busyAudio, setBusyAudio] = useState(false);
@@ -1945,7 +1950,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   function startReplyToMessage(message: ChatMessage) {
     setReplyTarget(buildMessageReplyReference(message));
     setShowAttachMenu(false);
-    setQuickSuggestions([]);
+    closeQuickSuggestions();
     composerInputRef.current?.focus();
   }
 
@@ -2191,6 +2196,37 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function handleDraftKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    // Lista de mensagens rapidas aberta (draft comecando com "/"): a lista
+    // fica ACIMA da caixa, entao a primeira seta pra cima destaca o item mais
+    // proximo dela (o ultimo) e cada seta sobe um; seta pra baixo desce e,
+    // passando do ultimo, volta pra caixa. Enter (item destacado) e Tab
+    // completam NO CAMPO sem enviar — o operador revisa e da Enter de novo
+    // pra mandar (Tab sem selecao completa a primeira). Esc fecha.
+    const count = quickSuggestions.length;
+    if (count > 0) {
+      const selected = quickSelectedIndex < count ? quickSelectedIndex : -1;
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setQuickSelectedIndex(selected < 0 ? count - 1 : Math.max(0, selected - 1));
+        return;
+      }
+      if (event.key === "ArrowDown" && selected >= 0) {
+        event.preventDefault();
+        setQuickSelectedIndex(selected >= count - 1 ? -1 : selected + 1);
+        return;
+      }
+      if (event.key === "Escape") { event.preventDefault(); closeQuickSuggestions(); return; }
+      if (event.key === "Tab" && !event.shiftKey) {
+        event.preventDefault();
+        applyQuickMessage(quickSuggestions[selected >= 0 ? selected : 0]);
+        return;
+      }
+      if (event.key === "Enter" && !event.shiftKey && selected >= 0) {
+        event.preventDefault();
+        applyQuickMessage(quickSuggestions[selected]);
+        return;
+      }
+    }
     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (!busySend && draft.trim()) void sendTextMessage(); return; }
     // Atalhos de formatacao do WhatsApp (os mesmos do WhatsApp Web):
     // envolvem a selecao com o marcador; sem selecao, inserem o par e
@@ -2229,12 +2265,24 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       const typed = trimmed.toLowerCase();
       const allQuick = [...systemSettings.quick_messages_global, ...userSettings.quick_messages].filter((qm) => qm.shortcut && qm.message);
       const matches = allQuick.filter((qm) => { const s = qm.shortcut.startsWith("/") ? qm.shortcut.toLowerCase() : `/${qm.shortcut.toLowerCase()}`; return s.startsWith(typed); });
-      setQuickSuggestions(matches);
-    } else { setQuickSuggestions([]); }
+      setQuickSuggestions(matches); setQuickSelectedIndex(-1);
+    } else { closeQuickSuggestions(); }
   }
 
+  function closeQuickSuggestions() { setQuickSuggestions([]); setQuickSelectedIndex(-1); }
+
+  // Completa no campo (clique, Tab ou Enter no item destacado) — o operador
+  // revisa/edita e da Enter de novo pra enviar.
   function applyQuickMessage(qm: { shortcut: string; message: string }) {
-    setDraft(qm.message); setQuickSuggestions([]); composerInputRef.current?.focus();
+    setDraft(qm.message); closeQuickSuggestions();
+    // Cursor no fim do texto completado (o value troca no re-render; rAF espera).
+    requestAnimationFrame(() => {
+      const el = composerInputRef.current;
+      if (!el) return;
+      el.focus();
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+    });
   }
 
   function toggleAttachMenu() { setShowAttachMenu((c) => !c); }
@@ -3003,7 +3051,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
     replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,
-    draft, setDraft, busySend, busyUpload, busyAudio, quickSuggestions, setQuickSuggestions,
+    draft, setDraft, busySend, busyUpload, busyAudio, quickSuggestions, setQuickSuggestions, quickSelectedIndex,
     sendTextMessage, submitText, submitMedia, submitFile, sendLocation,
     handleDraftKeyDown, handleDraftChange, applyQuickMessage, handlePrimaryAction, handleImageSelected,
     internalMode, setInternalMode,

@@ -764,7 +764,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, quickSelectedIndex, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
@@ -784,6 +784,12 @@ function ChatPanel() {
   const [showTakeoverPrompt, setShowTakeoverPrompt] = useState(false);
   const [greetDraft, setGreetDraft] = useState("");
   const activeMessageMenuRef = useRef<HTMLDivElement | null>(null);
+  const quickListRef = useRef<HTMLDivElement | null>(null);
+  // Mantem o item de mensagem rapida destacado pelo teclado visivel na lista rolavel.
+  useEffect(() => {
+    if (quickSelectedIndex < 0) return;
+    quickListRef.current?.querySelector<HTMLElement>(".is-selected")?.scrollIntoView({ block: "nearest" });
+  }, [quickSelectedIndex]);
   const selectedOperator = activeView === "equipe" ? findAssignedOperator(selectedContact, operators) : null;
   const selectedOperatorColor = selectedOperator ? operatorColor(selectedOperator.id) : null;
   const noInboundWindow = selectedContact && !selectedContact.last_inbound_at;
@@ -1061,8 +1067,8 @@ function ChatPanel() {
         </div>
 
         {quickSuggestions.length > 0 && (
-          <div className="quick-suggestions">{quickSuggestions.map((qm, idx) => (
-            <button key={idx} type="button" className="quick-suggestion-item" onClick={() => applyQuickMessage(qm)}>
+          <div className="quick-suggestions" role="listbox" aria-label="Mensagens rapidas" ref={quickListRef}>{quickSuggestions.map((qm, idx) => (
+            <button key={idx} type="button" role="option" aria-selected={idx === quickSelectedIndex} className={idx === quickSelectedIndex ? "quick-suggestion-item is-selected" : "quick-suggestion-item"} onClick={() => applyQuickMessage(qm)}>
               <strong>{qm.shortcut.startsWith("/") ? qm.shortcut : `/${qm.shortcut}`}</strong>
               <span className="sub">{qm.message.length > 80 ? qm.message.slice(0, 80) + "..." : qm.message}</span>
             </button>
@@ -1133,7 +1139,7 @@ function ChatPanel() {
               <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden />
             </div>
             <div className="composer-field">
-              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title="Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado" disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
+              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title="Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia" disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
             </div>
             <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={!selectedContact || busyUpload || busyComposerAction} aria-label={recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"}>
               {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : recording || hasDraft ? <SendIcon /> : <MicIcon />}

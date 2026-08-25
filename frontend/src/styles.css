@@ -1131,6 +1131,13 @@ textarea:focus {
   background: rgba(15, 118, 110, 0.08);
 }
 
+/* Item destacado pelo teclado (setas) — mais forte que o hover pra distinguir. */
+.quick-suggestion-item.is-selected {
+  background: rgba(15, 118, 110, 0.16);
+  outline: 1px solid var(--accent-dark);
+  outline-offset: -1px;
+}
+
 .quick-suggestion-item strong {
   flex-shrink: 0;
   color: var(--accent-dark);

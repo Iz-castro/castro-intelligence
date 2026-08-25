@@ -1,0 +1,79 @@
+# 2026-08-25 — Mensagens rápidas: import das globais da Varizemed + navegação por teclado
+
+Pedido do PO: (1) importar na lista **global** da Varizemed as mensagens rápidas do CRM anterior
+da clínica (`docs/temp.json`); (2) com a lista de sugestões aberta no compositor, percorrer os
+itens com as setas, Enter e Tab completam. Decisão do PO na hora: **Enter no item destacado
+completa no campo (não envia)** — o operador revisa e dá Enter de novo pra mandar ao lead
+(templates como `/ag`, `/remarcacao` têm "....." pra preencher).
+
+## Onde as mensagens rápidas vivem (verificado no código)
+
+- **Global do tenant:** `castro_crm_tenants/{tid}/system_settings/chat.quick_messages_global`
+  (`[{shortcut, message}]`). Mesmo doc de `pool_mode`, `bot_enabled`, alarme.
+  `quick_message_max` (default 20) é o teto **da lista pessoal**, aplicado só no frontend.
+- **Por operador:** `castro_crm_tenants/{tid}/user_settings/{user_id numérico}.quick_messages`.
+- API: `GET/PUT /api/settings/system` (PUT exige RBAC `gerenciar_config_sistema`, audita
+  `SYSTEM_SETTINGS_UPDATE`) e `GET/PUT /api/settings/user` (só o próprio). Rules: `system_settings`
+  read se `ownsTenant`, `user_settings` read/write false — tudo passa pela API.
+- Compositor: draft começando com `/` faz prefix-match (case-insensitive) em
+  `[...global, ...pessoal]`; ordem do array = ordem da sugestão; sem dedup entre escopos.
+- Os `quick_reply` de `webhook.py`/`types.ts` são botões de template da Meta — outra coisa.
+
+## Import (prod, tenant `varizemed`)
+
+- Script novo e reutilizável: `scripts/import_quick_messages_global.py` — dry-run por padrão,
+  `--apply`, **append idempotente** (atalho já existente é pulado, comparação case-insensitive),
+  grava undo em `scripts/_backfill_undo_quick_messages_<tenant>_<ts>.json` (gitignored),
+  `--undo <arquivo> --apply` restaura. Usa `save_system_settings` (mesmo caminho da API,
+  `merge=True`) — nenhum outro campo do doc é tocado. Exige `FIRESTORE_PROJECT_ID` explícito
+  (`gcloud config` aponta pro projeto velho de SP).
+- `docs/temp.json` (export do CRM antigo, formato `shortcut/title/text`) veio **truncado**: o
+  último objeto era só `{ "id` — **a 29ª mensagem se perdeu na cópia** (PO reenviar se existia).
+  Ajustes no import: uma entrada tinha `shortcut: ""` e o atalho `/agendamentohemorroida` no
+  `title` → recuperado; `**Valores do Tratamento:**` (markdown) → `*...*` (negrito WhatsApp) no
+  `/ch`; `title` descartado (nosso modelo só tem shortcut+message).
+- Resultado: **29 globais** = 28 novas + `/ola` → "ola global" (teste que já existia; apagar pela
+  UI de admin é decisão do PO). hubloc e varizemed-test seguem com 0 globais. Acentos conferidos
+  (`\xe1`, `\xe7`) — o `�` no console era só codepage do Git Bash.
+- Sem deploy pra isso; as configurações carregam **no login** → quem já estava logado precisa de F5.
+- Simulação do match: `/t` → `/t` (Tanusa) primeiro, depois `/te`, `/th`; `/$` → 3 preços.
+  Undo deste apply: `scripts/_backfill_undo_quick_messages_varizemed_20260825_104439.json`.
+
+## Navegação por teclado (frontend)
+
+- `frontend/src/context/CrmContext.tsx`: estado `quickSelectedIndex` (-1 = nenhum), helper
+  `closeQuickSuggestions()`; em `handleDraftKeyDown`, com a lista aberta: **↑** destaca o item
+  mais próximo da caixa (a lista fica ACIMA, então o último) e cada ↑ sobe um (clamp no topo);
+  **↓** desce e, passando do último, volta pra caixa; **Esc** fecha; **Tab** completa no campo
+  (sem seleção, a primeira); **Enter com item destacado** completa no campo. Enter **sem** seleção
+  continua enviando o draft literal (comportamento antigo, ex.: "/t" vai pro lead).
+  `applyQuickMessage` (clique/Tab/Enter) agora põe o cursor no fim do texto.
+- `frontend/src/App.tsx`: classe `.is-selected` + `aria-selected`, `role="listbox"/"option"`,
+  `scrollIntoView({ block: "nearest" })` no item destacado (lista tem `max-height: 180px`),
+  dica dos atalhos no `title` da textarea.
+- `frontend/src/styles.css`: `.quick-suggestion-item.is-selected` (fundo mais forte + contorno).
+- Gate: `npm run build` (tsc estrito + vite) OK.
+
+## Deploy
+
+- `gcloud run deploy castro-crm --source C:\Rafael\castro-intelligence --region us-west1
+  --project project-4a851bf9-f475-418c-800 --quiet` → revisão criada **`castro-crm-00090-gx8`**
+  (o gcloud imprimiu `00089-mhh` "serving 100 percent" — errado de novo; identificada por
+  `revisions list --sort-by "~metadata.creationTimestamp"`).
+- Promovida por nome (`update-traffic --to-revisions castro-crm-00090-gx8=100`); `status.traffic`
+  conferido: 100% na 00090-gx8, tag `staging` segue na 00074-zrt a 0%.
+- Smoke: `GET /` 200; `GET /api/client-config` 200 com `projectId` Oregon; bundle servido
+  `index-P8REM3MN.js` (mesmo hash do build local) contém `quick-suggestion-item is-selected`.
+- **Rollback:** `update-traffic --to-revisions castro-crm-00089-mhh=100`.
+- **Não commitado** (PO não pediu): working tree com `frontend/src/App.tsx`,
+  `frontend/src/context/CrmContext.tsx`, `frontend/src/styles.css` modificados +
+  `scripts/import_quick_messages_global.py` novo.
+
+## Pendências / follow-ups
+
+- Enter com a lista aberta e **nada** selecionado ainda envia o literal ("/t") — candidato a
+  completar a primeira sugestão (como Tab) em vez de enviar.
+- Sem dedup entre global e pessoal (atalho igual aparece duas vezes na sugestão).
+- `quick_message_max` não é validado no backend (`save_user_settings`).
+- 29ª mensagem do CRM antigo (truncada no `temp.json`) — reimportar com o script se o PO reenviar.
+- Apagar a global de teste `/ola` da varizemed (UI de admin).
