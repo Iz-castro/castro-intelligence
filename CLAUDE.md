@@ -33,6 +33,8 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (~61 asserts).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
+  Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
+  `frontend/` (~32 asserts, exit 0/1; compila com o esbuild do Vite).
 
 ## Deploy (produção)
 

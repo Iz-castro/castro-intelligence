@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from "re
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
+import { waPlainText } from "./utils/waFormat";
+import { WaText } from "./components/chat/WaText";
 import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
@@ -410,7 +412,7 @@ function ProtocolSearchCard() {
               return (
                 <div key={m.id} style={{ padding: "0.2rem 0.4rem", borderLeft: `3px solid ${accent}`, opacity: 0.95 }}>
                   <div className="sub" style={{ fontSize: "0.65rem", opacity: 0.7 }}>{when(m.timestamp_wa || m.created_at)} · {m.direction}</div>
-                  <div style={{ fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>{(m.content || `[${m.msg_type}]`).slice(0, 200)}</div>
+                  <div style={{ fontSize: "0.75rem", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{(m.content || `[${m.msg_type}]`).slice(0, 200)}</div>
                 </div>
               );
             })}
@@ -755,7 +757,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
   return (
     <div className={`reply-quote ${compact ? "compact" : ""}`}>
       <span className="reply-quote__sender">{senderName.trim() || "Mensagem"}</span>
-      <p>{preview}</p>
+      <p>{waPlainText(preview)}</p>
     </div>
   );
 }
@@ -1049,7 +1051,7 @@ function ChatPanel() {
                 ) : null}
                 <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message, operators)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.timestamp_wa || message.created_at)}</span></header>
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
-                {messageContentLabel(message) ? <p>{messageContentLabel(message)}</p> : null}
+                {messageContentLabel(message) ? <div className="bubble-text"><WaText text={messageContentLabel(message)} /></div> : null}
                 <MessageMedia message={message} />
                 <footer><span>{messageTypeLabel(message.msg_type)}{message.is_corrected ? " · corrigida" : ""}</span>{config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}</footer>
               </article>
@@ -1131,7 +1133,7 @@ function ChatPanel() {
               <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden />
             </div>
             <div className="composer-field">
-              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
+              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title="Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado" disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
             </div>
             <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={!selectedContact || busyUpload || busyComposerAction} aria-label={recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"}>
               {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : recording || hasDraft ? <SendIcon /> : <MicIcon />}

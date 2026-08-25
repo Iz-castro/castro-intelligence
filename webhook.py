@@ -79,6 +79,62 @@ def _resolve_webhook_tenant(channel, phone_number_id: str | None = None):
     return _WEBHOOK_DEFAULT_TENANT
 
 
+def _format_contacts_text(contacts):
+    """Cartao de contato do WhatsApp -> texto legivel pro operador.
+
+    A Meta manda uma lista de vCards estruturados (name/phones/emails/org/
+    addresses/urls). Antes era gravado str(lista) - repr Python numa linha
+    so, ilegivel na bolha, na previa de resposta e na busca. Nunca levanta:
+    qualquer surpresa no payload cai no repr antigo.
+    """
+    try:
+        if not isinstance(contacts, list) or not contacts:
+            return str(contacts)
+        cards = []
+        for card in contacts:
+            if not isinstance(card, dict):
+                continue
+            lines = []
+            name = card.get("name") if isinstance(card.get("name"), dict) else {}
+            formatted = str(name.get("formatted_name") or "").strip()
+            if not formatted:
+                parts = [name.get(k) for k in ("prefix", "first_name", "middle_name", "last_name", "suffix")]
+                formatted = " ".join(str(p).strip() for p in parts if p).strip()
+            lines.append(f"👤 {formatted or 'Contato'}")
+            for phone in card.get("phones") or []:
+                if not isinstance(phone, dict):
+                    continue
+                number = str(phone.get("phone") or phone.get("wa_id") or "").strip()
+                if number:
+                    lines.append(f"📞 {number}")
+            for email in card.get("emails") or []:
+                if not isinstance(email, dict):
+                    continue
+                addr = str(email.get("email") or "").strip()
+                if addr:
+                    lines.append(f"✉️ {addr}")
+            org = card.get("org") if isinstance(card.get("org"), dict) else {}
+            org_text = " - ".join(str(org.get(k)).strip() for k in ("company", "department", "title") if org.get(k))
+            if org_text:
+                lines.append(f"🏢 {org_text}")
+            for address in card.get("addresses") or []:
+                if not isinstance(address, dict):
+                    continue
+                addr_text = ", ".join(str(address.get(k)).strip() for k in ("street", "city", "state", "zip", "country") if address.get(k))
+                if addr_text:
+                    lines.append(f"📍 {addr_text}")
+            for url in card.get("urls") or []:
+                if not isinstance(url, dict):
+                    continue
+                link = str(url.get("url") or "").strip()
+                if link:
+                    lines.append(f"🔗 {link}")
+            cards.append("\n".join(lines))
+        return "\n\n".join(cards) if cards else str(contacts)
+    except Exception:
+        return str(contacts)
+
+
 def _fallback_reply_preview(message):
     content = str(message.get("content") or "").strip()
     if content:
@@ -650,8 +706,8 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             content = f"{loc_name} {loc_address}".strip() if (loc_name or loc_address) else ""
 
         elif msg_type == "contacts":
-            # Cartao de contato - salvar como texto JSON
-            content = str(msg.get("contacts", []))
+            # Cartao de contato - texto legivel (nome/telefones/e-mail...)
+            content = _format_contacts_text(msg.get("contacts", []))
 
         elif msg_type == "reaction":
             reaction = msg.get("reaction", {})
@@ -1152,7 +1208,7 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             content = f"{loc_name} {loc_address}".strip() if (loc_name or loc_address) else ""
 
         elif msg_type == "contacts":
-            content = str(echo.get("contacts", []))
+            content = _format_contacts_text(echo.get("contacts", []))
 
         elif msg_type == "reaction":
             reaction = echo.get("reaction", {}) if isinstance(echo.get("reaction"), dict) else {}

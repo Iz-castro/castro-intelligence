@@ -1817,7 +1817,7 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     wa_id = _wa_target(contact["wa_id"])
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": content}, **reply_context}
+    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": content, "preview_url": True}, **reply_context}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(url, json=payload, headers=headers)

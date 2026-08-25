@@ -1,4 +1,5 @@
 import type { ChatMessage, MessageReplyReference } from "../types";
+import { waPlainText } from "./waFormat";
 
 const dtf = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 
@@ -18,6 +19,8 @@ export function messageTypeLabel(value?: string) {
   const kind = String(value || "").trim().toLowerCase();
   if (!kind) return "mensagem";
   if (kind === "unsupported" || kind === "unknown") return "midia";
+  if (kind === "contacts") return "contato";
+  if (kind === "location") return "localizacao";
   return kind;
 }
 
@@ -84,7 +87,8 @@ function truncateText(value: string, maxLength: number) {
 export function buildMessageReplyReference(message: ChatMessage): MessageReplyReference {
   return {
     message_id: message.id,
-    preview: truncateText(messagePreviewText(message), 280),
+    // Sem marcadores do WhatsApp na citacao (igual ao app faz).
+    preview: truncateText(waPlainText(messagePreviewText(message)), 280),
     sender_name: truncateText(messageSenderLabel(message), 80),
   };
 }

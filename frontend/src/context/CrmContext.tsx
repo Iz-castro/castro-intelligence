@@ -2191,7 +2191,34 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function handleDraftKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (!busySend && draft.trim()) void sendTextMessage(); }
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); if (!busySend && draft.trim()) void sendTextMessage(); return; }
+    // Atalhos de formatacao do WhatsApp (os mesmos do WhatsApp Web):
+    // envolvem a selecao com o marcador; sem selecao, inserem o par e
+    // deixam o cursor no meio; com o par ja em volta, tiram (toggle).
+    if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+      const key = event.key.toLowerCase();
+      const marker = !event.shiftKey && key === "b" ? "*"
+        : !event.shiftKey && key === "i" ? "_"
+        : event.shiftKey && key === "x" ? "~"
+        : event.shiftKey && key === "m" ? "`"
+        : null;
+      if (marker) { event.preventDefault(); wrapDraftSelection(marker); }
+    }
+  }
+
+  function wrapDraftSelection(marker: string) {
+    const input = composerInputRef.current;
+    if (!input) return;
+    const value = input.value;
+    const start = input.selectionStart ?? value.length;
+    const end = input.selectionEnd ?? start;
+    const wrapped = start > 0 && value[start - 1] === marker && value[end] === marker;
+    const next = wrapped
+      ? value.slice(0, start - 1) + value.slice(start, end) + value.slice(end + 1)
+      : value.slice(0, start) + marker + value.slice(start, end) + marker + value.slice(end);
+    const delta = wrapped ? -1 : 1;
+    setDraft(next);
+    requestAnimationFrame(() => { input.focus(); input.setSelectionRange(start + delta, end + delta); });
   }
 
   function handleDraftChange(event: ChangeEvent<HTMLTextAreaElement>) {
