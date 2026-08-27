@@ -1586,3 +1586,19 @@ textarea:focus {
   from { transform: translateY(20px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
 }
+
+/* Editor de mensagens rapidas (configuracoes: globais do tenant e pessoais) */
+.qm-editor { display: flex; flex-direction: column; gap: 0.6rem; }
+.qm-card { border: 1px solid var(--border); border-radius: 16px; padding: 0.6rem 0.7rem; background: var(--panel-strong); }
+.qm-card.is-incomplete, .qm-card.is-duplicate { border-color: #e6a817; }
+.qm-card-head { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.4rem; }
+.qm-index { flex: 0 0 auto; min-width: 1.6rem; text-align: center; font-size: 0.78rem; opacity: 0.6; font-family: "IBM Plex Mono", monospace; }
+.qm-card-head .qm-title { flex: 1 1 auto; font-weight: 600; }
+.qm-card-head .qm-shortcut { flex: 0 0 170px; width: 170px; font-family: "IBM Plex Mono", monospace; }
+.qm-card-head .qm-remove { flex: 0 0 auto; padding: 0.4rem 0.6rem; font-size: 0.8rem; }
+.qm-text { resize: vertical; min-height: 3.4rem; font-size: 0.88rem; }
+.qm-warn { margin-top: 0.3rem; font-size: 0.8rem; color: #b45309; }
+.qm-add { align-self: flex-start; font-size: 0.85rem; padding: 0.5rem 0.8rem; }
+.qm-add:disabled { opacity: 0.5; cursor: not-allowed; }
+.qm-hint { font-size: 0.82rem; }
+.quick-suggestion-item .qs-title { flex-shrink: 0; font-weight: 600; font-size: 0.84rem; }

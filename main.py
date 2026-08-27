@@ -1042,7 +1042,10 @@ async def get_settings_system(current_user: dict = Depends(get_current_user)):
 async def update_settings_system(request: Request, current_user: dict = Depends(get_current_user)):
     ensure_permission(current_user, "gerenciar_config_sistema")
     body = await request.json()
-    result = save_system_settings(body)
+    try:
+        result = save_system_settings(body)
+    except ValueError as exc:  # mensagem rapida vazia/atalho repetido
+        raise HTTPException(status_code=400, detail=str(exc))
     log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(body))
     return result
 
@@ -1055,7 +1058,10 @@ async def get_settings_user(current_user: dict = Depends(get_current_user)):
 @app.put("/api/settings/user")
 async def update_settings_user(request: Request, current_user: dict = Depends(get_current_user)):
     body = await request.json()
-    result = save_user_settings(current_user["id"], body)
+    try:
+        result = save_user_settings(current_user["id"], body)
+    except ValueError as exc:  # mensagem rapida vazia/atalho repetido/limite
+        raise HTTPException(status_code=400, detail=str(exc))
     log_audit(current_user["id"], "USER_SETTINGS_UPDATE", str(body))
     return result
 

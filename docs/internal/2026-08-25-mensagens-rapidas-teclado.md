@@ -69,11 +69,57 @@ completa no campo (não envia)** — o operador revisa e dá Enter de novo pra m
   `frontend/src/context/CrmContext.tsx`, `frontend/src/styles.css` modificados +
   `scripts/import_quick_messages_global.py` novo.
 
+## Tarde — título por mensagem + trava contra mensagem vazia (rev `castro-crm-00091-btk`)
+
+Pedido do PO: título em cada mensagem rápida (global e pessoal) pra identificar/editar na
+configuração; e trava — a UI aceitava adicionar mensagem sem conteúdo (em prod o user 13 do
+hubloc tinha 3 linhas totalmente vazias).
+
+- **Modelo:** `QuickMessage = { shortcut, message, title? }` (`frontend/src/types.ts`). `title` é
+  só identificação (configurações + lista do compositor); não vai pro cliente. Backend guarda a
+  lista como vem — sem migração de schema.
+- **Editor novo** `frontend/src/components/settings/QuickMessagesEditor.tsx`, usado nos dois
+  lugares (modal "Minhas mensagens rapidas" e seção admin "Mensagens globais"): um card por
+  mensagem com nº, título, atalho e a mensagem em `textarea` (as da clínica têm até ~490
+  caracteres; o `input` de uma linha era inutilizável). Card incompleto ou com atalho repetido
+  fica marcado (borda âmbar + aviso) e **desabilita o "+ Adicionar"** até corrigir/remover.
+- **Trava em 3 camadas:** (1) editor acima; (2) `saveSystemSettingsAction`/`saveUserSettingsAction`
+  (`CrmContext.tsx`) recusam salvar com `quickMessagesProblem()` (`frontend/src/utils/quickMessages.ts`:
+  título+atalho+mensagem obrigatórios, atalho único) e mostram o erro; (3) **backend**
+  `_clean_quick_messages` (`database_firestore.py`): atalho e mensagem obrigatórios, atalho único
+  (case-insensitive, com/sem "/"), **`quick_message_max` agora vale no backend** pra lista pessoal,
+  título opcional; `ValueError` → **400** nos `PUT /api/settings/system|user` (`main.py`).
+  Testado direto: vazio total / mensagem vazia / atalho vazio / duplicado `/a` vs `A` / limite /
+  formato → todos rejeitados.
+- Lista de sugestões do compositor mostra o título entre o atalho e a prévia (`.qs-title`).
+- **Backfill (prod, com undo):** varizemed — 28 globais ganharam os títulos do CRM antigo
+  (recuperados do `temp.json` original; typos corrigidos: "Consulta Hemorroida", "Desconto Consulta
+  Angiologia") via `scripts/import_quick_messages_global.py`, que agora **preenche `title` de
+  atalho já existente sem título** (nunca sobrescreve mensagem; undo guarda o estado original —
+  `_backfill_undo_quick_messages_varizemed_20260825_113404.json`). Pessoais — título = nome do
+  atalho sem "/" (hubloc já usava o atalho como nome: `/1º PASSO`, `/PJ DOCS`…): hubloc 36
+  tituladas em 5 usuários + **3 linhas vazias removidas (user 13)**, varizemed 1; undo no scratchpad
+  da sessão (`undo_quick_titles_<tenant>_20260825_1134*.json`). Depois do backfill **toda lista
+  (global e pessoal) passa na validação nova** — ninguém fica travado ao salvar.
+- Gates: `py_compile` (main, database_firestore, script) + `npm run build` OK.
+- Deploy: revisão **`castro-crm-00091-btk`** (gcloud imprimiu `00090-gx8` de novo); promovida por
+  nome, tráfego 100% conferido; smoke `GET /` 200, `client-config` 200, bundle `index-D3YjpPXv.js`
+  com `qm-card`. **Rollback:** `update-traffic --to-revisions castro-crm-00090-gx8=100` (dados com
+  `title` são ignorados pelo frontend antigo — rollback seguro). Quem está logado precisa de F5.
+- **Commitado a pedido do PO em 2026-08-27** (commit seguinte ao `4166548` na `develop`):
+  `database_firestore.py`, `main.py`, `scripts/import_quick_messages_global.py`,
+  `frontend/src/{types.ts,App.tsx,context/CrmContext.tsx,styles.css}` + novos
+  `frontend/src/utils/quickMessages.ts`, `frontend/src/components/settings/QuickMessagesEditor.tsx`.
+- **Próxima frente (PO, 2026-08-27):** finalizar o `rating_request` — ver diário/memória
+  "Avaliação pós-conversão dormente" (template não existe na Meta; carimbo antes do envio;
+  captura de dígito sem janela).
+
 ## Pendências / follow-ups
 
 - Enter com a lista aberta e **nada** selecionado ainda envia o literal ("/t") — candidato a
   completar a primeira sugestão (como Tab) em vez de enviar.
-- Sem dedup entre global e pessoal (atalho igual aparece duas vezes na sugestão).
-- `quick_message_max` não é validado no backend (`save_user_settings`).
+- Sem dedup entre global e pessoal (atalho igual aparece duas vezes na sugestão) — a validação
+  de atalho único é por lista.
 - 29ª mensagem do CRM antigo (truncada no `temp.json`) — reimportar com o script se o PO reenviar.
-- Apagar a global de teste `/ola` da varizemed (UI de admin).
+- Global de teste `/ola` da varizemed: **apagada pelo PO** (2026-08-25).
+- Operadores do hubloc com título automático (= atalho) podem renomear na UI quando quiserem.

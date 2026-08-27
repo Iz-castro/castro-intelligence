@@ -9,6 +9,8 @@ import type {
   MessageReplyReference, Operator, PermissionKey, ProtocolSearchResult, SessionPerfil, SessionUser,
   SettingsPage, SystemSettings, TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
+import type { QuickMessage } from "../types";
+import { quickMessagesProblem } from "../utils/quickMessages";
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
 import { buildMessageReplyReference, formatRecordingTime, messageCopyText, messageMoment } from "../utils/formatting";
@@ -121,8 +123,8 @@ type CrmContextValue = {
   busySend: boolean;
   busyUpload: boolean;
   busyAudio: boolean;
-  quickSuggestions: { shortcut: string; message: string }[];
-  setQuickSuggestions: React.Dispatch<React.SetStateAction<{ shortcut: string; message: string }[]>>;
+  quickSuggestions: QuickMessage[];
+  setQuickSuggestions: React.Dispatch<React.SetStateAction<QuickMessage[]>>;
   // Item da lista de mensagens rapidas destacado pelo teclado (-1 = nenhum).
   quickSelectedIndex: number;
   sendTextMessage: () => Promise<void>;
@@ -132,7 +134,7 @@ type CrmContextValue = {
   sendLocation: () => Promise<void>;
   handleDraftKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
   handleDraftChange: (e: ChangeEvent<HTMLTextAreaElement>) => void;
-  applyQuickMessage: (qm: { shortcut: string; message: string }) => void;
+  applyQuickMessage: (qm: QuickMessage) => void;
   handlePrimaryAction: () => void;
   handleImageSelected: (e: ChangeEvent<HTMLInputElement>) => void;
   // Modo 1 (Sussurro): nota interna — nao vai pra Meta.
@@ -590,7 +592,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [draft, setDraft] = useState("");
   const [replyTarget, setReplyTarget] = useState<MessageReplyReference | null>(null);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
-  const [quickSuggestions, setQuickSuggestions] = useState<{ shortcut: string; message: string }[]>([]);
+  const [quickSuggestions, setQuickSuggestions] = useState<QuickMessage[]>([]);
   // Item da lista de sugestoes destacado pelo teclado (-1 = nenhum). Reseta
   // sempre que a lista muda (digitacao) ou fecha.
   const [quickSelectedIndex, setQuickSelectedIndex] = useState(-1);
@@ -2273,7 +2275,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Completa no campo (clique, Tab ou Enter no item destacado) — o operador
   // revisa/edita e da Enter de novo pra enviar.
-  function applyQuickMessage(qm: { shortcut: string; message: string }) {
+  function applyQuickMessage(qm: QuickMessage) {
     setDraft(qm.message); closeQuickSuggestions();
     // Cursor no fim do texto completado (o value troca no re-render; rAF espera).
     requestAnimationFrame(() => {
@@ -3024,6 +3026,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function saveSystemSettingsAction() {
     if (!bundle) return;
+    // Trava: mensagem global sem titulo/atalho/texto ou atalho repetido nao salva.
+    const problem = quickMessagesProblem(systemSettings.quick_messages_global, "Mensagens globais");
+    if (problem) { setError(problem); return; }
     try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
     catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }
@@ -3031,6 +3036,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function saveUserSettingsAction() {
     if (!bundle) return;
+    const problem = quickMessagesProblem(userSettings.quick_messages, "Minhas mensagens rapidas");
+    if (problem) { setError(problem); return; }
     try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/user", userSettings) as UserSettings; setUserSettings(r); setNotice("Suas configuracoes salvas."); }
     catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }

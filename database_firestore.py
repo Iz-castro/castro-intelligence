@@ -3123,6 +3123,41 @@ def write_backup_message(wa_message_id, contact_id, conversation_id, direction,
 
 _POOL_MODE_OPTIONS = ("legacy", "reception")
 
+
+def _clean_quick_messages(items, label, max_items=None):
+    """Normaliza e valida a lista de mensagens rapidas (globais ou pessoais).
+
+    Trava de dados (a UI valida antes, mas a garantia e aqui): atalho e
+    mensagem obrigatorios, atalho unico na lista (case-insensitive, com ou
+    sem "/"), limite opcional de itens. `title` e opcional — identifica a
+    mensagem nas configuracoes e na lista do compositor; nao vai pro cliente.
+    Levanta ValueError com texto pro usuario (o endpoint responde 400).
+    """
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise ValueError(f"{label}: formato invalido")
+    cleaned, seen = [], set()
+    for i, raw in enumerate(items, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"{label}: item {i} invalido")
+        shortcut = str(raw.get("shortcut") or "").strip()
+        message = str(raw.get("message") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        if not shortcut or not message:
+            raise ValueError(f"{label}: item {i} sem atalho ou sem mensagem")
+        key = (shortcut if shortcut.startswith("/") else "/" + shortcut).lower()
+        if key in seen:
+            raise ValueError(f"{label}: atalho repetido ({key})")
+        seen.add(key)
+        entry = {"shortcut": shortcut, "message": message}
+        if title:
+            entry["title"] = title
+        cleaned.append(entry)
+    if max_items is not None and len(cleaned) > max_items:
+        raise ValueError(f"{label}: limite de {max_items} mensagens rapidas")
+    return cleaned
+
 _DEFAULT_SYSTEM_SETTINGS = {
     "chat_prefix_enabled": False,
     "chat_prefix_roles": ["admin", "supervisor", "operador"],
@@ -3159,6 +3194,9 @@ def save_system_settings(settings: dict):
     # comportamento legado em vez de gravar lixo no doc.
     if "pool_mode" in filtered and str(filtered.get("pool_mode") or "") not in _POOL_MODE_OPTIONS:
         filtered["pool_mode"] = "legacy"
+    if "quick_messages_global" in filtered:
+        filtered["quick_messages_global"] = _clean_quick_messages(
+            filtered["quick_messages_global"], "Mensagens globais")
     filtered["updated_at"] = utcnow()
     document("system_settings", "chat").set(filtered, merge=True)
     return get_system_settings()
@@ -3195,6 +3233,11 @@ def get_user_settings(user_id: int):
 def save_user_settings(user_id: int, settings: dict):
     allowed = {"chat_prefix_enabled", "chat_prefix_name", "quick_messages"}
     filtered = {k: v for k, v in settings.items() if k in allowed}
+    if "quick_messages" in filtered:
+        # Limite por usuario (quick_message_max) agora vale no backend tambem.
+        max_items = int(get_system_settings().get("quick_message_max") or 0) or None
+        filtered["quick_messages"] = _clean_quick_messages(
+            filtered["quick_messages"], "Mensagens rapidas", max_items)
     filtered["updated_at"] = utcnow()
     document("user_settings", user_id).set(filtered, merge=True)
     return get_user_settings(user_id)

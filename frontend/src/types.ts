@@ -371,7 +371,7 @@ export type SystemSettings = {
   chat_prefix_enabled: boolean;
   chat_prefix_roles: string[];
   quick_message_max: number;
-  quick_messages_global: { shortcut: string; message: string }[];
+  quick_messages_global: QuickMessage[];
   notification_sound_enabled: boolean;
   alarm_enabled: boolean;
   alarm_threshold_minutes: number;
@@ -387,14 +387,16 @@ export type SystemSettings = {
 export type UserSettings = {
   chat_prefix_enabled: boolean;
   chat_prefix_name: string;
-  quick_messages: { shortcut: string; message: string }[];
+  quick_messages: QuickMessage[];
 };
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
 export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
 
-export type QuickMessage = { shortcut: string; message: string };
+// Mensagem rapida (global do tenant ou pessoal do operador). `title` e o nome
+// que identifica a mensagem nas configuracoes e na lista do compositor.
+export type QuickMessage = { shortcut: string; message: string; title?: string };
 
 // -- Google Chat (comunicacao interna) --
 

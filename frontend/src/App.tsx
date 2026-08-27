@@ -4,6 +4,7 @@ import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, Vide
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
+import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
 import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
@@ -1070,6 +1071,7 @@ function ChatPanel() {
           <div className="quick-suggestions" role="listbox" aria-label="Mensagens rapidas" ref={quickListRef}>{quickSuggestions.map((qm, idx) => (
             <button key={idx} type="button" role="option" aria-selected={idx === quickSelectedIndex} className={idx === quickSelectedIndex ? "quick-suggestion-item is-selected" : "quick-suggestion-item"} onClick={() => applyQuickMessage(qm)}>
               <strong>{qm.shortcut.startsWith("/") ? qm.shortcut : `/${qm.shortcut}`}</strong>
+              {qm.title ? <span className="qs-title">{qm.title}</span> : null}
               <span className="sub">{qm.message.length > 80 ? qm.message.slice(0, 80) + "..." : qm.message}</span>
             </button>
           ))}</div>
@@ -2429,14 +2431,8 @@ function AdminSettingsModal() {
               </div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens globais (padrao para todos):</span>
-                {systemSettings.quick_messages_global.map((qm, idx) => (
-                  <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
-                    <input value={qm.shortcut} onChange={(e) => { const u = [...systemSettings.quick_messages_global]; u[idx] = { ...u[idx], shortcut: e.target.value }; setSystemSettings((prev) => ({ ...prev, quick_messages_global: u })); }} placeholder="/atalho" style={{ width: 100 }} />
-                    <input value={qm.message} onChange={(e) => { const u = [...systemSettings.quick_messages_global]; u[idx] = { ...u[idx], message: e.target.value }; setSystemSettings((prev) => ({ ...prev, quick_messages_global: u })); }} placeholder="Mensagem completa" style={{ flex: 1 }} />
-                    <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => setSystemSettings((prev) => ({ ...prev, quick_messages_global: prev.quick_messages_global.filter((_, i) => i !== idx) }))}>X</button>
-                  </div>
-                ))}
-                <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => setSystemSettings((prev) => ({ ...prev, quick_messages_global: [...prev.quick_messages_global, { shortcut: "", message: "" }] }))}>+ Adicionar mensagem global</button>
+                <div className="sub qm-hint" style={{ marginBottom: "0.6rem" }}>Valem pra todos os operadores do tenant. O titulo identifica a mensagem aqui e na lista do chat — nao vai pro cliente.</div>
+                <QuickMessagesEditor items={systemSettings.quick_messages_global} onChange={(items) => setSystemSettings((prev) => ({ ...prev, quick_messages_global: items }))} addLabel="+ Adicionar mensagem global" />
               </div>
             </div>
             <div className="settings-section" style={{ marginTop: "1.2rem" }}>
