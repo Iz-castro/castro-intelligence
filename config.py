@@ -184,13 +184,37 @@ CX_DETECT_TIMEOUT_SECONDS = _float_env("CX_DETECT_TIMEOUT_SECONDS", 60.0)
 CX_READ_TIMEOUT_RETRY = _bool_env("CX_READ_TIMEOUT_RETRY", "true")
 
 # -- Qualificacao de contatos --
+# Reforma 2026-09: "novo" = sem interacao humana; "em_atendimento" = operador
+# interagiu (promovido automaticamente no 1o outbound humano); desfechos =
+# qualificado / nao_qualificado / convertido / nao_convertido.
 QUALIFICATION_OPTIONS = [
     "novo",
     "em_atendimento",
     "qualificado",
     "nao_qualificado",
     "convertido",
+    "nao_convertido",
 ]
+
+# -- Recibo de fechamento v2: protocolo + avaliacao por botoes (2026-09) --
+# O LIGA/DESLIGA da avaliacao e POR TENANT (system_settings.
+# rating_request_enabled, checkbox na aba Sistema — PO 2026-09-02), nao env.
+# Ligado: a pergunta (Ruim/Bom/Excelente) vai junto do protocolo no
+# fechamento manual — interativa dentro da janela de 24h, template
+# RATING_TEMPLATE_NAME fora dela. Desligado: dentro da janela vai so o texto
+# do protocolo; fora, o template simples CLOSE_TEMPLATE_NAME QUANDO aprovado
+# no WABA do canal (sem ele, fecha mudo — comportamento historico). Contrato
+# dos templates: {{1}} = primeiro nome, {{2}} = protocolo; o rating_request
+# tem 3 quick-replies Ruim/Bom/Excelente, o recibo_fechamento nao tem botao.
+RATING_TEMPLATE_NAME = os.getenv("RATING_TEMPLATE_NAME", "rating_request")
+RATING_TEMPLATE_LANG = os.getenv("RATING_TEMPLATE_LANG", "pt_BR")
+CLOSE_TEMPLATE_NAME = os.getenv("CLOSE_TEMPLATE_NAME", "recibo_fechamento")
+# Janela (horas) em que o clique de avaliacao ainda vale apos o pedido —
+# clique fora dela e ignorado (nunca vira nota nem chega ao bot).
+RATING_CAPTURE_HOURS = int(os.environ.get("RATING_CAPTURE_HOURS", "48"))
+# Nao re-perguntar avaliacao a quem recebeu pedido ha menos de N dias
+# (fechamentos frequentes do mesmo lead nao viram spam de pesquisa).
+RATING_REASK_DAYS = int(os.environ.get("RATING_REASK_DAYS", "7"))
 
 # -- Cargos / funcoes --
 ROLE_OPTIONS = [

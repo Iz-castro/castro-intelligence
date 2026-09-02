@@ -313,6 +313,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             <option value="qualificado">Qualificado</option>
             <option value="nao_qualificado">Nao qualificado</option>
             <option value="convertido">Convertido</option>
+            <option value="nao_convertido">Nao convertido</option>
           </select>
         </div>
         <button
@@ -621,7 +622,7 @@ function ContactList() {
             N/Q ja e um filtro por qualificacao (so nao_qualificado) e o Backup e
             historico importado — sem seletor nelas. O match em si
             (filteredConversations) e client-side sobre o que esta carregado. */}
-        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_lidos">Não lidas</option></select>}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option><option value="nao_lidos">Não lidas</option></select>}
         {/* "So espiar" (admin/supervisor): abrir conversa sem marcar como lida
             — badge e alarme continuam ate alguem tratar. Lembrado por navegador. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && canPeek && (
@@ -781,6 +782,9 @@ function ChatPanel() {
   const [openMessageMenuId, setOpenMessageMenuId] = useState<number | null>(null);
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+  // Gate de desfecho (reforma 2026-09): fechar lead ainda novo/em_atendimento
+  // abre o modal de qualificacao em vez de fechar direto.
+  const [showCloseModal, setShowCloseModal] = useState(false);
   const [busyTakeover, setBusyTakeover] = useState(false);
   const [showTakeoverPrompt, setShowTakeoverPrompt] = useState(false);
   const [greetDraft, setGreetDraft] = useState("");
@@ -895,6 +899,16 @@ function ChatPanel() {
     setOpenMessageMenuId(null);
   }, [selectedContactId]);
 
+  // Troca de lead/thread fecha modais presos a selecao anterior. Sem isto,
+  // o modal de encerramento sobrevivia a troca (ex.: thread assumida por
+  // outro operador zera selectedThreadId, flag fica true) e RESSUSCITAVA
+  // sobre o proximo lead aberto — um "Salvar e encerrar" fecharia e
+  // qualificaria o lead errado (revisao adversarial 2026-09-01).
+  useEffect(() => {
+    setShowCloseModal(false);
+    setShowTemplatePicker(false);
+  }, [selectedContactId, selectedThreadId]);
+
   useEffect(() => {
     if (openMessageMenuId === null) {
       setOpenMessageMenuDirection("down");
@@ -978,7 +992,12 @@ function ChatPanel() {
                     <button type="button" className="attach-option" onClick={() => { setShowTemplatePicker(true); closeDotsMenu(); }}><span>📋</span><span>Enviar template</span></button>
                     <div style={{ height: 1, background: "var(--border)", margin: "0.3rem 0.5rem" }} />
                     <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }}><span>✏️</span><span>Editar apelido</span></button>
-                    {selectedThreadId ? <button type="button" className="attach-option" onClick={() => { void setAttendance(selectedThreadId, attendanceClosed ? "aberto" : "fechado_manual"); closeDotsMenu(); }}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
+                    {selectedThreadId ? <button type="button" className="attach-option" onClick={() => {
+                      if (attendanceClosed) { void setAttendance(selectedThreadId, "aberto"); }
+                      else if (["novo", "em_atendimento"].includes(selectedContact.qualification || "novo")) { setShowCloseModal(true); }
+                      else { void setAttendance(selectedThreadId, "fechado_manual"); }
+                      closeDotsMenu();
+                    }}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
                     {ctx.systemSettings.pool_mode === "reception" && selectedContact.assigned_to != null ? <button type="button" className="attach-option" onClick={() => { void ctx.returnContactToPool(selectedContact.id); closeDotsMenu(); }}><span>↩️</span><span>Devolver à recepção</span></button> : null}
                     {selectedContact.attendance_protocol ? <button type="button" className="attach-option" onClick={() => { navigator.clipboard.writeText(selectedContact.attendance_protocol!).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button> : null}
                   </div>
@@ -1159,7 +1178,60 @@ function ChatPanel() {
           onClose={() => setShowTemplatePicker(false)}
         />
       ) : null}
+      {showCloseModal && selectedContact && selectedThreadId ? (
+        <CloseAttendanceModal
+          contact={selectedContact}
+          threadId={selectedThreadId}
+          onClose={() => setShowCloseModal(false)}
+        />
+      ) : null}
     </main>
+  );
+}
+
+// Gate de desfecho (reforma 2026-09): encerrar lead ainda "novo"/
+// "em_atendimento" exige a qualificacao final. So oferece DESFECHOS —
+// novo/em_atendimento sao estados de passagem e ficam fora do select.
+// A trava real e o 400 do backend (set-attendance); aqui e UX.
+function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact; threadId: string; onClose: () => void }) {
+  // `error` renderizado DENTRO do modal: o alert global fica atras do
+  // overlay do lightbox — um 400/403 do encerramento ficava invisivel.
+  const { setAttendance, busyTransfer, error } = useCrm();
+  const [outcome, setOutcome] = useState("");
+  // Nota PRE-CARREGADA com a atual: modal em branco ja apagou notas no
+  // passado (bug do form do painel) — nunca nasce vazio se o lead tem nota.
+  const [notes, setNotes] = useState(contact.notes || "");
+  const currentLabel = (contact.qualification || "novo") === "em_atendimento" ? "Em atendimento" : "Novo";
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Encerrar atendimento" onClick={onClose}>
+      <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+        <h2 style={{ margin: "0 0 0.6rem" }}>Encerrar atendimento</h2>
+        {error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{error}</span></div> : null}
+        <p className="sub" style={{ marginBottom: "0.8rem" }}>Este lead ainda esta como <strong>{currentLabel}</strong>. Qualifique o desfecho antes de encerrar.</p>
+        <label className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Desfecho *</label>
+        <select value={outcome} onChange={(e) => setOutcome(e.target.value)} style={{ width: "100%" }} autoFocus>
+          <option value="">Selecione...</option>
+          <option value="convertido">Convertido</option>
+          <option value="nao_convertido">Nao convertido</option>
+          <option value="qualificado">Qualificado</option>
+          <option value="nao_qualificado">Nao qualificado</option>
+        </select>
+        <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Notas de atendimento</label>
+        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={4} style={{ width: "100%" }} />
+        <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end", marginTop: "1rem" }}>
+          <button type="button" className="ghost" onClick={onClose} disabled={busyTransfer}>Cancelar</button>
+          <button
+            type="button"
+            className="primary"
+            disabled={!outcome || busyTransfer}
+            onClick={() => { void (async () => { const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes }); if (ok) onClose(); })(); }}
+          >
+            {busyTransfer ? "Encerrando..." : "Salvar e encerrar"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1213,6 +1285,19 @@ function formatDateBR(raw?: string | null): string {
 function reopenFirstName(contact?: Contact | null): string {
   const name = (contact?.whatsapp_profile_name || contact?.declared_name || contact?.display_name || "").trim();
   return name ? name.split(/\s+/)[0] : "cliente";
+}
+
+// Recibo v2: escala de 3 niveis por botao (1=Ruim 2=Bom 3=Excelente),
+// identificada pela PRESENCA do rating_label — nota legada 1-10 (pre-v2, sem
+// rotulo) usa as bandas e o formato antigos. Sem essa distincao, um "3/10"
+// legado viraria chip verde "3" (revisao adversarial 2026-09-01).
+function ratingChipColor(rating: number, label?: string): string {
+  if (label) return rating >= 3 ? "var(--success)" : rating === 2 ? "#e6a817" : "var(--danger)";
+  return rating >= 7 ? "var(--success)" : rating >= 4 ? "#e6a817" : "var(--danger)";
+}
+
+function ratingChipText(rating: number, label?: string): string {
+  return label || `${rating}/10`;
 }
 
 function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
@@ -1510,19 +1595,21 @@ function DetailPanel() {
             </div>
           ) : null}
 
-          {/* Rating (visivel apenas para quem supervisiona o tenant) */}
-          {canSeeAll && selectedContact.qualification === "convertido" ? (
+          {/* Rating (visivel apenas para quem supervisiona o tenant).
+              Recibo v2: avaliacao vem do FECHAMENTO (qualquer desfecho, nao
+              so convertido), escala 1-3 com rotulo; sem "pendente..." — o
+              carimbo agora so existe com pedido realmente enviado. */}
+          {canSeeAll && selectedContact.rating != null ? (
             <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
-              {selectedContact.rating != null ? (
-                <><span style={{ fontWeight: 600 }}>Avaliacao:</span><span className="chip" style={{ fontSize: "0.8rem", background: selectedContact.rating >= 7 ? "var(--success)" : selectedContact.rating >= 4 ? "#e6a817" : "var(--danger)", color: "#fff" }}>{selectedContact.rating}/10</span></>
-              ) : (
-                <span className="sub">Avaliacao pendente...</span>
-              )}
+              <span style={{ fontWeight: 600 }}>Avaliacao:</span>
+              <span className="chip" style={{ fontSize: "0.8rem", background: ratingChipColor(selectedContact.rating, selectedContact.rating_label), color: "#fff" }}>
+                {ratingChipText(selectedContact.rating, selectedContact.rating_label)}
+              </span>
             </div>
           ) : null}
 
           <CollapsibleCard title="Qualificacao">
-            <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option></select>
+            <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></select>
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" />
             <button className="primary" onClick={() => void saveQualification()} disabled={busySave}>{busySave ? "Salvando..." : "Salvar"}</button>
             {can("editar_dono_lead") && selectedContact.assigned_to ? (
@@ -2283,7 +2370,7 @@ function DashboardModal() {
                         <tr key={i} style={{ borderBottom: "1px solid var(--border)" }}>
                           <td style={{ padding: "0.4rem" }}>{String(r.display_name || r.wa_id || "")}</td>
                           <td style={{ textAlign: "right", padding: "0.4rem" }}>
-                            <span className="chip" style={{ fontSize: "0.75rem", background: Number(r.rating) >= 7 ? "var(--success)" : Number(r.rating) >= 4 ? "#e6a817" : "var(--danger)", color: "#fff" }}>{String(r.rating)}/10</span>
+                            <span className="chip" style={{ fontSize: "0.75rem", background: ratingChipColor(Number(r.rating), String(r.rating_label || "") || undefined), color: "#fff" }}>{ratingChipText(Number(r.rating), String(r.rating_label || "") || undefined)}</span>
                           </td>
                           <td style={{ padding: "0.4rem" }}>{r.converted_by_user_id ? operatorName(r.converted_by_user_id) : "-"}</td>
                           <td style={{ padding: "0.4rem" }}>{String(r.rating_received_at || "").slice(0, 10)}</td>
@@ -2665,6 +2752,28 @@ function NotificationsTab() {
             <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, alarm_sound_path: "" }))}>Usar padrao</button>
           )}
           <input ref={alarmFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "alarm"); }} />
+        </div>
+      </div>
+
+      <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+        <h3>Avaliacao pos-atendimento</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Ligada, o encerramento manual envia junto do protocolo a pergunta "como voce avalia o atendimento?" com botoes Ruim / Bom / Excelente. Dentro da janela de 24h a mensagem e gratuita; fora dela vai por template aprovado (conversa paga iniciada pela empresa). A nota do cliente fica visivel apenas para administradores e supervisores.</p>
+        <div className="settings-block">
+          <label className="settings-toggle">
+            <input type="checkbox" checked={systemSettings.rating_request_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, rating_request_enabled: e.target.checked }))} />
+            <span>Perguntar avaliacao ao encerrar atendimento</span>
+          </label>
+        </div>
+      </div>
+
+      <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+        <h3>Fechamento automatico por inatividade</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Com esta opcao ligada, o sistema fecha sozinho (a cada 30 min) atendimentos parados ha mais de 24h sem mensagem. Desligada, nenhuma conversa atendida fecha sozinha — o encerramento passa a ser sempre manual. Em qualquer caso, leads entregues pela recepcao que nunca receberam resposta humana voltam ao assistente virtual apos 7 dias (valvula de seguranca).</p>
+        <div className="settings-block">
+          <label className="settings-toggle">
+            <input type="checkbox" checked={systemSettings.auto_close_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, auto_close_enabled: e.target.checked }))} />
+            <span>Fechar atendimentos automaticamente por inatividade</span>
+          </label>
         </div>
       </div>
 

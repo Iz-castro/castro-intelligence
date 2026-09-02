@@ -166,6 +166,10 @@ export type Contact = {
   sale_owner_user_id?: number | null;
   sale_owner_uid?: string;
   rating?: number | null;
+  // Recibo v2 (2026-09): escala de 3 niveis por botao (Ruim/Bom/Excelente).
+  rating_label?: string;
+  // 1a interacao humana (promocao automatica novo -> em_atendimento).
+  first_human_contact_at?: string;
   unread_count?: number;
   unread?: number;
   is_archived?: number;
@@ -382,6 +386,12 @@ export type SystemSettings = {
   // Modo da fila "Novos" (ADR 0010): "legacy" = assumir pra falar;
   // "reception" = pool compartilhada (Recepcao).
   pool_mode: "legacy" | "reception";
+  // Fechamento automatico por inatividade (cron). false = todo encerramento
+  // vira manual; a valvula de orfaos (7 dias) continua ativa.
+  auto_close_enabled: boolean;
+  // Recibo v2: perguntar avaliacao (Ruim/Bom/Excelente) no encerramento
+  // manual. Por tenant; fora da janela de 24h usa template pago.
+  rating_request_enabled: boolean;
 };
 
 export type UserSettings = {

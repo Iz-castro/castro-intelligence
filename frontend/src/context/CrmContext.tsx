@@ -145,7 +145,7 @@ type CrmContextValue = {
   // Modo 3: supervisor assume a thread (vira Dono do Atendimento).
   supervisorTakeover: (conversationId: string) => Promise<void>;
   // Fase 4: fecha/reabre um atendimento manualmente.
-  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto") => Promise<void>;
+  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string }) => Promise<boolean>;
   // Fase 5A: busca por protocolo (admin/sup).
   loadProtocol: (protocolId: string) => Promise<ProtocolSearchResult | null>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
@@ -347,6 +347,8 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   notification_sound_path: "",
   bot_enabled: false,
   pool_mode: "legacy",
+  auto_close_enabled: true,
+  rating_request_enabled: false,
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -2358,8 +2360,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const contactId = selectedContact.id;
     try {
       setBusySave(true); setError(""); setNotice("");
-      await putJson(bundle.auth, `/api/wa/contact/${contactId}/qualify`, { qualification, notes });
-      setNotice("Qualificacao atualizada.");
+      const r = await putJson(bundle.auth, `/api/wa/contact/${contactId}/qualify`, { qualification, notes }) as { qualification_effective?: string };
+      // Verdade do servidor: "novo" em lead ja promovido e ignorado pelo
+      // backend (reforma 2026-09) — patchar com o valor efetivo, senao a UI
+      // mostraria "novo" salvo e o listener reverteria sem explicacao.
+      const effective = r?.qualification_effective || qualification;
+      setNotice(effective !== qualification && qualification === "novo"
+        ? "Notas salvas. Lead ja em atendimento nao volta a Novo."
+        : "Qualificacao atualizada.");
       // Contato hidratado sob demanda (extraContacts, fora do top-50 ao vivo)
       // e um fetch unico — sem este patch o chip e o filtro por qualificacao
       // da sidebar ficariam com o valor antigo ate recarregar a pagina. Quem
@@ -2369,12 +2377,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         const cur = prev.get(contactId);
         if (!cur) return prev;
         const next = new Map(prev);
-        next.set(contactId, { ...cur, qualification, notes });
+        next.set(contactId, { ...cur, qualification: effective, notes });
         return next;
       });
-      // O que foi salvo vira o novo seed: o form volta a contar como "nao
-      // tocado" e segue acompanhando mudancas futuras do servidor.
-      detailSeedRef.current = { id: contactId, qualification, notes };
+      // O que VALE no servidor vira o novo seed: o form volta a contar como
+      // "nao tocado" e segue acompanhando mudancas futuras.
+      detailSeedRef.current = { id: contactId, qualification: effective, notes };
+      setQualification(effective);
       if (!snapshotMode) await refreshPollingViews();
     }
     catch (e) { setError(errorText(e)); }
@@ -2987,14 +2996,43 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   // Fase 4: fecha (fechado_manual) ou reabre (aberto) um atendimento.
-  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto") {
-    if (!bundle) return;
+  // `outcome` (reforma 2026-09): qualificacao final + notas do gate de
+  // desfecho, no MESMO request — o backend recusa fechar lead novo/
+  // em_atendimento sem isso. Retorna sucesso pro modal so fechar se salvou.
+  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string }): Promise<boolean> {
+    if (!bundle) return false;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
-      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/set-attendance`, { status });
+      const body: Record<string, unknown> = { status };
+      if (outcome) { body.qualification = outcome.qualification; body.notes = outcome.notes; }
+      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/set-attendance`, body);
       setNotice(status === "fechado_manual" ? "Atendimento fechado." : "Atendimento reaberto.");
+      if (outcome && selectedContact) {
+        // Mesmo patch do saveQualification: camada estatica + seed do form,
+        // senao chip/filtro da sidebar e painel ficam com o valor antigo.
+        // `selectedContact` e o do momento da CHAMADA (o lead do modal) —
+        // correto pro patch por id. Ja o estado GLOBAL do form so pode ser
+        // tocado se o usuario ainda estiver NESSE lead: se trocou de conversa
+        // durante o await, sobrescreveria o form do lead novo com dados do
+        // antigo (revisao adversarial 2026-09-01). detailSeedRef acompanha a
+        // selecao (efeito de seed), entao id divergente = usuario trocou.
+        const contactId = selectedContact.id;
+        setExtraContacts((prev) => {
+          const cur = prev.get(contactId);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          next.set(contactId, { ...cur, qualification: outcome.qualification, notes: outcome.notes });
+          return next;
+        });
+        if (detailSeedRef.current?.id === contactId) {
+          detailSeedRef.current = { id: contactId, qualification: outcome.qualification, notes: outcome.notes };
+          setQualification(outcome.qualification);
+          setNotes(outcome.notes);
+        }
+      }
       if (!snapshotMode) await refreshPollingViews();
-    } catch (e) { setError(errorText(e)); }
+      return true;
+    } catch (e) { setError(errorText(e)); return false; }
     finally { setBusyTransfer(false); }
   }
 

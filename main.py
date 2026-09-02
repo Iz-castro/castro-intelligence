@@ -34,6 +34,7 @@ from config import (
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS, ATTENDANCE_AUTOCLOSE_HOURS,
+    RATING_TEMPLATE_NAME, RATING_TEMPLATE_LANG, RATING_REASK_DAYS, CLOSE_TEMPLATE_NAME,
     RECEPTION_UNATTENDED_RELEASE_DAYS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
@@ -2554,64 +2555,36 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
         raise HTTPException(status_code=404, detail="Contato nao encontrado")
     _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
     ensure_permission(current_user, "qualificar_lead")
+    # Reforma 2026-09: "novo" = nunca teve interacao humana; lead ja promovido
+    # nao regride por save do painel. Sem esta guarda, form semeado ANTES da
+    # promocao automatica (A2) e salvo depois gravava "novo" de volta e
+    # disparava nova promocao com nota duplicada (revisao adversarial).
+    _kept = ""
+    if (qualification == "novo"
+            and str(contact.get("qualification") or "novo") != "novo"):
+        _kept = str(contact.get("qualification"))
+        qualification = ""  # mantem a atual; notas seguem salvas normalmente
     update_wa_contact_qualification(contact_id, qualification, notes)
-    log_audit(current_user["id"], "CONTACT_QUALIFY", f"Contato {contact_id}: {qualification}")
+    _effective = qualification or _kept or str(contact.get("qualification") or "novo")
+    log_audit(current_user["id"], "CONTACT_QUALIFY",
+              f"Contato {contact_id}: {_effective}" + (" (downgrade p/ novo ignorado)" if _kept else ""))
 
-    result = {"status": "ok"}
+    # qualification_effective: o valor que VALE apos o save — o frontend
+    # patcha com a verdade do servidor (sem isto, o guard acima fazia a UI
+    # mostrar "novo" salvo com sucesso enquanto o servidor mantinha
+    # em_atendimento — revisao adversarial 2026-09-01).
+    result = {"status": "ok", "qualification_effective": _effective}
 
-    # Ao marcar como convertido: gravar quem converteu e enviar template de avaliacao
+    # Ao marcar como convertido: gravar quem converteu. O pedido de avaliacao
+    # NAO dispara mais aqui — desde o recibo v2 (2026-09) ele vai junto do
+    # protocolo no FECHAMENTO do atendimento (_close_daily_and_send_protocol),
+    # com carimbo pos-envio e captura por botao (fim do digito engolido que
+    # gerou o falso positivo do contato 193).
     if qualification == "convertido":
 
         fs_document("wa_contacts", contact_id).set({
             "converted_by_user_id": current_user["id"],
-            "rating_requested_at": fs_utcnow().isoformat(),
         }, merge=True)
-
-        # Enviar template de avaliacao (mensagem visivel apenas para admin)
-        try:
-            token, phone_id, api_base = _resolve_channel_creds(contact)
-            wa_id = _wa_target(contact["wa_id"])
-            rating_url = f"{api_base}/{phone_id}/messages"
-            rating_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            rating_payload = {
-                "messaging_product": "whatsapp",
-                "to": wa_id,
-                "type": "template",
-                "template": {
-                    "name": "rating_request",
-                    "language": {"code": "pt_BR"},
-                },
-            }
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(rating_url, json=rating_payload, headers=rating_headers)
-                resp_data = resp.json()
-
-            if resp.status_code == 200:
-                wa_msg_id = resp_data.get("messages", [{}])[0].get("id", "")
-                from channel_service import get_channel as _get_ch
-                _rating_channel = _get_ch(contact.get("channel_id")) if contact.get("channel_id") is not None else None
-                save_wa_message(
-                    wa_message_id=wa_msg_id, contact_id=contact_id, direction="outbound",
-                    msg_type="template", content="[avaliacao: responda de 1 a 10]",
-                    status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
-                    operator_id=current_user["id"],
-                    sender_user_id=current_user["id"],
-                    sent_by_name=str(current_user.get("display_name") or ""),
-                    channel_id=contact.get("channel_id"),
-                    channel_owner_user_id=(_rating_channel or {}).get("owner_user_id"),
-                    is_rating_message=True, visibility="admin_only",
-                )
-                result["rating_sent"] = True
-                logger.info("Rating template enviado para contato %d", contact_id)
-            else:
-                # Template pode nao existir ainda — nao bloqueia a conversao
-                error_msg = resp_data.get("error", {}).get("message", "")
-                logger.warning("Falha ao enviar rating template: %s", error_msg)
-                result["rating_sent"] = False
-                result["rating_error"] = error_msg
-        except Exception as exc:
-            logger.warning("Erro ao enviar rating template: %s", exc)
-            result["rating_sent"] = False
 
     return result
 
@@ -3492,8 +3465,12 @@ async def cron_expire_takeovers(request: Request):
                 summary.append({"tenant_id": tid, "expired": len(expired)})
             total += len(expired)
             # Fase 4: fecha atendimentos ATRIBUIDOS ociosos por inatividade.
+            # Toggle por tenant (auto_close_enabled): desligado, so a valvula
+            # de orfaos do Modo Recepcao fecha (PO 2026-09-01).
+            from database import is_auto_close_enabled
             closed = close_stale_attendances(
                 ATTENDANCE_AUTOCLOSE_HOURS, RECEPTION_UNATTENDED_RELEASE_DAYS,
+                inactivity_enabled=is_auto_close_enabled(),
             )
             for c in closed:
                 cc_id = c.get("contact_id")
@@ -3798,14 +3775,51 @@ async def wa_supervisor_takeover(conversation_id: str, current_user: dict = Depe
     return {"status": "taken_over", "announced": announced}
 
 
+async def _close_template_available(channel, name) -> bool:
+    """True se `name` esta APPROVED no WABA do canal (cache 60s do picker).
+
+    Guard do template SIMPLES de encerramento (CLOSE_TEMPLATE_NAME): evita 1
+    chamada Graph fadada a falhar POR FECHAMENTO em tenant que nao criou o
+    template — ruido cronico de log. O rating_request nao passa por aqui (ja
+    verificado/replicado nos 3 WABAs). Falha de cache/Meta = False (mudo,
+    comportamento historico)."""
+    try:
+        data = await _load_approved_templates_for_channel(channel)
+        return any(t.get("name") == name for t in (data or {}).get("templates", []))
+    except Exception:
+        return False
+
+
+def _rating_recently_asked(contact) -> bool:
+    """True se ja pedimos avaliacao a este lead ha menos de RATING_REASK_DAYS.
+    Timestamp ilegivel = nao bloqueia (carimbos legados ja limpos/velhos)."""
+    raw = (contact or {}).get("rating_requested_at")
+    if not raw:
+        return False
+    try:
+        dt = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt) < timedelta(days=RATING_REASK_DAYS)
+    except Exception:
+        return False
+
+
 async def _close_daily_and_send_protocol(contact, conv, channel, current_user, close_status):
     """Fase 5A: no fechamento de uma thread, fecha o Atendimento DIARIO do
     contato e (se ainda nao informado) envia o protocolo ao lead como
     "recibo". O CARIMBO de fechamento roda SEMPRE que o protocolo existe,
     inclusive pra protocolo de dia anterior (fix 3a); o ENVIO segue gateado a
-    protocolo do proprio dia + janela de 24h da Meta (texto livre; fora dela
-    fecha sem enviar, mesma regra do Modo 3). Idempotente — a flag
-    protocolo_informado bloqueia reenvio no retorno-zumbi.
+    protocolo do proprio dia. Idempotente — a flag protocolo_informado
+    bloqueia reenvio no retorno-zumbi.
+
+    Recibo v2 (2026-09, toggle por tenant rating_request_enabled): a pergunta de avaliacao
+    (Ruim/Bom/Excelente) vai JUNTO do protocolo — dentro da janela de 24h
+    como mensagem interativa de sessao (gratis), fora dela via template
+    aprovado (RATING_TEMPLATE_NAME). Carimbo rating_requested_at SO com envio
+    confirmado; re-pergunta bloqueada por RATING_REASK_DAYS. Com a flag
+    desligada, comportamento historico: texto do protocolo dentro da janela,
+    silencio fora dela.
 
     close_status: 'fechado_manual' | 'fechado_inatividade'.
     """
@@ -3824,41 +3838,157 @@ async def _close_daily_and_send_protocol(contact, conv, channel, current_user, c
     today_br = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y%m%d")
     is_today = pid.startswith(today_br + "-")
     sender_uid = (current_user or {}).get("id")
-    if is_today and not atendimento.get("protocolo_informado"):
-        within_24h = False
-        li = contact.get("last_inbound_at")
-        if li:
-            try:
-                li_dt = li if isinstance(li, datetime) else datetime.fromisoformat(str(li))
-                if li_dt.tzinfo is None:
-                    li_dt = li_dt.replace(tzinfo=timezone.utc)
-                within_24h = (datetime.now(timezone.utc) - li_dt) <= timedelta(hours=24)
-            except Exception:
-                within_24h = False
-        if within_24h and channel:
+    _informado = bool(atendimento.get("protocolo_informado"))
+    within_24h = False
+    li = contact.get("last_inbound_at")
+    if li:
+        try:
+            li_dt = li if isinstance(li, datetime) else datetime.fromisoformat(str(li))
+            if li_dt.tzinfo is None:
+                li_dt = li_dt.replace(tzinfo=timezone.utc)
+            within_24h = (datetime.now(timezone.utc) - li_dt) <= timedelta(hours=24)
+        except Exception:
+            within_24h = False
+    # So fechamento MANUAL (operador identificado) pergunta avaliacao —
+    # cron e fechado_cliente passam current_user=None e ficam mudos fora
+    # da janela (PO 2026-09-01; um cron falante viraria template pago em
+    # massa toda madrugada). O liga/desliga e POR TENANT (checkbox na aba
+    # Sistema — PO 2026-09-02); import local: database reexporta.
+    from database import is_rating_request_enabled
+    ask_rating = bool(is_rating_request_enabled() and channel
+                      and current_user is not None
+                      and not _rating_recently_asked(contact))
+    # Pernas de envio (revisao adversarial 2026-09-01 — o ramo do template
+    # era INALCANCAVEL: protocolo de HOJE implica inbound hoje implica janela
+    # aberta):
+    # - janela ABERTA: recibo do dia (frase diz "de hoje") — exige protocolo
+    #   de hoje e nao-informado.
+    # - janela FECHADA: SO o template de avaliacao, que cita o protocolo sem
+    #   dizer "hoje" — vale tambem pra protocolo de dia anterior (fechar
+    #   conversa fria e exatamente o caso de uso do PO pro template).
+    _send_janela = within_24h and is_today and not _informado
+    _send_template = (not within_24h) and ask_rating and not _informado
+    # Encerramento COMUM fora da janela (PO 2026-09-02): avaliacao desligada
+    # neste tenant, mas existe o template simples de recibo no WABA -> envia
+    # ele (sem botoes). Sem o template, mudo — comportamento historico. So
+    # fechamento manual, mesmo racional do ask_rating.
+    _send_plain = ((not within_24h) and not ask_rating and not _informado
+                   and current_user is not None and channel is not None
+                   and await _close_template_available(channel, CLOSE_TEMPLATE_NAME))
+    if pid:  # sempre True aqui (early-return acima); nivel preservado p/ diff enxuto
+        if channel and (_send_janela or _send_template or _send_plain):
             try:
                 token, phone_id, api_base = _resolve_channel_creds_by_id(channel["id"])
                 wa_id = _wa_target(contact["wa_id"])
-                msg = f"Seu protocolo de hoje é {pid}. Agradecemos pela confiança em nossa empresa."
+                first_name = _reopen_first_name(contact)
+                body_v2 = (
+                    f"Olá, {first_name}! Seu atendimento (protocolo {pid}) foi encerrado. "
+                    "Obrigado por confiar na nossa empresa. Para nos ajudar a manter a "
+                    "qualidade, como você avalia o atendimento recebido hoje?"
+                )
+                payload = None
+                msg_saved_type = "text"
+                template_cat = None
+                content_txt = ""
+                if _send_janela and ask_rating:
+                    # Janela aberta: interativa de sessao (gratis, sem template).
+                    # IDs rating_* sao o contrato do webhook (captura por botao).
+                    content_txt = body_v2
+                    payload = {
+                        "messaging_product": "whatsapp", "to": wa_id, "type": "interactive",
+                        "interactive": {
+                            "type": "button",
+                            "body": {"text": body_v2},
+                            "action": {"buttons": [
+                                {"type": "reply", "reply": {"id": "rating_ruim", "title": "Ruim"}},
+                                {"type": "reply", "reply": {"id": "rating_bom", "title": "Bom"}},
+                                {"type": "reply", "reply": {"id": "rating_excelente", "title": "Excelente"}},
+                            ]},
+                        },
+                    }
+                elif _send_janela:
+                    # Flag desligada (ou re-pergunta bloqueada): so o protocolo.
+                    content_txt = f"Seu protocolo de hoje é {pid}. Agradecemos pela confiança em nossa empresa."
+                    payload = {"messaging_product": "whatsapp", "to": wa_id,
+                               "type": "text", "text": {"body": content_txt}}
+                elif _send_template:
+                    # Fora da janela COM avaliacao: template rating_request
+                    # (conversa paga iniciada pela empresa). Ausente/reprovado
+                    # no WABA -> a Meta recusa, logamos e o fechamento segue
+                    # mudo (comportamento historico).
+                    content_txt = body_v2
+                    msg_saved_type = "template"
+                    template_cat = "utility"
+                    payload = {
+                        "messaging_product": "whatsapp", "to": wa_id, "type": "template",
+                        "template": {
+                            "name": RATING_TEMPLATE_NAME,
+                            "language": {"code": RATING_TEMPLATE_LANG},
+                            "components": [{"type": "body", "parameters": [
+                                {"type": "text", "text": first_name},
+                                {"type": "text", "text": pid},
+                            ]}],
+                        },
+                    }
+                else:
+                    # Fora da janela SEM avaliacao (_send_plain): template
+                    # simples de recibo, ja confirmado APPROVED no WABA.
+                    content_txt = (
+                        f"Olá, {first_name}! Seu atendimento (protocolo {pid}) foi "
+                        "encerrado. Obrigado por confiar na nossa empresa."
+                    )
+                    msg_saved_type = "template"
+                    template_cat = "utility"
+                    payload = {
+                        "messaging_product": "whatsapp", "to": wa_id, "type": "template",
+                        "template": {
+                            "name": CLOSE_TEMPLATE_NAME,
+                            "language": {"code": RATING_TEMPLATE_LANG},
+                            "components": [{"type": "body", "parameters": [
+                                {"type": "text", "text": first_name},
+                                {"type": "text", "text": pid},
+                            ]}],
+                        },
+                    }
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     resp = await client.post(
                         f"{api_base}/{phone_id}/messages",
                         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                        json={"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": msg}},
+                        json=payload,
                     )
                 if resp.status_code == 200:
                     wa_msg_id = (resp.json().get("messages", [{}])[0].get("id", ""))
                     save_wa_message(
                         wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
-                        msg_type="text", content=msg, status="sent",
+                        msg_type=msg_saved_type, content=content_txt, status="sent",
                         timestamp_wa=datetime.now(timezone.utc).isoformat(),
                         operator_id=sender_uid,
                         channel_id=channel["id"],
                         conversation_id=conv["id"] if conv else None,
                         sender_user_id=sender_uid,
                         channel_owner_user_id=channel.get("owner_user_id"),
+                        template_category=template_cat,
+                        # Recibo de sistema no fechamento nao e "inicio de
+                        # atendimento" — nao promove lead novo (reforma 2026-09).
+                        promote_qualification=False,
+                        # Nem "atividade": sem isto o proprio recibo reabria o
+                        # attendance_status que este request acabou de fechar
+                        # (revisao adversarial 2026-09-01).
+                        reopen_attendance=False,
                     )
                     mark_protocol_informed(pid)
+                    if ask_rating:
+                        # Carimbo SO com envio confirmado (fix da classe do
+                        # "Avaliacao pendente" eterno + digito engolido).
+                        fs_document("wa_contacts", contact["id"]).set(
+                            {"rating_requested_at": fs_utcnow().isoformat()}, merge=True,
+                        )
+                else:
+                    try:
+                        _err = (resp.json().get("error") or {}).get("message", "")
+                    except Exception:
+                        _err = f"http {resp.status_code}"
+                    logger.warning("close_daily_protocol: Meta recusou pid=%s: %s", pid, _err)
             except Exception as exc:
                 logger.warning("close_daily_protocol: falha ao enviar pid=%s: %s", pid, exc)
     close_daily_attendance(pid, close_status, sender_uid)
@@ -3868,8 +3998,14 @@ async def _close_daily_and_send_protocol(contact, conv, channel, current_user, c
 @app.post("/api/wa/conversation/{conversation_id}/set-attendance")
 async def wa_set_attendance(conversation_id: str, request: Request, current_user: dict = Depends(get_current_user)):
     """Fase 4 (ciclo de vida): fecha/reabre um atendimento manualmente.
-    body: {status: 'fechado_manual' | 'aberto'}. Dono do atendimento ou
-    admin/supervisor. Fechar manual zera o takeover."""
+    body: {status: 'fechado_manual' | 'aberto', qualification?, notes?}.
+    Dono do atendimento ou admin/supervisor. Fechar manual zera o takeover.
+
+    Gate de desfecho (reforma 2026-09): fechar manualmente um lead ainda
+    "novo"/"em_atendimento" EXIGE a qualificacao final no mesmo request
+    (convertido | nao_convertido | qualificado | nao_qualificado) — o modal
+    do frontend coleta, esta trava e a camada real. Cron e fechamento pelo
+    proprio cliente (fechado_cliente) nao passam por aqui; backup fora."""
     body = await request.json()
     status = (body.get("status") or "").strip()
     if status not in ("fechado_manual", "aberto"):
@@ -3898,8 +4034,48 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
         current_user,
         "fechar_atendimento_manual" if status == "fechado_manual" else "reabrir_atendimento_manual",
     )
-    set_attendance_status(conversation_id, status, clear_takeover=(status == "fechado_manual"))
     contact_id = conv.get("contact_id")
+    contact = get_wa_contact(contact_id) if contact_id is not None else None
+    qualification = str(body.get("qualification") or "").strip()
+    notes = body.get("notes")
+    if status == "fechado_manual":
+        _terminais = ("qualificado", "nao_qualificado", "convertido", "nao_convertido")
+        if qualification and qualification not in _terminais:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Desfecho invalido. Opcoes: {', '.join(_terminais)}",
+            )
+        _cur_q = str((contact or {}).get("qualification") or "novo")
+        _gate = (contact is not None and not conv.get("is_backup")
+                 and not contact.get("is_backup")
+                 and _cur_q in ("novo", "em_atendimento"))
+        if _gate and not qualification:
+            raise HTTPException(
+                status_code=400,
+                detail="Qualifique o desfecho antes de encerrar (convertido, nao_convertido, qualificado ou nao_qualificado).",
+            )
+        if qualification and contact is not None:
+            if not _gate:
+                # FORA do caso do gate (lead ja terminal/backup), mudar
+                # qualificacao por este endpoint exige o MESMO toggle do
+                # /qualify — sem isto, perfil "so fecha" reescrevia desfecho
+                # terminal de qualquer thread da pool e carimbava
+                # converted_by_user_id pra si (revisao adversarial 2026-09-01).
+                ensure_permission(current_user, "qualificar_lead")
+            # No caso do gate, cobre pelo toggle do FECHAMENTO (ja checado
+            # acima), sem exigir qualificar_lead: o gate torna o desfecho
+            # OBRIGATORIO pra fechar — exigir um segundo toggle criaria
+            # perfil que nao consegue encerrar nunca (deadlock). Auditado.
+            update_wa_contact_qualification(contact_id, qualification, notes)
+            if qualification == "convertido":
+                fs_document("wa_contacts", contact_id).set(
+                    {"converted_by_user_id": current_user["id"]}, merge=True,
+                )
+            log_audit(current_user["id"], "CONTACT_QUALIFY",
+                      f"Contato {contact_id}: {qualification} (no encerramento)")
+            contact = dict(contact)
+            contact["qualification"] = qualification
+    set_attendance_status(conversation_id, status, clear_takeover=(status == "fechado_manual"))
     if contact_id is not None:
         verb = "fechado" if status == "fechado_manual" else "reaberto"
         insert_transfer_system_message(
@@ -3910,7 +4086,7 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
     # protocolo ao lead (recibo). Idempotente: a flag protocolo_informado
     # bloqueia reenvio se outra thread do mesmo dia ja fechou antes.
     if contact_id is not None and status == "fechado_manual":
-        contact = get_wa_contact(contact_id)
+        # `contact` ja carregado acima (gate de desfecho) — 1 read a menos.
         from channel_service import get_channel as _get_channel
         channel = _get_channel(conv.get("channel_id")) if conv.get("channel_id") else None
         if contact:

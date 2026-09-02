@@ -53,6 +53,13 @@ export function normalizeContact(record: Record<string, unknown>, docId: string)
     bot_completed: Boolean(record.bot_completed),
     bot_setor_nome: String(record.bot_setor_nome || ""),
     lead_temperature: String(record.lead_temperature || ""),
+    // Recibo v2 (2026-09): rating era o exemplo classico do campo declarado
+    // em types.ts mas ausente da whitelist (so funcionava em polling mode).
+    rating: record.rating == null ? null : num(record.rating),
+    rating_label: String(record.rating_label || ""),
+    // Fonte da verdade do inicio do atendimento (a linha na nota e best-
+    // effort: some se o operador salvar notas editadas antes da promocao).
+    first_human_contact_at: iso(record.first_human_contact_at),
   };
 }
 

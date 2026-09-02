@@ -8,7 +8,7 @@ Trata mensagens de texto, imagem, audio, video, sticker, localizacao e documento
 import hmac
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from starlette.concurrency import run_in_threadpool
 
@@ -17,6 +17,7 @@ from config import (
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS,
     STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS, STT_FALLBACK_TEXT,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN,
+    RATING_CAPTURE_HOURS,
 )
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit, flag_conversation_takeover,
@@ -428,6 +429,108 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         logger.info("[REOPEN BTN] Cliente retomou | conv=%s", conversation_id)
 
 
+# Recibo v2 (2026-09): vocabulario dos cliques de avaliacao. IDs rating_*
+# vem da mensagem INTERATIVA de sessao (extract_interactive_inbound devolve o
+# id); os rotulos puros vem do quick-reply do TEMPLATE rating_request (a Meta
+# entrega o texto do botao). Escala de 3 niveis: 1=Ruim 2=Bom 3=Excelente.
+_RATING_CHOICES = {
+    "rating_ruim": (1, "Ruim"),
+    "rating_bom": (2, "Bom"),
+    "rating_excelente": (3, "Excelente"),
+    "ruim": (1, "Ruim"),
+    "bom": (2, "Bom"),
+    "excelente": (3, "Excelente"),
+}
+
+
+def _rating_choice_from_text(raw, allow_bare_words=False):
+    """(nota, rotulo) se o texto e um clique de avaliacao; None caso contrario.
+
+    allow_bare_words: os rotulos puros ("Ruim"/"Bom"/"Excelente") so valem
+    vindo de BOTAO de template — no caminho de texto normal um cliente
+    digitando "bom" nao pode ser engolido como nota (a licao do falso
+    positivo do digito, contato 193). IDs rating_* valem sempre."""
+    key = str(raw or "").strip().lower()
+    if not key:
+        return None
+    if not allow_bare_words and not key.startswith("rating_"):
+        return None
+    return _RATING_CHOICES.get(key)
+
+
+def _coerce_rating_ts(raw):
+    """datetime tz-aware a partir de datetime/ISO-string, ou None."""
+    if not raw:
+        return None
+    try:
+        dt = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    except Exception:
+        return None
+
+
+def _rating_request_pending(contact):
+    """True se ha pedido de avaliacao pendente E dentro da janela de captura.
+
+    Mesmas regras do _handle_rating_reply, avaliadas ANTES do persist pra
+    decidir se o clique e mensagem de CONTROLE (admin_only, sem unread) ou
+    mensagem normal visivel (clique expirado/sem pedido — o operador precisa
+    ver que o cliente interagiu)."""
+    if not contact:
+        return False
+    req_dt = _coerce_rating_ts(contact.get("rating_requested_at"))
+    if req_dt is None:
+        return False
+    rec_dt = _coerce_rating_ts(contact.get("rating_received_at"))
+    if rec_dt is not None and rec_dt >= req_dt:
+        return False
+    return (datetime.now(timezone.utc) - req_dt) <= timedelta(hours=RATING_CAPTURE_HOURS)
+
+
+async def _handle_rating_reply(contact_id, db_id, choice, contact=None):
+    """Registra a avaliacao pos-atendimento do recibo v2 (captura SO por botao).
+
+    `choice` = (nota, rotulo) ja resolvido pelo caller via
+    _rating_choice_from_text. Guard POR PEDIDO (revisao adversarial
+    2026-09-01): o clique so e ignorado se ESTE pedido ja foi respondido
+    (rating_received_at >= rating_requested_at) — um ciclo NOVO de
+    fechamento pode sobrescrever a nota anterior (senao o lead que ja avaliou
+    uma vez recebia template pago de novo e a resposta era descartada pra
+    sempre). Duplo clique/reentrega segue bloqueado: apos o 1o registro,
+    received >= requested. Fora de RATING_CAPTURE_HOURS ignora com log.
+    A bolha ja nasce admin_only/legivel no save (control_message)."""
+    if not choice:
+        return
+    nota, rotulo = choice
+    if db_id:
+        # Cinto-e-suspensorio: o save ja grava admin_only; este merge cobre
+        # qualquer caller futuro que nao passe as flags no persist.
+        document("wa_messages", db_id).set(
+            {"is_rating_message": True, "visibility": "admin_only"}, merge=True,
+        )
+    ctc = contact if contact is not None else get_wa_contact(contact_id)
+    if not ctc:
+        return
+    req_dt = _coerce_rating_ts(ctc.get("rating_requested_at"))
+    if req_dt is None:
+        logger.info("[RATING] clique sem pedido pendente ignorado contato=%s", contact_id)
+        return
+    rec_dt = _coerce_rating_ts(ctc.get("rating_received_at"))
+    if rec_dt is not None and rec_dt >= req_dt:
+        logger.info("[RATING] clique repetido ignorado (pedido ja respondido) contato=%s", contact_id)
+        return
+    if (datetime.now(timezone.utc) - req_dt) > timedelta(hours=RATING_CAPTURE_HOURS):
+        logger.info("[RATING] clique fora da janela de captura ignorado contato=%s", contact_id)
+        return
+    document("wa_contacts", contact_id).set({
+        "rating": nota,
+        "rating_label": rotulo,
+        "rating_received_at": utcnow().isoformat(),
+    }, merge=True)
+    log_audit(None, "WA_RATING_RECEIVED", f"contato={contact_id} nota={nota} ({rotulo})")
+    logger.info("[RATING] contato %s avaliou: %s (%s)", contact_id, nota, rotulo)
+
+
 # Fields que dependem de canal resolvido para escrever mensagem/contato.
 # smb_app_state_sync entra aqui porque o upsert_wa_contact agora requer
 # channel_id pra gerar conversation_id deterministico. Eventos fora
@@ -608,6 +711,20 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             except (ValueError, OSError):
                 ts_iso = datetime.now(timezone.utc).isoformat()
 
+        # -- Recibo v2: FORMA de clique de avaliacao detectada ANTES do
+        # upsert do contato (revisao 2026-09-01): o upsert bumpava recencia
+        # do CONTATO e auto-atribuia coexistence por causa de uma mensagem de
+        # controle invisivel. A VALIDADE (pedido pendente/janela) e decidida
+        # depois, com o contato lido; aqui basta a forma do clique.
+        _click_shape = None
+        if msg_type == "interactive":
+            _click_shape = _rating_choice_from_text(extract_interactive_inbound(msg))
+        elif msg_type == "button":
+            _btn_peek = msg.get("button", {}) if isinstance(msg.get("button"), dict) else {}
+            _click_shape = _rating_choice_from_text(
+                _btn_peek.get("payload") or _btn_peek.get("text"), allow_bare_words=True,
+            )
+
         # Registrar ou atualizar contato (com dados do canal).
         # skip_conversation_upsert: o save_wa_message logo abaixo upserta a
         # MESMA conversation (com message_at/unread corretos) — sem o skip
@@ -619,6 +736,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             source_channel_type=channel_type,
             auto_assign_user_id=channel_owner_id if channel_type == CHANNEL_TYPE_COEXISTENCE else None,
             skip_conversation_upsert=True,
+            control_click=_click_shape is not None,
         )
         reply_fields = _resolve_reply_reference(contact_id, msg.get("context"))
 
@@ -759,9 +877,13 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # tempo e seguia reentregando) e rodava o bot de novo sobre a
         # transcricao (varizemed 14/08: Val respondeu o endereco 2x pro mesmo
         # audio; hubloc: contato 8190 recebeu 17x a mesma resposta).
+        # "button" entrou em 2026-09-01 (recibo v2): sem ele a reentrega
+        # reprocessava o _handle_reopen_button (re-fechava e re-enviava o
+        # recibo — pendencia anotada em 2026-08-18) e re-registraria clique
+        # de avaliacao. "interactive" ja vira "text" no parsing acima.
         was_dup = (
             bool(get_wa_message_by_wa_message_id(msg_id))
-            if (msg_id and effective_msg_type in ("text", "audio"))
+            if (msg_id and effective_msg_type in ("text", "audio", "button"))
             else False
         )
 
@@ -770,6 +892,20 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # ensure_daily_attendance, takeover e gate do bot abaixo. Antes eram
         # 4 leituras do MESMO doc por mensagem (dieta de reads 2026-07-20).
         contact_row = get_wa_contact(contact_id)
+
+        # -- Recibo v2: clique de avaliacao decidido ANTES de persistir --
+        # (revisao adversarial 2026-09-01). Clique VALIDO (pedido pendente
+        # dentro da janela) e mensagem de CONTROLE: nasce admin_only, sem
+        # unread/recencia/reabertura. Clique INVALIDO (expirado/sem pedido)
+        # vira mensagem NORMAL e visivel — o operador precisa saber que o
+        # cliente interagiu; so o bot fica fora (curto-circuito abaixo).
+        _rating_click = _click_shape
+        if _rating_click is None and effective_msg_type == "text":
+            # id rating_* digitado a mao (raro) — nao passou no peek pre-upsert.
+            _rating_click = _rating_choice_from_text(content)
+        _click_valid = _rating_click is not None and _rating_request_pending(contact_row)
+        if _rating_click is not None:
+            content = f"[Avaliação do atendimento: {_rating_click[1]}]"
 
         # Persistir. sender_user_id=None em inbound (cliente final).
         # channel_owner_user_id captura o dono do numero (relevante p/ coexistence).
@@ -792,6 +928,9 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             phone_number_id=channel_phone_id,
             channel_owner_user_id=channel_owner_id,
             sender_user_id=None,
+            is_rating_message=bool(_rating_click),
+            visibility="admin_only" if _click_valid else "all",
+            control_message=_click_valid,
             **reply_fields,
         )
 
@@ -806,11 +945,30 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         if _silent_reprocess.get():
             continue
 
+        # -- Clique de avaliacao (interativa OU botao de template) --
+        # Curto-circuito TOTAL e incondicional: clique de avaliacao NUNCA
+        # segue pra takeover/bot/reroute — nem na reentrega da Meta (was_dup
+        # so pula a GRAVACAO; sem o continue, a reentrega caia no reroute de
+        # convertido e apagava o desfecho — revisao adversarial 2026-09-01).
+        # Invalido: a mensagem ja ficou visivel/contada acima; so nao vira
+        # nota nem alimenta a Val ("rating_bom" nao e fala de paciente).
+        if _rating_click is not None:
+            if _click_valid and not was_dup:
+                await _handle_rating_reply(contact_id, db_id, _rating_click, contact=contact_row)
+            elif not _click_valid:
+                logger.info(
+                    "[RATING] clique sem pedido valido (expirado/inexistente): "
+                    "mensagem visivel, sem captura | contato=%s", contact_id,
+                )
+            continue
+
         # -- Resposta de botao quick-reply (template de reabertura) --
-        # Registra a escolha do cliente (Retomar/Encerrar), atualiza o
-        # atendimento e curto-circuita: NAO roda bot/rating/takeover, que
-        # poderiam reatribuir lead ou disparar automacao indevida.
+        # Registra a escolha do cliente e curto-circuita: NAO roda
+        # bot/rating/takeover, que poderiam reatribuir lead ou disparar
+        # automacao indevida. Reentrega da Meta (was_dup) nao reprocessa.
         if effective_msg_type == "button":
+            if was_dup:
+                continue
             await _handle_reopen_button(
                 contact_id=contact_id,
                 wa_id=wa_id,
@@ -872,33 +1030,18 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                         contact_id,
                     )
 
-        # -- Lead convertido: capturar rating ou rerouting --
+        # -- Lead convertido retornando: rerouting --
         # Re-le do banco apenas se o bot rodou (pode ter mudado qualification/
         # bot_completed). Sem bot, contact_row do topo ainda reflete o estado.
+        # Captura de nota por DIGITO removida no recibo v2 (2026-09-01):
+        # engolia mensagem legitima do convertido como avaliacao (falso
+        # positivo contato 193). Avaliacao agora e SO por botao
+        # (_handle_rating_reply, curto-circuito antes do bot).
         _contact_fresh = get_wa_contact(contact_id) if bot_ran else contact_row
-        if _contact_fresh and _contact_fresh.get("qualification") == "convertido":
-            _has_pending_rating = (
-                _contact_fresh.get("rating_requested_at")
-                and _contact_fresh.get("rating") is None
-            )
-
-            if _has_pending_rating and effective_msg_type == "text" and content.strip().isdigit():
-                _rating_val = int(content.strip())
-                if 1 <= _rating_val <= 10:
-                    # Capturar avaliacao
-                    from firestore_common import document as _fs_doc, utcnow as _fs_now
-                    _fs_doc("wa_contacts", contact_id).set({
-                        "rating": _rating_val,
-                        "rating_received_at": _fs_now().isoformat(),
-                    }, merge=True)
-                    # Marcar a mensagem de resposta como admin_only
-                    if db_id:
-                        _fs_doc("wa_messages", db_id).set({
-                            "is_rating_message": True,
-                            "visibility": "admin_only",
-                        }, merge=True)
-                    logger.info("[RATING] Contato %d avaliou com nota %d", contact_id, _rating_val)
-            elif is_reception_mode():
+        # not was_dup: reentrega da Meta nao pode re-rodar o reroute (re-
+        # atribuia e regravava em_atendimento sobre desfecho recem-marcado).
+        if _contact_fresh and not was_dup and _contact_fresh.get("qualification") == "convertido":
+            if is_reception_mode():
                 # Modo Recepcao (ADR 0010): lead NAO gruda em pessoa. Paciente
                 # convertido que volta ("qual o endereco?", "tem estacionamento?")
                 # e atendido pelo agente de IA e, se precisar, cai na pool — o

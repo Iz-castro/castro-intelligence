@@ -680,8 +680,14 @@ def upsert_wa_conversation(
     message_at=None,
     advance_recency=True,
     human_outbound_at=None,
+    reopen_attendance=True,
 ):
     """Cria ou atualiza a conversation correspondente a (channel_id, wa_id).
+
+    reopen_attendance=False: NAO aplica a regra "atividade reabre atendimento
+    fechado" — uso do recibo de fechamento (revisao 2026-09-01: o proprio
+    recibo outbound reabria o attendance_status que o request acabou de
+    fechar) e de cliques de controle (avaliacao).
 
     Retorna conversation_id (string deterministica). Se a conversation
     ja existe, atualiza last_message_at e demais timestamps, alem de
@@ -763,8 +769,10 @@ def upsert_wa_conversation(
             updates["last_outbound_at"] = msg_at
         if human_outbound_at is not None:
             updates["last_human_outbound_at"] = human_outbound_at
-        if direction_for_unread in ("inbound", "outbound"):
+        if direction_for_unread in ("inbound", "outbound") and reopen_attendance:
             # Atividade reabre um atendimento fechado (Fase 4 — ciclo de vida).
+            # reopen_attendance=False: recibo de fechamento e cliques de
+            # controle nao sao "atividade" (revisao 2026-09-01).
             updates["attendance_status"] = "aberto"
         # Auto-assign se nao atribuido (coexistence)
         if auto_assign_user_id and not existing.get("assigned_to"):
@@ -1062,7 +1070,34 @@ def _reception_handoff_unattended(conv, unattended_release_days):
     return True
 
 
-def close_stale_attendances(max_idle_hours, unattended_release_days=7):
+def _reception_unattended_release_due(conv, unattended_release_days):
+    """True quando a VALVULA do Modo Recepcao deve soltar a thread: handoff
+    que NUNCA teve resposta humana e cuja espera estourou o teto de dias.
+
+    Complemento de _reception_handoff_unattended, usado quando o fechamento
+    por inatividade esta desligado (auto_close_enabled=False): nesse modo SO
+    o orfao estourado fecha (decisao do PO 2026-09-01 — thread atendida nunca
+    fecha sozinha, mas lead morto nao pode ficar preso em bot_completed=True
+    pra sempre). Em duvida (sem handoff_at, timestamp corrompido) retorna
+    False = nao fecha, o conservador quando a inatividade esta OFF."""
+    handoff_at = _coerce_timestamp(conv.get("handoff_at"))
+    if not isinstance(handoff_at, datetime):
+        return False
+    human_at = _coerce_timestamp(conv.get("last_human_outbound_at"))
+    if isinstance(human_at, datetime):
+        try:
+            if human_at > handoff_at:
+                return False  # ja teve resposta humana neste ciclo
+        except TypeError:
+            return False
+    try:
+        return (utcnow() - handoff_at) > timedelta(days=unattended_release_days)
+    except TypeError:
+        return False
+
+
+def close_stale_attendances(max_idle_hours, unattended_release_days=7,
+                            inactivity_enabled=True):
     """Fecha (attendance_status='fechado_inatividade') atendimentos ATRIBUIDOS
     ociosos ha mais de max_idle_hours (sem mensagem). Reabre sozinho na proxima
     mensagem (upsert_wa_conversation). Opera no tenant_context atual. Retorna
@@ -1071,7 +1106,13 @@ def close_stale_attendances(max_idle_hours, unattended_release_days=7):
     unattended_release_days: teto da espera por atendimento humano no Modo
     Recepcao (ver _reception_handoff_unattended). O cron passa o valor de
     config (RECEPTION_UNATTENDED_RELEASE_DAYS); o default aqui so cobre caller
-    que nao passa (simuladores)."""
+    que nao passa (simuladores).
+
+    inactivity_enabled: toggle por tenant (system_settings.auto_close_enabled,
+    lido pelo cron via is_auto_close_enabled). False = fechamento por
+    inatividade DESLIGADO: thread com dono nunca fecha, thread da pool so
+    fecha se for orfao estourado (_reception_unattended_release_due) — a
+    valvula continua ativa por decisao do PO 2026-09-01."""
     from datetime import timedelta
     cutoff = utcnow() - timedelta(hours=max_idle_hours)
     closed = []
@@ -1094,6 +1135,21 @@ def close_stale_attendances(max_idle_hours, unattended_release_days=7):
         conv = snap.to_dict() or {}
         if not conv.get("assigned_to") and not _reception:
             continue  # so atendimentos atribuidos (fila/bot nao fecham)
+        if conv.get("assigned_to") and not inactivity_enabled:
+            # Toggle do tenant OFF: atendimento com dono so fecha pela
+            # VALVULA — handoff que NUNCA teve resposta humana e estourou o
+            # teto. "Assumir" sem responder NAO e atendimento (revisao
+            # 2026-09-01: sem esta excecao o lead assumido-e-abandonado
+            # ficava preso pra sempre — bot mudo, dono ausente, sem caminho
+            # automatico de volta). Release_due primeiro: e so timestamp,
+            # nao gasta read; o contato so e lido no candidato real.
+            if (not _reception or conv.get("is_backup")
+                    or not _reception_unattended_release_due(conv, unattended_release_days)):
+                continue
+            _ctc_v = _get_doc("wa_contacts", conv.get("contact_id")) if conv.get("contact_id") is not None else None
+            if not _ctc_v or not _ctc_v.get("bot_completed"):
+                continue
+            # Cai no fluxo normal (stale check + fechamento/release).
         last = conv.get("last_message_at")
         if isinstance(last, str):
             try:
@@ -1119,6 +1175,10 @@ def close_stale_attendances(max_idle_hours, unattended_release_days=7):
             # ao bot e sumiria com ele da aba Recepcao (ver helper). A thread
             # segue "aberto" na pool ate alguem responder ou estourar o teto.
             if _reception_handoff_unattended(conv, unattended_release_days):
+                continue
+            if not inactivity_enabled and not _reception_unattended_release_due(conv, unattended_release_days):
+                # Toggle OFF: thread da pool ja atendida (ou sem handoff
+                # rastreavel) nao fecha por inatividade; so a valvula age.
                 continue
         # Mesma regra do fechamento manual: legacy reverte pro sale_owner;
         # reception devolve o lead ao agente de IA (release_lead_to_bot).
@@ -1239,11 +1299,19 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       phone_number_id="", source_channel_type="",
                       auto_assign_user_id=None,
                       from_message_event=True,
-                      skip_conversation_upsert=False):
+                      skip_conversation_upsert=False,
+                      control_click=False):
     """Cria ou atualiza um contato WhatsApp.
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
     ao operador dono do numero.
+
+    control_click=True (clique de avaliacao do recibo v2, revisao
+    2026-09-01): NAO avanca last_message_at (recencia — bolha admin_only
+    invisivel nao pode subir o contato nas views ordenadas) e NAO auto-atribui
+    coexistence (mudanca de posse por mensagem de controle). last_inbound_at
+    CONTINUA subindo: o clique abre/renova a janela de 24h na Meta de
+    verdade, e e ele que alimenta o _check_24h_window.
 
     Normaliza o nono digito BR e busca tambem variantes (com/sem '9')
     como defesa em profundidade contra callers que esquecam de
@@ -1271,6 +1339,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             existing, wa_id, display_name, channel_id, phone_number_id,
             source_channel_type, auto_assign_user_id, from_message_event, now,
             skip_conversation_upsert=skip_conversation_upsert,
+            control_click=control_click,
         )
 
     phone_formatted = format_phone_br(wa_id)
@@ -1341,6 +1410,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 winner, wa_id, display_name, channel_id, phone_number_id,
                 source_channel_type, auto_assign_user_id, from_message_event, now,
                 skip_conversation_upsert=skip_conversation_upsert,
+                control_click=control_click,
             )
         logger.warning(
             "wa_contact_index %s aponta p/ contato inexistente (%s) — recriando",
@@ -1366,7 +1436,8 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
 def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
                                 phone_number_id, source_channel_type,
                                 auto_assign_user_id, from_message_event, now,
-                                skip_conversation_upsert=False):
+                                skip_conversation_upsert=False,
+                                control_click=False):
     """Aplica updates a um contato JA existente. Usado pelo caminho normal
     (achado por wa_id) e pelo fallback do claim atomico (corrida perdida).
     Retorna o contact_id.
@@ -1377,7 +1448,10 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
     por mensagem (dieta de reads do webhook, 2026-07-20)."""
     updates = {}
     if from_message_event:
-        updates["last_message_at"] = now
+        if not control_click:
+            updates["last_message_at"] = now
+        # last_inbound_at sobe SEMPRE em evento de mensagem: e a verdade da
+        # janela de 24h da Meta (clique de botao tambem abre/renova janela).
         updates["last_inbound_at"] = now
     # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
     # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
@@ -1409,8 +1483,9 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
         updates["channel_id"] = channel_id
         updates["phone_number_id"] = phone_number_id
         updates["source_channel_type"] = source_channel_type
-    # Auto-atribuir para coexistence se nao atribuido
-    if auto_assign_user_id and not existing.get("assigned_to"):
+    # Auto-atribuir para coexistence se nao atribuido. Clique de controle
+    # (avaliacao) NUNCA muda posse de lead (control_click, revisao 2026-09-01).
+    if auto_assign_user_id and not control_click and not existing.get("assigned_to"):
         user = _get_doc("users", auto_assign_user_id)
         if user:
             updates["assigned_to"] = auto_assign_user_id
@@ -1669,11 +1744,15 @@ def get_wa_contacts_visible_to(user_id, department_id=None, include_archived=Fal
     return _enrich_and_sort_contacts(rows, include_archived=include_archived)
 
 
-def update_wa_contact_qualification(contact_id, qualification, notes=""):
+def update_wa_contact_qualification(contact_id, qualification, notes=None):
     # Guarda: qualification vazia NAO sobrescreve a existente (o endpoint
     # aceita "" pra "salvar so as notas"; antes gravava literalmente "" e o
     # lead sumia do filtro por qualificacao do frontend). Nenhum caller
     # legitimo limpa a qualificacao.
+    # notes default None (revisao 2026-09-01): o default antigo "" fazia o
+    # caller que omitia notes (reroute de convertido no webhook) APAGAR as
+    # notas do contato — incluindo o desfecho que o gate A3 exigiu e a trilha
+    # "Atendimento iniciado" do A2. None = nao toca nas notas.
     fields = {}
     if qualification:
         fields["qualification"] = qualification
@@ -2335,8 +2414,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     channel_owner_user_id=None, sender_user_id=None,
                     sent_by_name="",
                     template_category=None, media_size_bytes=0,
-                    advance_recency=True, contact=None):
+                    advance_recency=True, contact=None,
+                    promote_qualification=True,
+                    reopen_attendance=True,
+                    control_message=False):
     """Persiste mensagem WhatsApp.
+
+    reopen_attendance=False: a mensagem nao conta como "atividade" pro ciclo
+    de vida — nao reabre attendance_status fechado (uso: recibo de
+    fechamento; revisao 2026-09-01).
+
+    control_message=True (clique de avaliacao do recibo v2): mensagem de
+    CONTROLE solicitada pelo sistema, invisivel ao operador comum — nao
+    incrementa nao-lido (contato nem thread), nao cria/reabre o Atendimento
+    diario, nao avanca recencia e nao reabre o atendimento. Sem isto o clique
+    acendia badge/alarme de uma bolha admin_only que ninguem ve (classe do
+    incidente ADR 0011) e reabria protocolo/thread recem-fechados.
 
     Auditoria coexistence (Fase 2C):
       - `channel_owner_user_id`: dono fisico do numero (ex.: operador X que
@@ -2439,12 +2532,14 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
     # atual sem criar.
     protocol_id = None
     if contact_id is not None:
-        if direction == "inbound":
+        if direction == "inbound" and not control_message:
             try:
                 protocol_id = ensure_daily_attendance(contact_id, contact=contact)
             except Exception as exc:
                 logger.warning("ensure_daily_attendance falhou contact=%s: %s", contact_id, exc)
         else:
+            # Outbound/system e cliques de CONTROLE leem o protocolo atual sem
+            # criar/reabrir (clique de avaliacao nao e atendimento novo).
             try:
                 protocol_id = get_current_protocol_id(contact_id)
             except Exception:
@@ -2496,9 +2591,34 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
             _lma_advances = not isinstance(_cur_lma, datetime) or _eff_msg_at >= _cur_lma
         except TypeError:
             _lma_advances = True
-        updates = {"last_message_at": _eff_msg_at} if (_lma_advances and advance_recency) else {}
-        if direction == "inbound" and status == "received":
+        updates = {"last_message_at": _eff_msg_at} if (_lma_advances and advance_recency and not control_message) else {}
+        if direction == "inbound" and status == "received" and not control_message:
             updates["unread_count"] = int(contact.get("unread_count", 0)) + 1
+        # Reforma de qualificacoes (2026-09): a 1a interacao HUMANA promove o
+        # lead "novo" a "em_atendimento" e deixa rastro na nota. Mesmo sinal
+        # do last_human_outbound_at (outbound com operador identificado) —
+        # bot (sender None), inbound e system ficam de fora. O recibo de
+        # protocolo do fechamento passa promote_qualification=False (texto de
+        # sistema no encerramento nao e inicio de atendimento).
+        if (
+            promote_qualification
+            and direction == "outbound"
+            and sender_user_id is not None
+            and (contact.get("qualification") or "novo") == "novo"
+        ):
+            # Data REAL da mensagem (_eff_msg_at), nao relogio de parede:
+            # replay de history/backup carimbaria "iniciado hoje" numa
+            # conversa de meses atras (revisao 2026-09-01 — mesmo motivo do
+            # guard monotonico logo acima).
+            _started_at = _eff_msg_at
+            if _started_at.tzinfo is None:
+                _started_at = _started_at.replace(tzinfo=timezone.utc)
+            _started_br = _started_at.astimezone(_BR_TZ).strftime("%d/%m/%Y %H:%M")
+            _note_line = f"Atendimento iniciado em {_started_br}"
+            _cur_notes = str(contact.get("notes") or "").strip()
+            updates["qualification"] = "em_atendimento"
+            updates["first_human_contact_at"] = _eff_msg_at
+            updates["notes"] = f"{_cur_notes}\n{_note_line}" if _cur_notes else _note_line
         if updates:
             document("wa_contacts", contact_id).set(updates, merge=True)
 
@@ -2513,7 +2633,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     channel_id=eff_channel_id,
                     source_channel_type=(contact or {}).get("source_channel_type", ""),
                     phone_number_id=eff_phone_number_id,
-                    direction_for_unread="inbound" if direction == "inbound" and status == "received" else ("outbound" if direction == "outbound" else None),
+                    direction_for_unread=None if control_message else ("inbound" if direction == "inbound" and status == "received" else ("outbound" if direction == "outbound" else None)),
                     # Conversa herda o Dono do Lead (contact.assigned_to). O guard
                     # de orfa em upsert_wa_conversation (so atribui se a thread NAO
                     # tem dono) garante que isto nunca pisa em transferencia de
@@ -2522,7 +2642,11 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     # fecha esse vetor].
                     auto_assign_user_id=(contact or {}).get("assigned_to"),
                     message_at=_eff_msg_at,
-                    advance_recency=advance_recency,
+                    # control_message: recencia da THREAD nao avanca (a
+                    # ordenacao visivel da sidebar e por thread; o contato ja
+                    # subiu no upsert_wa_contact pre-parse, inocuo — so
+                    # afeta a janela de hidratacao, nao a ordem das linhas).
+                    advance_recency=advance_recency and not control_message,
                     # Resposta HUMANA ao cliente: outbound com operador
                     # identificado. Fica de fora mensagem do bot
                     # (sender_user_id None), system message e nota interna
@@ -2534,6 +2658,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                         if direction == "outbound" and sender_user_id is not None
                         else None
                     ),
+                    reopen_attendance=reopen_attendance and not control_message,
                 )
             except Exception as exc:
                 logger.warning("Falha ao upsert conversation para msg %s: %s", message_id, exc)
@@ -2867,9 +2992,12 @@ def get_usage_history(months=3):
 
 
 def get_all_ratings(date_from=None, date_to=None):
-    """Retorna contatos convertidos com rating."""
+    """Retorna contatos com avaliacao registrada. Recibo v2 (2026-09):
+    qualquer fechamento avaliado conta, nao so convertidos — a query saiu de
+    qualification=='convertido' pra rating>0 (desigualdade em campo unico,
+    indice automatico)."""
     rows = []
-    for snap in collection("wa_contacts").where("qualification", "==", "convertido").stream():
+    for snap in collection("wa_contacts").where("rating", ">", 0).stream():
         data = _raw_doc(snap)
         if not data or data.get("rating") is None:
             continue
@@ -3175,6 +3303,16 @@ _DEFAULT_SYSTEM_SETTINGS = {
     # sem dono, sem virar dono; autoria vai na mensagem). Default no READ —
     # nunca backfill; kill-switch = PUT pool_mode=legacy (sem deploy).
     "pool_mode": "legacy",
+    # Fechamento automatico por inatividade (cron). False = atendimento com
+    # interacao humana NUNCA fecha sozinho (todo encerramento vira manual);
+    # a valvula de orfaos do Modo Recepcao (handoff sem NENHUMA resposta
+    # humana alem do teto de dias) continua ativa — decisao do PO 2026-09-01.
+    "auto_close_enabled": True,
+    # Recibo v2: pergunta de avaliacao (Ruim/Bom/Excelente) junto do
+    # protocolo no encerramento manual. Toggle POR TENANT (PO 2026-09-02, no
+    # lugar do env global): admin liga/desliga na aba Sistema sem deploy.
+    # Default False — liga por decisao explicita de cada empresa.
+    "rating_request_enabled": False,
 }
 
 
@@ -3194,6 +3332,17 @@ def save_system_settings(settings: dict):
     # comportamento legado em vez de gravar lixo no doc.
     if "pool_mode" in filtered and str(filtered.get("pool_mode") or "") not in _POOL_MODE_OPTIONS:
         filtered["pool_mode"] = "legacy"
+    # Coercao fechada dos toggles booleanos (revisao 2026-09-01):
+    # bool("false") e True — um PUT cru com string (kill-switch de madrugada,
+    # JSON a mao) falharia silenciosamente LIGADO. Espirito do pool_mode.
+    for _bool_key in ("auto_close_enabled", "rating_request_enabled"):
+        if _bool_key in filtered:
+            _raw_b = filtered[_bool_key]
+            if isinstance(_raw_b, str):
+                filtered[_bool_key] = _raw_b.strip().lower() not in (
+                    "false", "0", "no", "off", "")
+            else:
+                filtered[_bool_key] = bool(_raw_b)
     if "quick_messages_global" in filtered:
         filtered["quick_messages_global"] = _clean_quick_messages(
             filtered["quick_messages_global"], "Mensagens globais")
@@ -3214,6 +3363,32 @@ def is_reception_mode() -> bool:
     except Exception as exc:
         logger.warning("is_reception_mode: leitura falhou, assumindo legacy: %s", exc)
         return False
+
+
+def is_rating_request_enabled() -> bool:
+    """True se este tenant pergunta avaliacao no encerramento manual (recibo
+    v2). Toggle por tenant (PO 2026-09-02). Fail-closed: erro de leitura NAO
+    pergunta — avaliacao e opt-in explicito, e fora da janela custa template
+    pago."""
+    try:
+        return bool(get_system_settings().get("rating_request_enabled", False))
+    except Exception as exc:
+        logger.warning("is_rating_request_enabled: leitura falhou, assumindo OFF: %s", exc)
+        return False
+
+
+def is_auto_close_enabled() -> bool:
+    """True se o cron pode fechar atendimentos por INATIVIDADE neste tenant.
+
+    Toggle por tenant (system_settings.auto_close_enabled). Fail-safe: erro
+    de leitura mantem o comportamento historico (fecha). A valvula de orfaos
+    do Modo Recepcao NAO passa por aqui — continua ativa mesmo com o toggle
+    desligado (ver close_stale_attendances)."""
+    try:
+        return bool(get_system_settings().get("auto_close_enabled", True))
+    except Exception as exc:
+        logger.warning("is_auto_close_enabled: leitura falhou, assumindo ligado: %s", exc)
+        return True
 
 
 def get_user_settings(user_id: int):

@@ -128,12 +128,24 @@ class _DocRef:
         else:
             coll[self.doc_id] = dict(data)
 
+    def create(self, data):
+        # Claim atomico (wa_message_index / wa_contact_index): falha se existe.
+        from google.api_core import exceptions as _gexc
+        coll = STORE.setdefault(self.coll, {})
+        if self.doc_id in coll:
+            raise _gexc.AlreadyExists("ja existe")
+        coll[self.doc_id] = dict(data)
+
 
 class _QSnap:
     def __init__(self, coll, doc_id, data):
         self.id = doc_id
         self._data = data
         self.reference = _DocRef(coll, doc_id)
+
+    @property
+    def exists(self):
+        return self._data is not None
 
     def to_dict(self):
         return dict(self._data) if self._data else None
@@ -143,15 +155,26 @@ class _CollRef:
     def __init__(self, coll):
         self.coll = coll
         self._filters = []
+        self._limit = None
 
     def where(self, field, op, value):
         self._filters.append((field, op, value))
         return self
 
+    def limit(self, n):
+        # Necessario p/ _get_first_by_field (.where().limit(1)) — usado pelo
+        # upsert_wa_contact e pelo dedup do save_wa_message.
+        self._limit = n
+        return self
+
     def stream(self):
+        emitted = 0
         for doc_id, data in list(STORE.get(self.coll, {}).items()):
             if all(op == "==" and data.get(f) == v for (f, op, v) in self._filters):
                 yield _QSnap(self.coll, doc_id, data)
+                emitted += 1
+                if self._limit is not None and emitted >= self._limit:
+                    break
 
 
 _SEQ = {"n": 1000}
@@ -513,6 +536,98 @@ def cenario_carimbo_humano():
 
 
 # =========================================================================
+# Cenario 5d — reforma de qualificacoes (2026-09): 1o outbound humano
+# promove lead "novo" a "em_atendimento" com rastro na nota
+# =========================================================================
+
+def cenario_promocao_qualificacao():
+    titulo("CENARIO 5d — 1o outbound humano promove novo -> em_atendimento")
+    patch_store()
+    STORE["wa_contacts"] = {"55": {"id": 55, "wa_id": "5531977776666",
+                                   "assigned_to": None, "qualification": "novo",
+                                   "notes": "", "source_channel_type": "standard"}}
+    STORE["wa_conversations"] = {}
+
+    def _msg(direction, **kw):
+        # Snapshot fresco a cada chamada (o caller real re-le o contato).
+        contato = dict(STORE["wa_contacts"]["55"])
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=55, direction=direction, msg_type="text",
+            content="x", status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
+            channel_id=6, conversation_id="6__5531977776666", contact=contato, **kw,
+        )
+        return STORE["wa_contacts"]["55"]
+
+    ctc = _msg("outbound")  # bot: sem sender_user_id
+    check(ctc.get("qualification") == "novo", "mensagem do BOT nao promove")
+    ctc = _msg("inbound")
+    check(ctc.get("qualification") == "novo", "inbound nao promove")
+    ctc = _msg("outbound", sender_user_id=7, promote_qualification=False)
+    check(ctc.get("qualification") == "novo",
+          "recibo de sistema (promote_qualification=False) nao promove")
+    ctc = _msg("outbound", sender_user_id=7)
+    check(ctc.get("qualification") == "em_atendimento",
+          "outbound de OPERADOR promove novo -> em_atendimento")
+    check("Atendimento iniciado em" in str(ctc.get("notes") or ""),
+          "promocao deixa rastro na nota com timestamp")
+    check(ctc.get("first_human_contact_at") is not None,
+          "promocao carimba first_human_contact_at")
+    notas_antes = str(ctc.get("notes") or "")
+    ctc = _msg("outbound", sender_user_id=7)
+    check(str(ctc.get("notes") or "") == notas_antes
+          and ctc.get("qualification") == "em_atendimento",
+          "lead ja em_atendimento: 2o outbound nao re-promove nem duplica nota")
+    restore_dbf()
+
+
+# =========================================================================
+# Cenario 5e — toggle auto_close_enabled=False (PO 2026-09-01): fechamento
+# por inatividade desligado, mas a VALVULA de orfaos continua ativa
+# =========================================================================
+
+def cenario_auto_close_toggle():
+    titulo("CENARIO 5e — auto_close OFF: so a valvula de orfaos fecha")
+    patch_store()
+    dbf.is_reception_mode = lambda: True
+    _seed_handoff_pendente()
+    # P7: thread ASSUMIDA cujo handoff nunca teve resposta humana e estourou
+    # o teto — a valvula TAMBEM alcanca thread com dono (revisao 2026-09-01:
+    # sem isto o lead assumido-e-abandonado ficava preso pra sempre).
+    STORE["wa_conversations"]["P7"] = _conv("P7", 46, 7, hours_old=48, handoff_at=_ts(24 * 9))
+    STORE["wa_contacts"]["46"] = {"id": 46, "bot_completed": True}
+
+    closed = dbf.close_stale_attendances(24, 7, inactivity_enabled=False)
+    ids = sorted(c["conversation_id"] for c in closed)
+    check(ids == ["P4", "P7"], f"toggle OFF: so os orfaos estourados (valvula) fecham (fechou {ids})")
+    check(STORE["wa_conversations"]["P2"].get("attendance_status") == "aberto",
+          "toggle OFF: pool JA atendida nao fecha por inatividade")
+    check(STORE["wa_conversations"]["P5"].get("attendance_status") == "aberto",
+          "toggle OFF: doc legado sem handoff_at nao fecha (conservador)")
+    check(STORE["wa_conversations"]["P6"].get("attendance_status") == "aberto",
+          "toggle OFF: thread com dono DENTRO do teto nao fecha")
+    check(STORE["wa_contacts"]["46"].get("bot_completed") is False,
+          "toggle OFF: assumido-e-nunca-respondido estourado volta pro agente de IA")
+    check(STORE["wa_contacts"]["43"].get("bot_completed") is False,
+          "toggle OFF: valvula devolve o orfao estourado ao agente de IA")
+    check(STORE["wa_contacts"]["40"].get("bot_completed") is True,
+          "toggle OFF: orfao dentro do teto segue esperando na pool")
+
+    # Legacy com toggle OFF: nada fecha automaticamente.
+    dbf.is_reception_mode = lambda: False
+    _seed_close_stale()
+    closed = dbf.close_stale_attendances(24, 7, inactivity_enabled=False)
+    check(closed == [], "legacy + toggle OFF: nenhum fechamento automatico")
+
+    # Default do parametro preserva o comportamento historico (ligado).
+    dbf.is_reception_mode = lambda: True
+    _seed_close_stale()
+    closed = dbf.close_stale_attendances(24)
+    ids = sorted(c["conversation_id"] for c in closed)
+    check(ids == ["A", "B"], f"default (ligado): comportamento historico intacto (fechou {ids})")
+    restore_dbf()
+
+
+# =========================================================================
 # Cenario 11 — release_lead_to_bot (fechamento devolve ao agente de IA)
 # =========================================================================
 
@@ -691,6 +806,190 @@ def cenario_set_attendance_orfa():
         main.get_wa_conversation_by_id = real_get_conv
         main.get_wa_contact = real_get_ctc
         restore_dbf()
+
+
+def cenario_gate_desfecho():
+    titulo("CENARIO 16 — gate de desfecho no encerramento manual (reforma 2026-09)")
+    reset_rbac()
+    set_reception(False)
+    patch_store()
+    STORE["wa_conversations"] = {"c16": {"id": "c16", "contact_id": 1, "assigned_to": 7,
+                                         "attendance_status": "aberto",
+                                         "source_channel_type": "standard"}}
+    STORE["wa_contacts"] = {"1": {"id": 1, "wa_id": "5531966665555", "assigned_to": 7,
+                                  "qualification": "em_atendimento", "notes": ""}}
+    real_get_conv = main.get_wa_conversation_by_id
+    real_get_ctc = main.get_wa_contact
+    real_sysmsg = main.insert_transfer_system_message
+    main.get_wa_conversation_by_id = lambda cid: dict(STORE["wa_conversations"]["c16"])
+    main.get_wa_contact = lambda cid: dict(STORE["wa_contacts"]["1"])
+    # Banner de sistema nao e o alvo aqui (o mock nao cobre o dedup por
+    # wa_message_id que ele dispara) — stub no-op, padrao do sim.
+    main.insert_transfer_system_message = lambda *a, **k: None
+    try:
+        req = _FakeRequest({"status": "fechado_manual"})
+        expect_http(lambda: asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR))),
+                    400, "fechar em_atendimento SEM desfecho -> 400")
+        check(STORE["wa_conversations"]["c16"].get("attendance_status") == "aberto",
+              "400 do gate nao fecha a thread")
+        req = _FakeRequest({"status": "fechado_manual", "qualification": "banana"})
+        expect_http(lambda: asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR))),
+                    400, "desfecho fora do vocabulario -> 400")
+        req = _FakeRequest({"status": "fechado_manual", "qualification": "novo"})
+        expect_http(lambda: asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR))),
+                    400, "estado de passagem (novo) nao e desfecho -> 400")
+        req = _FakeRequest({"status": "fechado_manual", "qualification": "nao_convertido",
+                            "notes": "negociou e nao fechou"})
+        asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR)))
+        check(STORE["wa_conversations"]["c16"].get("attendance_status") == "fechado_manual",
+              "com desfecho valido: fecha")
+        check(STORE["wa_contacts"]["1"].get("qualification") == "nao_convertido",
+              "desfecho gravado no contato no MESMO request")
+        check(STORE["wa_contacts"]["1"].get("notes") == "negociou e nao fechou",
+              "notas do modal gravadas junto")
+        # Lead ja com desfecho terminal fecha direto, sem exigir qualificacao.
+        STORE["wa_conversations"]["c16"]["attendance_status"] = "aberto"
+        req = _FakeRequest({"status": "fechado_manual"})
+        asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR)))
+        check(STORE["wa_conversations"]["c16"].get("attendance_status") == "fechado_manual",
+              "lead ja qualificado (terminal) fecha sem gate")
+    finally:
+        main.get_wa_conversation_by_id = real_get_conv
+        main.get_wa_contact = real_get_ctc
+        main.insert_transfer_system_message = real_sysmsg
+        restore_dbf()
+
+
+def cenario_rating_botao():
+    titulo("CENARIO 17 — recibo v2: captura de avaliacao SO por botao")
+    import webhook as wh
+    patch_store()
+    # Matcher: rotulo puro so vale vindo de BOTAO de template; id rating_*
+    # (interativa de sessao) vale sempre; texto comum nunca vira nota.
+    check(wh._rating_choice_from_text("bom") is None,
+          "texto 'bom' digitado NAO e nota (licao do digito engolido)")
+    check(wh._rating_choice_from_text("Excelente", allow_bare_words=True) == (3, "Excelente"),
+          "rotulo do botao de template mapeia (3, Excelente)")
+    check(wh._rating_choice_from_text("rating_ruim") == (1, "Ruim"),
+          "id interativo mapeia (1, Ruim)")
+    check(wh._rating_choice_from_text("oi, tudo bem?", allow_bare_words=True) is None,
+          "texto comum ignorado mesmo no caminho de botao")
+
+    # Handler: bindings do webhook apontam pro firestore_common real —
+    # patcha direto no modulo e restaura no finally.
+    real_doc, real_get, real_audit = wh.document, wh.get_wa_contact, wh.log_audit
+    wh.document = dbf.document
+    wh.get_wa_contact = lambda cid: (
+        dict(STORE["wa_contacts"][str(cid)])
+        if STORE.get("wa_contacts", {}).get(str(cid)) is not None else None
+    )
+    wh.log_audit = lambda *a, **k: None
+    def _pick(raw, bare=False):
+        return wh._rating_choice_from_text(raw, allow_bare_words=bare)
+
+    try:
+        STORE["wa_contacts"] = {
+            "70": {"id": 70, "rating_requested_at": _ts(1), "rating": None},
+            "71": {"id": 71, "rating": None},
+            "72": {"id": 72, "rating_requested_at": _ts(72), "rating": None},
+            # Ciclo NOVO de fechamento: nota antiga respondida ha 200h, pedido
+            # recarimbado ha 1h -> clique novo DEVE sobrescrever (fix da
+            # revisao: re-pergunta cuja resposta era descartada pra sempre).
+            "73": {"id": 73, "rating": 2, "rating_label": "Bom",
+                   "rating_received_at": _ts(200), "rating_requested_at": _ts(1)},
+        }
+        STORE["wa_messages"] = {"900": {"id": 900}}
+        asyncio.run(wh._handle_rating_reply(70, 900, _pick("rating_excelente")))
+        check(STORE["wa_contacts"]["70"].get("rating") == 3
+              and STORE["wa_contacts"]["70"].get("rating_label") == "Excelente",
+              "clique valido (pedido de 1h atras) grava nota 3 + rotulo")
+        check(STORE["wa_messages"]["900"].get("visibility") == "admin_only",
+              "resposta de avaliacao vira admin_only (avaliado nao ve)")
+        asyncio.run(wh._handle_rating_reply(70, 900, _pick("rating_ruim")))
+        check(STORE["wa_contacts"]["70"].get("rating") == 3,
+              "clique repetido (mesmo pedido) nao sobrescreve a nota")
+        asyncio.run(wh._handle_rating_reply(71, None, _pick("rating_bom")))
+        check(STORE["wa_contacts"]["71"].get("rating") is None,
+              "sem pedido pendente: clique ignorado")
+        asyncio.run(wh._handle_rating_reply(72, None, _pick("rating_bom")))
+        check(STORE["wa_contacts"]["72"].get("rating") is None,
+              "pedido de 72h atras: janela de captura (48h) expirou, ignora")
+        asyncio.run(wh._handle_rating_reply(73, None, _pick("rating_ruim")))
+        check(STORE["wa_contacts"]["73"].get("rating") == 1
+              and STORE["wa_contacts"]["73"].get("rating_label") == "Ruim",
+              "pedido NOVO (recarimbado apos resposta velha): clique sobrescreve")
+    finally:
+        wh.document, wh.get_wa_contact, wh.log_audit = real_doc, real_get, real_audit
+        restore_dbf()
+
+
+def cenario_recibo_nao_reabre():
+    titulo("CENARIO 18 — recibo/clique de controle nao reabrem nem contam (revisao)")
+    patch_store()
+    STORE["wa_contacts"] = {"80": {"id": 80, "wa_id": "5531955554444",
+                                   "assigned_to": None, "qualification": "convertido",
+                                   "unread_count": 0, "source_channel_type": "standard"}}
+    STORE["wa_conversations"] = {"6__5531955554444": {
+        "id": "6__5531955554444", "contact_id": 80,
+        "attendance_status": "fechado_manual", "unread_count": 0,
+        "last_message_at": _ts(1),
+    }}
+
+    def _save(direction, **kw):
+        contato = dict(STORE["wa_contacts"]["80"])
+        kw.setdefault("status", "sent" if direction == "outbound" else "received")
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=80, direction=direction, msg_type="text",
+            content="x",
+            timestamp_wa=datetime.now(timezone.utc).isoformat(),
+            channel_id=6, conversation_id="6__5531955554444", contact=contato, **kw,
+        )
+        return STORE["wa_conversations"]["6__5531955554444"]
+
+    # Recibo de fechamento: outbound com reopen_attendance=False NAO reabre.
+    conv = _save("outbound", sender_user_id=7, reopen_attendance=False,
+                 promote_qualification=False)
+    check(conv.get("attendance_status") == "fechado_manual",
+          "recibo (reopen_attendance=False) nao reabre o atendimento fechado")
+
+    # Clique de avaliacao: inbound control_message nao conta nem reabre nada.
+    lma_antes = STORE["wa_contacts"]["80"].get("last_message_at")
+    conv = _save("inbound", control_message=True)
+    check(conv.get("attendance_status") == "fechado_manual",
+          "clique de controle nao reabre o atendimento")
+    check(int(conv.get("unread_count") or 0) == 0,
+          "clique de controle nao incrementa nao-lido da thread")
+    check(int(STORE["wa_contacts"]["80"].get("unread_count") or 0) == 0,
+          "clique de controle nao incrementa nao-lido do contato")
+    check(STORE["wa_contacts"]["80"].get("last_message_at") == lma_antes,
+          "clique de controle nao avanca recencia do contato")
+    check(not STORE.get("attendances_daily"),
+          "clique de controle nao cria/reabre Atendimento diario")
+
+    # Comportamento historico preservado: inbound NORMAL reabre e conta.
+    conv = _save("inbound")
+    check(conv.get("attendance_status") == "aberto"
+          and int(conv.get("unread_count") or 0) == 1,
+          "inbound normal segue reabrindo e contando (retorno-zumbi intacto)")
+
+    # Upsert do contato (topo do webhook) com control_click: nao bumpa
+    # recencia nem auto-atribui coex; last_inbound_at (janela Meta) sobe.
+    STORE["wa_contacts"]["81"] = {"id": 81, "wa_id": "5531944443333",
+                                  "assigned_to": None, "qualification": "novo",
+                                  "last_message_at": "2026-01-01T00:00:00+00:00"}
+    STORE["users"] = {"9": {"id": 9, "firebase_uid": "uid9"}}
+    dbf.upsert_wa_contact("5531944443333", "Paciente", channel_id=2,
+                          source_channel_type="coexistence",
+                          auto_assign_user_id=9, skip_conversation_upsert=True,
+                          control_click=True)
+    ctc81 = STORE["wa_contacts"]["81"]
+    check(ctc81.get("last_message_at") == "2026-01-01T00:00:00+00:00",
+          "upsert control_click: recencia do contato nao sobe")
+    check(ctc81.get("assigned_to") is None,
+          "upsert control_click: clique nao muda posse (coex nao auto-atribui)")
+    check(ctc81.get("last_inbound_at") is not None,
+          "upsert control_click: last_inbound_at sobe (janela Meta e real)")
+    restore_dbf()
 
 
 def cenario_contato_manual():
@@ -883,10 +1182,15 @@ def run():
     cenario_close_stale()
     cenario_handoff_pendente()
     cenario_carimbo_humano()
+    cenario_promocao_qualificacao()
+    cenario_auto_close_toggle()
     cenario_fechar_orfa()
     cenario_transfer_rbac()
     cenario_perfis_merge()
     cenario_set_attendance_orfa()
+    cenario_gate_desfecho()
+    cenario_rating_botao()
+    cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()
     cenario_return_to_pool()
