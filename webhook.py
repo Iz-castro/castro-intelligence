@@ -327,6 +327,20 @@ def _normalize_reopen_choice(text):
     return s.lower().strip()
 
 
+def _reopen_action_from_choice(raw):
+    """'encerrar' | 'retomar' | None a partir do texto/payload do botao.
+
+    "continuar" conta como retomar (Frente C1, 2026-09-02): o template
+    aprovado da varizemed usa o botao [Continuar] e caia no "nao
+    reconhecida" — clique do paciente era ignorado."""
+    choice = _normalize_reopen_choice(raw)
+    if "encerr" in choice:
+        return "encerrar"
+    if "retom" in choice or "continu" in choice:
+        return "retomar"
+    return None
+
+
 async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
                                 db_id, content, ts_iso, reply_fields, ws_notify_callback=None):
     """Processa a resposta de um botao quick-reply do template de reabertura.
@@ -353,14 +367,9 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
     if not conversation_id and channel_id and wa_id:
         conversation_id = f"{channel_id}__{wa_id}"
 
-    choice = _normalize_reopen_choice(button.get("payload") or button.get("text"))
-    if "encerr" in choice:
-        action = "encerrar"
-    elif "retom" in choice:
-        action = "retomar"
-    else:
-        action = None
-        logger.info("[REOPEN BTN] resposta nao reconhecida | conv=%s txt=%s", conversation_id, choice[:40])
+    action = _reopen_action_from_choice(button.get("payload") or button.get("text"))
+    if action is None:
+        logger.info("[REOPEN BTN] resposta nao reconhecida | conv=%s", conversation_id)
 
     # Emite a mensagem de botao p/ clientes conectados (paridade com o emit
     # padrao de inbound; em snapshot mode o Firestore tambem propaga).
@@ -394,6 +403,17 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         logger.warning("[REOPEN BTN] falha ao gravar reopen_response conv=%s: %s", conversation_id, exc)
 
     if action == "encerrar":
+        # Frente C1 (ADR 0009 D2): opt-out de retomada carimbado no CONTATO —
+        # consumido pelo envio pontual (409) e pelo futuro lote. Distinto da
+        # revogacao LGPD (J-3): o lead segue atendivel normalmente; so nao
+        # recebe mais template de reabertura.
+        try:
+            document("wa_contacts", contact_id).set({
+                "reopen_opt_out": True,
+                "reopen_opt_out_at": utcnow().isoformat(),
+            }, merge=True)
+        except Exception as exc:
+            logger.warning("[REOPEN BTN] opt-out stamp falhou contato=%s: %s", contact_id, exc)
         set_attendance_status(conversation_id, "fechado_cliente", clear_takeover=True)
         insert_transfer_system_message(
             contact_id,
@@ -944,6 +964,16 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # pending antigos, para AQUI: nada de botao/takeover/bot/rating/outbound.
         if _silent_reprocess.get():
             continue
+
+        # -- Frente C1: contador de reaberturas --
+        # QUALQUER mensagem do cliente zera reopen_attempts (legado: sem o
+        # reset, o auto-resolve do lote fecharia conversa de cliente que
+        # respondeu). Idempotente na reentrega (ja estara em 0).
+        if contact_row and int(contact_row.get("reopen_attempts") or 0) > 0:
+            try:
+                document("wa_contacts", contact_id).set({"reopen_attempts": 0}, merge=True)
+            except Exception as exc:
+                logger.warning("reset de reopen_attempts falhou contato=%s: %s", contact_id, exc)
 
         # -- Clique de avaliacao (interativa OU botao de template) --
         # Curto-circuito TOTAL e incondicional: clique de avaliacao NUNCA

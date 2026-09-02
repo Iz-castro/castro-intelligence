@@ -2294,6 +2294,15 @@ async def wa_reopen_conversation(
     conv, contact, channel = _resolve_send_target(conversation_id, None)
     _check_conv_send_permission(conv, current_user, contact, channel=channel)
 
+    # Frente C1 (ADR 0009 D2): cliente que respondeu Encerrar a uma
+    # reabertura anterior esta em OPT-OUT de retomada — envio manual bloqueia
+    # com aviso (e o lote futuro filtra). Opt-out != revogacao LGPD.
+    if contact and contact.get("reopen_opt_out"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cliente pediu para nao ser reaberto (respondeu Encerrar a uma reabertura anterior).",
+        )
+
     template_name = (body.template_name if body else None) or REOPEN_TEMPLATE_NAME
     language = (body.language if body else None) or REOPEN_TEMPLATE_LANG
 
@@ -2341,6 +2350,15 @@ async def wa_reopen_conversation(
         template_category="utility",
     )
     result = await wa_send_template(body=send_body, current_user=current_user)
+    # Frente C1: contador do auto-resolve do lote (legado REOPEN_MAX_ATTEMPTS)
+    # + cooldown. So no SUCESSO do envio (wa_send_template levanta em falha).
+    try:
+        fs_document("wa_contacts", contact["id"]).set({
+            "reopen_attempts": int(contact.get("reopen_attempts") or 0) + 1,
+            "last_reopen_template_at": fs_utcnow().isoformat(),
+        }, merge=True)
+    except Exception as exc:
+        logger.warning("reopen: carimbo de tentativa falhou contato=%s: %s", contact.get("id"), exc)
     log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} template={template_name} nome={nome} data={data}")
     out = result if isinstance(result, dict) else {"status": "sent"}
     return {**out, "rendered": {"nome": nome, "data": data}}

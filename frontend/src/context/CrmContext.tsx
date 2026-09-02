@@ -290,10 +290,11 @@ type CrmContextValue = {
   searchText: string;
   qualificationFilter: string;
   setQualificationFilter: (v: string) => void;
-  // Frente B: filtro por tag (slug) — client-side, com intersecao com o
-  // filtro de qualificacao (pedido do PO: "convertido" + "varizes").
-  tagFilter: string;
-  setTagFilter: (v: string) => void;
+  // Frente B: filtro por tags (slugs) — MULTIPLO com semantica E (lead
+  // precisa ter TODAS as selecionadas; PO 2026-09-02: "[unimed, varizes]"),
+  // client-side, em intersecao com o filtro de qualificacao.
+  tagFilter: string[];
+  setTagFilter: (v: string[]) => void;
   saveContactTags: (contactId: number, tags: string[], tagLabels?: Record<string, string>) => Promise<boolean>;
   saveGlobalTags: (tags: TagDef[]) => Promise<boolean>;
   saveUserTags: (tags: TagDef[]) => Promise<boolean>;
@@ -569,7 +570,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [activeView, setActiveView] = useState<ActiveView>("novos");
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
   const [qualificationFilter, setQualificationFilter] = useState("");
-  const [tagFilter, setTagFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState<string[]>([]);
   // "Nao lidas" (select de qualificacao): alem de filtrar o carregado, busca
   // no Firestore as threads com unread_count>0 do escopo da caixa, fora da
   // janela de recencia (mensagem de fim de semana some do top-50 e a operadora
@@ -945,9 +946,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         ? ((conv.unread_count ?? conv.unread ?? 0) > 0 || conv.id === selectedThreadId)
         : (c?.qualification || "novo") === qualificationFilter);
     const matchesChannel = activeView !== "meus" || !channelFilter || convChannelKey(conv) === channelFilter;
-    // Frente B: filtro por tag e INTERSECAO com os demais (qualificacao +
-    // tag + canal), sobre os slugs do contato.
-    const matchesTag = !tagFilter || (c?.tags || []).includes(tagFilter);
+    // Frente B: filtro por tags e INTERSECAO com os demais (qualificacao +
+    // canal) e entre SI (semantica E: todas as selecionadas presentes).
+    const matchesTag = tagFilter.length === 0 || tagFilter.every((slug) => (c?.tags || []).includes(slug));
     return matchesSearch && matchesQual && matchesChannel && matchesTag;
   });
 
@@ -1241,7 +1242,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setReplyTarget(null);
     setSearch("");
     setQualificationFilter("");
-    setTagFilter("");
+    setTagFilter([]);
     setEquipeOperatorFilter("");
     setNotice("");
     setError("");

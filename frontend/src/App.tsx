@@ -166,32 +166,32 @@ function NavBar() {
   const poolReception = systemSettings.pool_mode === "reception";
   return (
     <nav className="crm-nav">
-      {canSeeAll && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); setTagFilter(""); }} title="Contatos no bot">
+      {canSeeAll && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); setTagFilter([]); }} title="Contatos no bot">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><line x1="8" y1="16" x2="8" y2="16.01"/><line x1="16" y1="16" x2="16" y2="16.01"/><line x1="12" y1="19" x2="12" y2="19.01"/></svg>
         <span className="nav-label">Bot</span>
         {botUnread > 0 && <span className="nav-badge">{botUnread > 99 ? "99+" : botUnread}</span>}
       </button>}
-      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); setTagFilter(""); }} title={poolReception ? "Recepcao (pool compartilhada)" : "Novos leads"}>
+      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); setTagFilter([]); }} title={poolReception ? "Recepcao (pool compartilhada)" : "Novos leads"}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="14"/><line x1="9" y1="11" x2="15" y2="11"/></svg>
         <span className="nav-label">{poolReception ? "Recepção" : "Novos"}</span>
         {novosUnread > 0 && <span className="nav-badge">{novosUnread > 99 ? "99+" : novosUnread}</span>}
       </button>
-      <button className={`nav-item ${activeView === "meus" ? "active" : ""}`} onClick={() => { setActiveView("meus"); setQualificationFilter(""); setTagFilter(""); }} title="Meus atendimentos">
+      <button className={`nav-item ${activeView === "meus" ? "active" : ""}`} onClick={() => { setActiveView("meus"); setQualificationFilter(""); setTagFilter([]); }} title="Meus atendimentos">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span className="nav-label">Meus</span>
         {meusUnread > 0 && <span className="nav-badge">{meusUnread > 99 ? "99+" : meusUnread}</span>}
       </button>
-      <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); setTagFilter(""); }} title="Nao qualificados">
+      <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); setTagFilter([]); }} title="Nao qualificados">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
         <span className="nav-label">N/Q</span>
         {nqUnread > 0 && <span className="nav-badge">{nqUnread > 99 ? "99+" : nqUnread}</span>}
       </button>
-      {canSeeAll && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setTagFilter(""); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
+      {canSeeAll && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setTagFilter([]); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span className="nav-label">Equipe</span>
         {equipeUnread > 0 && <span className="nav-badge">{equipeUnread > 99 ? "99+" : equipeUnread}</span>}
       </button>}
-      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); setTagFilter(""); }} title="Conversas em backup (historico importado)">
+      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); setTagFilter([]); }} title="Conversas em backup (historico importado)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/></svg>
         <span className="nav-label">Backup</span>
         {backupUnread > 0 && <span className="nav-badge">{backupUnread > 99 ? "99+" : backupUnread}</span>}
@@ -517,9 +517,9 @@ const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(
 function ContactList() {
   const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, userSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
   const tagOptions = buildTagOptions(systemSettings.tags_global, userSettings.tags);
-  // Revisao B: registry esvaziado fazia o select SUMIR com o filtro ainda
+  // Revisao B: registry esvaziado fazia o controle SUMIR com o filtro ainda
   // aplicado (lista vazia sem controle visivel). Sem opcoes, limpa.
-  useEffect(() => { if (tagFilter && tagOptions.length === 0) setTagFilter(""); }, [tagFilter, tagOptions.length, setTagFilter]);
+  useEffect(() => { if (tagFilter.length > 0 && tagOptions.length === 0) setTagFilter([]); }, [tagFilter, tagOptions.length, setTagFilter]);
   const poolReception = systemSettings.pool_mode === "reception";
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
@@ -628,10 +628,6 @@ function ContactList() {
             historico importado — sem seletor nelas. O match em si
             (filteredConversations) e client-side sobre o que esta carregado. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option><option value="nao_lidos">Não lidas</option></select>}
-        {/* Filtro por tag (Frente B): INTERSECAO com o filtro acima —
-            "convertido" + "varizes" acha convertidos de varizes. Client-side
-            sobre o carregado, como o de qualificacao. */}
-        {QUALIFICATION_FILTER_VIEWS.has(activeView) && tagOptions.length > 0 && <select className="compact" value={tagFilter} onChange={(e) => setTagFilter(e.target.value)} title="Filtrar por tag" aria-label="Filtrar por tag"><option value="">Tags</option>{tagOptions.map((t) => <option key={t.slug} value={t.slug}>{t.label}</option>)}</select>}
         {/* "So espiar" (admin/supervisor): abrir conversa sem marcar como lida
             — badge e alarme continuam ate alguem tratar. Lembrado por navegador. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && canPeek && (
@@ -641,6 +637,42 @@ function ContactList() {
           </label>
         )}
       </div>
+      {/* Faixa de tags clicaveis (PO 2026-09-02, no lugar do select): filtro
+          MULTIPLO com semantica E — clicar liga/desliga; selecionada ganha
+          borda grossa + negrito. Mesmo espirito dos chips do CRM antigo. */}
+      {QUALIFICATION_FILTER_VIEWS.has(activeView) && tagOptions.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", padding: "0.15rem 0.9rem 0.5rem", alignItems: "center" }}>
+          {tagOptions.map((t) => {
+            const on = tagFilter.includes(t.slug);
+            return (
+              <button
+                key={t.slug}
+                type="button"
+                onClick={() => setTagFilter(on ? tagFilter.filter((s) => s !== t.slug) : [...tagFilter, t.slug])}
+                title={on ? `Remover filtro: ${t.label}` : `Filtrar por: ${t.label}`}
+                aria-pressed={on}
+                style={{
+                  background: t.color || "#334155",
+                  color: tagTextColor(t.color || "#334155"),
+                  border: on ? "2px solid currentColor" : "2px solid transparent",
+                  fontWeight: on ? 700 : 500,
+                  opacity: on || tagFilter.length === 0 ? 1 : 0.55,
+                  borderRadius: 6,
+                  padding: "0.15rem 0.55rem",
+                  fontSize: "0.72rem",
+                  cursor: "pointer",
+                  lineHeight: 1.4,
+                }}
+              >
+                {t.label}
+              </button>
+            );
+          })}
+          {tagFilter.length > 0 && (
+            <button type="button" className="ghost" style={{ fontSize: "0.7rem", padding: "0.15rem 0.5rem" }} onClick={() => setTagFilter([])}>limpar ({tagFilter.length})</button>
+          )}
+        </div>
+      )}
       <div className="contact-list">
         {renderItems.slice(0, visibleLimit).map(({ contact, conversation }) => {
           // Fase 3.D: assigned/department vem da Conversation (cutover Fase 2C);
@@ -1291,7 +1323,9 @@ function isReopenTemplate(t?: WhatsAppTemplate | null): boolean {
   const buttonTexts = (t.components || [])
     .filter((c) => String(c.type).toUpperCase() === "BUTTONS")
     .flatMap((c) => (c.buttons || []).map((b) => norm(b.text || "")));
-  return buttonTexts.some((x) => x.includes("retomar")) && buttonTexts.some((x) => x.includes("encerrar"));
+  // "continuar" conta como retomar (Frente C1): template aprovado da
+  // varizemed usa o botao [Continuar].
+  return buttonTexts.some((x) => x.includes("retomar") || x.includes("continuar")) && buttonTexts.some((x) => x.includes("encerrar"));
 }
 
 function formatDateBR(raw?: string | null): string {

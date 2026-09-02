@@ -973,6 +973,40 @@ def cenario_tags_lead():
         check(True, "registry: slug repetido (case-insensitive) -> ValueError")
 
 
+def cenario_reabertura_travas():
+    titulo("CENARIO 20 — Frente C1: matcher do botao + opt-out de retomada")
+    import webhook as wh
+    # Matcher: continuar = retomar (template da varizemed); rotulos de
+    # avaliacao NUNCA podem virar acao de reabertura.
+    check(wh._reopen_action_from_choice("Encerrar atendimento") == "encerrar",
+          "Encerrar -> encerrar")
+    check(wh._reopen_action_from_choice("Retomar atendimento") == "retomar",
+          "Retomar -> retomar")
+    check(wh._reopen_action_from_choice("Continuar") == "retomar",
+          "[Continuar] (varizemed) -> retomar")
+    check(wh._reopen_action_from_choice("Excelente") is None,
+          "rotulo de avaliacao nao vira acao de reabertura")
+    check(wh._reopen_action_from_choice("Sim, quero") is None,
+          "texto qualquer -> None (log de nao reconhecida)")
+
+    # Opt-out (ADR 0009 D2): envio pontual bloqueia com 409 ANTES de montar
+    # template/enviar qualquer coisa.
+    real_resolve = main._resolve_send_target
+    real_check = main._check_conv_send_permission
+    main._resolve_send_target = lambda cid, ch: (
+        {"id": cid, "contact_id": 1, "channel_id": 6},
+        {"id": 1, "wa_id": "5531966665555", "reopen_opt_out": True},
+        {"id": 6, "channel_type": "standard"},
+    )
+    main._check_conv_send_permission = lambda *a, **k: None
+    try:
+        expect_http(lambda: asyncio.run(main.wa_reopen_conversation("6__5531966665555", body=None, current_user=dict(SUPERVISOR))),
+                    409, "contato com reopen_opt_out: reabertura pontual -> 409")
+    finally:
+        main._resolve_send_target = real_resolve
+        main._check_conv_send_permission = real_check
+
+
 def cenario_recibo_nao_reabre():
     titulo("CENARIO 18 — recibo/clique de controle nao reabrem nem contam (revisao)")
     patch_store()
@@ -1241,6 +1275,7 @@ def run():
     cenario_gate_desfecho()
     cenario_rating_botao()
     cenario_tags_lead()
+    cenario_reabertura_travas()
     cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()
