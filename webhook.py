@@ -28,6 +28,7 @@ from database import (
     normalize_br_phone,
     get_wa_conversation_by_id, set_attendance_status,
     insert_transfer_system_message, get_current_protocol_id,
+    mark_contact_bot_done,
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
@@ -431,6 +432,17 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         logger.info("[REOPEN BTN] Cliente encerrou | conv=%s", conversation_id)
     else:  # retomar
         set_attendance_status(conversation_id, "aberto")
+        # Revisao adversarial C2: lead devolvido ao bot (reception) que clica
+        # Retomar/Continuar caia em zona morta — bot_completed falso esconde a
+        # thread da aba Recepcao e clique de botao nao dispara turno de bot.
+        # Mesmo carimbo de engajamento humano do envio manual pelo app
+        # (main._check_conv_send_permission): a thread volta visivel pra equipe.
+        if contact and not contact.get("bot_completed"):
+            try:
+                mark_contact_bot_done(contact_id)
+            except Exception as exc:
+                logger.warning("[REOPEN BTN] mark_contact_bot_done falhou contato=%s: %s",
+                               contact_id, exc)
         # Reabre o Atendimento diario se existir (espelha set-attendance).
         pid = get_current_protocol_id(contact_id)
         if pid:
@@ -969,9 +981,11 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # QUALQUER mensagem do cliente zera reopen_attempts (legado: sem o
         # reset, o auto-resolve do lote fecharia conversa de cliente que
         # respondeu). Idempotente na reentrega (ja estara em 0).
-        if contact_row and int(contact_row.get("reopen_attempts") or 0) > 0:
+        if contact_row and (int(contact_row.get("reopen_attempts") or 0) > 0
+                            or contact_row.get("reopen_resolved_at")):
             try:
-                document("wa_contacts", contact_id).set({"reopen_attempts": 0}, merge=True)
+                document("wa_contacts", contact_id).set(
+                    {"reopen_attempts": 0, "reopen_resolved_at": None}, merge=True)
             except Exception as exc:
                 logger.warning("reset de reopen_attempts falhou contato=%s: %s", contact_id, exc)
 

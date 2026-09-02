@@ -18,7 +18,7 @@ _TEMPLATES_TTL_S = 60.0
 _BILLING_TTL_S_OK = 300.0   # billing OK: cache 5min
 _BILLING_TTL_S_ERR = 30.0   # billing erro/rate-limited: cache 30s (evita re-bater)
 from fastapi import (
-    FastAPI, Request,
+    FastAPI, Request, BackgroundTasks,
     HTTPException, Depends, Query, UploadFile, File, Form,
 )
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse, Response
@@ -35,6 +35,7 @@ from config import (
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS, ATTENDANCE_AUTOCLOSE_HOURS,
     RATING_TEMPLATE_NAME, RATING_TEMPLATE_LANG, RATING_REASK_DAYS, CLOSE_TEMPLATE_NAME,
+    REOPEN_MAX_ATTEMPTS, REOPEN_COOLDOWN_HOURS, REOPEN_BATCH_MAX_SENDS,
     RECEPTION_UNATTENDED_RELEASE_DAYS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
@@ -91,7 +92,7 @@ from channel_service import (
 )
 from auth import authenticate_firebase_token, invalidate_auth_cache
 from firestore_common import (
-    collection_name, document as fs_document, utcnow as fs_utcnow,
+    collection_name, collection as fs_coll, document as fs_document, utcnow as fs_utcnow,
 )
 from rbac import (
     PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
@@ -2259,6 +2260,72 @@ def _reopen_first_name(contact: dict) -> str:
     return name.split()[0] if name else "cliente"
 
 
+def _reopen_template_params(tpl, nome, data):
+    """Parameters do body pro template de retomada, introspectando o template
+    REAL (evita #132000 por contagem hardcoded). Semantica por posicao vem do
+    EXEMPLO do template: valor dd/mm/aaaa -> data; senao nome na 1a posicao,
+    data nas demais. Sem template (introspeccao indisponivel): 2 params
+    legados (nome, data)."""
+    import re as _re
+    if not tpl:
+        return [{"type": "text", "text": nome}, {"type": "text", "text": data}]
+    body_comp = next((c for c in (tpl.get("components") or [])
+                      if str(c.get("type", "")).upper() == "BODY"), None) or {}
+    n_params = len(set(_re.findall(r"\{\{(\d+)\}\}", str(body_comp.get("text") or ""))))
+    _ex_rows = ((body_comp.get("example") or {}).get("body_text") or [])
+    examples = _ex_rows[0] if _ex_rows else []
+    _date_re = _re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+    params: list[dict] = []
+    for i in range(n_params):
+        ex = str(examples[i]).strip() if i < len(examples) else ""
+        if _date_re.match(ex):
+            params.append({"type": "text", "text": data})
+        else:
+            params.append({"type": "text", "text": nome if i == 0 else data})
+    return params
+
+
+def _template_is_reopen_shape(tpl) -> bool:
+    """True se os quick-replies formam o par retomar|continuar + encerrar —
+    mesmo vocabulario do matcher do webhook (_reopen_action_from_choice)."""
+    import unicodedata
+
+    def _norm(s):
+        return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii").lower()
+
+    texts = [_norm(b.get("text")) for c in (tpl.get("components") or [])
+             if str(c.get("type", "")).upper() == "BUTTONS"
+             for b in (c.get("buttons") or [])]
+    return (any(("retom" in t) or ("continu" in t) for t in texts)
+            and any("encerr" in t for t in texts))
+
+
+async def _resolve_reopen_template(channel):
+    """Template de retomada da WABA do canal (Frente C2): prefere o nome do
+    env (REOPEN_TEMPLATE_NAME) se aprovado e com o formato certo; senao o
+    primeiro aprovado cujo formato dos botoes bate. None = canal sem template
+    de retomada (leads dele viram 'sem_template' no preview)."""
+    try:
+        data = await _load_approved_templates_for_channel(channel)
+    except Exception as exc:
+        logger.warning("reopen-batch: templates do canal %s indisponiveis: %s",
+                       channel.get("id"), exc)
+        return None
+    tpls = data.get("templates", []) or []
+    named = next((t for t in tpls if t.get("name") == REOPEN_TEMPLATE_NAME
+                  and _template_is_reopen_shape(t)), None)
+    if named:
+        return named
+    # Fallback generico: so UTILITY (um MARKETING com botao "Continuar"
+    # passaria no shape e mudaria a categoria de billing/consentimento) e
+    # preferindo pt (revisao adversarial C2).
+    candidatos = [t for t in tpls if _template_is_reopen_shape(t)
+                  and str(t.get("category") or "").upper() == "UTILITY"]
+    return (next((t for t in candidatos
+                  if str(t.get("language") or "").lower().startswith("pt")), None)
+            or (candidatos[0] if candidatos else None))
+
+
 def _reopen_last_conv_date(conv: dict, contact: dict) -> str:
     """{{2}}: data da ultima conversa em DD/MM/AAAA (BRT). Usa o
     last_message_at da thread aberta (ja em maos, sem query extra) com
@@ -2308,13 +2375,6 @@ async def wa_reopen_conversation(
 
     nome = _reopen_first_name(contact)
     data = _reopen_last_conv_date(conv, contact)
-    # Introspecta o template REAL em vez de hardcodar 2 parametros: a versao
-    # aprovada no console pode ter so {{1}} (=data, caso atual) ou {{1}}/{{2}}
-    # (desenho original). Hardcodar causava #132000 (param count mismatch).
-    # Semantica por posicao decidida pelo EXEMPLO do template (data dd/mm/aaaa
-    # -> preenche a data; senao nome na 1a posicao, data nas demais).
-    import re as _re
-    params: list[dict] = []
     tpl = None
     if channel:
         try:
@@ -2323,24 +2383,7 @@ async def wa_reopen_conversation(
                         if t.get("name") == template_name and t.get("language") == language), None)
         except Exception as exc:
             logger.warning("reopen: introspeccao de template falhou (%s); usando 2 params legados", exc)
-    if tpl:
-        body_comp = next((c for c in (tpl.get("components") or [])
-                          if str(c.get("type", "")).upper() == "BODY"), None) or {}
-        n_params = len(set(_re.findall(r"\{\{(\d+)\}\}", str(body_comp.get("text") or ""))))
-        _ex_rows = ((body_comp.get("example") or {}).get("body_text") or [])
-        examples = _ex_rows[0] if _ex_rows else []
-        _date_re = _re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
-        for i in range(n_params):
-            ex = str(examples[i]).strip() if i < len(examples) else ""
-            if _date_re.match(ex):
-                params.append({"type": "text", "text": data})
-            else:
-                params.append({"type": "text", "text": nome if i == 0 else data})
-    else:
-        params = [
-            {"type": "text", "text": nome},
-            {"type": "text", "text": data},
-        ]
+    params = _reopen_template_params(tpl, nome, data)
     components = [{"type": "body", "parameters": params}] if params else None
     send_body = WaSendTemplateRequest(
         conversation_id=conversation_id,
@@ -2362,6 +2405,329 @@ async def wa_reopen_conversation(
     log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} template={template_name} nome={nome} data={data}")
     out = result if isinstance(result, dict) else {"status": "sent"}
     return {**out, "rendered": {"nome": nome, "data": data}}
+
+
+# -- Frente C2: Reabertura em lote (o "botao" do sistema antigo, com freios) --
+
+async def _plan_reopen_batch():
+    """Scan (database.scan_reopen_candidates) + resolucao de canal/template
+    por candidato. Retorna (scan_ajustado, plano, canais, tpl_por_canal)."""
+    from database import scan_reopen_candidates
+    from channel_service import get_channel as _get_ch
+    scan = scan_reopen_candidates(
+        max_attempts=REOPEN_MAX_ATTEMPTS,
+        cooldown_hours=REOPEN_COOLDOWN_HOURS,
+        window_hours=24,
+    )
+    plano, canais, tpl_por_canal = [], {}, {}
+
+    def _desclassifica(c, motivo):
+        scan["pulados"][motivo] = scan["pulados"].get(motivo, 0) + 1
+        dep = c.get("department_id") or 0
+        if scan["por_setor"].get(dep):
+            scan["por_setor"][dep] -= 1
+
+    for c in scan["enviaveis"]:
+        ch_id = c.get("channel_id")
+        if ch_id is None:
+            _desclassifica(c, "canal_invalido")
+            continue
+        if ch_id not in canais:
+            canais[ch_id] = _get_ch(ch_id) or {}
+        ch = canais[ch_id]
+        # So canal standard ativo — mesmo guard do send_template_bulk
+        # (campanha NUNCA sai por numero coexistence).
+        if not ch or not ch.get("is_active") or ch.get("channel_type") != "standard":
+            _desclassifica(c, "canal_invalido")
+            continue
+        if ch_id not in tpl_por_canal:
+            tpl_por_canal[ch_id] = await _resolve_reopen_template(ch)
+        if not tpl_por_canal[ch_id]:
+            _desclassifica(c, "sem_template")
+            continue
+        plano.append(c)
+    return scan, plano, canais, tpl_por_canal
+
+
+@app.post("/api/admin/reopen-batch/preview")
+async def reopen_batch_preview(current_user: dict = Depends(get_current_user)):
+    """Dry-run do lote (paridade com o preview do legado + exigencia D3 do
+    ADR 0009: mostrar em qual SETOR as retomadas vao cair ANTES do disparo)."""
+    ensure_permission(current_user, "reabrir_em_lote")
+    scan, plano, _canais, _tpls = await _plan_reopen_batch()
+    from database import get_all_departments as _get_deps
+    dep_nome = {d.get("id"): d.get("name") for d in _get_deps(include_inactive=True)}
+    por_setor = [
+        {"department_id": k or None,
+         "department_name": dep_nome.get(k) or "Sem setor",
+         "count": v}
+        for k, v in sorted(scan["por_setor"].items(), key=lambda kv: -kv[1]) if v > 0
+    ]
+    amostra = [{
+        "contact_id": c.get("id"),
+        "nome": c.get("display_name") or c.get("phone_formatted") or "",
+        "department_id": c.get("department_id"),
+    } for c in plano[:20]]
+    return {
+        "enviaveis": len(plano),
+        "auto_resolve": len(scan["auto_resolve"]),
+        "pulados": scan["pulados"],
+        "por_setor": por_setor,
+        "amostra": amostra,
+        "max_sends_default": REOPEN_BATCH_MAX_SENDS,
+    }
+
+
+@app.post("/api/admin/reopen-batch")
+async def reopen_batch_execute(request: Request, background_tasks: BackgroundTasks,
+                               current_user: dict = Depends(get_current_user)):
+    """Dispara o lote (supervisor/admin — toggle reabrir_em_lote). O RE-SCAN
+    aqui e a fonte da verdade (o preview pode ter envelhecido); execucao
+    assincrona via BackgroundTasks com pacing + circuit breakers."""
+    ensure_permission(current_user, "reabrir_em_lote")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        max_sends = max(1, min(int(body.get("max_sends") or REOPEN_BATCH_MAX_SENDS), 250))
+    except Exception:
+        max_sends = REOPEN_BATCH_MAX_SENDS
+    # Trava de execucao unica (revisao adversarial C2): dois lotes em paralelo
+    # (dois admins, ou fechar/reabrir o modal) mandariam o MESMO template pago
+    # 2x pro mesmo lead. Lote "executando" com progresso recente bloqueia;
+    # sem progresso ha 2h+ = instancia reciclada no meio -> marca interrompido
+    # e libera (o carimbo por envio ja protege contra reenvio).
+    _stale_cut = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    for _bs in fs_coll("reopen_batches").where("status", "==", "executando").stream():
+        _bd = _bs.to_dict() or {}
+        if str(_bd.get("last_progress_at") or _bd.get("started_at") or "") > _stale_cut:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lote {_bd.get('id')} ainda em execucao. Aguarde ele terminar.",
+            )
+        fs_document("reopen_batches", _bs.id).set({"status": "interrompido"}, merge=True)
+    scan, plano, canais, tpls = await _plan_reopen_batch()
+    if not plano and not scan["auto_resolve"]:
+        raise HTTPException(status_code=400, detail="Nenhum lead elegivel para reabertura agora.")
+    from database import next_sequence as _next_seq
+    from firestore_common import get_tenant_context as _get_tid
+    batch_id = _next_seq("reopen_batches")
+    tid = _get_tid() or str(current_user.get("tenant_id") or "")
+    fs_document("reopen_batches", batch_id).set({
+        "id": batch_id, "status": "executando",
+        "started_by": current_user["id"],
+        "started_at": fs_utcnow().isoformat(),
+        "planejados": min(len(plano), max_sends),
+        "auto_resolve_planejados": len(scan["auto_resolve"]),
+        "max_sends": max_sends,
+        "pulados_scan": scan["pulados"],
+        "enviados": 0, "resolvidos": 0, "falhas": 0,
+        "last_progress_at": fs_utcnow().isoformat(),
+    })
+    log_audit(current_user["id"], "REOPEN_BATCH_START",
+              f"batch={batch_id} planejados={min(len(plano), max_sends)} auto_resolve={len(scan['auto_resolve'])} max={max_sends}")
+    background_tasks.add_task(
+        _run_reopen_batch, tid, batch_id, plano[:max_sends],
+        scan["auto_resolve"], canais, tpls, current_user["id"],
+    )
+    return {"status": "ok", "batch_id": batch_id,
+            "planejados": min(len(plano), max_sends),
+            "auto_resolve": len(scan["auto_resolve"])}
+
+
+@app.get("/api/admin/reopen-batch/{batch_id}")
+async def reopen_batch_status(batch_id: int, current_user: dict = Depends(get_current_user)):
+    ensure_permission(current_user, "reabrir_em_lote")
+    snap = fs_document("reopen_batches", batch_id).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Lote nao encontrado")
+    d = snap.to_dict() or {}
+    # BackgroundTasks nao sobrevive a recicle da instancia (CPU throttling e
+    # decisao de custo do PO): "executando" sem progresso ha 5min+ = worker
+    # morto — reporta interrompido pro front nao fazer polling eterno.
+    if d.get("status") == "executando":
+        _lp = str(d.get("last_progress_at") or d.get("started_at") or "")
+        if _lp and _lp < (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat():
+            d["status"] = "interrompido"
+    return d
+
+
+async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tpls, starter_id):
+    """Executa o lote FORA do request (BackgroundTasks). Re-seta o contexto de
+    tenant (o middleware ja resetou o do request — mesmo padrao do cron).
+
+    Freios portados do scripts/send_template_bulk.py: pacing 1.5s, aborta em
+    5 falhas consecutivas e em held_for_quality_assessment. Envio pelo
+    caminho DIRETO (creds do canal): nada de _check_conv_send_permission —
+    que silenciaria a Val (mark_contact_bot_done) — e sem avancar recencia
+    (mil threads no topo do listener esconderiam as conversas reais)."""
+    from firestore_common import set_tenant_context, reset_tenant_context
+    token_ctx = set_tenant_context(tenant_id)
+    enviados = resolvidos = falhas = consecutivas = 0
+    abortado = ""
+    try:
+        # 1) AUTO-RESOLVE (PO: "muito importante"): fecha SEM enviar quem ja
+        # recebeu retomada e nunca respondeu. Mudo, como o cron. Revisao
+        # adversarial C2: teto de 250 por lote + yield a cada contato (a fase
+        # rodava sem await nenhum — congelava o event loop e o webhook junto)
+        # e carimbo reopen_resolved_at que torna a fase TERMINAL (o scan pula
+        # ja-resolvidos; o excedente do teto drena no proximo lote).
+        if len(auto_resolve) > 250:
+            logger.info("reopen-batch %s: auto-resolve limitado a 250 de %s",
+                        batch_id, len(auto_resolve))
+        for n_res, c in enumerate(auto_resolve[:250]):
+            cid = c.get("id")
+            try:
+                fechou = False
+                for _cs in fs_coll("wa_conversations").where("contact_id", "==", cid).stream():
+                    cv = _cs.to_dict() or {}
+                    if cv.get("is_backup") or cv.get("attendance_status") != "aberto":
+                        continue
+                    # Coexistence fica FORA do lote por inteiro (envio e
+                    # resolve): thread coex e agenda pessoal do operador.
+                    _cv_chid = cv.get("channel_id")
+                    if _cv_chid not in canais:
+                        from channel_service import get_channel as _get_ch_res
+                        canais[_cv_chid] = _get_ch_res(_cv_chid) or {}
+                    if (canais[_cv_chid] or {}).get("channel_type") == "coexistence":
+                        continue
+                    set_attendance_status(_cs.id, "fechado_inatividade", clear_takeover=True)
+                    insert_transfer_system_message(
+                        cid, "Reabertura sem resposta — atendimento encerrado automaticamente.",
+                        None, conversation_id=_cs.id, advance_recency=False,
+                    )
+                    fechou = True
+                fs_document("wa_contacts", cid).set(
+                    {"reopen_resolved_at": fs_utcnow().isoformat()}, merge=True)
+                if fechou:
+                    resolvidos += 1
+                    try:
+                        await _close_daily_and_send_protocol(c, None, None, None, "fechado_inatividade")
+                    except Exception:
+                        pass
+            except Exception as exc:
+                falhas += 1
+                logger.warning("reopen-batch auto-resolve contato=%s falhou: %s",
+                               cid, exc, exc_info=True)
+            if (n_res + 1) % 25 == 0:
+                fs_document("reopen_batches", batch_id).set(
+                    {"resolvidos": resolvidos, "falhas": falhas,
+                     "last_progress_at": fs_utcnow().isoformat()}, merge=True)
+            await asyncio.sleep(0.05)
+        # 2) ENVIOS com pacing
+        for i, c in enumerate(plano):
+            ch = canais.get(c.get("channel_id")) or {}
+            tpl = tpls.get(c.get("channel_id")) or {}
+            try:
+                token, phone_id, api_base = _resolve_channel_creds_by_id(ch["id"])
+                wa_id = _wa_target(c["wa_id"])
+                nome = _reopen_first_name(c)
+                data = _reopen_last_conv_date(None, c)
+                params = _reopen_template_params(tpl, nome, data)
+                payload = {
+                    "messaging_product": "whatsapp", "to": wa_id, "type": "template",
+                    "template": {
+                        "name": tpl.get("name"),
+                        "language": {"code": tpl.get("language") or "pt_BR"},
+                        **({"components": [{"type": "body", "parameters": params}]} if params else {}),
+                    },
+                }
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        f"{api_base}/{phone_id}/messages",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json=payload,
+                    )
+                if resp.status_code == 200:
+                    # Carimbo PRIMEIRO (revisao adversarial C2): o template
+                    # pago JA saiu — se o save da mensagem falhar ou a
+                    # instancia morrer aqui, cooldown/attempts impedem que o
+                    # proximo lote reenvie pro mesmo cliente.
+                    fs_document("wa_contacts", c["id"]).set({
+                        "reopen_attempts": int(c.get("reopen_attempts") or 0) + 1,
+                        "last_reopen_template_at": fs_utcnow().isoformat(),
+                    }, merge=True)
+                    try:
+                        _rbody = resp.json()
+                    except Exception:
+                        _rbody = {}
+                    _msg0 = (_rbody.get("messages") or [{}])[0]
+                    try:
+                        save_wa_message(
+                            wa_message_id=_msg0.get("id", ""), contact_id=c["id"], direction="outbound",
+                            msg_type="template", content=f"[Reabertura em lote: {tpl.get('name')}]",
+                            status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
+                            operator_id=starter_id, sender_user_id=starter_id,
+                            channel_id=ch.get("id"),
+                            channel_owner_user_id=ch.get("owner_user_id"),
+                            template_category=str(tpl.get("category") or "utility").lower(),
+                            promote_qualification=False,
+                            reopen_attendance=False,  # reabre so quando o CLIENTE responder
+                            advance_recency=False,    # lote nao pode estourar o top-50
+                            human_outbound=False,     # template de lote NAO e atencao humana
+                                                      # (nao desarma valvula/auto-close reception)
+                        )
+                    except Exception as exc:
+                        logger.warning("reopen-batch: envio ok mas save falhou contato=%s: %s",
+                                       c.get("id"), exc)
+                    enviados += 1
+                    consecutivas = 0
+                    # Freio de reputacao (portado do send_template_bulk): a
+                    # Meta devolve held_for_quality_assessment DENTRO do 200.
+                    if str(_msg0.get("message_status") or "") == "held_for_quality_assessment":
+                        abortado = "held_for_quality_assessment"
+                        fs_document("reopen_batches", batch_id).set(
+                            {"ultimo_message_status": "held_for_quality_assessment"}, merge=True)
+                        break
+                else:
+                    falhas += 1
+                    try:
+                        _err = resp.json().get("error") or {}
+                    except Exception:
+                        _err = {}
+                    _code = _err.get("code")
+                    # Erro PERMANENTE por destinatario (numero invalido,
+                    # janela, param do template): carimba o cooldown pra nao
+                    # travar a cabeca da fila do proximo lote e NAO conta pro
+                    # breaker (a ordem do scan e deterministica — 5 leads
+                    # ruins seguidos abortariam todo lote pra sempre).
+                    if _code in (100, 131026, 131047, 131049, 131051,
+                                 132000, 132001, 132005, 132007, 132012):
+                        fs_document("wa_contacts", c["id"]).set(
+                            {"last_reopen_template_at": fs_utcnow().isoformat()}, merge=True)
+                    else:
+                        consecutivas += 1
+                    logger.warning("reopen-batch envio falhou contato=%s code=%s sub=%s",
+                                   c.get("id"), _code, (_err.get("error_data") or {}).get("details", "")[:80])
+                    if "held_for_quality" in str(_err).lower():
+                        abortado = "held_for_quality_assessment"
+                        break
+            except Exception as exc:
+                falhas += 1
+                consecutivas += 1
+                logger.warning("reopen-batch contato=%s excecao: %s", c.get("id"), exc)
+            if consecutivas >= 5:
+                abortado = "5 falhas consecutivas"
+                break
+            if (i + 1) % 10 == 0:
+                fs_document("reopen_batches", batch_id).set(
+                    {"enviados": enviados, "falhas": falhas, "resolvidos": resolvidos,
+                     "last_progress_at": fs_utcnow().isoformat()}, merge=True)
+            await asyncio.sleep(1.5)
+    except Exception as exc:
+        logger.error("reopen-batch %s falhou: %s", batch_id, exc)
+        abortado = abortado or "erro interno"
+    finally:
+        fs_document("reopen_batches", batch_id).set({
+            "status": "abortado" if abortado else "concluido",
+            "abort_motivo": abortado,
+            "enviados": enviados, "resolvidos": resolvidos, "falhas": falhas,
+            "finished_at": fs_utcnow().isoformat(),
+        }, merge=True)
+        log_audit(None, "REOPEN_BATCH_END",
+                  f"batch={batch_id} enviados={enviados} resolvidos={resolvidos} falhas={falhas} abort={abortado or '-'}")
+        reset_tenant_context(token_ctx)
 
 
 @app.get("/api/wa/templates")

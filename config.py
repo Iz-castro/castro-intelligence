@@ -209,6 +209,17 @@ QUALIFICATION_OPTIONS = [
 RATING_TEMPLATE_NAME = os.getenv("RATING_TEMPLATE_NAME", "rating_request")
 RATING_TEMPLATE_LANG = os.getenv("RATING_TEMPLATE_LANG", "pt_BR")
 CLOSE_TEMPLATE_NAME = os.getenv("CLOSE_TEMPLATE_NAME", "recibo_fechamento")
+
+# -- Reabertura em lote (Frente C2, 2026-09) --
+# Tentativas de retomada SEM resposta antes do auto-resolve fechar a conversa
+# sem enviar de novo (faxina da base; legado usava 1). Qualquer inbound do
+# cliente zera o contador (webhook).
+REOPEN_MAX_ATTEMPTS = max(1, int(os.environ.get("REOPEN_MAX_ATTEMPTS", "1")))
+# Cooldown minimo entre templates de retomada pro MESMO lead (anti-spam).
+REOPEN_COOLDOWN_HOURS = int(os.environ.get("REOPEN_COOLDOWN_HOURS", "24"))
+# Teto de envios POR EXECUCAO do lote (o tier da Meta e por portfolio, em
+# destinatarios unicos/24h, SEM codigo de erro ao estourar — contamos nos).
+REOPEN_BATCH_MAX_SENDS = int(os.environ.get("REOPEN_BATCH_MAX_SENDS", "100"))
 # Janela (horas) em que o clique de avaliacao ainda vale apos o pedido —
 # clique fora dela e ignorado (nunca vira nota nem chega ao bot).
 RATING_CAPTURE_HOURS = int(os.environ.get("RATING_CAPTURE_HOURS", "48"))

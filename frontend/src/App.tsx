@@ -144,6 +144,7 @@ function TopBar() {
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("tags")}><span>🏷️</span><span>Tags de leads</span></button>
+              {can("reabrir_em_lote") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("reopen")}><span>🔁</span><span>Reabertura em lote</span></button>}
               {can("gerenciar_config_sistema") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
               {can("gerenciar_perfis_acesso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("perfis")}><span>🛡️</span><span>Perfis de acesso</span></button>}
               {(can("gerenciar_canais") || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
@@ -2207,6 +2208,8 @@ function SettingsModals() {
 
       {showSettings === "tags" ? <TagsSettingsModal /> : null}
 
+      {showSettings === "reopen" && can("reabrir_em_lote") ? <ReopenBatchModal /> : null}
+
       {showSettings === "whatsapp" ? <WhatsAppSignupModal /> : null}
       {showSettings === "whatsapp-standard" ? <WhatsAppSignupModal channelType="standard" /> : null}
 
@@ -2271,6 +2274,204 @@ function TagsSettingsModal() {
           <TagEditorRows tags={personalDraft} onChange={(next) => { personalDirty.current = true; setPersonalDraft(next); }} />
           <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveUserTags(personalDraft)) personalDirty.current = false; })(); }} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar minhas tags"}</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reabertura em lote (Frente C2) — preview -> confirmar -> progresso
+// ---------------------------------------------------------------------------
+
+type ReopenPreview = {
+  enviaveis: number;
+  auto_resolve: number;
+  pulados: Record<string, number>;
+  por_setor: { department_id: number | null; department_name: string; count: number }[];
+  amostra: { contact_id: number; nome: string; department_id: number | null }[];
+  max_sends_default: number;
+};
+
+type ReopenBatchDoc = {
+  id: number;
+  status: string;
+  planejados: number;
+  auto_resolve_planejados: number;
+  enviados: number;
+  resolvidos: number;
+  falhas: number;
+  abort_motivo?: string;
+  max_sends?: number;
+};
+
+const REOPEN_SKIP_LABELS: Record<string, string> = {
+  janela_aberta: "Conversa recente (janela de 24h ainda aberta)",
+  janela_desconhecida: "Sem registro de mensagem do cliente",
+  cooldown: "Retomada enviada ha pouco (aguardando cooldown)",
+  opt_out: "Cliente pediu para nao ser reaberto",
+  ja_resolvido: "Ja encerrado por lote anterior (sem resposta)",
+  lgpd_revogado: "Consentimento LGPD revogado",
+  arquivado: "Lead arquivado",
+  backup: "Lead da Caixa Backup",
+  canal_invalido: "Canal inativo ou coexistence",
+  sem_template: "Canal sem template de retomada aprovado",
+};
+
+function ReopenBatchModal() {
+  const { bundle, setShowSettings, can } = useCrm();
+  const [preview, setPreview] = useState<ReopenPreview | null>(null);
+  const [busyPreview, setBusyPreview] = useState(false);
+  const [busyExec, setBusyExec] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [maxSends, setMaxSends] = useState("");
+  const [batchId, setBatchId] = useState<number | null>(null);
+  const [batch, setBatch] = useState<ReopenBatchDoc | null>(null);
+  const [localError, setLocalError] = useState("");
+  const [showSample, setShowSample] = useState(false);
+
+  const loadPreview = useCallback(async () => {
+    if (!bundle) return;
+    setBusyPreview(true); setLocalError(""); setConfirming(false);
+    try {
+      const res = await sendJson<ReopenPreview>(bundle.auth, "/api/admin/reopen-batch/preview");
+      setPreview(res);
+      // Nao clobbera o limite ja digitado ao atualizar a previa.
+      setMaxSends((prev) => prev || String(res.max_sends_default || 100));
+    } catch (e: unknown) { setLocalError(errorText(e)); }
+    finally { setBusyPreview(false); }
+  }, [bundle]);
+
+  useEffect(() => { void loadPreview(); }, [loadPreview]);
+
+  // Poll do doc do lote enquanto o worker roda (progresso atualiza a cada ~10 envios).
+  useEffect(() => {
+    if (!bundle || batchId === null) return;
+    let stopped = false;
+    let timer = 0;
+    const tick = async () => {
+      try {
+        const doc = await getJson<ReopenBatchDoc>(bundle.auth, `/api/admin/reopen-batch/${batchId}`);
+        if (stopped) return;
+        setBatch(doc);
+        if (doc.status === "executando") timer = window.setTimeout(() => void tick(), 2500);
+      } catch {
+        if (!stopped) timer = window.setTimeout(() => void tick(), 5000);
+      }
+    };
+    timer = window.setTimeout(() => void tick(), 1200);
+    return () => { stopped = true; window.clearTimeout(timer); };
+  }, [bundle, batchId]);
+
+  async function executeBatch() {
+    if (!bundle) return;
+    setBusyExec(true); setLocalError("");
+    try {
+      const parsed = parseInt(maxSends, 10);
+      const limit = Number.isFinite(parsed) ? Math.max(1, Math.min(parsed, 250)) : undefined;
+      const res = await sendJson<{ batch_id: number; planejados: number; auto_resolve: number }>(bundle.auth, "/api/admin/reopen-batch", limit ? { max_sends: limit } : {});
+      setConfirming(false);
+      // Seed do progresso com a resposta do POST (o doc so atualiza a cada ~10 envios).
+      setBatch({ id: res.batch_id, status: "executando", planejados: res.planejados, auto_resolve_planejados: res.auto_resolve, enviados: 0, resolvidos: 0, falhas: 0 });
+      setBatchId(res.batch_id);
+    } catch (e: unknown) { setLocalError(errorText(e)); setConfirming(false); }
+    finally { setBusyExec(false); }
+  }
+
+  const skips = Object.entries(preview?.pulados || {}).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  const running = batch?.status === "executando" || (batchId !== null && !batch);
+  const canManage = can("reabrir_em_lote");
+
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Reabertura em lote" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
+        <h2 style={{ margin: "0 0 0.4rem" }}>Reabertura em lote</h2>
+        <p className="sub" style={{ marginBottom: "1rem" }}>
+          Envia o template de retomada aos leads <strong>em atendimento</strong> frios (fora da janela de 24h).
+          Quem ja recebeu retomada e nunca respondeu e <strong>encerrado automaticamente</strong>, sem novo envio.
+        </p>
+        {localError ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{localError}</span></div> : null}
+
+        {batchId !== null ? (
+          <div className="settings-section">
+            <h3>{running ? "Executando..." : batch?.status === "abortado" ? "Lote abortado" : batch?.status === "interrompido" ? "Lote interrompido (sem progresso)" : "Lote concluido"}</h3>
+            <div className="settings-block" style={{ fontSize: "0.9rem", lineHeight: 1.8 }}>
+              <div>Enviados: <strong>{batch?.enviados ?? 0}</strong> de {batch?.planejados ?? "?"}</div>
+              <div>Encerrados sem resposta (auto-resolve): <strong>{batch?.resolvidos ?? 0}</strong> de {batch?.auto_resolve_planejados ?? "?"}</div>
+              <div>Falhas: <strong>{batch?.falhas ?? 0}</strong></div>
+              {batch?.abort_motivo ? <div className="sub">Motivo: {batch.abort_motivo}</div> : null}
+              {running ? <div className="sub">O progresso atualiza a cada ~10 envios. Pode fechar esta janela — o lote continua no servidor.</div> : null}
+            </div>
+            {!running ? (
+              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { setBatchId(null); setBatch(null); void loadPreview(); }}>Nova previa</button>
+            ) : null}
+          </div>
+        ) : (
+          <>
+            <div className="settings-section">
+              <h3>Previa {busyPreview ? "(atualizando...)" : ""}</h3>
+              {preview ? (
+                <div className="settings-block" style={{ fontSize: "0.9rem", lineHeight: 1.8 }}>
+                  <div>Receberao a retomada: <strong>{preview.enviaveis}</strong></div>
+                  <div>Serao encerrados sem novo envio (ja tentado, sem resposta): <strong>{preview.auto_resolve}</strong></div>
+                  {preview.por_setor.length ? (
+                    <div style={{ marginTop: "0.4rem" }}>
+                      <div style={{ fontWeight: 600 }}>Setor de destino das respostas:</div>
+                      {preview.por_setor.map((s) => (
+                        <div key={String(s.department_id)} style={{ paddingLeft: "0.8rem" }}>{s.department_name}: <strong>{s.count}</strong></div>
+                      ))}
+                      <div className="sub" style={{ paddingLeft: "0.8rem" }}>A distribuicao considera todos os elegiveis; o limite de envios corta a lista na ordem da varredura.</div>
+                    </div>
+                  ) : null}
+                  {skips.length ? (
+                    <div style={{ marginTop: "0.4rem" }}>
+                      <div style={{ fontWeight: 600 }}>Fora do lote:</div>
+                      {skips.map(([motivo, n]) => (
+                        <div key={motivo} className="sub" style={{ paddingLeft: "0.8rem" }}>{REOPEN_SKIP_LABELS[motivo] || motivo}: {n}</div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {preview.amostra.length ? (
+                    <div style={{ marginTop: "0.4rem" }}>
+                      <button className="ghost" style={{ padding: "0.2rem 0.5rem", fontSize: "0.8rem" }} onClick={() => setShowSample((v) => !v)}>
+                        {showSample ? "Ocultar amostra" : `Ver amostra (${preview.amostra.length})`}
+                      </button>
+                      {showSample ? preview.amostra.map((a) => (
+                        <div key={a.contact_id} className="sub" style={{ paddingLeft: "0.8rem" }}>#{a.contact_id} — {a.nome || "(sem nome)"}</div>
+                      )) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ) : <div className="sub">{busyPreview ? "Carregando previa..." : "Previa indisponivel."}</div>}
+              <button className="ghost" style={{ marginTop: "0.6rem", fontSize: "0.85rem", padding: "0.4rem 0.8rem" }} onClick={() => void loadPreview()} disabled={busyPreview}>Atualizar previa</button>
+            </div>
+
+            {canManage && preview && (preview.enviaveis > 0 || preview.auto_resolve > 0) ? (
+              <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+                <h3>Disparo</h3>
+                <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", marginBottom: "0.6rem" }}>
+                  <label style={{ fontSize: "0.88rem" }}>Limite de envios:</label>
+                  <input type="number" min={1} max={250} value={maxSends} onChange={(e) => setMaxSends(e.target.value)} style={{ width: 90 }} />
+                </div>
+                {confirming ? (
+                  <div className="settings-block" style={{ fontSize: "0.9rem" }}>
+                    <p style={{ margin: "0 0 0.6rem" }}>
+                      Confirmar: enviar retomada a ate <strong>{Math.min(preview.enviaveis, Math.max(1, Math.min(parseInt(maxSends, 10) || preview.max_sends_default, 250)))}</strong> leads
+                      {preview.auto_resolve > 0 ? <> e encerrar <strong>{preview.auto_resolve}</strong> sem resposta</> : null}?
+                      Templates fora da janela sao <strong>conversas pagas</strong> na Meta.
+                    </p>
+                    <div style={{ display: "flex", gap: "0.6rem" }}>
+                      <button className="primary" onClick={() => void executeBatch()} disabled={busyExec}>{busyExec ? "Disparando..." : "Confirmar disparo"}</button>
+                      <button className="ghost" onClick={() => setConfirming(false)} disabled={busyExec}>Cancelar</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button className="primary" onClick={() => setConfirming(true)} disabled={busyPreview || busyExec}>Disparar lote</button>
+                )}
+              </div>
+            ) : null}
+          </>
+        )}
       </div>
     </div>
   );

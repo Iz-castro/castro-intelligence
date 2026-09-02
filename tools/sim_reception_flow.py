@@ -1007,6 +1007,173 @@ def cenario_reabertura_travas():
         main._check_conv_send_permission = real_check
 
 
+def cenario_scan_reabertura():
+    titulo("CENARIO 21 — Frente C2: scan classifica o publico do lote")
+    patch_store()
+    _now = datetime.now(timezone.utc)
+
+    def _h(hrs):
+        return (_now - timedelta(hours=hrs)).isoformat()
+
+    STORE["wa_contacts"] = {
+        "1": {"id": 1, "qualification": "em_atendimento", "last_inbound_at": _h(30), "department_id": 2},
+        "2": {"id": 2, "qualification": "em_atendimento", "last_inbound_at": _h(2)},
+        "3": {"id": 3, "qualification": "em_atendimento", "last_inbound_at": _h(30), "reopen_opt_out": True},
+        "4": {"id": 4, "qualification": "em_atendimento", "last_inbound_at": _h(30), "last_reopen_template_at": _h(3)},
+        "5": {"id": 5, "qualification": "em_atendimento", "last_inbound_at": _h(30), "reopen_attempts": 1},
+        "6": {"id": 6, "qualification": "em_atendimento"},
+        "7": {"id": 7, "qualification": "em_atendimento", "last_inbound_at": _h(30), "is_archived": 1},
+        "8": {"id": 8, "qualification": "em_atendimento", "last_inbound_at": _h(30), "is_backup": True},
+        "9": {"id": 9, "qualification": "em_atendimento", "last_inbound_at": _h(30), "lgpd_revoked": True},
+        "10": {"id": 10, "qualification": "novo", "last_inbound_at": _h(30)},
+    }
+    r = dbf.scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24)
+    check([c["id"] for c in r["enviaveis"]] == [1],
+          "so o lead frio/limpo e ENVIAVEL (novo nem entra na query)")
+    check([c["id"] for c in r["auto_resolve"]] == [5],
+          "attempts >= max vira AUTO-RESOLVE (fecha sem enviar)")
+    check(r["pulados"] == {"janela_aberta": 1, "opt_out": 1, "cooldown": 1,
+                           "janela_desconhecida": 1, "arquivado": 1,
+                           "backup": 1, "lgpd_revogado": 1},
+          f"pulados classificados por motivo ({r['pulados']})")
+    check(r["por_setor"] == {2: 1}, "por_setor (D3) conta so os enviaveis")
+    restore_dbf()
+
+
+def cenario_worker_lote():
+    titulo("CENARIO 22 — Frente C2: worker do lote (envio, auto-resolve, freios)")
+    # Exercita main._run_reopen_batch de ponta a ponta com Meta stubada —
+    # cobre o caminho que a revisao adversarial pegou quebrado (fs_coll
+    # NameError matava o auto-resolve em silencio) e os freios novos.
+    import types as _types
+    patch_store()
+    _now = datetime.now(timezone.utc)
+    STORE["wa_contacts"] = {
+        "31": {"id": 31, "wa_id": "5531911112222", "channel_id": 6,
+               "qualification": "em_atendimento",
+               "last_inbound_at": (_now - timedelta(hours=30)).isoformat(),
+               "source_channel_type": "standard", "unread_count": 0},
+        "32": {"id": 32, "wa_id": "5531933334444", "channel_id": 6,
+               "qualification": "em_atendimento",
+               "last_inbound_at": (_now - timedelta(hours=40)).isoformat(),
+               "reopen_attempts": 1, "unread_count": 0},
+        "33": {"id": 33, "wa_id": "5531955556666", "channel_id": 6,
+               "qualification": "em_atendimento",
+               "last_inbound_at": (_now - timedelta(hours=30)).isoformat(),
+               "source_channel_type": "standard", "unread_count": 0},
+    }
+    STORE["wa_conversations"] = {
+        "6__5531933334444": {"id": "6__5531933334444", "contact_id": 32, "channel_id": 6,
+                             "attendance_status": "aberto", "unread_count": 0,
+                             "last_message_at": (_now - timedelta(hours=40)).isoformat()},
+    }
+    canal = {"id": 6, "channel_type": "standard", "is_active": True, "owner_user_id": None}
+    tpl = {"name": "atualizao_de_solicitao", "language": "pt_BR", "category": "UTILITY",
+           "components": [
+               {"type": "BODY", "text": "Ola {{1}}, sua ultima conversa foi em {{2}}.",
+                "example": {"body_text": [["Rafael", "01/01/2026"]]}},
+               {"type": "BUTTONS", "buttons": [
+                   {"type": "QUICK_REPLY", "text": "Retomar"},
+                   {"type": "QUICK_REPLY", "text": "Encerrar"}]},
+           ]}
+
+    sent_payloads = []
+    resp_body = {"messages": [{"id": "wamid.SIM1"}]}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return dict(resp_body)
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            sent_payloads.append(json)
+            return _FakeResp()
+
+    async def _fast_sleep(_s):
+        return None
+
+    closed_daily = []
+
+    async def _fake_close_daily(*a, **k):
+        closed_daily.append(a)
+        return True
+
+    real_fs_coll, real_fs_doc = main.fs_coll, main.fs_document
+    real_httpx, real_asyncio = main.httpx, main.asyncio
+    real_creds = main._resolve_channel_creds_by_id
+    real_close_daily = main._close_daily_and_send_protocol
+    main.fs_coll = lambda name: _CollRef(name)
+    main.fs_document = dbf.document
+    main.httpx = _types.SimpleNamespace(AsyncClient=_FakeAsyncClient)
+    main.asyncio = _types.SimpleNamespace(sleep=_fast_sleep)
+    main._resolve_channel_creds_by_id = lambda chid: ("tok", "pnid", "https://graph.example")
+    main._close_daily_and_send_protocol = _fake_close_daily
+    try:
+        asyncio.run(main._run_reopen_batch(
+            "", 9001,
+            [dict(STORE["wa_contacts"]["31"])],
+            [dict(STORE["wa_contacts"]["32"])],
+            {6: canal}, {6: tpl}, 7,
+        ))
+        check(len(sent_payloads) == 1
+              and sent_payloads[0]["template"]["name"] == "atualizao_de_solicitao"
+              and len(sent_payloads[0]["template"]["components"][0]["parameters"]) == 2,
+              "envio: 1 template com 2 params (nome+data) pro lead enviavel")
+        c31 = STORE["wa_contacts"]["31"]
+        check(int(c31.get("reopen_attempts") or 0) == 1 and c31.get("last_reopen_template_at"),
+              "envio 200: attempts+cooldown carimbados no contato")
+        th31 = STORE["wa_conversations"].get("6__5531911112222") or {}
+        check(not th31.get("last_human_outbound_at"),
+              "template de lote NAO carimba last_human_outbound_at (valvula reception)")
+        check(STORE["wa_conversations"]["6__5531933334444"].get("attendance_status") == "fechado_inatividade",
+              "auto-resolve: thread aberta do lead ja-tentado fecha (fs_coll vivo)")
+        c32 = STORE["wa_contacts"]["32"]
+        check(bool(c32.get("reopen_resolved_at")) and len(closed_daily) == 1,
+              "auto-resolve: reopen_resolved_at carimbado + carimbo diario chamado")
+        b1 = STORE["reopen_batches"]["9001"]
+        check(b1.get("status") == "concluido" and b1.get("enviados") == 1
+              and b1.get("resolvidos") == 1 and b1.get("falhas") == 0,
+              f"doc do lote: concluido 1/1/0 ({b1})")
+
+        # held_for_quality_assessment vem DENTRO do 200 (freio de reputacao).
+        resp_body["messages"] = [{"id": "wamid.SIM2",
+                                  "message_status": "held_for_quality_assessment"}]
+        asyncio.run(main._run_reopen_batch(
+            "", 9002,
+            [dict(STORE["wa_contacts"]["33"])], [],
+            {6: canal}, {6: tpl}, 7,
+        ))
+        b2 = STORE["reopen_batches"]["9002"]
+        check(b2.get("status") == "abortado"
+              and b2.get("abort_motivo") == "held_for_quality_assessment"
+              and b2.get("enviados") == 1,
+              "held no corpo do 200: envio conta/carimba e o lote ABORTA")
+
+        # Scan pos-lote: enviado recente cai em cooldown; auto-resolvido e
+        # TERMINAL (ja_resolvido) — nao volta ao balde em todo lote.
+        r = dbf.scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24)
+        check(r["enviaveis"] == [] and r["auto_resolve"] == []
+              and r["pulados"] == {"cooldown": 2, "ja_resolvido": 1},
+              f"scan pos-lote: cooldown x2 + ja_resolvido ({r['pulados']})")
+    finally:
+        main.fs_coll, main.fs_document = real_fs_coll, real_fs_doc
+        main.httpx, main.asyncio = real_httpx, real_asyncio
+        main._resolve_channel_creds_by_id = real_creds
+        main._close_daily_and_send_protocol = real_close_daily
+        restore_dbf()
+
+
 def cenario_recibo_nao_reabre():
     titulo("CENARIO 18 — recibo/clique de controle nao reabrem nem contam (revisao)")
     patch_store()
@@ -1276,6 +1443,8 @@ def run():
     cenario_rating_botao()
     cenario_tags_lead()
     cenario_reabertura_travas()
+    cenario_scan_reabertura()
+    cenario_worker_lote()
     cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()

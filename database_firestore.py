@@ -2417,8 +2417,14 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     advance_recency=True, contact=None,
                     promote_qualification=True,
                     reopen_attendance=True,
-                    control_message=False):
+                    control_message=False,
+                    human_outbound=True):
     """Persiste mensagem WhatsApp.
+
+    human_outbound=False: outbound com operador identificado que NAO conta
+    como atencao humana (uso: template da reabertura em lote — carimbar
+    last_human_outbound_at desarmaria a valvula/auto-close do Modo Recepcao
+    em massa; revisao adversarial C2). Autoria/auditoria seguem normais.
 
     reopen_attendance=False: a mensagem nao conta como "atividade" pro ciclo
     de vida — nao reabre attendance_status fechado (uso: recibo de
@@ -2656,6 +2662,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     human_outbound_at=(
                         _eff_msg_at
                         if direction == "outbound" and sender_user_id is not None
+                        and human_outbound
                         else None
                     ),
                     reopen_attendance=reopen_attendance and not control_message,
@@ -3375,6 +3382,84 @@ def _clean_tag_defs(items, label, max_items=None):
 def update_wa_contact_tags(contact_id, slugs):
     """Grava a lista (ja limpa por clean_lead_tags) no contato."""
     document("wa_contacts", contact_id).set({"tags": list(slugs)}, merge=True)
+
+
+def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
+    """Frente C2: varre leads "em_atendimento" e classifica pro lote de
+    reabertura. Query server-side por IGUALDADE (indice automatico, sem
+    composto — mesma dieta do close_stale_attendances); demais filtros em
+    Python. O caller (main) valida canal/template e executa.
+
+    Retorna {"enviaveis": [contatos], "auto_resolve": [contatos],
+             "pulados": {motivo: n}, "por_setor": {department_id|0: n}}.
+
+    Regras (PO 2026-09-01/02): publico = em_atendimento; fora da janela de
+    24h (janela desconhecida NAO envia — template e conversa paga, so com
+    evidencia de janela fechada); cooldown por lead; attempts >= max vira
+    AUTO-RESOLVE (fecha sem enviar — "muito importante", PO); exclui opt-out
+    (ADR 0009 D2), lgpd_revoked, arquivado e backup."""
+    now = utcnow()
+    janela_cutoff = now - timedelta(hours=window_hours)
+    cooldown_cutoff = now - timedelta(hours=cooldown_hours)
+
+    def _ts(raw):
+        if not raw:
+            return None
+        try:
+            dt = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        except Exception:
+            return None
+
+    enviaveis, auto_resolve = [], []
+    pulados = {}
+    por_setor = {}
+
+    def _skip(motivo):
+        pulados[motivo] = pulados.get(motivo, 0) + 1
+
+    for snap in collection("wa_contacts").where("qualification", "==", "em_atendimento").stream():
+        c = snap.to_dict() or {}
+        c.setdefault("id", snap.id)
+        if int(c.get("is_archived") or 0):
+            _skip("arquivado")
+            continue
+        if c.get("is_backup"):
+            _skip("backup")
+            continue
+        if c.get("reopen_opt_out"):
+            _skip("opt_out")
+            continue
+        if c.get("lgpd_revoked"):
+            _skip("lgpd_revogado")
+            continue
+        li = _ts(c.get("last_inbound_at"))
+        if li is None:
+            _skip("janela_desconhecida")
+            continue
+        if li > janela_cutoff:
+            _skip("janela_aberta")
+            continue
+        lrt = _ts(c.get("last_reopen_template_at"))
+        if lrt is not None and lrt > cooldown_cutoff:
+            _skip("cooldown")
+            continue
+        if int(c.get("reopen_attempts") or 0) >= max_attempts:
+            # Auto-resolve e TERMINAL (revisao adversarial C2): o worker
+            # carimba reopen_resolved_at ao processar; sem o skip, o mesmo
+            # lead voltava ao balde em TODO lote, pra sempre (inbound limpa
+            # o carimbo junto com o reset de attempts no webhook).
+            if c.get("reopen_resolved_at"):
+                _skip("ja_resolvido")
+                continue
+            auto_resolve.append(c)
+            continue
+        enviaveis.append(c)
+        dep = c.get("department_id") or 0
+        por_setor[dep] = por_setor.get(dep, 0) + 1
+
+    return {"enviaveis": enviaveis, "auto_resolve": auto_resolve,
+            "pulados": pulados, "por_setor": por_setor}
 
 
 _DEFAULT_SYSTEM_SETTINGS = {

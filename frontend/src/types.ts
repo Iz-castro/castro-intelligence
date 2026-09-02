@@ -59,6 +59,7 @@ export type PermissionKey =
   | "editar_dono_lead"
   | "qualificar_lead"
   | "gerenciar_tags_globais"
+  | "reabrir_em_lote"
   | "editar_declared_name"
   | "arquivar_lead"
   | "adicionar_contato_manual"
@@ -412,7 +413,7 @@ export type UserSettings = {
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
 
 // Mensagem rapida (global do tenant ou pessoal do operador). `title` e o nome
 // que identifica a mensagem nas configuracoes e na lista do compositor.
