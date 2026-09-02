@@ -1043,6 +1043,12 @@ async def get_settings_system(current_user: dict = Depends(get_current_user)):
 async def update_settings_system(request: Request, current_user: dict = Depends(get_current_user)):
     ensure_permission(current_user, "gerenciar_config_sistema")
     body = await request.json()
+    # tags_global SO pelo endpoint proprio (/api/settings/tags-global, toggle
+    # gerenciar_tags_globais). Revisao B: aceitar aqui (1) contornava o
+    # toggle e (2) o frontend manda o objeto INTEIRO — salvar sons com estado
+    # stale apagava/revertia o registry que um supervisor editou no meio.
+    if isinstance(body, dict):
+        body.pop("tags_global", None)
     try:
         result = save_system_settings(body)
     except ValueError as exc:  # mensagem rapida vazia/atalho repetido
@@ -1063,7 +1069,10 @@ async def update_settings_user(request: Request, current_user: dict = Depends(ge
         result = save_user_settings(current_user["id"], body)
     except ValueError as exc:  # mensagem rapida vazia/atalho repetido/limite
         raise HTTPException(status_code=400, detail=str(exc))
-    log_audit(current_user["id"], "USER_SETTINGS_UPDATE", str(body))
+    # So as CHAVES no audit (revisao B): o body agora carrega tags pessoais,
+    # cujo conteudo pode ser dado de saude — nao vai em claro pro log.
+    _keys = sorted(body.keys()) if isinstance(body, dict) else []
+    log_audit(current_user["id"], "USER_SETTINGS_UPDATE", f"keys={_keys}")
     return result
 
 
@@ -2589,6 +2598,83 @@ async def qualify_contact(contact_id: int, request: Request, current_user: dict 
     return result
 
 
+def _register_personal_tags(current_user, label_map, slugs):
+    """Frente B: tag DIGITADA como nova vira tag PESSOAL do operador
+    (criacao on-the-fly — PO 2026-09-02). `label_map` {slug: rotulo} vem do
+    frontend e contem SO o que o usuario digitou de novo nesta acao —
+    revisao B: registrar tudo que estava aplicado adotava como "minhas" as
+    tags de colegas a cada re-save da lista. Best-effort: falha aqui nunca
+    bloqueia a aplicacao no lead."""
+    try:
+        if not isinstance(label_map, dict) or not label_map:
+            return
+        from database import (
+            get_system_settings, get_user_settings, save_user_settings,
+            normalize_tag_slug,
+        )
+        known = {t.get("slug") for t in (get_system_settings().get("tags_global") or [])}
+        personal = list(get_user_settings(current_user["id"]).get("tags") or [])
+        known.update(t.get("slug") for t in personal)
+        slug_set = set(slugs)
+        novos = []
+        for raw_slug, raw_label in label_map.items():
+            s = normalize_tag_slug(raw_slug)
+            if s and s in slug_set and s not in known:
+                novos.append({"slug": s, "label": str(raw_label or "").strip()[:60] or s})
+                known.add(s)
+        if not novos:
+            return
+        if len(personal) + len(novos) > 100:
+            logger.info("tags pessoais no limite (100) p/ user %s — novas nao registradas",
+                        current_user.get("id"))
+            return
+        save_user_settings(current_user["id"], {"tags": personal + novos})
+    except Exception as exc:
+        logger.warning("registro de tag pessoal falhou (nao-fatal): %s", exc)
+
+
+@app.put("/api/wa/contact/{contact_id}/tags")
+async def wa_set_contact_tags(contact_id: int, request: Request, current_user: dict = Depends(get_current_user)):
+    """Frente B: substitui as tags do lead. body: {tags: [str]}.
+
+    Qualquer operador com acesso ao lead (LGPD via _require_contact_access) —
+    aplicar tag e parte do atendimento, sem toggle proprio. Slugs
+    normalizados no write (licao do legado crm_tags); tag inedita vira
+    pessoal do operador."""
+    body = await request.json()
+    raw_tags = body.get("tags")
+    from database import clean_lead_tags, update_wa_contact_tags
+    try:
+        slugs = clean_lead_tags(raw_tags)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    contact = get_wa_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato nao encontrado")
+    _require_contact_access(contact, current_user)  # LGPD: so dono/pool/admin
+    update_wa_contact_tags(contact_id, slugs)
+    _register_personal_tags(current_user, body.get("tag_labels"), slugs)
+    log_audit(current_user["id"], "CONTACT_TAGS", f"Contato {contact_id}: {len(slugs)} tag(s)")
+    return {"status": "ok", "tags": slugs}
+
+
+@app.put("/api/settings/tags-global")
+async def save_tags_global_settings(request: Request, current_user: dict = Depends(get_current_user)):
+    """Frente B: registry de tags GLOBAIS do tenant. Toggle proprio
+    (gerenciar_tags_globais, seed ON p/ supervisor e admin — PO 2026-09-02);
+    nao reusa gerenciar_config_sistema, que e so-admin por seed."""
+    ensure_permission(current_user, "gerenciar_tags_globais")
+    body = await request.json()
+    from database import save_system_settings as _save_sys
+    try:
+        result = _save_sys({"tags_global": body.get("tags_global")})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    log_audit(current_user["id"], "TAGS_GLOBAL_UPDATE",
+              f"{len(result.get('tags_global') or [])} tag(s)")
+    return result
+
+
 @app.post("/api/wa/contact/{contact_id}/read")
 async def mark_contact_read(contact_id: int, current_user: dict = Depends(get_current_user)):
     """LEGADO: marca todas as mensagens inbound do contato como lidas
@@ -4045,6 +4131,16 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
                 status_code=400,
                 detail=f"Desfecho invalido. Opcoes: {', '.join(_terminais)}",
             )
+        # Tags do modal (Frente B): valida ANTES de qualquer escrita — um 400
+        # aqui nao pode deixar qualificacao gravada com fechamento abortado.
+        _tags_raw = body.get("tags")
+        _tag_slugs = None
+        if _tags_raw is not None:
+            from database import clean_lead_tags as _clean_lead_tags
+            try:
+                _tag_slugs = _clean_lead_tags(_tags_raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
         _cur_q = str((contact or {}).get("qualification") or "novo")
         _gate = (contact is not None and not conv.get("is_backup")
                  and not contact.get("is_backup")
@@ -4075,6 +4171,12 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
                       f"Contato {contact_id}: {qualification} (no encerramento)")
             contact = dict(contact)
             contact["qualification"] = qualification
+        if _tag_slugs is not None and contact is not None:
+            from database import update_wa_contact_tags as _upd_tags
+            _upd_tags(contact_id, _tag_slugs)
+            _register_personal_tags(current_user, body.get("tag_labels"), _tag_slugs)
+            log_audit(current_user["id"], "CONTACT_TAGS",
+                      f"Contato {contact_id}: {len(_tag_slugs)} tag(s) (no encerramento)")
     set_attendance_status(conversation_id, status, clear_takeover=(status == "fechado_manual"))
     if contact_id is not None:
         verb = "fechado" if status == "fechado_manual" else "reaberto"

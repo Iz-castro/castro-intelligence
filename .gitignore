@@ -80,3 +80,7 @@ cx/
 # Documentacao de referencia da Meta (WhatsApp Business Platform) baixada
 docs meta/
 docs/lista temp.md
+
+# Undos de scripts de manutencao (dados operacionais, nunca versionar)
+scripts/_cleanup_rating_undo_*.json
+scripts/_backfill_undo_*.json

@@ -3286,11 +3286,103 @@ def _clean_quick_messages(items, label, max_items=None):
         raise ValueError(f"{label}: limite de {max_items} mensagens rapidas")
     return cleaned
 
+# -- Tags de lead (Frente B, 2026-09-02) --------------------------------------
+# Vocabulario em DOIS registries no shape das quick messages: tags GLOBAIS do
+# tenant (system_settings.tags_global, editadas por quem tem o toggle
+# gerenciar_tags_globais — supervisor+admin por seed) e tags PESSOAIS de cada
+# operador (user_settings.tags, criadas on-the-fly ao aplicar). O LEAD guarda
+# so a lista de SLUGS normalizados (wa_contacts.tags) — licao do legado
+# crm_tags: tag gravada sem normalizar obrigava busca brute-force por
+# variantes de caixa/acento.
+
+_TAG_SLUG_MAX = 40
+_TAG_LABEL_MAX = 60
+LEAD_TAGS_MAX = 12
+
+
+def normalize_tag_slug(raw):
+    """Slug canonico: minusculo, sem acento, so [a-z0-9_-]; espaco vira '-'."""
+    import unicodedata
+    token = str(raw or "").strip().casefold()
+    token = unicodedata.normalize("NFKD", token)
+    token = "".join(ch for ch in token if not unicodedata.combining(ch))
+    token = token.replace(" ", "-")
+    token = "".join(ch for ch in token if ch.isalnum() or ch in ("_", "-"))
+    return token[:_TAG_SLUG_MAX]
+
+
+def clean_lead_tags(raw_tags):
+    """Normaliza/dedupa as tags de um LEAD (lista de strings -> slugs).
+
+    ValueError com texto pt-BR pro endpoint responder 400. Dedupe e
+    case/acento-insensitive por construcao (slug canonico)."""
+    if raw_tags is None:
+        return []
+    if not isinstance(raw_tags, (list, tuple)):
+        raise ValueError("Tags: formato invalido (esperada uma lista)")
+    out, seen = [], set()
+    for raw in raw_tags:
+        if not isinstance(raw, str):
+            # Revisao B: dict/num virava slug-lixo em silencio (str(dict)).
+            raise ValueError("Tags: cada tag deve ser texto")
+        slug = normalize_tag_slug(raw)
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        out.append(slug)
+    if len(out) > LEAD_TAGS_MAX:
+        raise ValueError(f"Maximo de {LEAD_TAGS_MAX} tags por lead")
+    return out
+
+
+def _valid_hex_color(color):
+    return (len(color) == 7 and color[0] == "#"
+            and all(ch in "0123456789abcdefABCDEF" for ch in color[1:]))
+
+
+def _clean_tag_defs(items, label, max_items=None):
+    """Valida um registry de tags ({slug|label, color?}). Mesma disciplina do
+    _clean_quick_messages: ValueError com texto de usuario -> 400."""
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise ValueError(f"{label}: formato invalido")
+    cleaned, seen = [], set()
+    for i, raw in enumerate(items, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"{label}: item {i} invalido")
+        rotulo = str(raw.get("label") or "").strip()
+        slug = normalize_tag_slug(raw.get("slug") or rotulo)
+        if not slug:
+            raise ValueError(f"{label}: item {i} sem nome")
+        if len(rotulo) > _TAG_LABEL_MAX:
+            raise ValueError(f"{label}: nome da tag excede {_TAG_LABEL_MAX} caracteres")
+        if slug in seen:
+            raise ValueError(f"{label}: tag repetida ({slug})")
+        seen.add(slug)
+        entry = {"slug": slug, "label": rotulo or slug}
+        color = str(raw.get("color") or "").strip()
+        if color:
+            if not _valid_hex_color(color):
+                raise ValueError(f"{label}: cor invalida em '{entry['label']}' (use #rrggbb)")
+            entry["color"] = color
+        cleaned.append(entry)
+    if max_items is not None and len(cleaned) > max_items:
+        raise ValueError(f"{label}: limite de {max_items} tags")
+    return cleaned
+
+
+def update_wa_contact_tags(contact_id, slugs):
+    """Grava a lista (ja limpa por clean_lead_tags) no contato."""
+    document("wa_contacts", contact_id).set({"tags": list(slugs)}, merge=True)
+
+
 _DEFAULT_SYSTEM_SETTINGS = {
     "chat_prefix_enabled": False,
     "chat_prefix_roles": ["admin", "supervisor", "operador"],
     "quick_message_max": 20,
     "quick_messages_global": [],
+    "tags_global": [],
     "notification_sound_enabled": True,
     "alarm_enabled": True,
     "alarm_threshold_minutes": 5,
@@ -3346,6 +3438,9 @@ def save_system_settings(settings: dict):
     if "quick_messages_global" in filtered:
         filtered["quick_messages_global"] = _clean_quick_messages(
             filtered["quick_messages_global"], "Mensagens globais")
+    if "tags_global" in filtered:
+        filtered["tags_global"] = _clean_tag_defs(
+            filtered["tags_global"], "Tags globais", max_items=200)
     filtered["updated_at"] = utcnow()
     document("system_settings", "chat").set(filtered, merge=True)
     return get_system_settings()
@@ -3397,6 +3492,10 @@ def get_user_settings(user_id: int):
         "chat_prefix_enabled": False,
         "chat_prefix_name": "",
         "quick_messages": [],
+        # Tags PESSOAIS do operador (Frente B): criadas on-the-fly ao aplicar
+        # uma tag que nao existe nos registries; alimentam so o autocomplete
+        # dele (as globais valem pra todos).
+        "tags": [],
     }
     if not doc:
         return defaults
@@ -3406,13 +3505,15 @@ def get_user_settings(user_id: int):
 
 
 def save_user_settings(user_id: int, settings: dict):
-    allowed = {"chat_prefix_enabled", "chat_prefix_name", "quick_messages"}
+    allowed = {"chat_prefix_enabled", "chat_prefix_name", "quick_messages", "tags"}
     filtered = {k: v for k, v in settings.items() if k in allowed}
     if "quick_messages" in filtered:
         # Limite por usuario (quick_message_max) agora vale no backend tambem.
         max_items = int(get_system_settings().get("quick_message_max") or 0) or None
         filtered["quick_messages"] = _clean_quick_messages(
             filtered["quick_messages"], "Mensagens rapidas", max_items)
+    if "tags" in filtered:
+        filtered["tags"] = _clean_tag_defs(filtered["tags"], "Minhas tags", max_items=100)
     filtered["updated_at"] = utcnow()
     document("user_settings", user_id).set(filtered, merge=True)
     return get_user_settings(user_id)

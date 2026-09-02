@@ -9,7 +9,7 @@ import type {
   MessageReplyReference, Operator, PermissionKey, ProtocolSearchResult, SessionPerfil, SessionUser,
   SettingsPage, SystemSettings, TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
-import type { QuickMessage } from "../types";
+import type { QuickMessage, TagDef } from "../types";
 import { quickMessagesProblem } from "../utils/quickMessages";
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
@@ -145,7 +145,7 @@ type CrmContextValue = {
   // Modo 3: supervisor assume a thread (vira Dono do Atendimento).
   supervisorTakeover: (conversationId: string) => Promise<void>;
   // Fase 4: fecha/reabre um atendimento manualmente.
-  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string }) => Promise<boolean>;
+  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string; tags?: string[]; tag_labels?: Record<string, string> }) => Promise<boolean>;
   // Fase 5A: busca por protocolo (admin/sup).
   loadProtocol: (protocolId: string) => Promise<ProtocolSearchResult | null>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
@@ -279,7 +279,7 @@ type CrmContextValue = {
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
   toggleSettingsMenu: () => void;
-  openSettingsPage: (page: "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
+  openSettingsPage: (page: "chat" | "quick" | "tags" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
   settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -290,6 +290,13 @@ type CrmContextValue = {
   searchText: string;
   qualificationFilter: string;
   setQualificationFilter: (v: string) => void;
+  // Frente B: filtro por tag (slug) — client-side, com intersecao com o
+  // filtro de qualificacao (pedido do PO: "convertido" + "varizes").
+  tagFilter: string;
+  setTagFilter: (v: string) => void;
+  saveContactTags: (contactId: number, tags: string[], tagLabels?: Record<string, string>) => Promise<boolean>;
+  saveGlobalTags: (tags: TagDef[]) => Promise<boolean>;
+  saveUserTags: (tags: TagDef[]) => Promise<boolean>;
   // Filtro por canal do "Meus" (standard vs coex). Opcoes derivadas das
   // conversas do proprio operador; só ha filtro com 2+ canais.
   channelFilter: string;
@@ -349,12 +356,14 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   pool_mode: "legacy",
   auto_close_enabled: true,
   rating_request_enabled: false,
+  tags_global: [],
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
   chat_prefix_enabled: false,
   chat_prefix_name: "",
   quick_messages: [],
+  tags: [],
 };
 
 // Janela AO VIVO do admin/supervisor (target "all") e tamanho da pagina
@@ -560,6 +569,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [activeView, setActiveView] = useState<ActiveView>("novos");
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
   const [qualificationFilter, setQualificationFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
   // "Nao lidas" (select de qualificacao): alem de filtrar o carregado, busca
   // no Firestore as threads com unread_count>0 do escopo da caixa, fora da
   // janela de recencia (mensagem de fim de semana some do top-50 e a operadora
@@ -935,7 +945,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         ? ((conv.unread_count ?? conv.unread ?? 0) > 0 || conv.id === selectedThreadId)
         : (c?.qualification || "novo") === qualificationFilter);
     const matchesChannel = activeView !== "meus" || !channelFilter || convChannelKey(conv) === channelFilter;
-    return matchesSearch && matchesQual && matchesChannel;
+    // Frente B: filtro por tag e INTERSECAO com os demais (qualificacao +
+    // tag + canal), sobre os slugs do contato.
+    const matchesTag = !tagFilter || (c?.tags || []).includes(tagFilter);
+    return matchesSearch && matchesQual && matchesChannel && matchesTag;
   });
 
   const chatSearchLower = chatSearch.trim().toLowerCase();
@@ -1228,6 +1241,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setReplyTarget(null);
     setSearch("");
     setQualificationFilter("");
+    setTagFilter("");
     setEquipeOperatorFilter("");
     setNotice("");
     setError("");
@@ -2390,6 +2404,60 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusySave(false); }
   }
 
+  // Frente B: substitui as tags do lead. O backend normaliza (slug canonico,
+  // max 12) e registra tag inedita como pessoal do operador — por isso o
+  // refetch das user settings apos salvar (autocomplete ganha a tag nova).
+  async function saveContactTags(contactId: number, tags: string[], tagLabels?: Record<string, string>): Promise<boolean> {
+    if (!bundle) return false;
+    try {
+      setBusySave(true); setError(""); setNotice("");
+      // tag_labels: SO as tags digitadas como novas nesta acao (slug->rotulo)
+      // — e o que o backend registra como tag pessoal (revisao B: mandar a
+      // lista toda adotava tags de colegas como "minhas").
+      const r = await putJson(bundle.auth, `/api/wa/contact/${contactId}/tags`, { tags, tag_labels: tagLabels || {} }) as { tags?: string[] };
+      const slugs = r?.tags || [];
+      setNotice("Tags atualizadas.");
+      setExtraContacts((prev) => {
+        const cur = prev.get(contactId);
+        if (!cur) return prev;
+        const next = new Map(prev);
+        next.set(contactId, { ...cur, tags: slugs });
+        return next;
+      });
+      getJson<UserSettings>(bundle.auth, "/api/settings/user").then((usr) => setUserSettings(usr)).catch(() => {});
+      return true;
+    } catch (e) { setError(errorText(e)); return false; }
+    finally { setBusySave(false); }
+  }
+
+  // Frente B: salva SO as tags pessoais (nao passa pelo saveUserSettingsAction
+  // — revisao B: a validacao das mensagens rapidas bloqueava salvar tags, e o
+  // PUT parcial evita clobber de quick_messages com estado stale).
+  async function saveUserTags(tags: TagDef[]): Promise<boolean> {
+    if (!bundle) return false;
+    try {
+      setBusySettings(true); setError(""); setNotice("");
+      const r = await putJson(bundle.auth, "/api/settings/user", { tags }) as UserSettings;
+      setUserSettings(r);
+      setNotice("Minhas tags salvas.");
+      return true;
+    } catch (e) { setError(errorText(e)); return false; }
+    finally { setBusySettings(false); }
+  }
+
+  // Frente B: registry de tags GLOBAIS (gerenciar_tags_globais).
+  async function saveGlobalTags(tags: TagDef[]): Promise<boolean> {
+    if (!bundle) return false;
+    try {
+      setBusySettings(true); setError(""); setNotice("");
+      const r = await putJson(bundle.auth, "/api/settings/tags-global", { tags_global: tags }) as SystemSettings;
+      setSystemSettings(r); setSettingsLoaded(true);
+      setNotice("Tags globais salvas.");
+      return true;
+    } catch (e) { setError(errorText(e)); return false; }
+    finally { setBusySettings(false); }
+  }
+
   function startEditUser(op: Operator) { setEditingUserId(op.id); setEditRole(op.role); setEditPerfilId(op.perfil_acesso_id || ""); setEditDeptId(op.department_id ?? ""); }
 
   async function saveUserRole(userId: number) {
@@ -2996,15 +3064,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   // Fase 4: fecha (fechado_manual) ou reabre (aberto) um atendimento.
-  // `outcome` (reforma 2026-09): qualificacao final + notas do gate de
-  // desfecho, no MESMO request — o backend recusa fechar lead novo/
-  // em_atendimento sem isso. Retorna sucesso pro modal so fechar se salvou.
-  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string }): Promise<boolean> {
+  // `outcome` (reforma 2026-09): qualificacao final + notas + tags do gate
+  // de desfecho, no MESMO request — o backend recusa fechar lead novo/
+  // em_atendimento sem desfecho. Retorna sucesso pro modal so fechar se salvou.
+  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string; tags?: string[]; tag_labels?: Record<string, string> }): Promise<boolean> {
     if (!bundle) return false;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
       const body: Record<string, unknown> = { status };
-      if (outcome) { body.qualification = outcome.qualification; body.notes = outcome.notes; }
+      if (outcome) { body.qualification = outcome.qualification; body.notes = outcome.notes; if (outcome.tags) { body.tags = outcome.tags; body.tag_labels = outcome.tag_labels || {}; } }
       await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/set-attendance`, body);
       setNotice(status === "fechado_manual" ? "Atendimento fechado." : "Atendimento reaberto.");
       if (outcome && selectedContact) {
@@ -3021,7 +3089,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           const cur = prev.get(contactId);
           if (!cur) return prev;
           const next = new Map(prev);
-          next.set(contactId, { ...cur, qualification: outcome.qualification, notes: outcome.notes });
+          next.set(contactId, { ...cur, qualification: outcome.qualification, notes: outcome.notes, ...(outcome.tags ? { tags: outcome.tags } : {}) });
           return next;
         });
         if (detailSeedRef.current?.id === contactId) {
@@ -3048,7 +3116,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
-  async function openSettingsPage(page: "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") {
+  async function openSettingsPage(page: "chat" | "quick" | "tags" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") {
     if (!bundle) return;
     if (page === "whatsapp" || page === "whatsapp-standard" || page === "perfis") {
       setShowSettings(page);
@@ -3116,7 +3184,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
     showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
-    search, setSearch, searchText, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
+    search, setSearch, searchText, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, saveContactTags, saveGlobalTags, saveUserTags, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
     loadMorePoolConversations, canLoadMorePool,

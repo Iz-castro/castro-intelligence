@@ -60,6 +60,7 @@ PERMISSION_CATALOG = [
     ("Atendimento", "enviar_template", "Enviar template"),
     ("Lead", "editar_dono_lead", "Reatribuir dono do lead / devolver ao bot"),
     ("Lead", "qualificar_lead", "Qualificar lead"),
+    ("Lead", "gerenciar_tags_globais", "Gerenciar tags globais do tenant"),
     ("Lead", "editar_declared_name", "Editar nome declarado"),
     ("Lead", "arquivar_lead", "Arquivar lead"),
     ("Lead", "adicionar_contato_manual", "Adicionar contato manual"),
@@ -136,6 +137,7 @@ SEED_PERFIS = {
             # Lead
             "editar_dono_lead", "qualificar_lead", "editar_declared_name",
             "arquivar_lead", "adicionar_contato_manual", "exportar_contatos",
+            "gerenciar_tags_globais",
             # Canais (sem acoes destrutivas)
             "gerenciar_canais", "autorizar_coex_para_operador",
             # Auditoria

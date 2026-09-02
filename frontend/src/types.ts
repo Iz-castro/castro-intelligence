@@ -58,6 +58,7 @@ export type PermissionKey =
   | "enviar_template"
   | "editar_dono_lead"
   | "qualificar_lead"
+  | "gerenciar_tags_globais"
   | "editar_declared_name"
   | "arquivar_lead"
   | "adicionar_contato_manual"
@@ -170,6 +171,8 @@ export type Contact = {
   rating_label?: string;
   // 1a interacao humana (promocao automatica novo -> em_atendimento).
   first_human_contact_at?: string;
+  // Frente B: slugs normalizados das tags do lead (max 12).
+  tags?: string[];
   unread_count?: number;
   unread?: number;
   is_archived?: number;
@@ -392,17 +395,24 @@ export type SystemSettings = {
   // Recibo v2: perguntar avaliacao (Ruim/Bom/Excelente) no encerramento
   // manual. Por tenant; fora da janela de 24h usa template pago.
   rating_request_enabled: boolean;
+  // Frente B: tags GLOBAIS do tenant (supervisor/admin gerenciam).
+  tags_global: TagDef[];
 };
+
+// Tag de lead (Frente B): slug canonico + rotulo de exibicao + cor opcional.
+export type TagDef = { slug: string; label: string; color?: string };
 
 export type UserSettings = {
   chat_prefix_enabled: boolean;
   chat_prefix_name: string;
   quick_messages: QuickMessage[];
+  // Frente B: tags PESSOAIS do operador (criadas on-the-fly ao aplicar).
+  tags: TagDef[];
 };
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
 
 // Mensagem rapida (global do tenant ou pessoal do operador). `title` e o nome
 // que identifica a mensagem nas configuracoes e na lista do compositor.

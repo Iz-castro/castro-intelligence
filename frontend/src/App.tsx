@@ -11,7 +11,7 @@ import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, ProtocolSearchResult, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -143,6 +143,7 @@ function TopBar() {
             <div className="settings-dropdown">
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
               <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
+              <button type="button" className="attach-option" onClick={() => void openSettingsPage("tags")}><span>🏷️</span><span>Tags de leads</span></button>
               {can("gerenciar_config_sistema") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
               {can("gerenciar_perfis_acesso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("perfis")}><span>🛡️</span><span>Perfis de acesso</span></button>}
               {(can("gerenciar_canais") || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
@@ -159,38 +160,38 @@ function TopBar() {
 }
 
 function NavBar() {
-  const { activeView, setActiveView, setQualificationFilter, setEquipeOperatorFilter, canSeeAll, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, systemSettings } = useCrm();
+  const { activeView, setActiveView, setQualificationFilter, setTagFilter, setEquipeOperatorFilter, canSeeAll, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, systemSettings } = useCrm();
   // Modo Recepcao (ADR 0010): a fila "Novos" vira "Recepcao" (pool
   // compartilhada) — so rotulo; a chave "novos" e os filtros nao mudam.
   const poolReception = systemSettings.pool_mode === "reception";
   return (
     <nav className="crm-nav">
-      {canSeeAll && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); }} title="Contatos no bot">
+      {canSeeAll && systemSettings.bot_enabled && <button className={`nav-item ${activeView === "bot" ? "active" : ""}`} onClick={() => { setActiveView("bot"); setQualificationFilter(""); setTagFilter(""); }} title="Contatos no bot">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><line x1="8" y1="16" x2="8" y2="16.01"/><line x1="16" y1="16" x2="16" y2="16.01"/><line x1="12" y1="19" x2="12" y2="19.01"/></svg>
         <span className="nav-label">Bot</span>
         {botUnread > 0 && <span className="nav-badge">{botUnread > 99 ? "99+" : botUnread}</span>}
       </button>}
-      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); }} title={poolReception ? "Recepcao (pool compartilhada)" : "Novos leads"}>
+      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); setTagFilter(""); }} title={poolReception ? "Recepcao (pool compartilhada)" : "Novos leads"}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="14"/><line x1="9" y1="11" x2="15" y2="11"/></svg>
         <span className="nav-label">{poolReception ? "Recepção" : "Novos"}</span>
         {novosUnread > 0 && <span className="nav-badge">{novosUnread > 99 ? "99+" : novosUnread}</span>}
       </button>
-      <button className={`nav-item ${activeView === "meus" ? "active" : ""}`} onClick={() => { setActiveView("meus"); setQualificationFilter(""); }} title="Meus atendimentos">
+      <button className={`nav-item ${activeView === "meus" ? "active" : ""}`} onClick={() => { setActiveView("meus"); setQualificationFilter(""); setTagFilter(""); }} title="Meus atendimentos">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span className="nav-label">Meus</span>
         {meusUnread > 0 && <span className="nav-badge">{meusUnread > 99 ? "99+" : meusUnread}</span>}
       </button>
-      <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); }} title="Nao qualificados">
+      <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); setTagFilter(""); }} title="Nao qualificados">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
         <span className="nav-label">N/Q</span>
         {nqUnread > 0 && <span className="nav-badge">{nqUnread > 99 ? "99+" : nqUnread}</span>}
       </button>
-      {canSeeAll && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
+      {canSeeAll && <button className={`nav-item ${activeView === "equipe" ? "active" : ""}`} onClick={() => { setActiveView("equipe"); setQualificationFilter(""); setTagFilter(""); setEquipeOperatorFilter(""); }} title="Atendimentos da equipe">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span className="nav-label">Equipe</span>
         {equipeUnread > 0 && <span className="nav-badge">{equipeUnread > 99 ? "99+" : equipeUnread}</span>}
       </button>}
-      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); }} title="Conversas em backup (historico importado)">
+      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); setTagFilter(""); }} title="Conversas em backup (historico importado)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/></svg>
         <span className="nav-label">Backup</span>
         {backupUnread > 0 && <span className="nav-badge">{backupUnread > 99 ? "99+" : backupUnread}</span>}
@@ -514,7 +515,11 @@ const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(
 const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["bot", "novos", "meus", "equipe"]);
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, userSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
+  const tagOptions = buildTagOptions(systemSettings.tags_global, userSettings.tags);
+  // Revisao B: registry esvaziado fazia o select SUMIR com o filtro ainda
+  // aplicado (lista vazia sem controle visivel). Sem opcoes, limpa.
+  useEffect(() => { if (tagFilter && tagOptions.length === 0) setTagFilter(""); }, [tagFilter, tagOptions.length, setTagFilter]);
   const poolReception = systemSettings.pool_mode === "reception";
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
@@ -539,7 +544,7 @@ function ContactList() {
   // segue sendo o total carregado. Reseta ao trocar de caixa/busca/filtro.
   const SIDEBAR_PAGE = 50;
   const [visibleLimit, setVisibleLimit] = useState(SIDEBAR_PAGE);
-  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, channelFilter, equipeOperatorFilter]);
+  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, tagFilter, channelFilter, equipeOperatorFilter]);
 
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
@@ -623,6 +628,10 @@ function ContactList() {
             historico importado — sem seletor nelas. O match em si
             (filteredConversations) e client-side sobre o que esta carregado. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option><option value="nao_lidos">Não lidas</option></select>}
+        {/* Filtro por tag (Frente B): INTERSECAO com o filtro acima —
+            "convertido" + "varizes" acha convertidos de varizes. Client-side
+            sobre o carregado, como o de qualificacao. */}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && tagOptions.length > 0 && <select className="compact" value={tagFilter} onChange={(e) => setTagFilter(e.target.value)} title="Filtrar por tag" aria-label="Filtrar por tag"><option value="">Tags</option>{tagOptions.map((t) => <option key={t.slug} value={t.slug}>{t.label}</option>)}</select>}
         {/* "So espiar" (admin/supervisor): abrir conversa sem marcar como lida
             — badge e alarme continuam ate alguem tratar. Lembrado por navegador. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && canPeek && (
@@ -981,6 +990,9 @@ function ChatPanel() {
                   {capitalizeFirst(selectedThread?.lead_temperature || selectedContact.lead_temperature || "")}
                 </span>
               ) : null}
+              {(selectedContact.tags || []).map((slug) => (
+                <TagChip key={slug} slug={slug} meta={buildTagMeta(ctx.systemSettings.tags_global, ctx.userSettings.tags)} />
+              ))}
             </div>
             <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.4rem", justifyContent: "flex-end" }}>
               {ctx.can("assumir_atendimento") && (!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id) ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={busyAssume}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}
@@ -1196,8 +1208,13 @@ function ChatPanel() {
 function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact; threadId: string; onClose: () => void }) {
   // `error` renderizado DENTRO do modal: o alert global fica atras do
   // overlay do lightbox — um 400/403 do encerramento ficava invisivel.
-  const { setAttendance, busyTransfer, error } = useCrm();
+  const { setAttendance, busyTransfer, error, systemSettings, userSettings } = useCrm();
   const [outcome, setOutcome] = useState("");
+  // Tags no encerramento (Frente B): "fechou com o paciente -> convertido +
+  // tags pra busca futura", num passo so.
+  const [tags, setTags] = useState<string[]>(contact.tags || []);
+  const [tagLabels, setTagLabels] = useState<Record<string, string>>({});
+  const tagMeta = buildTagMeta(systemSettings.tags_global, userSettings.tags);
   // Nota PRE-CARREGADA com a atual: modal em branco ja apagou notas no
   // passado (bug do form do painel) — nunca nasce vazio se o lead tem nota.
   const [notes, setNotes] = useState(contact.notes || "");
@@ -1217,6 +1234,8 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
           <option value="qualificado">Qualificado</option>
           <option value="nao_qualificado">Nao qualificado</option>
         </select>
+        <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Tags</label>
+        <TagDraftEditor draft={tags} onChange={setTags} meta={tagMeta} listId="tag-suggestions-close" onNewLabel={(slug, label) => setTagLabels((prev) => ({ ...prev, [slug]: label }))} />
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Notas de atendimento</label>
         <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={4} style={{ width: "100%" }} />
         <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end", marginTop: "1rem" }}>
@@ -1225,7 +1244,7 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
             type="button"
             className="primary"
             disabled={!outcome || busyTransfer}
-            onClick={() => { void (async () => { const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes }); if (ok) onClose(); })(); }}
+            onClick={() => { void (async () => { const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels }); if (ok) onClose(); })(); }}
           >
             {busyTransfer ? "Encerrando..." : "Salvar e encerrar"}
           </button>
@@ -1298,6 +1317,113 @@ function ratingChipColor(rating: number, label?: string): string {
 
 function ratingChipText(rating: number, label?: string): string {
   return label || `${rating}/10`;
+}
+
+// -- Tags de lead (Frente B) -------------------------------------------------
+// Espelho do normalize_tag_slug do backend (manter em sincronia): minusculo,
+// sem acento, espaco vira hifen, so [a-z0-9_-], max 40.
+function slugifyTag(raw: string): string {
+  return raw.trim().toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").replace(/ /g, "-").replace(/[^a-z0-9_-]/g, "").slice(0, 40);
+}
+
+// Contraste do texto do chip pela luminancia da cor (revisao B: branco fixo
+// sumia sobre cor clara do color picker).
+function tagTextColor(bg?: string): string {
+  if (!bg || bg.length !== 7) return "#fff";
+  const r = parseInt(bg.slice(1, 3), 16), g = parseInt(bg.slice(3, 5), 16), b = parseInt(bg.slice(5, 7), 16);
+  return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? "#1f2937" : "#fff";
+}
+
+// Metadados (rotulo/cor) por slug: pessoais primeiro, globais VENCEM em
+// colisao (vocabulario oficial do tenant manda na exibicao).
+function buildTagMeta(globalTags?: TagDef[], personalTags?: TagDef[]): Map<string, TagDef> {
+  const map = new Map<string, TagDef>();
+  for (const t of personalTags || []) if (t.slug) map.set(t.slug, t);
+  for (const t of globalTags || []) if (t.slug) map.set(t.slug, t);
+  return map;
+}
+
+function buildTagOptions(globalTags?: TagDef[], personalTags?: TagDef[]): TagDef[] {
+  return Array.from(buildTagMeta(globalTags, personalTags).values())
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function TagChip({ slug, meta, onRemove }: { slug: string; meta: Map<string, TagDef>; onRemove?: () => void }) {
+  const t = meta.get(slug);
+  return (
+    <span className="chip" style={t?.color ? { background: t.color, color: tagTextColor(t.color) } : undefined}>
+      {t?.label || slug}
+      {onRemove ? <button type="button" onClick={onRemove} style={{ marginLeft: 4, background: "none", border: "none", color: "inherit", cursor: "pointer", padding: 0 }} aria-label={`Remover tag ${t?.label || slug}`}>×</button> : null}
+    </span>
+  );
+}
+
+// Editor compacto de tags (chips + input com sugestoes). Usado no painel do
+// contato e no modal de encerramento. `draft` guarda o que o usuario digitou
+// (rotulo ou slug) — o backend normaliza pro slug canonico no save.
+function TagDraftEditor({ draft, onChange, meta, listId, onNewLabel }: { draft: string[]; onChange: (next: string[]) => void; meta: Map<string, TagDef>; listId: string; onNewLabel?: (slug: string, label: string) => void }) {
+  const [input, setInput] = useState("");
+  const atLimit = draft.length >= 12;
+  const add = (raw: string) => {
+    const typed = raw.trim();
+    if (!typed || atLimit) return;
+    // Rotulo existente do autocomplete resolve pro SLUG do registry —
+    // revisao B: renomear tag global partia o vocabulario (label novo virava
+    // slug novo e o filtro ficava cego). Draft guarda SEMPRE slugs.
+    let slug = "";
+    for (const t of meta.values()) {
+      if (t.label.toLowerCase() === typed.toLowerCase()) { slug = t.slug; break; }
+    }
+    const isNew = !slug && !meta.has(slugifyTag(typed));
+    if (!slug) slug = slugifyTag(typed);
+    if (!slug) { setInput(""); return; }
+    if (!draft.includes(slug)) {
+      onChange([...draft, slug]);
+      if (isNew && onNewLabel) onNewLabel(slug, typed);
+    }
+    setInput("");
+  };
+  return (
+    <>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", marginBottom: "0.4rem" }}>
+        {draft.map((slug) => <TagChip key={slug} slug={slug} meta={meta} onRemove={() => onChange(draft.filter((s) => s !== slug))} />)}
+        {draft.length === 0 ? <span className="sub" style={{ fontSize: "0.8rem" }}>Sem tags.</span> : null}
+      </div>
+      <div style={{ display: "flex", gap: "0.4rem" }}>
+        <input list={listId} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(input); } }} placeholder={atLimit ? "Limite de 12 tags por lead" : "Adicionar tag (Enter)"} disabled={atLimit} style={{ flex: 1 }} />
+        <button className="ghost" type="button" onClick={() => add(input)} disabled={atLimit} aria-label="Adicionar tag">+</button>
+      </div>
+      <datalist id={listId}>{Array.from(meta.values()).map((t) => <option key={t.slug} value={t.label} />)}</datalist>
+    </>
+  );
+}
+
+function ContactTagsCard({ contact }: { contact: Contact }) {
+  const { saveContactTags, systemSettings, userSettings, busySave } = useCrm();
+  const [draft, setDraft] = useState<string[]>(contact.tags || []);
+  const [newLabels, setNewLabels] = useState<Record<string, string>>({});
+  // Seed com o cuidado do form de qualificacao (revisao B): re-semeia na
+  // troca de lead E quando o SERVIDOR muda com o draft intocado (ex.: tags
+  // gravadas pelo modal de encerramento) — sem isso, "Salvar" aqui apagava
+  // o que outro caminho acabou de gravar. Draft tocado nunca e clobberado.
+  const tagSeedRef = useRef<{ id: number; tags: string }>({ id: contact.id, tags: (contact.tags || []).join("|") });
+  const serverTags = (contact.tags || []).join("|");
+  useEffect(() => {
+    const untouched = draft.join("|") === tagSeedRef.current.tags;
+    if (contact.id !== tagSeedRef.current.id || (untouched && serverTags !== tagSeedRef.current.tags)) {
+      tagSeedRef.current = { id: contact.id, tags: serverTags };
+      setDraft(serverTags ? serverTags.split("|") : []);
+      setNewLabels({});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contact.id, serverTags]);
+  const meta = buildTagMeta(systemSettings.tags_global, userSettings.tags);
+  return (
+    <CollapsibleCard title="Tags">
+      <TagDraftEditor draft={draft} onChange={setDraft} meta={meta} listId="tag-suggestions-panel" onNewLabel={(slug, label) => setNewLabels((prev) => ({ ...prev, [slug]: label }))} />
+      <button className="primary" style={{ marginTop: "0.6rem" }} onClick={() => { void (async () => { const ok = await saveContactTags(contact.id, draft, newLabels); if (ok) { tagSeedRef.current = { id: contact.id, tags: draft.join("|") }; setNewLabels({}); } })(); }} disabled={busySave}>{busySave ? "Salvando..." : "Salvar tags"}</button>
+    </CollapsibleCard>
+  );
 }
 
 function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
@@ -1616,6 +1742,7 @@ function DetailPanel() {
               <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={busyReturnBot} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
             ) : null}
           </CollapsibleCard>
+          <ContactTagsCard contact={selectedContact} />
           {can("transferir_atendimento") ? <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move so este atendimento (thread). O Dono do Lead nao muda.</span>
             <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
@@ -2044,6 +2171,8 @@ function SettingsModals() {
         </div>
       ) : null}
 
+      {showSettings === "tags" ? <TagsSettingsModal /> : null}
+
       {showSettings === "whatsapp" ? <WhatsAppSignupModal /> : null}
       {showSettings === "whatsapp-standard" ? <WhatsAppSignupModal channelType="standard" /> : null}
 
@@ -2053,6 +2182,63 @@ function SettingsModals() {
 
       {showSettings === "dashboard" && can("ver_dashboard_uso") ? <DashboardModal /> : null}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tags de lead (Frente B) — registry global (supervisor/admin) + pessoais
+// ---------------------------------------------------------------------------
+
+function TagEditorRows({ tags, onChange }: { tags: TagDef[]; onChange: (next: TagDef[]) => void }) {
+  return (
+    <div className="settings-block">
+      {tags.map((t, idx) => (
+        <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
+          <input value={t.label} onChange={(e) => { const u = [...tags]; u[idx] = { ...u[idx], label: e.target.value }; onChange(u); }} placeholder="Nome da tag (ex: varizes)" style={{ flex: 1 }} />
+          <input type="color" value={t.color || "#334155"} onChange={(e) => { const u = [...tags]; u[idx] = { ...u[idx], color: e.target.value }; onChange(u); }} title="Cor da tag" style={{ width: 44, padding: 2, height: 34 }} />
+          <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => onChange(tags.filter((_, i) => i !== idx))}>X</button>
+        </div>
+      ))}
+      <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => onChange([...tags, { slug: "", label: "" }])}>+ Adicionar tag</button>
+    </div>
+  );
+}
+
+function TagsSettingsModal() {
+  const { setShowSettings, systemSettings, userSettings, saveGlobalTags, saveUserTags, busySettings, can, error, notice } = useCrm();
+  // Rascunhos LOCAIS (revisao B): editar userSettings direto sujava o estado
+  // global ao fechar sem salvar, e o re-seed incondicional perdia a digitacao
+  // quando um refetch de settings chegava no meio. Draft tocado nunca e
+  // clobberado; re-seed so limpo.
+  const [globalDraft, setGlobalDraft] = useState<TagDef[]>(systemSettings.tags_global || []);
+  const globalDirty = useRef(false);
+  useEffect(() => { if (!globalDirty.current) setGlobalDraft(systemSettings.tags_global || []); }, [systemSettings.tags_global]);
+  const [personalDraft, setPersonalDraft] = useState<TagDef[]>(userSettings.tags || []);
+  const personalDirty = useRef(false);
+  useEffect(() => { if (!personalDirty.current) setPersonalDraft(userSettings.tags || []); }, [userSettings.tags]);
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Tags de leads" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+        <h2 style={{ margin: "0 0 1.2rem" }}>Tags de leads</h2>
+        {error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{error}</span></div> : null}
+        {notice ? <div className="alert success" style={{ marginBottom: "0.6rem" }}><span>{notice}</span></div> : null}
+        {can("gerenciar_tags_globais") ? (
+          <div className="settings-section">
+            <h3>Tags globais do tenant</h3>
+            <p className="sub" style={{ marginBottom: "0.6rem" }}>Aparecem no autocomplete de toda a equipe. Mantenha o vocabulario oficial aqui (ex.: varizes, hemorroidas, convenio, retorno).</p>
+            <TagEditorRows tags={globalDraft} onChange={(next) => { globalDirty.current = true; setGlobalDraft(next); }} />
+            <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveGlobalTags(globalDraft)) globalDirty.current = false; })(); }} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar tags globais"}</button>
+          </div>
+        ) : null}
+        <div className="settings-section" style={{ marginTop: can("gerenciar_tags_globais") ? "1.2rem" : 0 }}>
+          <h3>Minhas tags</h3>
+          <p className="sub" style={{ marginBottom: "0.6rem" }}>Criadas automaticamente quando voce aplica uma tag nova num lead. So aparecem no seu autocomplete.</p>
+          <TagEditorRows tags={personalDraft} onChange={(next) => { personalDirty.current = true; setPersonalDraft(next); }} />
+          <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveUserTags(personalDraft)) personalDirty.current = false; })(); }} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar minhas tags"}</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2768,7 +2954,7 @@ function NotificationsTab() {
 
       <div className="settings-section" style={{ marginTop: "1.2rem" }}>
         <h3>Fechamento automatico por inatividade</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Com esta opcao ligada, o sistema fecha sozinho (a cada 30 min) atendimentos parados ha mais de 24h sem mensagem. Desligada, nenhuma conversa atendida fecha sozinha — o encerramento passa a ser sempre manual. Em qualquer caso, leads entregues pela recepcao que nunca receberam resposta humana voltam ao assistente virtual apos 7 dias (valvula de seguranca).</p>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Com esta opcao ligada, o sistema fecha sozinho (a cada 30 min) atendimentos parados ha mais de 24h sem mensagem. Desligada, nenhuma conversa atendida fecha sozinha — o encerramento passa a ser sempre manual.{systemSettings.pool_mode === "reception" ? " Em qualquer caso, leads entregues pela recepcao que nunca receberam resposta humana voltam ao assistente virtual apos 7 dias (valvula de seguranca)." : ""}</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.auto_close_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, auto_close_enabled: e.target.checked }))} />
@@ -2777,7 +2963,7 @@ function NotificationsTab() {
         </div>
       </div>
 
-      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes de notificacao"}</button>
+      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
     </>
   );
 }

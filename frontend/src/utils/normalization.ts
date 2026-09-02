@@ -60,6 +60,8 @@ export function normalizeContact(record: Record<string, unknown>, docId: string)
     // Fonte da verdade do inicio do atendimento (a linha na nota e best-
     // effort: some se o operador salvar notas editadas antes da promocao).
     first_human_contact_at: iso(record.first_human_contact_at),
+    // Frente B: slugs das tags do lead (whitelist obrigatoria em snapshot).
+    tags: Array.isArray(record.tags) ? record.tags.map((t) => String(t)) : [],
   };
 }
 

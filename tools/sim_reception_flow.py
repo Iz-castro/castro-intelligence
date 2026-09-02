@@ -853,6 +853,19 @@ def cenario_gate_desfecho():
         asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR)))
         check(STORE["wa_conversations"]["c16"].get("attendance_status") == "fechado_manual",
               "lead ja qualificado (terminal) fecha sem gate")
+        # Tags no encerramento (Frente B): gravadas NORMALIZADAS no contato.
+        # ("qualificado" e nao "convertido": o carimbo converted_by usa o
+        # fs_document REAL do main, fora do mock deste harness.)
+        STORE["wa_conversations"]["c16"]["attendance_status"] = "aberto"
+        req = _FakeRequest({"status": "fechado_manual", "qualification": "qualificado",
+                            "notes": "fechou", "tags": ["Varizes", "Consulta Marcada"],
+                            "tag_labels": {"consulta-marcada": "Consulta Marcada"}})
+        asyncio.run(main.wa_set_attendance("c16", req, current_user=dict(OPERADOR)))
+        check(STORE["wa_contacts"]["1"].get("tags") == ["varizes", "consulta-marcada"],
+              "tags do modal gravadas normalizadas (slug) no contato")
+        check(any(t.get("slug") == "consulta-marcada"
+                  for t in (STORE.get("user_settings", {}).get("7", {}).get("tags") or [])),
+              "tag inedita vira tag PESSOAL do operador (on-the-fly)")
     finally:
         main.get_wa_conversation_by_id = real_get_conv
         main.get_wa_contact = real_get_ctc
@@ -921,6 +934,43 @@ def cenario_rating_botao():
     finally:
         wh.document, wh.get_wa_contact, wh.log_audit = real_doc, real_get, real_audit
         restore_dbf()
+
+
+def cenario_tags_lead():
+    titulo("CENARIO 19 — tags de lead (Frente B): normalizacao + limites")
+    check(dbf.normalize_tag_slug("  Varizes  ") == "varizes", "slug: minusculo + trim")
+    check(dbf.normalize_tag_slug("Hemorróidas") == "hemorroidas", "slug: sem acento")
+    check(dbf.normalize_tag_slug("nao fechou") == "nao-fechou", "slug: espaco vira hifen")
+    check(dbf.clean_lead_tags(["Varizes", "varizes", "VARIZES", ""]) == ["varizes"],
+          "dedupe case/acento-insensitive; vazio descartado")
+    try:
+        dbf.clean_lead_tags([f"t{i}" for i in range(13)])
+        check(False, "13 tags deveria levantar ValueError")
+    except ValueError:
+        check(True, "limite de 12 tags por lead (400 no endpoint)")
+    try:
+        dbf.clean_lead_tags("nao-lista")
+        check(False, "nao-lista deveria levantar ValueError")
+    except ValueError:
+        check(True, "tags em formato nao-lista -> ValueError")
+    try:
+        dbf.clean_lead_tags([{"slug": "x"}])
+        check(False, "item dict deveria levantar ValueError")
+    except ValueError:
+        check(True, "item nao-string vira 400 (nao slug-lixo silencioso)")
+    defs = dbf._clean_tag_defs([{"label": "Varizes", "color": "#22c55e"}], "Tags globais")
+    check(defs == [{"slug": "varizes", "label": "Varizes", "color": "#22c55e"}],
+          "registry: slug derivado do rotulo + cor hex aceita")
+    try:
+        dbf._clean_tag_defs([{"label": "A", "color": "verde"}], "Tags globais")
+        check(False, "cor invalida deveria levantar ValueError")
+    except ValueError:
+        check(True, "registry: cor invalida -> ValueError")
+    try:
+        dbf._clean_tag_defs([{"label": "Dor"}, {"label": "dor"}], "Tags globais")
+        check(False, "slug repetido deveria levantar ValueError")
+    except ValueError:
+        check(True, "registry: slug repetido (case-insensitive) -> ValueError")
 
 
 def cenario_recibo_nao_reabre():
@@ -1190,6 +1240,7 @@ def run():
     cenario_set_attendance_orfa()
     cenario_gate_desfecho()
     cenario_rating_botao()
+    cenario_tags_lead()
     cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()
