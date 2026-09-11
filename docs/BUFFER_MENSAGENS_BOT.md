@@ -1,13 +1,14 @@
 # Buffer de mensagens do bot (Val) — debounce de mensagens picadas
 
-> **Status em 2026-09-11: DESENHO v2, APROVADO PARA IMPLEMENTAÇÃO NESTA BRANCH**
-> (`feature/bot-buffer`). O v1 deste desenho passou por revisão adversarial
+> **Status em 2026-09-11: IMPLEMENTADO NESTA BRANCH, KILL-SWITCH DESLIGADO.**
+> (`feature/bot-buffer`). `BOT_BUFFER_SECONDS=0` mantém todos os tenants no
+> fluxo anterior; ativação deve começar pelo `varizemed-test`. O v1 deste desenho passou por revisão adversarial
 > (2 críticos Opus contra o código real — 21 achados, 2 críticos de premissa)
 > e este v2 incorpora TODAS as correções. Os pontos marcados **[REV]** vêm da
 > revisão — não os "simplifique" de volta.
-> Antes de mergear no develop: gates completos (`sim_bot_flow` 56 /
-> `sim_cx_flow` 172 / `sim_reception_flow` 171 + harness novo do buffer) e
-> revisão adversarial da implementação — padrão da casa.
+> Gates locais completos: `sim_bot_flow` 56 / `sim_cx_flow` 173 /
+> `sim_reception_flow` 173 / `sim_buffer_flow` 36. Antes de mergear no develop:
+> revisão adversarial da implementação e canário no `varizemed-test`.
 
 ## Problema numa frase
 
@@ -160,11 +161,12 @@ mensagem do contato drena tudo; (b) passo novo no cron de 30min:
 
 | Arquivo | Mudança |
 |---|---|
-| `webhook.py` | pré-varredura do payload; pontos ~1050/~1163 viram `_buffered_bot_turn`; bypass por msg_type cru interactive; turno imediato com drain |
+| `webhook.py` | pré-varredura do payload; dispatch de texto/áudio via `_buffered_bot_turn`; bypass por msg_type cru interactive; turno imediato com drain |
 | `bot_service.py` | 1 linha no `_clear_bot_state` (limpar bot_buffers) — o resto intocado |
 | `database_firestore.py` | helpers transacionais `append_bot_buffer` / `claim_and_drain_bot_buffer` / `flush_stale_bot_buffers` + limpeza em `return_contact_to_bot`/`release_lead_to_bot` |
 | `config.py` | 2 envs |
-| `main.py` | passo do flush no cron (com teto/orçamento) + helper de envio compartilhado |
+| `main.py` | passo do flush no cron (com teto/orçamento) |
+| `bot_sender.py` | helper de envio extraído do webhook e compartilhado pelo caminho ao vivo/cron |
 | harness NOVO | ver §Testes — `sim_cx_flow` NÃO exercita o webhook |
 
 ## Testes obrigatórios [REV: harness certo]

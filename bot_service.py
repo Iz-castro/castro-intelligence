@@ -249,6 +249,7 @@ def _set_bot_state(contact_id: int, state: dict):
 
 def _clear_bot_state(contact_id: int):
     document("bot_states", contact_id).delete()
+    document("bot_buffers", contact_id).delete()
 
 
 SETOR_COMERCIAL = 1

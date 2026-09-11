@@ -171,6 +171,34 @@ def _float_env(key, default):
 
 CX_DETECT_TIMEOUT_SECONDS = _float_env("CX_DETECT_TIMEOUT_SECONDS", 60.0)
 
+
+def _nonnegative_float_env(key, default):
+    """Float de feature que aceita zero como kill-switch."""
+    raw = os.getenv(key)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        value = float("nan")
+    if not (value >= 0):  # tambem rejeita NaN
+        import logging
+        logging.getLogger("castro_crm.config").warning(
+            "%s=%r invalido — usando default %s", key, raw, default,
+        )
+        return default
+    return value
+
+
+# -- Debounce de mensagens do bot CX --
+# Default zero: deploy nao muda o comportamento de tenant nenhum. Tenants CX
+# podem sobrescrever no READ por settings.ai.buffer_seconds (kill sem deploy).
+BOT_BUFFER_SECONDS = _nonnegative_float_env("BOT_BUFFER_SECONDS", 0.0)
+try:
+    BOT_BUFFER_MAX_CHARS = max(1, int(os.getenv("BOT_BUFFER_MAX_CHARS", "256")))
+except ValueError:
+    BOT_BUFFER_MAX_CHARS = 256
+
 # Read-timeout da chamada PRINCIPAL do turno reenvia a mensagem 1x antes do
 # fallback "instabilidade momentanea" (pedido do PO 2026-08-20: lead real
 # aceitou a LGPD, o agente levou >109s e morreu em DEADLINE_EXCEEDED — o

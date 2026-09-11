@@ -5,9 +5,11 @@ Processamento de eventos recebidos via webhook da Meta Cloud API.
 Trata mensagens de texto, imagem, audio, video, sticker, localizacao e documentos.
 """
 
+import asyncio
 import hmac
 import hashlib
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from starlette.concurrency import run_in_threadpool
@@ -18,6 +20,7 @@ from config import (
     STT_LANGUAGE_CODE, STT_TIMEOUT_SECONDS, STT_FALLBACK_TEXT,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN,
     RATING_CAPTURE_HOURS,
+    BOT_BUFFER_SECONDS, BOT_BUFFER_MAX_CHARS, CX_DETECT_TIMEOUT_SECONDS,
 )
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit, flag_conversation_takeover,
@@ -29,13 +32,18 @@ from database import (
     get_wa_conversation_by_id, set_attendance_status,
     insert_transfer_system_message, get_current_protocol_id,
     mark_contact_bot_done,
+    append_bot_buffer, claim_and_drain_bot_buffer,
+    drain_claimed_bot_buffer, release_bot_buffer_claim,
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
 from bot_service import process_bot_message_async
-from bot_transport import build_outbound_payload, extract_interactive_inbound
-from firestore_common import set_tenant_context, reset_tenant_context, document, utcnow
-from tenant_service import lookup_phone_routing
+from bot_transport import extract_interactive_inbound
+from bot_sender import send_bot_reply
+from firestore_common import (
+    set_tenant_context, reset_tenant_context, get_tenant_context, document, utcnow,
+)
+from tenant_service import lookup_phone_routing, get_tenant
 from pii_redaction import redact_phone, redact_name
 from pending_events import enqueue_pending_event
 from contextvars import ContextVar
@@ -56,6 +64,13 @@ _WEBHOOK_DEFAULT_TENANT = "hubloc"
 # antes de chamar process_webhook_payload, pra entregar mensagens historicas sem
 # disparar auto-reply em mensagem antiga.
 _silent_reprocess: "ContextVar[bool]" = ContextVar("silent_reprocess", default=False)
+
+# Indirecoes injetaveis no simulador do buffer (a suite nao espera 10s reais).
+_buffer_sleep = asyncio.sleep
+_buffer_monotonic = time.monotonic
+
+# Compatibilidade para simuladores/callers que ja patcham o nome privado.
+_send_bot_reply = send_bot_reply
 
 
 def _resolve_webhook_tenant(channel, phone_number_id: str | None = None):
@@ -274,50 +289,6 @@ def _resolve_webhook_channel(value):
         metadata,
     )
     return None, "no_phone_number_id"
-
-
-async def _send_bot_reply(wa_id: str, reply, contact_id: int, token: str, phone_id: str,
-                          channel_id=None, channel_owner_user_id=None):
-    """Envia resposta do bot via WhatsApp Cloud API e salva no banco.
-
-    `reply` pode ser str (texto) ou dict (type="interactive_buttons", ex.:
-    consentimento LGPD). A traducao para o payload da Meta e o texto a
-    persistir (corpo visivel, nunca o dict cru) vem de bot_transport.
-
-    sender_user_id=None marca a mensagem como originada pelo bot
-    automatico (nao por operador humano).
-    """
-    import httpx
-    from config import GRAPH_API_BASE
-    from database import save_wa_message
-
-    url = f"{GRAPH_API_BASE}/{phone_id}/messages"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload_msg, store_content = build_outbound_payload(reply, wa_id)
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, json=payload_msg, headers=headers)
-            result = resp.json()
-        wa_msg_id = result.get("messages", [{}])[0].get("id", "") if resp.status_code == 200 else ""
-        save_wa_message(
-            wa_message_id=wa_msg_id,
-            contact_id=contact_id,
-            direction="outbound",
-            msg_type="text",
-            content=store_content,
-            status="sent" if resp.status_code == 200 else "failed",
-            timestamp_wa=datetime.now(timezone.utc).isoformat(),
-            operator_id=None,
-            channel_id=channel_id,
-            channel_owner_user_id=channel_owner_user_id,
-            sender_user_id=None,
-        )
-        if resp.status_code == 200:
-            logger.info("[BOT] Resposta enviada para %s | contact=%d", redact_phone(wa_id), contact_id)
-        else:
-            logger.warning("[BOT] Falha ao enviar resposta | status=%s | erro=%s", resp.status_code, result)
-    except Exception as e:
-        logger.error("[BOT] Erro ao enviar resposta: %s", e, exc_info=True)
 
 
 def _normalize_reopen_choice(text):
@@ -712,6 +683,323 @@ async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
                     _process_statuses(value)
 
 
+_BUFFER_CLAIM_WAIT_SECONDS = 30.0
+_BUFFER_CLAIM_POLL_SECONDS = 2.0
+_BUFFER_MAX_DRAIN_LOOPS = 3
+_BUFFER_SETTLED = object()
+
+
+class _DeferredBotBuffer:
+    """Append feito sem sleep porque havia candidato posterior no payload."""
+
+    __slots__ = ("token",)
+
+    def __init__(self, token):
+        self.token = token
+
+
+def _tenant_bot_buffer_seconds() -> float:
+    """Janela efetiva do tenant; zero para builtin/CX pausado/config invalida."""
+    tid = get_tenant_context()
+    try:
+        tenant = get_tenant(tid) or {} if tid else {}
+    except Exception as exc:
+        logger.warning("[BOT-BUFFER] leitura do tenant %s falhou: %s", tid, exc)
+        return 0.0
+    settings = tenant.get("settings")
+    ai_cfg = settings.get("ai") if isinstance(settings, dict) else None
+    if not isinstance(ai_cfg, dict):
+        return 0.0
+    if str(ai_cfg.get("bot_engine") or "").strip().lower() != "dialogflow_cx":
+        return 0.0
+    if str(ai_cfg.get("status") or "active").strip().lower() != "active":
+        return 0.0
+    raw = ai_cfg.get("buffer_seconds", BOT_BUFFER_SECONDS)
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[BOT-BUFFER] settings.ai.buffer_seconds invalido no tenant %s: %r",
+            tid, raw,
+        )
+        return max(0.0, float(BOT_BUFFER_SECONDS))
+    if seconds < 0:
+        logger.warning(
+            "[BOT-BUFFER] settings.ai.buffer_seconds negativo no tenant %s: %r",
+            tid, raw,
+        )
+        return max(0.0, float(BOT_BUFFER_SECONDS))
+    return seconds
+
+
+def _bot_buffer_consent_resolved(contact_id) -> bool:
+    """O debounce so arma na fase CX plena; pre-consentimento fica intacto."""
+    snapshot = document("bot_states", contact_id).get()
+    state = snapshot.to_dict() or {} if snapshot.exists else {}
+    return state.get("lgpd_consent") is True
+
+
+def _join_bot_buffer_items(items) -> str:
+    ordered = sorted(
+        (item for item in (items or []) if isinstance(item, dict)),
+        key=lambda item: (str(item.get("ts") or ""), int(item.get("n") or 0)),
+    )
+    joined = "\n".join(
+        str(item.get("text") or "").strip() for item in ordered
+        if str(item.get("text") or "").strip()
+    )
+    if len(joined) > BOT_BUFFER_MAX_CHARS:
+        logger.warning(
+            "[BOT-BUFFER] rajada com %d chars truncada para os %d finais",
+            len(joined), BOT_BUFFER_MAX_CHARS,
+        )
+        joined = joined[-BOT_BUFFER_MAX_CHARS:]
+    return joined
+
+
+async def _run_bot_turn_and_send(
+    contact_id, text, contact_name, wa_id, token, phone_id,
+    channel_id=None, channel_owner_user_id=None,
+):
+    reply = await process_bot_message_async(contact_id, text, contact_name)
+    if reply:
+        await _send_bot_reply(
+            wa_id, reply, contact_id, token, phone_id,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+        )
+    return reply
+
+
+async def process_claimed_bot_buffer(
+    contact_id, claim_id, items, contact_name, wa_id, token, phone_id,
+    channel_id=None, channel_owner_user_id=None,
+):
+    """Executa o lote ja claimado e absorve itens que chegam durante o turno."""
+    current_items = list(items or [])
+    try:
+        for iteration in range(_BUFFER_MAX_DRAIN_LOOPS):
+            text = _join_bot_buffer_items(current_items)
+            if text:
+                contact = get_wa_contact(contact_id)
+                if not contact or contact.get("assigned_to") or contact.get("bot_completed"):
+                    logger.info(
+                        "[BOT-BUFFER] contato %s saiu do bot antes do turno — descartando lote",
+                        contact_id,
+                    )
+                    return
+                await _run_bot_turn_and_send(
+                    contact_id, text, contact_name, wa_id, token, phone_id,
+                    channel_id=channel_id,
+                    channel_owner_user_id=channel_owner_user_id,
+                )
+
+            # No teto, libera o claim sem drenar novamente. Se chegou texto
+            # durante o 3o turno, o token/oldest_at ficam para o handler dele
+            # (ou para o cron), evitando um loop sem limite dentro do webhook.
+            if iteration + 1 >= _BUFFER_MAX_DRAIN_LOOPS:
+                break
+            drained = drain_claimed_bot_buffer(contact_id, claim_id)
+            if drained.get("status") != "drained":
+                return
+            current_items = drained.get("items") or []
+            if not current_items:
+                break
+    except Exception:
+        # O inbound ja foi persistido. Nao propaga ao wrapper do webhook: um
+        # pending retry voltaria com was_dup=True e nunca repetiria o bot.
+        logger.exception(
+            "[BOT-BUFFER] falha no turno claimado | contato=%s", contact_id,
+        )
+    finally:
+        try:
+            release_bot_buffer_claim(contact_id, claim_id)
+        except Exception:
+            logger.exception(
+                "[BOT-BUFFER] falha ao liberar claim | contato=%s", contact_id,
+            )
+
+
+async def _claim_buffer_waiting(contact_id, expected_token=None):
+    deadline = _buffer_monotonic() + _BUFFER_CLAIM_WAIT_SECONDS
+    while True:
+        result = claim_and_drain_bot_buffer(
+            contact_id,
+            expected_token=expected_token,
+            claim_ttl_seconds=2 * CX_DETECT_TIMEOUT_SECONDS + 60,
+        )
+        if result.get("status") != "busy":
+            return result
+        remaining = deadline - _buffer_monotonic()
+        if remaining <= 0:
+            return result
+        await _buffer_sleep(min(_BUFFER_CLAIM_POLL_SECONDS, remaining))
+
+
+async def _run_immediate_bot_turn(
+    contact_id, text, contact_name, wa_id, token, phone_id,
+    channel_id=None, channel_owner_user_id=None,
+):
+    """Interativa pos-LGPD: drena a rajada anterior e so depois roda o clique."""
+    claim = await _claim_buffer_waiting(contact_id, expected_token=None)
+    if claim.get("status") == "claimed":
+        await process_claimed_bot_buffer(
+            contact_id, claim.get("claim_id"), claim.get("items") or [],
+            contact_name, wa_id, token, phone_id,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+        )
+    elif claim.get("status") == "busy":
+        # Nao perde uma acao explicita do paciente. O caso normal termina antes
+        # dos 30s; se o CX anterior ultrapassar isso, preserva o clique com um
+        # turno direto e registra a degradacao de serializacao.
+        logger.warning(
+            "[BOT-BUFFER] claim ainda vivo apos %.0fs; turno interativo direto | contato=%s",
+            _BUFFER_CLAIM_WAIT_SECONDS, contact_id,
+        )
+    await _run_bot_turn_and_send(
+        contact_id, text, contact_name, wa_id, token, phone_id,
+        channel_id=channel_id,
+        channel_owner_user_id=channel_owner_user_id,
+    )
+
+
+async def _buffered_bot_turn(
+    contact_id, text, timestamp_iso, raw_msg_type, wait_for_quiet,
+    buffer_seconds, contact_name, wa_id, token, phone_id,
+    channel_id=None, channel_owner_user_id=None,
+):
+    """Seleciona caminho atual, debounce ou turno interativo serializado."""
+    if buffer_seconds <= 0:
+        return await _run_bot_turn_and_send(
+            contact_id, text, contact_name, wa_id, token, phone_id,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+        )
+
+    try:
+        consented = _bot_buffer_consent_resolved(contact_id)
+    except Exception:
+        logger.exception(
+            "[BOT-BUFFER] falha ao ler estado LGPD; usando turno direto | contato=%s",
+            contact_id,
+        )
+        return await _run_bot_turn_and_send(
+            contact_id, text, contact_name, wa_id, token, phone_id,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+        )
+    if not consented:
+        return await _run_bot_turn_and_send(
+            contact_id, text, contact_name, wa_id, token, phone_id,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+        )
+
+    if str(raw_msg_type or "").strip().lower() == "interactive":
+        try:
+            await _run_immediate_bot_turn(
+                contact_id, text, contact_name, wa_id, token, phone_id,
+                channel_id=channel_id,
+                channel_owner_user_id=channel_owner_user_id,
+            )
+            return _BUFFER_SETTLED
+        except Exception:
+            logger.exception(
+                "[BOT-BUFFER] falha ao serializar interativa; usando turno direto | contato=%s",
+                contact_id,
+            )
+            return await _run_bot_turn_and_send(
+                contact_id, text, contact_name, wa_id, token, phone_id,
+                channel_id=channel_id,
+                channel_owner_user_id=channel_owner_user_id,
+            )
+
+    appended = False
+    my_token = None
+    try:
+        append_result = append_bot_buffer(contact_id, text, timestamp_iso)
+        appended = True
+        my_token = append_result.get("token")
+        if not wait_for_quiet:
+            return _DeferredBotBuffer(my_token)
+        await _buffer_sleep(buffer_seconds)
+        claim = await _claim_buffer_waiting(contact_id, expected_token=my_token)
+        if claim.get("status") != "claimed":
+            return _BUFFER_SETTLED
+        await process_claimed_bot_buffer(
+            contact_id, claim.get("claim_id"), claim.get("items") or [],
+            contact_name, wa_id, token, phone_id,
+            channel_id=channel_id,
+            channel_owner_user_id=channel_owner_user_id,
+        )
+    except Exception:
+        logger.exception(
+            "[BOT-BUFFER] falha no debounce | contato=%s", contact_id,
+        )
+        # Sem append duravel nao ha cron/handler futuro que recupere o turno.
+        if not appended:
+            return await _run_bot_turn_and_send(
+                contact_id, text, contact_name, wa_id, token, phone_id,
+                channel_id=channel_id,
+                channel_owner_user_id=channel_owner_user_id,
+            )
+        return _DeferredBotBuffer(my_token)
+    return _BUFFER_SETTLED
+
+
+async def _finish_deferred_payload_buffer(entry, buffer_seconds):
+    """Da sleep/claim ao ultimo append real se o candidato previsto falhou.
+
+    Exemplo: payload contem texto seguido de audio, mas o audio nao baixa ou
+    nao gera transcricao. Sem este fechamento, o texto ficaria orfao ate o
+    cron apesar de ser a ultima mensagem realmente elegivel daquele payload.
+    """
+    try:
+        await _buffer_sleep(buffer_seconds)
+        claim = await _claim_buffer_waiting(
+            entry["contact_id"], expected_token=entry["expected_token"],
+        )
+        if claim.get("status") != "claimed":
+            return
+        await process_claimed_bot_buffer(
+            contact_id=entry["contact_id"],
+            claim_id=claim.get("claim_id"),
+            items=claim.get("items") or [],
+            contact_name=entry["contact_name"],
+            wa_id=entry["wa_id"],
+            token=entry["token"],
+            phone_id=entry["phone_id"],
+            channel_id=entry.get("channel_id"),
+            channel_owner_user_id=entry.get("channel_owner_user_id"),
+        )
+    except Exception:
+        # O append ja e duravel e o cron ainda pode recuperar o lote.
+        logger.exception(
+            "[BOT-BUFFER] falha ao fechar append deferido do payload | contato=%s",
+            entry.get("contact_id"),
+        )
+
+
+def _last_buffer_candidate_by_sender(messages, buffer_seconds):
+    """Pre-varredura: evita sleep serial nas k-1 primeiras do mesmo payload."""
+    if buffer_seconds <= 0:
+        return {}
+    last = {}
+    for index, msg in enumerate(messages):
+        raw_type = str(msg.get("type") or "unknown").strip().lower()
+        candidate = False
+        if raw_type == "text":
+            body = str((msg.get("text") or {}).get("body") or "").strip()
+            candidate = bool(body) and _rating_choice_from_text(body) is None
+        elif raw_type == "audio" and FEATURE_AUDIO_TRANSCRIPTION:
+            candidate = bool((msg.get("audio") or {}).get("id"))
+        if candidate:
+            sender = normalize_br_phone(msg.get("from", ""))
+            last[sender] = index
+    return last
+
+
 async def _process_messages(value, ws_notify_callback, channel=None):
     """Processa mensagens recebidas de clientes."""
     contacts_data = value.get("contacts", [])
@@ -725,13 +1013,19 @@ async def _process_messages(value, ws_notify_callback, channel=None):
     channel_owner_id = channel.get("owner_user_id") if channel else None
     channel_token = str(channel.get("access_token", "")).strip() if channel else ""
 
-    for msg in value.get("messages", []):
+    messages = value.get("messages", [])
+    buffer_seconds = _tenant_bot_buffer_seconds()
+    last_buffer_candidate = _last_buffer_candidate_by_sender(messages, buffer_seconds)
+    deferred_payload_buffers = {}
+
+    for msg_index, msg in enumerate(messages):
         # Normaliza nono digito BR — Meta entrega numero ora com '9' ora sem
         # (numeros antigos/legados). Sem normalizacao, o mesmo cliente cria
         # contatos e conversations duplicadas.
         wa_id = normalize_br_phone(msg.get("from", ""))
         msg_id = msg.get("id", "")
         msg_type = msg.get("type", "unknown")
+        raw_msg_type = msg_type
         timestamp = msg.get("timestamp", "")
 
         # Converter timestamp Unix para ISO
@@ -1059,15 +1353,35 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 # was_dup=True pularia o bot permanentemente (achado da revisao).
                 # Degrada so a resposta do bot; auto-recupera na proxima msg.
                 try:
-                    bot_reply = await process_bot_message_async(contact_id, content, contact_name)
-                    if bot_reply:
-                        _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
-                        _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
-                        await _send_bot_reply(
-                            wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
-                            channel_id=channel_id,
-                            channel_owner_user_id=channel_owner_id,
-                        )
+                    _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
+                    _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
+                    _bot_buffer_outcome = await _buffered_bot_turn(
+                        contact_id=contact_id,
+                        text=content,
+                        timestamp_iso=ts_iso,
+                        raw_msg_type=raw_msg_type,
+                        wait_for_quiet=(last_buffer_candidate.get(wa_id) == msg_index),
+                        buffer_seconds=buffer_seconds,
+                        contact_name=contact_name,
+                        wa_id=wa_id,
+                        token=_bot_token,
+                        phone_id=_bot_phone_id,
+                        channel_id=channel_id,
+                        channel_owner_user_id=channel_owner_id,
+                    )
+                    if isinstance(_bot_buffer_outcome, _DeferredBotBuffer):
+                        deferred_payload_buffers[wa_id] = {
+                            "contact_id": contact_id,
+                            "expected_token": _bot_buffer_outcome.token,
+                            "contact_name": contact_name,
+                            "wa_id": wa_id,
+                            "token": _bot_token,
+                            "phone_id": _bot_phone_id,
+                            "channel_id": channel_id,
+                            "channel_owner_user_id": channel_owner_id,
+                        }
+                    elif _bot_buffer_outcome is _BUFFER_SETTLED:
+                        deferred_payload_buffers.pop(wa_id, None)
                 except Exception:
                     logger.exception(
                         "[BOT] falha ao processar/responder inbound do contato %s",
@@ -1160,17 +1474,35 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                                 and not _ctc_pos_stt.get("bot_completed")
                             ):
                                 try:
-                                    bot_reply = await process_bot_message_async(
-                                        contact_id, transcript, contact_name,
+                                    _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
+                                    _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
+                                    _bot_buffer_outcome = await _buffered_bot_turn(
+                                        contact_id=contact_id,
+                                        text=transcript,
+                                        timestamp_iso=ts_iso,
+                                        raw_msg_type=raw_msg_type,
+                                        wait_for_quiet=(last_buffer_candidate.get(wa_id) == msg_index),
+                                        buffer_seconds=buffer_seconds,
+                                        contact_name=contact_name,
+                                        wa_id=wa_id,
+                                        token=_bot_token,
+                                        phone_id=_bot_phone_id,
+                                        channel_id=channel_id,
+                                        channel_owner_user_id=channel_owner_id,
                                     )
-                                    if bot_reply:
-                                        _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
-                                        _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
-                                        await _send_bot_reply(
-                                            wa_id, bot_reply, contact_id, _bot_token, _bot_phone_id,
-                                            channel_id=channel_id,
-                                            channel_owner_user_id=channel_owner_id,
-                                        )
+                                    if isinstance(_bot_buffer_outcome, _DeferredBotBuffer):
+                                        deferred_payload_buffers[wa_id] = {
+                                            "contact_id": contact_id,
+                                            "expected_token": _bot_buffer_outcome.token,
+                                            "contact_name": contact_name,
+                                            "wa_id": wa_id,
+                                            "token": _bot_token,
+                                            "phone_id": _bot_phone_id,
+                                            "channel_id": channel_id,
+                                            "channel_owner_user_id": channel_owner_id,
+                                        }
+                                    elif _bot_buffer_outcome is _BUFFER_SETTLED:
+                                        deferred_payload_buffers.pop(wa_id, None)
                                 except Exception:
                                     logger.exception(
                                         "[BOT] falha ao processar transcricao do contato %s",
@@ -1199,6 +1531,15 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                     **reply_fields,
                 },
             })
+
+    # A pre-varredura e estrutural; o ultimo audio pode falhar antes de gerar
+    # texto, ou a ultima mid do payload pode ja ser uma reentrega. Nesse caso,
+    # fecha em paralelo o ultimo append que realmente aconteceu por contato.
+    if deferred_payload_buffers:
+        await asyncio.gather(*(
+            _finish_deferred_payload_buffer(entry, buffer_seconds)
+            for entry in deferred_payload_buffers.values()
+        ))
 
 
 def _process_statuses(value):

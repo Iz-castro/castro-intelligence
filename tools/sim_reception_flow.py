@@ -35,6 +35,8 @@ import main  # noqa: E402  (real: gate de envio + endpoint de assume)
 import rbac  # noqa: E402
 import database  # noqa: E402  (reexporta database_firestore)
 import database_firestore as dbf  # noqa: E402
+import channel_service  # noqa: E402
+import firestore_common  # noqa: E402
 
 # Guarda originais pra restaurar entre cenarios.
 _REAL_IS_RECEPTION = dbf.is_reception_mode
@@ -42,6 +44,12 @@ _REAL_GET_DOC = dbf._get_doc
 _REAL_DOCUMENT = dbf.document
 _REAL_COLLECTION = dbf.collection
 _REAL_NEXT_SEQUENCE = dbf.next_sequence
+_REAL_GET_CHANNEL = channel_service.get_channel
+_REAL_REFRESH_CHANNELS = channel_service.refresh_channels
+_REAL_MAIN_FS_COLL = main.fs_coll
+_REAL_MAIN_FS_DOCUMENT = main.fs_document
+_REAL_COMMON_COLLECTION = firestore_common.collection
+_REAL_COMMON_DOCUMENT = firestore_common.document
 
 # RBAC nunca le Firestore neste sim: doc de perfil ausente -> fallback da
 # role (dual-check real). Cenarios especificos injetam um doc fake.
@@ -118,6 +126,10 @@ class _DocRef:
         self.coll = coll
         self.doc_id = str(doc_id)
 
+    @property
+    def id(self):
+        return self.doc_id
+
     def get(self):
         return _Snap(STORE.get(self.coll, {}).get(self.doc_id))
 
@@ -135,6 +147,9 @@ class _DocRef:
         if self.doc_id in coll:
             raise _gexc.AlreadyExists("ja existe")
         coll[self.doc_id] = dict(data)
+
+    def delete(self):
+        STORE.get(self.coll, {}).pop(self.doc_id, None)
 
 
 class _QSnap:
@@ -167,6 +182,12 @@ class _CollRef:
         self._limit = n
         return self
 
+    def document(self, doc_id=None):
+        if doc_id is None:
+            _SEQ["n"] += 1
+            doc_id = _SEQ["n"]
+        return _DocRef(self.coll, doc_id)
+
     def stream(self):
         emitted = 0
         for doc_id, data in list(STORE.get(self.coll, {}).items()):
@@ -192,6 +213,17 @@ def patch_store():
         _SEQ["n"] += 1
         return _SEQ["n"]
     dbf.next_sequence = _fake_next_sequence
+    # upsert_wa_conversation importa estes nomes dentro da funcao. Sem o stub,
+    # um cache miss do simulador tenta descobrir ADC/gcloud e deixa de ser local.
+    channel_service.get_channel = lambda channel_id: {
+        "id": channel_id, "is_active": True, "channel_type": "standard",
+        "display_phone_number": "", "label": "Teste",
+    }
+    channel_service.refresh_channels = lambda: None
+    main.fs_coll = lambda coll: _CollRef(coll)
+    main.fs_document = lambda coll, doc_id: _DocRef(coll, doc_id)
+    firestore_common.collection = lambda coll: _CollRef(coll)
+    firestore_common.document = lambda coll, doc_id: _DocRef(coll, doc_id)
 
 
 def restore_dbf():
@@ -201,6 +233,12 @@ def restore_dbf():
     dbf.document = _REAL_DOCUMENT
     dbf.collection = _REAL_COLLECTION
     dbf.next_sequence = _REAL_NEXT_SEQUENCE
+    channel_service.get_channel = _REAL_GET_CHANNEL
+    channel_service.refresh_channels = _REAL_REFRESH_CHANNELS
+    main.fs_coll = _REAL_MAIN_FS_COLL
+    main.fs_document = _REAL_MAIN_FS_DOCUMENT
+    firestore_common.collection = _REAL_COMMON_COLLECTION
+    firestore_common.document = _REAL_COMMON_DOCUMENT
 
 
 # =========================================================================
@@ -640,6 +678,7 @@ def cenario_release_to_bot():
                "attendance_protocol": "20260805-20-REC", "sale_owner_user_id": 3,
                "lead_temperature": "morno"},
         "21": {"id": 21, "assigned_to": 3, "lgpd_revoked": True},
+        "22": {"id": 22, "assigned_to": 3, "bot_completed": True},
     }
     STORE["wa_conversations"] = {
         "T1": {"id": "T1", "contact_id": 20, "assigned_to": 3, "assigned_to_uid": "uid3"},
@@ -648,6 +687,10 @@ def cenario_release_to_bot():
     }
     STORE["bot_states"] = {"20": {"lgpd_status": "accepted", "cx_snapshot": {"x": 1},
                                   "human_active": True, "cx_fail_count": 2}}
+    STORE["bot_buffers"] = {
+        "20": {"items": [{"text": "ciclo velho"}], "token": "a"},
+        "22": {"items": [{"text": "ciclo velho"}], "token": "b"},
+    }
 
     fields = dbf.release_lead_to_bot(20, "T1", "fechado_manual")
     c = STORE["wa_contacts"]["20"]
@@ -668,8 +711,13 @@ def cenario_release_to_bot():
     check(bs.get("human_active") is False and bs.get("cx_snapshot") is None
           and bs.get("cx_fail_count") == 0 and bs.get("lgpd_status") == "accepted",
           "bot_states: ciclo CX zerado, prova LGPD preservada")
+    check("20" not in STORE.get("bot_buffers", {}),
+          "release_lead_to_bot limpa o buffer do ciclo fechado")
     check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None,
           "guard J-3: lgpd_revoked NAO volta pro funil (release=None)")
+    check(dbf.return_contact_to_bot(22, 7) is True
+          and "22" not in STORE.get("bot_buffers", {}),
+          "return_contact_to_bot tambem limpa o buffer anterior")
     restore_dbf()
 
 

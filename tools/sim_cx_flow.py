@@ -330,6 +330,10 @@ check(r3 == "O tratamento com microespuma e simples.",
       "resposta do 2o turno sem prefixo de aceite")
 
 print("\n=== e: handoff pedido pelo agente ===")
+STORE.setdefault("bot_buffers", {})["1"] = {
+    "items": [{"text": "nao pode sobreviver", "ts": "2026-09-11T00:00:00+00:00", "n": 1}],
+    "token": "old-token",
+}
 CX_SCRIPT.append(_cx_ok(
     "Claro! Estou te transferindo para a equipe.",
     handoff_request=True,
@@ -339,6 +343,7 @@ CX_SCRIPT.append(_cx_ok(
 r4 = envia(1, "quero falar com atendente")
 contato1 = STORE["wa_contacts"]["1"]
 check(contato1.get("bot_completed") is True, "handoff -> bot_completed=True")
+check("1" not in STORE.get("bot_buffers", {}), "handoff limpa buffer pendente do ciclo")
 check(contato1.get("department_id") == 10,
       "handoff -> department_id do bot_key 'atendimento' (Recepcao)")
 check(contato1.get("assigned_to") in (None, ""),

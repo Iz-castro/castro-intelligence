@@ -27,10 +27,11 @@ lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente 
 
 Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os gates são:
 
-- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
+- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, ~44 asserts, exit 0/1). CX: `tools\sim_cx_flow.py`.
-  Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (~61 asserts).
+  API, exercita o código real, 56 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (173).
+  Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (173).
+  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (36).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
@@ -135,6 +136,9 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
   transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
   mesmo áudio por dias (incidente 2026-08-14/18).
+- **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
+  somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
+  `settings.ai.buffer_seconds`. Ativar primeiro no `varizemed-test`.
 
 ## Mapa de módulos (onde mexer)
 
@@ -152,6 +156,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | RBAC dinâmico por tenant | `rbac.py` |
 | Gate LGPD | `lgpd_bot.py` |
 | Bot builtin + dispatcher builtin/CX | `bot_service.py` |
+| Envio de resposta automática WhatsApp | `bot_sender.py` |
 | Horário comercial por tenant (aviso builtin + params CX) | `business_hours.py` |
 | Redação de PII em logs | `pii_redaction.py` |
 | Frontend (estado central + listeners) | `frontend/src/context/CrmContext.tsx`, `App.tsx` |

@@ -37,6 +37,7 @@ from config import (
     RATING_TEMPLATE_NAME, RATING_TEMPLATE_LANG, RATING_REASK_DAYS, CLOSE_TEMPLATE_NAME,
     REOPEN_MAX_ATTEMPTS, REOPEN_COOLDOWN_HOURS, REOPEN_BATCH_MAX_SENDS,
     RECEPTION_UNATTENDED_RELEASE_DAYS,
+    CX_DETECT_TIMEOUT_SECONDS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
     CORS_ORIGINS, GCS_MEDIA_BUCKET, IS_CLOUD_RUN,
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
@@ -83,6 +84,7 @@ from database import (
     get_assume_counter, decrement_assume_counter, increment_assume_counter,
     mark_contact_pending_response, clear_contact_pending_response,
     reset_assume_counter,
+    flush_stale_bot_buffers, release_bot_buffer_claim,
 )
 from channel_service import (
     get_all_active_channels, get_channels_for_user,
@@ -100,7 +102,7 @@ from rbac import (
     ensure_permission, get_perfil, has_permission, toggles_beyond_user,
 )
 from pii_redaction import redact_phone, redact_name
-from webhook import process_webhook_payload, validate_signature
+from webhook import process_webhook_payload, validate_signature, process_claimed_bot_buffer
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
@@ -3914,6 +3916,7 @@ async def cron_expire_takeovers(request: Request):
 
     summary: list[dict] = []
     total = 0
+    buffer_flushed_total = 0
     for tenant in list_tenants(active_only=True):
         tid = str(tenant.get("id") or "")
         if not tid:
@@ -3976,13 +3979,87 @@ async def cron_expire_takeovers(request: Request):
             if closed:
                 summary.append({"tenant_id": tid, "closed": len(closed)})
             total += len(closed)
+
+            # Buffer do bot por ultimo: expire/close tem prioridade dentro dos
+            # 300s do request. Processa no maximo 10 contatos e so inicia um
+            # novo claim enquanto o orcamento best-effort de 60s nao acabou.
+            buffer_started = _monotonic()
+            buffer_flushed = 0
+            buffer_discarded = 0
+            while buffer_flushed < 10 and _monotonic() - buffer_started < 60:
+                batches = flush_stale_bot_buffers(
+                    cutoff_iso=(fs_utcnow() - timedelta(minutes=5)).isoformat(),
+                    limit=10,
+                    max_claims=1,
+                    claim_ttl_seconds=2 * CX_DETECT_TIMEOUT_SECONDS + 60,
+                )
+                if not batches:
+                    break
+                batch = batches[0]
+                buffer_flushed += 1
+                buffer_discarded += int(batch.get("discarded") or 0)
+                contact_id = batch.get("contact_id")
+                claim_id = batch.get("claim_id")
+                items = batch.get("items") or []
+                if not items:
+                    release_bot_buffer_claim(contact_id, claim_id)
+                    continue
+                contact_b = get_wa_contact(contact_id)
+                if not contact_b:
+                    logger.warning(
+                        "cron bot-buffer: contato %s nao encontrado", contact_id,
+                    )
+                    release_bot_buffer_claim(contact_id, claim_id)
+                    continue
+                from channel_service import get_channel as _get_buffer_channel
+                channel_b = _get_buffer_channel(contact_b.get("channel_id")) \
+                    if contact_b.get("channel_id") else None
+                if not channel_b:
+                    logger.warning(
+                        "cron bot-buffer: canal do contato %s nao encontrado", contact_id,
+                    )
+                    release_bot_buffer_claim(contact_id, claim_id)
+                    continue
+                await process_claimed_bot_buffer(
+                    contact_id=contact_id,
+                    claim_id=claim_id,
+                    items=items,
+                    contact_name=str(
+                        contact_b.get("declared_name")
+                        or contact_b.get("display_name")
+                        or contact_b.get("whatsapp_profile_name")
+                        or ""
+                    ),
+                    wa_id=str(contact_b.get("wa_id") or ""),
+                    token=str(channel_b.get("access_token") or WHATSAPP_TOKEN or "").strip(),
+                    phone_id=str(
+                        channel_b.get("phone_number_id")
+                        or WHATSAPP_PHONE_NUMBER_ID
+                        or ""
+                    ).strip(),
+                    channel_id=channel_b.get("id"),
+                    channel_owner_user_id=channel_b.get("owner_user_id"),
+                )
+            if buffer_flushed or buffer_discarded:
+                summary.append({
+                    "tenant_id": tid,
+                    "bot_buffers_flushed": buffer_flushed,
+                    "bot_buffer_items_discarded": buffer_discarded,
+                })
+            buffer_flushed_total += buffer_flushed
         except Exception as exc:
             logger.error("expire-takeovers tenant %s falhou: %s", tid, exc)
             summary.append({"tenant_id": tid, "error": str(exc)})
         finally:
             reset_tenant_context(token)
 
-    return {"status": "ok", "timeout_hours": TAKEOVER_TIMEOUT_HOURS, "expired_total": total, "tenants": summary}
+    return {
+        "status": "ok",
+        "timeout_hours": TAKEOVER_TIMEOUT_HOURS,
+        "expired_total": total,
+        "bot_buffers_flushed_total": buffer_flushed_total,
+        "tenants": summary,
+    }
 
 
 @app.get("/api/wa/contact/{contact_id}")

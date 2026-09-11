@@ -2,6 +2,7 @@
 
 import logging
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -59,6 +60,277 @@ def _get_first_by_field(name, field_name, value):
     for snapshot in query.stream():
         return _raw_doc(snapshot)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Buffer persistido do bot CX (debounce de mensagens picadas)
+# ---------------------------------------------------------------------------
+
+_BOT_BUFFER_MAX_ITEM_AGE_SECONDS = 10 * 60
+
+
+def _bot_buffer_dt(value):
+    parsed = _coerce_timestamp(value)
+    if not isinstance(parsed, datetime):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _bot_buffer_iso(value, fallback=None):
+    parsed = _bot_buffer_dt(value)
+    if parsed is not None:
+        return parsed.isoformat()
+    return (fallback or utcnow()).astimezone(timezone.utc).isoformat()
+
+
+def _bot_buffer_live_claim(data, now, claim_ttl_seconds):
+    claimed_at = _bot_buffer_dt(data.get("claimed_at"))
+    if claimed_at is None:
+        return False
+    return claimed_at > now - timedelta(seconds=max(1.0, float(claim_ttl_seconds)))
+
+
+def _filter_and_sort_bot_buffer_items(items, now, max_item_age_seconds):
+    cutoff = now - timedelta(seconds=max(1.0, float(max_item_age_seconds)))
+    kept = []
+    discarded = 0
+    for raw in items if isinstance(items, list) else []:
+        if not isinstance(raw, dict):
+            discarded += 1
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            discarded += 1
+            continue
+        item_dt = _bot_buffer_dt(raw.get("ts"))
+        if item_dt is not None and item_dt < cutoff:
+            discarded += 1
+            continue
+        try:
+            order = int(raw.get("n") or 0)
+        except (TypeError, ValueError):
+            order = 0
+        kept.append({
+            "text": text,
+            "ts": _bot_buffer_iso(raw.get("ts"), fallback=now),
+            "n": order,
+        })
+    kept.sort(key=lambda item: (item["ts"], item["n"]))
+    return kept, discarded
+
+
+@firestore.transactional
+def _transactional_append_bot_buffer(transaction, ref, text, timestamp_iso):
+    snapshot = ref.get(transaction=transaction)
+    data = snapshot.to_dict() or {} if snapshot.exists else {}
+    items = list(data.get("items") or [])
+    next_n = 1
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            next_n = max(next_n, int(item.get("n") or 0) + 1)
+        except (TypeError, ValueError):
+            continue
+
+    now = utcnow()
+    item_ts = _bot_buffer_iso(timestamp_iso, fallback=now)
+    items.append({"text": str(text), "ts": item_ts, "n": next_n})
+    current_oldest = (
+        _bot_buffer_iso(data.get("oldest_at"), fallback=now)
+        if data.get("oldest_at") else item_ts
+    )
+    oldest_at = min(current_oldest, item_ts)
+    token = str(uuid.uuid4())
+    transaction.set(ref, {
+        "items": items,
+        "token": token,
+        "oldest_at": oldest_at,
+        # claimed_at existente e preservado pelo merge: appends durante um
+        # turno ficam para o drain-loop do detentor atual.
+    }, merge=True)
+    return {"token": token, "n": next_n, "oldest_at": oldest_at}
+
+
+def append_bot_buffer(contact_id, text, timestamp_iso=""):
+    """Anexa texto ao buffer do contato e rotaciona seu token atomicamente."""
+    ref = document("bot_buffers", contact_id)
+    client = get_firestore_client()
+    return _transactional_append_bot_buffer(
+        client.transaction(), ref, str(text or ""), timestamp_iso,
+    )
+
+
+@firestore.transactional
+def _transactional_claim_and_drain_bot_buffer(
+    transaction, ref, expected_token, claim_ttl_seconds, max_item_age_seconds,
+):
+    snapshot = ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return {"status": "missing", "items": [], "discarded": 0}
+    data = snapshot.to_dict() or {}
+    if expected_token is not None and str(data.get("token") or "") != str(expected_token):
+        return {"status": "superseded", "items": [], "discarded": 0}
+
+    now = utcnow()
+    if data.get("claimed_at") and _bot_buffer_live_claim(data, now, claim_ttl_seconds):
+        return {"status": "busy", "items": [], "discarded": 0}
+
+    raw_items = data.get("items") or []
+    if not raw_items:
+        transaction.delete(ref)
+        return {"status": "empty", "items": [], "discarded": 0}
+
+    items, discarded = _filter_and_sort_bot_buffer_items(
+        raw_items, now, max_item_age_seconds,
+    )
+    # O ISO funciona tambem como identidade opaca do claim. O detentor so
+    # drena/libera se este valor continuar igual; takeover de claim vencido
+    # invalida com seguranca o handler antigo.
+    claim_id = now.astimezone(timezone.utc).isoformat()
+    transaction.set(ref, {
+        "items": [],
+        "token": str(uuid.uuid4()),
+        "claimed_at": claim_id,
+        "oldest_at": None,
+    }, merge=True)
+    return {
+        "status": "claimed",
+        "items": items,
+        "discarded": discarded,
+        "claim_id": claim_id,
+    }
+
+
+def claim_and_drain_bot_buffer(
+    contact_id, expected_token=None, claim_ttl_seconds=180,
+    max_item_age_seconds=_BOT_BUFFER_MAX_ITEM_AGE_SECONDS,
+):
+    """Tenta assumir e drenar uma rajada.
+
+    expected_token=None e usado pelo turno interativo imediato/cron. Um claim
+    vivo nunca e roubado; claim vencido pode ser retomado.
+    """
+    ref = document("bot_buffers", contact_id)
+    client = get_firestore_client()
+    result = _transactional_claim_and_drain_bot_buffer(
+        client.transaction(), ref, expected_token, claim_ttl_seconds,
+        max_item_age_seconds,
+    )
+    if result.get("discarded"):
+        logger.warning(
+            "[BOT-BUFFER] %d item(ns) com mais de 10min descartado(s) | contato=%s",
+            result["discarded"], contact_id,
+        )
+    return result
+
+
+@firestore.transactional
+def _transactional_drain_claimed_bot_buffer(
+    transaction, ref, claim_id, max_item_age_seconds,
+):
+    snapshot = ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return {"status": "missing", "items": [], "discarded": 0}
+    data = snapshot.to_dict() or {}
+    if str(data.get("claimed_at") or "") != str(claim_id or ""):
+        return {"status": "lost_claim", "items": [], "discarded": 0}
+    now = utcnow()
+    items, discarded = _filter_and_sort_bot_buffer_items(
+        data.get("items") or [], now, max_item_age_seconds,
+    )
+    transaction.set(ref, {
+        "items": [],
+        "token": str(uuid.uuid4()),
+        "oldest_at": None,
+    }, merge=True)
+    return {"status": "drained", "items": items, "discarded": discarded}
+
+
+def drain_claimed_bot_buffer(
+    contact_id, claim_id,
+    max_item_age_seconds=_BOT_BUFFER_MAX_ITEM_AGE_SECONDS,
+):
+    """Drena itens que chegaram durante o turno do detentor do claim."""
+    ref = document("bot_buffers", contact_id)
+    client = get_firestore_client()
+    result = _transactional_drain_claimed_bot_buffer(
+        client.transaction(), ref, claim_id, max_item_age_seconds,
+    )
+    if result.get("discarded"):
+        logger.warning(
+            "[BOT-BUFFER] %d item(ns) com mais de 10min descartado(s) | contato=%s",
+            result["discarded"], contact_id,
+        )
+    return result
+
+
+@firestore.transactional
+def _transactional_release_bot_buffer_claim(transaction, ref, claim_id):
+    snapshot = ref.get(transaction=transaction)
+    if not snapshot.exists:
+        return False
+    data = snapshot.to_dict() or {}
+    if str(data.get("claimed_at") or "") != str(claim_id or ""):
+        return False
+    if data.get("items"):
+        transaction.set(ref, {"claimed_at": None}, merge=True)
+    else:
+        transaction.delete(ref)
+    return True
+
+
+def release_bot_buffer_claim(contact_id, claim_id):
+    """Libera claim sem apagar itens anexados durante o ultimo turno."""
+    ref = document("bot_buffers", contact_id)
+    client = get_firestore_client()
+    return _transactional_release_bot_buffer_claim(
+        client.transaction(), ref, claim_id,
+    )
+
+
+def clear_bot_buffer(contact_id):
+    """Invalida handlers dormindo e remove qualquer rajada do ciclo anterior."""
+    document("bot_buffers", contact_id).delete()
+
+
+def flush_stale_bot_buffers(
+    cutoff_iso, limit=10, max_claims=1, claim_ttl_seconds=180,
+    max_item_age_seconds=_BOT_BUFFER_MAX_ITEM_AGE_SECONDS,
+):
+    """Claima buffers orfaos anteriores ao cutoff e devolve lotes drenados.
+
+    O envio e async e fica no cron; este helper limita-se a query barata pelo
+    escalar oldest_at e ao claim transacional. `max_claims=1` permite ao cron
+    verificar seu orcamento antes de assumir o proximo contato.
+    """
+    query_limit = max(int(limit or 1), int(max_claims or 1))
+    query = collection("bot_buffers").where(
+        "oldest_at", "<", str(cutoff_iso),
+    ).limit(query_limit)
+    claimed = []
+    for snapshot in query.stream():
+        data = snapshot.to_dict() or {}
+        result = claim_and_drain_bot_buffer(
+            snapshot.id,
+            expected_token=data.get("token"),
+            claim_ttl_seconds=claim_ttl_seconds,
+            max_item_age_seconds=max_item_age_seconds,
+        )
+        if result.get("status") != "claimed":
+            continue
+        contact_id = snapshot.id
+        try:
+            contact_id = int(contact_id)
+        except (TypeError, ValueError):
+            pass
+        result["contact_id"] = contact_id
+        claimed.append(result)
+        if len(claimed) >= max(1, int(max_claims or 1)):
+            break
+    return claimed
 
 
 def _sort_records(records, field_name, reverse=False):
@@ -2126,6 +2398,10 @@ def return_contact_to_bot(contact_id, returned_by_user_id):
         }, merge=True)
     except Exception as exc:
         logger.warning("return_contact_to_bot: falha ao limpar bot_state %s: %s", contact_id, exc)
+    try:
+        clear_bot_buffer(contact_id)
+    except Exception as exc:
+        logger.warning("return_contact_to_bot: falha ao limpar bot_buffer %s: %s", contact_id, exc)
     # Log na transfer_log
     transfer_id = next_sequence("wa_transfer_log")
     document("wa_transfer_log", transfer_id).set({
@@ -2233,6 +2509,10 @@ def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=No
         }, merge=True)
     except Exception as exc:
         logger.warning("release_lead_to_bot: falha ao limpar bot_state %s: %s", contact_id, exc)
+    try:
+        clear_bot_buffer(contact_id)
+    except Exception as exc:
+        logger.warning("release_lead_to_bot: falha ao limpar bot_buffer %s: %s", contact_id, exc)
     # Passo 2 — threads nao-backup: sem dono (mantem department_id).
     for _snap in collection("wa_conversations").where("contact_id", "==", contact_id).stream():
         _cd = _snap.to_dict() or {}
