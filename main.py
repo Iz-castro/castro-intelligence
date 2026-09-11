@@ -5113,13 +5113,17 @@ async def export_data(
         output = io.StringIO()
         if contacts:
             fields = ["id", "wa_id", "display_name", "phone_formatted", "qualification",
+                       "tags",
                        "assigned_to", "assigned_name", "department_name", "channel_id",
                        "source_channel_type", "rating", "first_seen_at", "last_message_at",
                        "notes"]
             writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             for c in contacts:
-                writer.writerow(c)
+                # tags e lista -> serializa "a;b" (o DictWriter gravaria o
+                # repr Python da lista). Compromisso LGPD (portabilidade):
+                # docs/compliance/TAGS_E_PRIVACIDADE_VARIZEMED.md.
+                writer.writerow({**c, "tags": ";".join(c.get("tags") or [])})
         csv_content = output.getvalue()
         return Response(
             content=csv_content,
