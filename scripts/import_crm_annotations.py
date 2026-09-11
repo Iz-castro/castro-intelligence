@@ -24,6 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from database_firestore import (  # noqa: E402
+    _resolve_display_name,
+    build_contact_search_fields,
+)
 from firestore_common import get_firestore_client  # noqa: E402
 
 PREFIX = os.environ.get("FIRESTORE_COLLECTION_PREFIX", "castro_crm")
@@ -87,8 +91,23 @@ def main() -> int:
         if len(refs) > 1:
             multi += 1
         for ref in refs:
+            payload_fields = dict(fields)
+            # Picker v2.1 (revisao F2a): import que grava declared_name tem
+            # que recalcular display_name + campos de busca no MESMO write
+            # (senao o picker acha o lead pelo nome VELHO). Le o doc atual
+            # so quando o nome muda — mesma regra do write-path.
+            if "declared_name" in payload_fields:
+                atual = ref.get().to_dict() or {}
+                merged = {**atual, **payload_fields}
+                merged["display_name"] = _resolve_display_name(
+                    merged.get("declared_name", ""),
+                    merged.get("whatsapp_profile_name", ""),
+                    merged.get("phone_formatted", ""),
+                )
+                payload_fields["display_name"] = merged["display_name"]
+                payload_fields.update(build_contact_search_fields(merged))
             if args.confirm:
-                ref.set(fields, merge=True)
+                ref.set(payload_fields, merge=True)
         applied += 1
 
     print(f"  aplicados:       {applied}")

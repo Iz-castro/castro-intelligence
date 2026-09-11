@@ -618,6 +618,108 @@ def _resolve_display_name(declared_name, whatsapp_profile_name, phone_formatted)
     return declared_name or whatsapp_profile_name or phone_formatted or ""
 
 
+# -- Picker v2.1: campos de busca derivados (docs/PICKER_V2_1_AGENDA_PAGINADA.md) --
+# Funcao PURA e unica: write-path e backfill usam a MESMA. Mudou a regra de
+# normalizacao? Incrementa SEARCH_SCHEMA_VERSION (localiza docs a re-backfillar).
+
+SEARCH_SCHEMA_VERSION = 1
+_SEARCH_PREFIX_MIN = 2
+_SEARCH_PREFIX_MAX = 15
+_SEARCH_MAX_WORDS = 12
+_SEARCH_MAX_PREFIXES = 100
+_SEARCH_MAX_ALIAS_CHARS = 120
+
+
+def normalize_search_text(value):
+    """Normaliza texto pra busca: NFKD sem acento + casefold + classe
+    EXPLICITA [0-9a-z] (independente da versao do Unicode do interpretador —
+    prod roda 3.10, scripts rodam 3.12; isalnum() divergiria entre eles).
+    Invisiveis (Cf: ZWSP/ZWJ/BOM/RTL) e soft-hyphen sao DELETADOS antes,
+    nao viram espaco (senao partiam a palavra). "D'Avila" -> "d avila"."""
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(value or ""))
+    s = "".join(ch for ch in s
+                if unicodedata.category(ch) != "Cf" and ch != "­"
+                and not unicodedata.combining(ch))
+    s = s.casefold()
+    s = re.sub(r"[^0-9a-z]+", " ", s)
+    return " ".join(s.split())
+
+
+def build_contact_search_fields(contact):
+    """Campos derivados de busca do picker v2.1. Entrada: dict do contato
+    (bastam declared_name / whatsapp_profile_name / display_name / wa_id).
+    Deterministica e idempotente (arrays ordenados/dedupados) — backfill
+    compara resultado e so escreve o que mudou."""
+    declared = str(contact.get("declared_name") or "").strip()
+    wpn = str(contact.get("whatsapp_profile_name") or "").strip()
+    display = str(contact.get("display_name") or "").strip()
+    wa_id = str(contact.get("wa_id") or "").strip()
+    # Forma CANONICA (nono digito BR) — mesmo criterio que o resto do sistema
+    # usa pra achar contato. Doc legado com wa_id de 12 digitos indexa o
+    # numero real; sem isso, busca por prefixo nacional/local nao o acharia
+    # (revisao adversarial F2a).
+    digits = "".join(ch for ch in normalize_br_phone(wa_id) if ch.isdigit())
+
+    # Nome efetivo: mesma precedencia do _sort_key historico do /contacts/all.
+    effective = normalize_search_text(declared or wpn or display)[:_SEARCH_MAX_ALIAS_CHARS]
+    # "Nome util" = ao menos UMA letra apos normalizar ("3M Equipamentos"
+    # conta; telefone puro nao) — melhor que startswith(letter) do v2.
+    has_letter = any(ch.isalpha() for ch in effective)
+    name_normalized = effective if has_letter else ""
+    sort_key = f"0_{effective}" if has_letter else f"1_{digits}"
+
+    # Prefixos (2..15 chars) de cada palavra de TODOS os aliases validos —
+    # display_name que e so telefone fica fora. Limites anti-fan-out.
+    words = []
+    for alias in (declared, wpn, display):
+        alias_norm = normalize_search_text(alias)[:_SEARCH_MAX_ALIAS_CHARS]
+        if not alias_norm or not any(c.isalpha() for c in alias_norm):
+            continue
+        for w in alias_norm.split():
+            if w not in words:
+                words.append(w)
+    # Orcamento em ROUND-ROBIN por comprimento: toda palavra indexada ganha
+    # os prefixos curtos ANTES de qualquer palavra ganhar os longos — o corte
+    # em 100 nunca deixa uma palavra sem nenhum prefixo (revisao F2a: o corte
+    # pos-sorted eliminava palavras inteiras do fim do alfabeto).
+    seen = set()
+    cheio = False
+    for ln in range(_SEARCH_PREFIX_MIN, _SEARCH_PREFIX_MAX + 1):
+        if cheio:
+            break
+        for w in words[:_SEARCH_MAX_WORDS]:
+            if len(seen) >= _SEARCH_MAX_PREFIXES:
+                cheio = True
+                break
+            if len(w) >= ln:
+                seen.add(w[:ln])
+    name_prefixes = sorted(seen)
+
+    # Telefone: e164 canonico (wa_id so digitos), nacional (sem 55) e parte
+    # local (sem DDD) — validos so pra numero BR canonico; sufixo via reverso.
+    phone_national = digits[2:] if digits.startswith("55") and len(digits) >= 12 else ""
+    phone_local = phone_national[2:] if phone_national else ""
+    return {
+        "sort_key": sort_key,
+        "name_normalized": name_normalized,
+        "name_prefixes": name_prefixes,
+        "phone_e164_digits": digits,
+        "phone_national": phone_national,
+        "phone_local": phone_local,
+        "wa_id_reversed": digits[::-1],
+        "search_schema_version": SEARCH_SCHEMA_VERSION,
+    }
+
+
+def _search_fields_for_update(existing, updates):
+    """Search fields do doc RESULTANTE de um update parcial (doc atual +
+    updates) — atualizacao parcial de nome precisa do documento inteiro
+    (v2.1 secao 10.2)."""
+    return build_contact_search_fields({**(existing or {}), **(updates or {})})
+
+
 # ---------------------------------------------------------------------------
 # wa_conversations — sub-threads por canal (Fase 2)
 # ---------------------------------------------------------------------------
@@ -1370,6 +1472,10 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "rating": None,
         "rating_requested_at": None,
         "is_archived": 0,
+        # Picker v2.1 (revisao F2a, CRITICO): as queries novas filtram
+        # is_backup por igualdade — doc SEM o campo nao entra no indice e
+        # o lead novo sumiria do picker. Todo contato vivo nasce False.
+        "is_backup": False,
         "unread_count": 0,
         "first_seen_at": now,
         # Timestamps de mensagem so populados quando vem de evento real.
@@ -1378,6 +1484,8 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "last_message_at": now if from_message_event else None,
         "last_inbound_at": now if from_message_event else None,
     }
+    # Picker v2.1: campos de busca derivados no MESMO write da criacao.
+    new_contact.update(build_contact_search_fields(new_contact))
     # Auto-atribuir para coexistence
     if auto_assign_user_id:
         user = _get_doc("users", auto_assign_user_id)
@@ -1478,6 +1586,10 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
         updates["display_name"] = _resolve_display_name(
             declared, display_name, updates.get("phone_formatted") or existing.get("phone_formatted", ""),
         )
+    # Picker v2.1: nome ou wa_id mudou -> recalcula os campos de busca no
+    # MESMO write (atualizacao parcial usa o doc inteiro, secao 10.2).
+    if any(k in updates for k in ("wa_id", "whatsapp_profile_name", "display_name")):
+        updates.update(_search_fields_for_update(existing, updates))
     # Atualizar canal se ainda nao definido ou se mudou
     if channel_id is not None and not existing.get("channel_id"):
         updates["channel_id"] = channel_id
@@ -1577,6 +1689,7 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
                     existing.get("whatsapp_profile_name", ""),
                     existing.get("phone_formatted", ""),
                 )
+                updates.update(_search_fields_for_update(existing, updates))
             if updates:
                 document("wa_contacts", existing["id"]).set(updates, merge=True)
             return existing["id"], None
@@ -1597,6 +1710,7 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
                 existing.get("whatsapp_profile_name", ""),
                 existing.get("phone_formatted", ""),
             )
+            updates.update(_search_fields_for_update(existing, updates))
         if not existing.get("department_id") and user.get("department_id"):
             updates["department_id"] = user["department_id"]
         document("wa_contacts", existing["id"]).set(updates, merge=True)
@@ -1635,11 +1749,14 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
         "rating": None,
         "rating_requested_at": None,
         "is_archived": 0,
+        "is_backup": False,  # v2.1: query do picker filtra por igualdade
         "unread_count": 0,
         "first_seen_at": now,
         "last_message_at": None,
         "last_inbound_at": None,
     }
+    # Picker v2.1: campos de busca derivados no MESMO write da criacao.
+    new_contact.update(build_contact_search_fields(new_contact))
     document("wa_contacts", contact_id).set(new_contact)
     # Fase 3: cria conversation associada para o contato manual aparecer
     # imediatamente na sidebar (que agora itera por threads, nao contatos).
@@ -1665,10 +1782,13 @@ def update_wa_contact_declared_name(contact_id, declared_name):
         return False
     phone_formatted = existing.get("phone_formatted", "")
     whatsapp_name = existing.get("whatsapp_profile_name", "")
-    document("wa_contacts", contact_id).set({
+    updates = {
         "declared_name": declared_name,
         "display_name": _resolve_display_name(declared_name, whatsapp_name, phone_formatted),
-    }, merge=True)
+    }
+    # Picker v2.1: renome recalcula os campos de busca no MESMO write.
+    updates.update(_search_fields_for_update(existing, updates))
+    document("wa_contacts", contact_id).set(updates, merge=True)
     return True
 
 
@@ -3148,6 +3268,10 @@ def create_backup_contact(wa_id, display_name, channel_id, first_seen_at, last_t
         "last_message_at": _coerce_timestamp(last_ts),
         "last_inbound_at": None,
     }
+    # Picker v2.1: backup tambem sai com os campos de busca (o picker
+    # exclui is_backup na query, mas o invariante "doc novo = schema v1"
+    # vale pra toda criacao).
+    new_contact.update(build_contact_search_fields(new_contact))
     idx_ref = document("wa_contact_index", wa_id)
     try:
         idx_ref.create({"contact_id": contact_id, "created_at": utcnow()})
