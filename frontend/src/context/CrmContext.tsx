@@ -95,6 +95,9 @@ type CrmContextValue = {
   backupUnread: number;
   equipeOperatorFilter: string;
   setEquipeOperatorFilter: (v: string) => void;
+  equipeChannelFilter: string;
+  setEquipeChannelFilter: (v: string) => void;
+  equipeChannelOptions: ChannelFilterOption[];
   equipeFiltered: Conversation[];
 
   // Messages
@@ -569,6 +572,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [search, setSearch] = useState("");
   const [activeView, setActiveView] = useState<ActiveView>("novos");
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
+  // Filtro por canal do Equipe (espelho do "Meus"; PO 2026-09-03): separa as
+  // conversas do operador selecionado por numero quando ele tem coexistence.
+  const [equipeChannelFilter, setEquipeChannelFilter] = useState("");
   const [qualificationFilter, setQualificationFilter] = useState("");
   const [tagFilter, setTagFilter] = useState<string[]>([]);
   // "Nao lidas" (select de qualificacao): alem de filtrar o carregado, busca
@@ -776,9 +782,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // cobre o fallback, entao nenhuma thread fica invisivel sob filtro.
   const convChannelKey = (conv: Conversation): string =>
     conv.channel_id != null ? String(conv.channel_id) : (conv.id.includes("__") ? conv.id.split("__")[0] : "");
-  const myChannelOptions = useMemo<ChannelFilterOption[]>(() => {
+  const buildChannelFilterOptions = (convs: Conversation[]): ChannelFilterOption[] => {
     const byKey = new Map<string, { id: string; type: "standard" | "coexistence"; phone: string }>();
-    for (const conv of meusConversations) {
+    for (const conv of convs) {
       const key = convChannelKey(conv);
       if (!key) continue;
       const phone = conv.channel_phone_number || conv.channel_label || "";
@@ -791,7 +797,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return [...byKey.values()]
       .sort((a, b) => (a.type !== b.type ? (a.type === "standard" ? -1 : 1) : a.phone.localeCompare(b.phone)))
       .map((o) => ({ id: o.id, type: o.type, label: `${o.type === "standard" ? "Standard" : "Coex"} - ${o.phone || `canal ${o.id}`}` }));
-  }, [meusConversations]);
+  };
+  const myChannelOptions = useMemo<ChannelFilterOption[]>(
+    () => buildChannelFilterOptions(meusConversations),
+    [meusConversations]);  // eslint-disable-line react-hooks/exhaustive-deps
   // Sem opcao "Todos" (decisao de produto): com 2+ canais o filtro abre no
   // primeiro (standard vem antes); com 0-1 canal a caixa some e o filtro
   // desarma pra nao esconder nada.
@@ -916,6 +925,25 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const nqUnread = sumUnread(nqConversations);
   const equipeUnread = sumUnread(equipeConversations);
   const backupUnread = sumUnread(backupConversations);
+  // Filtro por canal do Equipe (espelho do "Meus"; PO 2026-09-03): quando o
+  // operador SELECIONADO tem thread em mais de um numero (standard + coex),
+  // um segundo select separa as conversas por canal — standard primeiro e
+  // default. Opcoes derivadas das proprias conversas do operador (sem
+  // endpoint novo); sem operador selecionado ("Todos"), sem select.
+  const equipeChannelOptions = useMemo<ChannelFilterOption[]>(
+    () => (equipeOperatorFilter
+      ? buildChannelFilterOptions(equipeConversations.filter((conv) => String(conv.assigned_to) === equipeOperatorFilter))
+      : []),
+    [equipeConversations, equipeOperatorFilter]);  // eslint-disable-line react-hooks/exhaustive-deps
+  // Mesma regra do Meus: 2+ canais -> abre no primeiro (standard vem antes);
+  // 0-1 canal -> caixa some e filtro desarma. Trocar de operador re-snapa.
+  useEffect(() => {
+    if (equipeChannelOptions.length > 1) {
+      if (!equipeChannelOptions.some((o) => o.id === equipeChannelFilter)) setEquipeChannelFilter(equipeChannelOptions[0].id);
+    } else if (equipeChannelFilter) {
+      setEquipeChannelFilter("");
+    }
+  }, [equipeChannelOptions, equipeChannelFilter]);
   const equipeFiltered = equipeOperatorFilter
     ? equipeConversations.filter((conv) => String(conv.assigned_to) === equipeOperatorFilter)
     : equipeConversations;
@@ -945,7 +973,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       || (qualificationFilter === UNREAD_FILTER
         ? ((conv.unread_count ?? conv.unread ?? 0) > 0 || conv.id === selectedThreadId)
         : (c?.qualification || "novo") === qualificationFilter);
-    const matchesChannel = activeView !== "meus" || !channelFilter || convChannelKey(conv) === channelFilter;
+    const matchesChannel = activeView === "meus"
+      ? (!channelFilter || convChannelKey(conv) === channelFilter)
+      : activeView === "equipe"
+        ? (!equipeChannelFilter || convChannelKey(conv) === equipeChannelFilter)
+        : true;
     // Frente B: filtro por tags e INTERSECAO com os demais (qualificacao +
     // canal) e entre SI (semantica E: todas as selecionadas presentes).
     const matchesTag = tagFilter.length === 0 || tagFilter.every((slug) => (c?.tags || []).includes(slug));
@@ -1244,6 +1276,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setQualificationFilter("");
     setTagFilter([]);
     setEquipeOperatorFilter("");
+    setEquipeChannelFilter("");
     setNotice("");
     setError("");
   }
@@ -3161,7 +3194,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,
     contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
-    activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeFiltered,
+    activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeChannelFilter, setEquipeChannelFilter, equipeChannelOptions, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,
     replyTarget, startReplyToMessage, cancelReply, copyMessageText: copyMessageTextAction,

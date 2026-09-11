@@ -516,7 +516,7 @@ const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(
 const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["bot", "novos", "meus", "equipe"]);
 
 function ContactList() {
-  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, userSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
+  const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, equipeChannelFilter, setEquipeChannelFilter, equipeChannelOptions, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, userSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
   const tagOptions = buildTagOptions(systemSettings.tags_global, userSettings.tags);
   // Revisao B: registry esvaziado fazia o controle SUMIR com o filtro ainda
   // aplicado (lista vazia sem controle visivel). Sem opcoes, limpa.
@@ -545,7 +545,7 @@ function ContactList() {
   // segue sendo o total carregado. Reseta ao trocar de caixa/busca/filtro.
   const SIDEBAR_PAGE = 50;
   const [visibleLimit, setVisibleLimit] = useState(SIDEBAR_PAGE);
-  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, tagFilter, channelFilter, equipeOperatorFilter]);
+  useEffect(() => { setVisibleLimit(SIDEBAR_PAGE); }, [activeView, search, qualificationFilter, tagFilter, channelFilter, equipeOperatorFilter, equipeChannelFilter]);
 
   // Helper robusto: last_message_at pode vir como string ISO (do polling
   // /api/wa/conversations) OU como Firestore Timestamp object (do snapshot
@@ -624,6 +624,7 @@ function ContactList() {
         {(activeView === "meus" || activeView === "novos") && <button type="button" className="composer-icon" style={{ width: 36, height: 36, flexShrink: 0 }} onClick={() => setShowNewContact(true)} title="Selecionar ou criar contato" aria-label="Selecionar contato"><AddressBookIcon /></button>}
         {activeView === "meus" && myChannelOptions.length > 1 && <select className="compact" value={channelFilter} onChange={(e) => setChannelFilter(e.target.value)} title="Filtrar por canal" aria-label="Filtrar por canal">{myChannelOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</select>}
         {activeView === "equipe" && <select className="compact" value={equipeOperatorFilter} onChange={(e) => setEquipeOperatorFilter(e.target.value)}><option value="">Todos operadores</option>{operators.filter((op) => op.id !== sessionUser?.id).map((op) => <option key={op.id} value={String(op.id)}>{op.display_name}</option>)}</select>}
+        {activeView === "equipe" && equipeChannelOptions.length > 1 && <select className="compact" value={equipeChannelFilter} onChange={(e) => setEquipeChannelFilter(e.target.value)} title="Filtrar por canal do operador" aria-label="Filtrar por canal do operador">{equipeChannelOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</select>}
         {/* Filtro por qualificacao: Bot, Novos/Recepcao, Meus e Equipe. A caixa
             N/Q ja e um filtro por qualificacao (so nao_qualificado) e o Backup e
             historico importado — sem seletor nelas. O match em si
