@@ -317,7 +317,8 @@ exigiu antes de LIGAR (o deploy desligado não depende delas):
 PO confirmou): 4 textos em 15s → `turno 1 com 4 item(ns)` → 1 resposta; 1 texto
 → 1 turno (janela 10s + CX 7s); 2 textos → 1 turno com handoff; áudio + texto
 após retorno ao bot → 1 resposta (áudio superado pelo texto). Zero warnings ou
-descartes; coleção vazia ao final. Próximo passo: PO decide a varizemed real.
+descartes; coleção vazia ao final. **Varizemed real ligada em 2026-09-14 11:20Z**
+(`buffer_seconds=10`, a pedido do PO; sem lote de reabertura no tenant).
 
 Decisão registrada em `docs/decisions/0012-buffer-debounce-bot-cx.md`.
 

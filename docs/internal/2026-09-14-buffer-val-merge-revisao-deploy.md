@@ -129,8 +129,9 @@ PO testou ~8h (BRT) e confirmou. Logs `[BOT-BUFFER]` novos provam o caminho:
 ## Próximos passos
 
 1. ~~Canário no `varizemed-test`~~ feito e aprovado (acima).
-2. PO decide a varizemed real (`set_tenant_buffer --tenant varizemed --seconds 10 --yes`),
-   em dia calmo, com o diag aberto; avaliar antes o Whisper em thread.
+2. ~~PO decide a varizemed real~~ **ligada às 11:20Z** (`set_tenant_buffer --tenant
+   varizemed --seconds 10 --yes`; sem lote de reabertura registrado; coleção vazia).
+   Kill sem deploy: `--seconds 0`. Whisper em thread segue como follow-up.
 3. Follow-ups: Whisper em thread; `wipe_channel_data.py` + RoPA/RIPD com
    `bot_buffers`; TTL policy do Firestore; backfill do picker v2.1 (agendado
    com o PO em casa — fora desta frente).
