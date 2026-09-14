@@ -313,6 +313,12 @@ exigiu antes de LIGAR (o deploy desligado não depende delas):
    (janela + turno dentro do request do admin); com F05 a mensagem atrasada
    não nasce vencida. Aceito.
 
+**Canário executado e APROVADO em 2026-09-14 11:12–11:16Z** (rev `00099-lxq`,
+PO confirmou): 4 textos em 15s → `turno 1 com 4 item(ns)` → 1 resposta; 1 texto
+→ 1 turno (janela 10s + CX 7s); 2 textos → 1 turno com handoff; áudio + texto
+após retorno ao bot → 1 resposta (áudio superado pelo texto). Zero warnings ou
+descartes; coleção vazia ao final. Próximo passo: PO decide a varizemed real.
+
 Decisão registrada em `docs/decisions/0012-buffer-debounce-bot-cx.md`.
 
 ## O que NÃO fazer

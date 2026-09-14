@@ -112,12 +112,25 @@ não coincidir com lote de reabertura/campanha de template. Tudo em
   `castro-crm-00099-lxq` promovida por nome (rollback = `00098-g52`, que já
   tem o buffer; `00097-fd4` só com o buffer zerado e drenado).
 
+## Re-teste após o fix, 11:12–11:16Z (rev `00099-lxq`): APROVADO
+
+PO testou ~8h (BRT) e confirmou. Logs `[BOT-BUFFER]` novos provam o caminho:
+
+- 11:12:31/32/40/46, 4 textos → 3× `handler sem turno (superseded)` →
+  `turno 1 com 4 item(ns), 47 chars` (11:12:56) → CX 13s → **1 resposta** 11:13:10.
+  A 1ª mensagem do ciclo entrou no buffer (fix da hidratação funcionando).
+- 11:13:20, 1 texto → `turno 1 com 1 item(ns)` → 1 resposta (10s + 7s).
+- 11:14:22/28, 2 textos → 1 turno → handoff (`temperatura=morno`); a mensagem
+  de 11:14:52 chegou durante o turno e ficou pra equipe (desenho).
+- 11:16:18 áudio + 11:16:20 texto (após retorno ao bot) → áudio superado →
+  `turno 1 com 2 item(ns), 54 chars` → **1 resposta** 11:16:38.
+- Zero warnings, zero descartes, `_diag_bot_buffers` vazio depois.
+
 ## Próximos passos
 
-1. PO: canário no `varizemed-test`
-   (`.venv\Scripts\python.exe -m scripts.set_tenant_buffer --tenant varizemed-test --seconds 10 --yes`)
-   seguindo a checklist; teste real pelo número de teste 7195-7758.
-2. PO decide a varizemed real.
+1. ~~Canário no `varizemed-test`~~ feito e aprovado (acima).
+2. PO decide a varizemed real (`set_tenant_buffer --tenant varizemed --seconds 10 --yes`),
+   em dia calmo, com o diag aberto; avaliar antes o Whisper em thread.
 3. Follow-ups: Whisper em thread; `wipe_channel_data.py` + RoPA/RIPD com
    `bot_buffers`; TTL policy do Firestore; backfill do picker v2.1 (agendado
    com o PO em casa — fora desta frente).
