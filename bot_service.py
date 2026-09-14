@@ -630,6 +630,32 @@ def _cx_policy_version(ai_cfg: dict) -> str:
     return f"{tid}-sem-versao"
 
 
+def lgpd_consent_resolved(state, contact, ai_cfg=None) -> bool:
+    """True se o consentimento LGPD deste contato ja esta resolvido.
+
+    Mesma regra da hidratacao em _process_cx_message: estado True vale; estado
+    False (recusa) nunca vale; estado AUSENTE vale se o contato guarda a prova
+    (lgpd_consent=True, nao revogado, policy_version vigente). Usado pelo
+    buffer do webhook para decidir se pode fazer debounce ANTES do turno:
+    apos release_lead_to_bot o bot_states nasce sem lgpd_* e, sem esta regra,
+    a 1a mensagem do ciclo novo rodava turno direto e a seguinte virava
+    resposta dupla (canario varizemed-test 2026-09-14).
+    """
+    state = state if isinstance(state, dict) else {}
+    contact = contact if isinstance(contact, dict) else {}
+    if state.get("lgpd_consent") is True:
+        return True
+    if state.get("lgpd_consent") is not None:
+        return False
+    if ai_cfg is None:
+        ai_cfg = _get_tenant_ai_config()
+    return bool(
+        contact.get("lgpd_consent") is True
+        and not contact.get("lgpd_revoked")
+        and str(contact.get("lgpd_policy_version") or "").strip() == _cx_policy_version(ai_cfg)
+    )
+
+
 async def process_bot_message_async(
     contact_id: int, text: str, contact_name: str = ""
 ) -> Optional[Union[str, dict]]:

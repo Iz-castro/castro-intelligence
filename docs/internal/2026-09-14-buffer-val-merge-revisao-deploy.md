@@ -75,6 +75,41 @@ não coincidir com lote de reabertura/campanha de template. Tudo em
   `castro-crm-00097-fd4`. Smoke: `GET /` 200 e `GET /api/client-config` 200
   (projectId Oregon).
 
+## Canário no `varizemed-test` ("Castro Intelligence SAC"), 04:21–04:30Z
+
+- Ligado às 04:21Z (`set_tenant_buffer --seconds 10 --yes`); cache das instâncias
+  atualizou às 04:25:33 (log "Tenant cache refreshed"). PO testou pelo número
+  ***0484 (contato 8) e reportou "não funcionou". Linha do tempo reconstruída
+  pelos logs (request log do Cloud Run: `timestamp` = início, `latency` = duração):
+  - 04:25:33–38: 3 textos → **nenhuma resposta**: o lead ainda estava com a
+    equipe (`bot_completed`, qualificação "convertido"); foram pra caixa do
+    operador. Não é o buffer.
+  - 04:26:04: PO fechou o atendimento (`set-attendance`) → `release_lead_to_bot`
+    → `bot_states` recriado SEM `lgpd_*` (o handoff anterior tinha apagado o doc).
+  - 04:26:15: clique de avaliação "Bom" no recibo (curto-circuito, ok).
+  - 04:26:32 (m5): gate antigo viu `lgpd_consent` ausente → **turno direto**
+    (12s de CX) → resposta 04:26:45. Durante o turno, hidratação gravou o
+    consentimento no estado.
+  - 04:26:35 + 04:26:39 (m6, m7): **bufferizadas → 1 turno** (m6 superada em
+    10,4s; m7 claimou, CX 6s) → resposta 04:26:56. 04:26:50 (m8) chegou durante
+    o turno → **drain-loop** → resposta 04:27:02. Buffer funcionando.
+  - 04:27:02 (m9): bufferizada, turno de handoff levou **36s** de CX; m10/m11
+    chegaram durante o turno e, com o handoff, ficaram pra equipe (desenho).
+  - 04:28:03: PO fechou de novo → `release_lead_to_bot` → estado sem `lgpd_*`.
+  - 04:29:24 áudio (Whisper 3,2s, síncrono: o request do texto seguinte ficou
+    parado 4s até a transcrição acabar) → **turno direto** (mesmo gap) →
+    resposta 04:29:38; 04:29:30 texto → bufferizado (10s + 3s) → resposta
+    04:29:44. Duas respostas = o gap de hidratação, não o buffer.
+- Causa da percepção: (1) a 1ª mensagem de cada ciclo novo após
+  `release_lead_to_bot` não era bufferizada (gate lia só `bot_states`); (2) turnos
+  lentos da Val (12s, 36s) somados à janela de 10s; (3) zero log no caminho feliz
+  do buffer.
+- Fix (mesmo dia): `bot_service.lgpd_consent_resolved` (regra de hidratação
+  compartilhada) usado pelo gate do buffer com o contato já lido no webhook;
+  logs `[BOT-BUFFER]` por mensagem (turno N com k itens / handler sem turno /
+  consentimento não resolvido); cenário 19 no sim (56 checagens). Verificado por
+  3 refutadores Opus antes do deploy.
+
 ## Próximos passos
 
 1. PO: canário no `varizemed-test`

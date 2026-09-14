@@ -25,6 +25,7 @@ except Exception:
 
 import webhook as wh  # noqa: E402
 import database_firestore as dbf  # noqa: E402
+import bot_service  # noqa: E402
 
 
 CONTACTS = {}
@@ -44,6 +45,7 @@ AI_CFG = {
     "bot_engine": "dialogflow_cx",
     "status": "active",
     "buffer_seconds": 0.04,
+    "lgpd_policy_version": "test-v1",
 }
 
 BLOCK_FIRST_CX = False
@@ -135,6 +137,7 @@ def _reset(consented=True, assigned=False, completed=False):
         "bot_engine": "dialogflow_cx",
         "status": "active",
         "buffer_seconds": 0.04,
+        "lgpd_policy_version": "test-v1",
     })
     cid = _ensure_contact("5531999999999")
     CONTACTS[str(cid)].update({
@@ -217,6 +220,13 @@ async def _fake_cx(text):
 
 async def _fake_process_bot(contact_id, text, contact_name=""):
     state = STATES.setdefault(str(contact_id), {})
+    # Hidratacao pela prova do contato (espelho de bot_service._process_cx_message).
+    contact = CONTACTS.get(str(contact_id)) or {}
+    if (state.get("lgpd_consent") is None and contact.get("lgpd_consent") is True
+            and not contact.get("lgpd_revoked")
+            and contact.get("lgpd_policy_version") == AI_CFG.get("lgpd_policy_version")):
+        state["lgpd_consent"] = True
+        state["lgpd_status"] = "accepted"
     if state.get("lgpd_consent") is True:
         return await _fake_cx(text)
     normalized = str(text or "").strip().lower()
@@ -355,6 +365,9 @@ def _install_patches():
     wh.is_reception_mode = lambda: True
     wh._buffer_sleep = asyncio.sleep
     wh._buffer_monotonic = time.monotonic
+    # lgpd_consent_resolved REAL (importado no webhook); so a config de IA do
+    # tenant e substituida para nao tocar Firestore/tenant context.
+    bot_service._get_tenant_ai_config = lambda: dict(AI_CFG)
 
     stt = types.ModuleType("transcription_service")
     stt.get_speech_client = lambda: object()
@@ -687,6 +700,33 @@ async def scenario_kill_switch_key_absent():
           "sem override e env 0 -> um turno por mensagem, sem tocar no buffer")
 
 
+async def scenario_new_cycle_hydration():
+    title("19. Ciclo novo apos release_lead_to_bot: bot_states sem lgpd_*, prova no contato (canario 2026-09-14)")
+    cid = _reset(consented=False)
+    STATES[str(cid)] = {"step": "cx", "human_active": False}  # recriado pelo release, sem lgpd_*
+    CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_policy_version": AI_CFG["lgpd_policy_version"]})
+    await asyncio.gather(
+        _deliver([_text("n1", "voltei")]),
+        _deliver([_text("n2", "quero remarcar")]),
+    )
+    check(CX_CALLS == ["voltei\nquero remarcar"], "1a mensagem do ciclo novo entra no buffer (prova do contato)")
+    check(STATES[str(cid)].get("lgpd_consent") is True and not BUFFERS, "turno hidratou o estado; nada orfao")
+
+    # Prova de OUTRA versao de politica nao vale: pre-consentimento, turno direto (re-pergunta LGPD).
+    cid = _reset(consented=False)
+    STATES[str(cid)] = {"step": "cx"}
+    CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_policy_version": "outra-versao"})
+    await _deliver([_text("n3", "oi")])
+    check(CX_CALLS == [] and not BUFFERS and len(SENT) == 1, "prova de versao antiga: sem buffer, fluxo LGPD refeito")
+
+    # Recusa registrada no estado tem precedencia sobre a prova do contato.
+    cid = _reset(consented=False)
+    STATES[str(cid)] = {"step": "cx", "lgpd_consent": False, "lgpd_status": "refused"}
+    CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_policy_version": AI_CFG["lgpd_policy_version"]})
+    await _deliver([_text("n4", "oi")])
+    check(CX_CALLS == [] and not BUFFERS, "recusa no estado: sem buffer, sem turno CX")
+
+
 def scenario_transaction_contracts():
     title("14. Contratos transacionais da persistencia real")
 
@@ -789,6 +829,7 @@ async def main():
     await scenario_wall_clock_budget()
     await scenario_interactive_busy_after_wait()
     await scenario_kill_switch_key_absent()
+    await scenario_new_cycle_hydration()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

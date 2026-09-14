@@ -38,7 +38,7 @@ from database import (
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
-from bot_service import process_bot_message_async
+from bot_service import process_bot_message_async, lgpd_consent_resolved
 from bot_transport import extract_interactive_inbound
 from bot_sender import send_bot_reply
 from firestore_common import (
@@ -750,11 +750,19 @@ def _tenant_bot_buffer_seconds() -> float:
     return seconds
 
 
-def _bot_buffer_consent_resolved(contact_id) -> bool:
-    """O debounce so arma na fase CX plena; pre-consentimento fica intacto."""
+def _bot_buffer_consent_resolved(contact_id, contact=None) -> bool:
+    """O debounce so arma na fase CX plena; pre-consentimento fica intacto.
+
+    Mesma regra de hidratacao do bot_service (lgpd_consent_resolved): estado
+    True, ou estado AUSENTE com prova valida no contato. Sem a 2a parte, a 1a
+    mensagem apos release_lead_to_bot (bot_states recriado sem lgpd_*) rodava
+    turno direto e a seguinte virava resposta dupla (canario 2026-09-14).
+    """
     snapshot = document("bot_states", contact_id).get()
     state = snapshot.to_dict() or {} if snapshot.exists else {}
-    return state.get("lgpd_consent") is True
+    if state.get("lgpd_consent") is None and contact is None:
+        contact = get_wa_contact(contact_id)
+    return lgpd_consent_resolved(state, contact)
 
 
 def _join_bot_buffer_items(items) -> str:
@@ -814,6 +822,10 @@ async def process_claimed_bot_buffer(
                         contact_id,
                     )
                     return
+                logger.info(
+                    "[BOT-BUFFER] turno %d com %d item(ns), %d chars | contato=%s",
+                    iteration + 1, len(current_items), len(text), contact_id,
+                )
                 await _run_bot_turn_and_send(
                     contact_id, text, contact_name, wa_id, token, phone_id,
                     channel_id=channel_id,
@@ -920,7 +932,7 @@ async def _run_immediate_bot_turn(
 async def _buffered_bot_turn(
     contact_id, text, timestamp_iso, raw_msg_type, wait_for_quiet,
     buffer_seconds, contact_name, wa_id, token, phone_id,
-    channel_id=None, channel_owner_user_id=None, deadline=None,
+    channel_id=None, channel_owner_user_id=None, deadline=None, contact=None,
 ):
     """Seleciona caminho atual, debounce ou turno interativo serializado."""
     if buffer_seconds <= 0:
@@ -931,7 +943,7 @@ async def _buffered_bot_turn(
         )
 
     try:
-        consented = _bot_buffer_consent_resolved(contact_id)
+        consented = _bot_buffer_consent_resolved(contact_id, contact)
     except Exception:
         logger.exception(
             "[BOT-BUFFER] falha ao ler estado LGPD; usando turno direto | contato=%s",
@@ -943,6 +955,10 @@ async def _buffered_bot_turn(
             channel_owner_user_id=channel_owner_user_id,
         )
     if not consented:
+        logger.info(
+            "[BOT-BUFFER] consentimento LGPD nao resolvido; turno direto | contato=%s",
+            contact_id,
+        )
         return await _run_bot_turn_and_send(
             contact_id, text, contact_name, wa_id, token, phone_id,
             channel_id=channel_id,
@@ -982,6 +998,14 @@ async def _buffered_bot_turn(
             contact_id, expected_token=my_token, deadline=deadline,
         )
         if claim.get("status") != "claimed":
+            # superseded = chegou mensagem mais nova (o handler dela responde);
+            # busy = turno em voo (drain-loop do detentor); missing = handoff;
+            # empty = nada a processar; no_budget = sem orcamento de parede
+            # (ja logado em warning por _claim_buffer_waiting).
+            logger.info(
+                "[BOT-BUFFER] handler sem turno (%s) | contato=%s",
+                claim.get("status"), contact_id,
+            )
             return _BUFFER_SETTLED
         await process_claimed_bot_buffer(
             contact_id, claim.get("claim_id"), claim.get("items") or [],
@@ -1432,6 +1456,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                         wait_for_quiet=(last_buffer_candidate.get(wa_id) == msg_index),
                         buffer_seconds=buffer_seconds,
                         deadline=buffer_deadline,
+                        contact=contact_row,
                         contact_name=contact_name,
                         wa_id=wa_id,
                         token=_bot_token,
@@ -1554,6 +1579,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                                         wait_for_quiet=(last_buffer_candidate.get(wa_id) == msg_index),
                                         buffer_seconds=buffer_seconds,
                                         deadline=buffer_deadline,
+                                        contact=_ctc_pos_stt,
                                         contact_name=contact_name,
                                         wa_id=wa_id,
                                         token=_bot_token,

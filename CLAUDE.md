@@ -31,7 +31,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 56 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (173).
   Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (173).
-  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (52).
+  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (56).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em

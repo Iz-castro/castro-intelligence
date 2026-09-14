@@ -47,7 +47,13 @@ qualquer espera.
   `user_first_input` (`bot_service.py:783`) — texto junto seria jogado fora.
   Regra: **antes do append, ler o estado; só bufferar se
   `lgpd_consent is True`** (fase CX plena). Pré-consentimento = fluxo atual,
-  intocado, mensagem a mensagem.
+  intocado, mensagem a mensagem. **[REV-IMPL canário 2026-09-14]** "estado"
+  aqui segue a MESMA regra de hidratação do `bot_service`
+  (`lgpd_consent_resolved`): estado `True` vale; estado `False` nunca vale;
+  estado AUSENTE vale se o contato guarda a prova (`lgpd_consent=True`, não
+  revogado, `policy_version` vigente). Sem isso, após `release_lead_to_bot`
+  (que recria `bot_states` sem `lgpd_*` quando o handoff apagou o doc) a 1ª
+  mensagem do ciclo novo rodava turno direto e a 2ª virava resposta dupla.
 - **Conteúdo de origem `interactive` NUNCA entra no buffer** **[REV]** —
   guardar o `msg_type` CRU antes da normalização da linha ~893 e usar como
   bypass. Clique pós-consentimento roda turno imediato; ver §Turno imediato.
@@ -269,7 +275,12 @@ exigiu antes de LIGAR (o deploy desligado não depende delas):
 
 1. **Observabilidade:** `scripts/_diag_bot_buffers.py --tenant varizemed-test --watch 5`
    (read-only, sem texto do paciente) aberto durante o canário; filtro
-   `[BOT-BUFFER]` no Cloud Logging; `bot_buffer_items_discarded` no retorno do cron.
+   `[BOT-BUFFER]` no Cloud Logging (uma linha por mensagem: `turno N com k
+   item(ns)`, `handler sem turno (superseded|busy|missing)`, `consentimento LGPD
+   nao resolvido; turno direto`); `bot_buffer_items_discarded` no retorno do cron.
+   Nos logs de request do Cloud Run, o `timestamp` é o INÍCIO e `latency` a
+   duração — um handler superado aparece com ~10s, o detentor com janela +
+   turno(s).
 2. **Ligar:** `scripts/set_tenant_buffer.py --tenant varizemed-test --seconds 10 --yes`
    (cache de tenant ≤60s). Roteiro: 3 textos em ~4s → 1 resposta com o texto
    junto e doc `bot_buffers/{contato}` apagado; handoff no meio da rajada;
