@@ -108,7 +108,9 @@ não coincidir com lote de reabertura/campanha de template. Tudo em
   compartilhada) usado pelo gate do buffer com o contato já lido no webhook;
   logs `[BOT-BUFFER]` por mensagem (turno N com k itens / handler sem turno /
   consentimento não resolvido); cenário 19 no sim (56 checagens). Verificado por
-  3 refutadores Opus antes do deploy.
+  3 refutadores Opus antes do deploy. Commit `5c39f8a`; revisão
+  `castro-crm-00099-lxq` promovida por nome (rollback = `00098-g52`, que já
+  tem o buffer; `00097-fd4` só com o buffer zerado e drenado).
 
 ## Próximos passos
 
