@@ -194,8 +194,11 @@ def _nonnegative_float_env(key, default):
 # Default zero: deploy nao muda o comportamento de tenant nenhum. Tenants CX
 # podem sobrescrever no READ por settings.ai.buffer_seconds (kill sem deploy).
 BOT_BUFFER_SECONDS = _nonnegative_float_env("BOT_BUFFER_SECONDS", 0.0)
+# Teto 256 = limite de queryInput.text do Dialogflow CX. O conector corta pela
+# CABECA (bot_engine_dialogflow._MAX_INPUT_CHARS); um valor maior aqui faria o
+# webhook preservar o FIM e o conector descartar justamente esse fim (F19).
 try:
-    BOT_BUFFER_MAX_CHARS = max(1, int(os.getenv("BOT_BUFFER_MAX_CHARS", "256")))
+    BOT_BUFFER_MAX_CHARS = min(256, max(1, int(os.getenv("BOT_BUFFER_MAX_CHARS", "256"))))
 except ValueError:
     BOT_BUFFER_MAX_CHARS = 256
 

@@ -236,51 +236,47 @@ async def _fake_send(wa_id, reply, contact_id, token, phone_id, **kwargs):
     return True
 
 
-def _append_buffer(contact_id, text, timestamp_iso=""):
+def _append_buffer(contact_id, text, timestamp_iso="", at_iso=None):
+    # Espelha _transactional_append_bot_buffer: ts = ordem (Meta), at = idade.
     key = str(contact_id)
     data = BUFFERS.setdefault(key, {"items": [], "claimed_at": None, "oldest_at": None})
     n = max([int(i.get("n") or 0) for i in data["items"]] or [0]) + 1
-    ts = timestamp_iso or datetime.now(timezone.utc).isoformat()
-    data["items"].append({"text": str(text), "ts": ts, "n": n})
+    at = at_iso or datetime.now(timezone.utc).isoformat()
+    ts = timestamp_iso or at
+    data["items"].append({"text": str(text), "ts": ts, "n": n, "at": at})
     data["token"] = str(uuid.uuid4())
-    data["oldest_at"] = min(filter(None, (data.get("oldest_at"), ts)))
+    data["oldest_at"] = data.get("oldest_at") or at
     return {"token": data["token"], "n": n, "oldest_at": data["oldest_at"]}
 
 
 def _fresh_items(items):
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-    kept = []
-    discarded = 0
-    for item in items:
-        try:
-            parsed = datetime.fromisoformat(str(item.get("ts") or "").replace("Z", "+00:00"))
-        except ValueError:
-            parsed = datetime.now(timezone.utc)
-        if parsed < cutoff:
-            discarded += 1
-        else:
-            kept.append(copy.deepcopy(item))
-    kept.sort(key=lambda item: (item.get("ts") or "", int(item.get("n") or 0)))
-    return kept, discarded
+    # Filtro REAL (idade por `at`, ordem por (ts, n)) — sem duble divergente.
+    return dbf._filter_and_sort_bot_buffer_items(
+        items, datetime.now(timezone.utc), 600,
+    )
 
 
-def _claim_buffer(contact_id, expected_token=None, **kwargs):
+def _claim_buffer(contact_id, expected_token=None, claim_ttl_seconds=None, **kwargs):
+    # Espelha o real: claim vivo = claimed_at OU claim_hb dentro do TTL
+    # (TTL derivado quando None); claim vencido pode ser retomado.
     key = str(contact_id)
     data = BUFFERS.get(key)
     if data is None:
         return {"status": "missing", "items": [], "discarded": 0}
     if expected_token is not None and data.get("token") != expected_token:
         return {"status": "superseded", "items": [], "discarded": 0}
-    if data.get("claimed_at"):
+    now = datetime.now(timezone.utc)
+    ttl = claim_ttl_seconds if claim_ttl_seconds is not None else dbf.bot_buffer_claim_ttl_seconds()
+    if data.get("claimed_at") and dbf._bot_buffer_live_claim(data, now, ttl):
         return {"status": "busy", "items": [], "discarded": 0}
     if not data.get("items"):
         BUFFERS.pop(key, None)
         return {"status": "empty", "items": [], "discarded": 0}
     items, discarded = _fresh_items(data["items"])
-    claim_id = str(uuid.uuid4())
+    claim_id = now.isoformat()
     data.update({
         "items": [], "token": str(uuid.uuid4()), "claimed_at": claim_id,
-        "oldest_at": None,
+        "claim_hb": claim_id, "oldest_at": None,
     })
     return {
         "status": "claimed", "items": items, "discarded": discarded,
@@ -295,7 +291,10 @@ def _drain_buffer(contact_id, claim_id, **kwargs):
     if data.get("claimed_at") != claim_id:
         return {"status": "lost_claim", "items": [], "discarded": 0}
     items, discarded = _fresh_items(data.get("items") or [])
-    data.update({"items": [], "token": str(uuid.uuid4()), "oldest_at": None})
+    data.update({
+        "items": [], "token": str(uuid.uuid4()), "oldest_at": None,
+        "claim_hb": datetime.now(timezone.utc).isoformat(),
+    })
     return {"status": "drained", "items": items, "discarded": discarded}
 
 
@@ -306,6 +305,7 @@ def _release_claim(contact_id, claim_id):
         return False
     if data.get("items"):
         data["claimed_at"] = None
+        data["claim_hb"] = None
     else:
         BUFFERS.pop(key, None)
     return True
@@ -493,7 +493,8 @@ async def scenario_orphan_flush():
     title("8. Flush de orfao e descarte acima de 10min")
     cid = _reset(consented=True)
     now = datetime.now(timezone.utc)
-    _append_buffer(cid, "orfao recuperavel", (now - timedelta(minutes=6)).isoformat())
+    six_min_ago = (now - timedelta(minutes=6)).isoformat()
+    _append_buffer(cid, "orfao recuperavel", six_min_ago, at_iso=six_min_ago)
     batch = _flush_stale((now - timedelta(minutes=5)).isoformat())[0]
     await wh.process_claimed_bot_buffer(
         cid, batch["claim_id"], batch["items"], "Paciente",
@@ -501,7 +502,8 @@ async def scenario_orphan_flush():
     )
     check(CX_CALLS == ["orfao recuperavel"], "item de 6min recuperado pelo flush")
 
-    _append_buffer(cid, "velho demais", (now - timedelta(minutes=11)).isoformat())
+    eleven_min_ago = (now - timedelta(minutes=11)).isoformat()
+    _append_buffer(cid, "velho demais", eleven_min_ago, at_iso=eleven_min_ago)
     old_batch = _flush_stale((now - timedelta(minutes=5)).isoformat())[0]
     before = len(CX_CALLS)
     await wh.process_claimed_bot_buffer(
@@ -584,6 +586,107 @@ async def scenario_payload_last_candidate_fails():
     check(not BUFFERS, "payload com redelivery termina sem buffer pendente")
 
 
+async def scenario_delayed_delivery():
+    title("15. Entrega atrasada/reprocesso: idade pelo append, nao pelo ts da Meta (F05)")
+    _reset(consented=True)
+    old_unix = int(time.time()) - 20 * 60
+    await _deliver([_text("late1", "quero remarcar", unix_ts=old_unix)])
+    check(CX_CALLS == ["quero remarcar"], "ts da Meta de 20min atras ainda recebe turno (nao nasce vencido)")
+    check(not BUFFERS, "nada descartado nem orfao")
+
+
+async def scenario_wall_clock_budget():
+    global BLOCK_FIRST_CX
+    title("16. Orcamento de parede: sem tempo para outro turno, detentor NAO drena (F02/F12)")
+    cid = _reset(consented=True)
+    BLOCK_FIRST_CX = True
+    # Deadline ja vencido: o 1o turno roda (itens ja sairam do doc), mas o
+    # drain-loop nao inicia um 2o; o item que chegou durante o turno fica no doc.
+    _append_buffer(cid, "primeiro")
+    claim = _claim_buffer(cid)
+    holder = asyncio.create_task(wh.process_claimed_bot_buffer(
+        cid, claim["claim_id"], claim["items"], "Paciente",
+        CONTACTS[str(cid)]["wa_id"], "token", "phone", channel_id=7,
+        deadline=wh._buffer_monotonic() - 1,
+    ))
+    await FIRST_CX_STARTED.wait()
+    _append_buffer(cid, "chegou durante o turno")
+    RELEASE_FIRST_CX.set()
+    await holder
+    check(CX_CALLS == ["primeiro"], "sem orcamento -> so o turno ja claimado roda")
+    data = BUFFERS.get(str(cid)) or {}
+    check([i["text"] for i in data.get("items", [])] == ["chegou durante o turno"]
+          and not data.get("claimed_at"),
+          "item novo preservado no doc e claim liberado (proximo handler/cron)")
+
+    # Cron: max_drain_loops=1 -> mesmo comportamento mesmo com orcamento sobrando.
+    cid = _reset(consented=True)
+    BLOCK_FIRST_CX = True
+    _append_buffer(cid, "cron um")
+    claim = _claim_buffer(cid)
+    holder = asyncio.create_task(wh.process_claimed_bot_buffer(
+        cid, claim["claim_id"], claim["items"], "Paciente",
+        CONTACTS[str(cid)]["wa_id"], "token", "phone", channel_id=7,
+        max_drain_loops=1,
+    ))
+    await FIRST_CX_STARTED.wait()
+    _append_buffer(cid, "cron dois")
+    RELEASE_FIRST_CX.set()
+    await holder
+    check(CX_CALLS == ["cron um"], "cron roda 1 turno por contato")
+    check([i["text"] for i in (BUFFERS.get(str(cid)) or {}).get("items", [])] == ["cron dois"],
+          "item chegado durante o turno do cron fica para o proximo tick/handler")
+
+    # Sleeper sem orcamento nao claima (itens ficam com token intacto).
+    cid = _reset(consented=True)
+    _append_buffer(cid, "sem orcamento")
+    token_before = BUFFERS[str(cid)]["token"]
+    result = await wh._claim_buffer_waiting(
+        cid, expected_token=token_before, deadline=wh._buffer_monotonic() - 1,
+    )
+    check(result.get("status") == "no_budget" and BUFFERS[str(cid)]["items"]
+          and BUFFERS[str(cid)]["token"] == token_before,
+          "sem orcamento -> nao claima, lote fica no doc com token intacto")
+
+
+async def scenario_interactive_busy_after_wait():
+    global BLOCK_FIRST_CX
+    title("17. Interativa com claim vivo alem da espera: clique nao se perde (F24)")
+    _reset(consented=True)
+    BLOCK_FIRST_CX = True
+    previous_wait = wh._BUFFER_CLAIM_WAIT_SECONDS
+    previous_poll = wh._BUFFER_CLAIM_POLL_SECONDS
+    wh._BUFFER_CLAIM_WAIT_SECONDS = 0.05
+    wh._BUFFER_CLAIM_POLL_SECONDS = 0.01
+    try:
+        first = asyncio.create_task(_deliver([_text("b1", "turno longo")]))
+        await FIRST_CX_STARTED.wait()
+        click = asyncio.create_task(_deliver([_interactive("b2", "acao_interativa")]))
+        await asyncio.sleep(0.2)
+        check(CX_CALLS == ["turno longo", "acao_interativa"],
+              "apos a espera, o clique roda turno direto (degradacao registrada em log)")
+        RELEASE_FIRST_CX.set()
+        await asyncio.gather(first, click)
+    finally:
+        wh._BUFFER_CLAIM_WAIT_SECONDS = previous_wait
+        wh._BUFFER_CLAIM_POLL_SECONDS = previous_poll
+    check(len(SENT) == 2 and not BUFFERS, "duas respostas (uma por turno), nada orfao")
+
+
+async def scenario_kill_switch_key_absent():
+    title("18. Kill-switch com a config REAL do deploy: chave ausente + env 0 (F25)")
+    _reset(consented=True)
+    AI_CFG.pop("buffer_seconds", None)
+    previous = wh.BOT_BUFFER_SECONDS
+    wh.BOT_BUFFER_SECONDS = 0.0
+    try:
+        await _deliver([_text("k1", "um"), _text("k2", "dois")])
+    finally:
+        wh.BOT_BUFFER_SECONDS = previous
+    check(CX_CALLS == ["um", "dois"] and not BUFFERS,
+          "sem override e env 0 -> um turno por mensagem, sem tocar no buffer")
+
+
 def scenario_transaction_contracts():
     title("14. Contratos transacionais da persistencia real")
 
@@ -627,14 +730,45 @@ def scenario_transaction_contracts():
         tx, ref, third["token"], 180, 600,
     )
     check(busy["status"] == "busy", "claim vivo nao e roubado")
-    drained = dbf._transactional_drain_claimed_bot_buffer.to_wrap(
-        tx, ref, claimed["claim_id"], 600,
-    )
-    check([i["text"] for i in drained["items"]] == ["durante"], "detentor drena append em voo")
-    released = dbf._transactional_release_bot_buffer_claim.to_wrap(
-        tx, ref, claimed["claim_id"],
-    )
-    check(released is True and ref.data is None, "claim vazio libera removendo o doc")
+    ttl = dbf.bot_buffer_claim_ttl_seconds()
+    check(ttl == 2 * wh.CX_DETECT_TIMEOUT_SECONDS + 60, "TTL do claim derivado do config (checklist e)")
+    real_utcnow = dbf.utcnow
+    try:
+        # Relogio ja alem do TTL da IDENTIDADE quando o detentor drena: o drain
+        # renova o heartbeat com o relogio "atual" e o claim continua VIVO (F01).
+        dbf.utcnow = lambda: real_utcnow() + timedelta(seconds=ttl + 30)
+        drained = dbf._transactional_drain_claimed_bot_buffer.to_wrap(
+            tx, ref, claimed["claim_id"], 600,
+        )
+        check([i["text"] for i in drained["items"]] == ["durante"], "detentor drena append em voo")
+        check(ref.data.get("claim_hb") and ref.data["claim_hb"] != claimed["claim_id"],
+              "drain renova o heartbeat do claim (F01)")
+        fourth = dbf._transactional_append_bot_buffer.to_wrap(tx, ref, "mais um", stamp)
+        still_busy = dbf._transactional_claim_and_drain_bot_buffer.to_wrap(
+            tx, ref, fourth["token"], ttl, 600,
+        )
+        check(still_busy["status"] == "busy",
+              "identidade vencida + heartbeat fresco = claim vivo, nao e roubado (F01)")
+        # Heartbeat tambem vencido -> takeover (cenario 8b); detentor antigo
+        # perde drain e release.
+        dbf.utcnow = lambda: real_utcnow() + timedelta(seconds=2 * (ttl + 30))
+        taken = dbf._transactional_claim_and_drain_bot_buffer.to_wrap(
+            tx, ref, fourth["token"], ttl, 600,
+        )
+        check(taken["status"] == "claimed" and [i["text"] for i in taken["items"]] == ["mais um"],
+              "claim vencido (identidade + heartbeat) e retomado com os itens pendentes (8b)")
+        lost = dbf._transactional_drain_claimed_bot_buffer.to_wrap(
+            tx, ref, claimed["claim_id"], 600,
+        )
+        check(lost["status"] == "lost_claim", "detentor antigo nao drena mais")
+        check(dbf._transactional_release_bot_buffer_claim.to_wrap(tx, ref, claimed["claim_id"]) is False,
+              "detentor antigo nao libera o claim novo")
+        released = dbf._transactional_release_bot_buffer_claim.to_wrap(
+            tx, ref, taken["claim_id"],
+        )
+        check(released is True and ref.data is None, "claim vazio libera removendo o doc")
+    finally:
+        dbf.utcnow = real_utcnow
 
 
 async def main():
@@ -651,6 +785,10 @@ async def main():
     await scenario_handoff_cleanup()
     await scenario_audio()
     await scenario_payload_last_candidate_fails()
+    await scenario_delayed_delivery()
+    await scenario_wall_clock_budget()
+    await scenario_interactive_busy_after_wait()
+    await scenario_kill_switch_key_absent()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

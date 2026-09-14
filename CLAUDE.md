@@ -31,7 +31,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 56 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (173).
   Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (173).
-  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (36).
+  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (52).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
@@ -138,7 +138,9 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   mesmo áudio por dias (incidente 2026-08-14/18).
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
-  `settings.ai.buffer_seconds`. Ativar primeiro no `varizemed-test`.
+  `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar
+  primeiro no `varizemed-test`. Claim com heartbeat + orçamento de parede de 240s por request
+  (Cloud Run mata em 300s) — não tire nenhum dos dois (`docs/BUFFER_MENSAGENS_BOT.md` §Revisão).
 
 ## Mapa de módulos (onde mexer)
 

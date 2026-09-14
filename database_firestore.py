@@ -85,11 +85,33 @@ def _bot_buffer_iso(value, fallback=None):
     return (fallback or utcnow()).astimezone(timezone.utc).isoformat()
 
 
+def bot_buffer_claim_ttl_seconds():
+    """TTL do claim DERIVADO do teto de um turno CX (nunca hardcoded).
+
+    Um turno pode levar timeout + reenvio (CX_READ_TIMEOUT_RETRY); o detentor
+    renova o heartbeat a cada drain, entao o TTL cobre UM turno, nao a soma
+    do drain-loop.
+    """
+    from config import CX_DETECT_TIMEOUT_SECONDS
+    return 2 * float(CX_DETECT_TIMEOUT_SECONDS) + 60
+
+
 def _bot_buffer_live_claim(data, now, claim_ttl_seconds):
-    claimed_at = _bot_buffer_dt(data.get("claimed_at"))
-    if claimed_at is None:
+    """Claim vivo = identidade (claimed_at) OU heartbeat (claim_hb) dentro do TTL.
+
+    Sem heartbeat, 3 turnos lentos no drain-loop somariam mais que o TTL e
+    outro ator (sleeper/interativa/cron) roubaria o claim com o detentor em
+    voo -> 2 turnos CX concorrentes na mesma sessao (revisao 2026-09-14, F01).
+    """
+    stamps = [
+        stamp for stamp in (
+            _bot_buffer_dt(data.get("claimed_at")),
+            _bot_buffer_dt(data.get("claim_hb")),
+        ) if stamp is not None
+    ]
+    if not stamps:
         return False
-    return claimed_at > now - timedelta(seconds=max(1.0, float(claim_ttl_seconds)))
+    return max(stamps) > now - timedelta(seconds=max(1.0, float(claim_ttl_seconds)))
 
 
 def _filter_and_sort_bot_buffer_items(items, now, max_item_age_seconds):
@@ -104,8 +126,11 @@ def _filter_and_sort_bot_buffer_items(items, now, max_item_age_seconds):
         if not text:
             discarded += 1
             continue
-        item_dt = _bot_buffer_dt(raw.get("ts"))
-        if item_dt is not None and item_dt < cutoff:
+        # IDADE pelo instante do append (`at`); `ts` da Meta e so ORDENACAO.
+        # Entrega atrasada/reprocesso de pending nao pode nascer vencido (F05).
+        # Itens sem `at` (gravados antes deste campo) caem no `ts`.
+        age_dt = _bot_buffer_dt(raw.get("at")) or _bot_buffer_dt(raw.get("ts"))
+        if age_dt is not None and age_dt < cutoff:
             discarded += 1
             continue
         try:
@@ -116,6 +141,7 @@ def _filter_and_sort_bot_buffer_items(items, now, max_item_age_seconds):
             "text": text,
             "ts": _bot_buffer_iso(raw.get("ts"), fallback=now),
             "n": order,
+            "at": _bot_buffer_iso(raw.get("at") or raw.get("ts"), fallback=now),
         })
     kept.sort(key=lambda item: (item["ts"], item["n"]))
     return kept, discarded
@@ -136,13 +162,16 @@ def _transactional_append_bot_buffer(transaction, ref, text, timestamp_iso):
             continue
 
     now = utcnow()
+    now_iso = now.astimezone(timezone.utc).isoformat()
+    # ts = instante da Meta (ORDENACAO do join); at = instante do append
+    # (IDADE p/ descarte e p/ oldest_at do flush do cron). Separados porque
+    # uma entrega atrasada/reprocesso de pending chegaria "vencida" (F05).
     item_ts = _bot_buffer_iso(timestamp_iso, fallback=now)
-    items.append({"text": str(text), "ts": item_ts, "n": next_n})
-    current_oldest = (
+    items.append({"text": str(text), "ts": item_ts, "n": next_n, "at": now_iso})
+    oldest_at = (
         _bot_buffer_iso(data.get("oldest_at"), fallback=now)
-        if data.get("oldest_at") else item_ts
+        if data.get("oldest_at") else now_iso
     )
-    oldest_at = min(current_oldest, item_ts)
     token = str(uuid.uuid4())
     transaction.set(ref, {
         "items": items,
@@ -194,6 +223,8 @@ def _transactional_claim_and_drain_bot_buffer(
         "items": [],
         "token": str(uuid.uuid4()),
         "claimed_at": claim_id,
+        # heartbeat: renovado a cada drain do detentor (_bot_buffer_live_claim)
+        "claim_hb": claim_id,
         "oldest_at": None,
     }, merge=True)
     return {
@@ -205,14 +236,17 @@ def _transactional_claim_and_drain_bot_buffer(
 
 
 def claim_and_drain_bot_buffer(
-    contact_id, expected_token=None, claim_ttl_seconds=180,
+    contact_id, expected_token=None, claim_ttl_seconds=None,
     max_item_age_seconds=_BOT_BUFFER_MAX_ITEM_AGE_SECONDS,
 ):
     """Tenta assumir e drenar uma rajada.
 
     expected_token=None e usado pelo turno interativo imediato/cron. Um claim
-    vivo nunca e roubado; claim vencido pode ser retomado.
+    vivo nunca e roubado; claim vencido pode ser retomado. claim_ttl_seconds
+    None = derivado do config (bot_buffer_claim_ttl_seconds).
     """
+    if claim_ttl_seconds is None:
+        claim_ttl_seconds = bot_buffer_claim_ttl_seconds()
     ref = document("bot_buffers", contact_id)
     client = get_firestore_client()
     result = _transactional_claim_and_drain_bot_buffer(
@@ -245,6 +279,8 @@ def _transactional_drain_claimed_bot_buffer(
         "items": [],
         "token": str(uuid.uuid4()),
         "oldest_at": None,
+        # Renova a posse: o proximo turno do drain-loop conta TTL do zero.
+        "claim_hb": now.astimezone(timezone.utc).isoformat(),
     }, merge=True)
     return {"status": "drained", "items": items, "discarded": discarded}
 
@@ -276,7 +312,7 @@ def _transactional_release_bot_buffer_claim(transaction, ref, claim_id):
     if str(data.get("claimed_at") or "") != str(claim_id or ""):
         return False
     if data.get("items"):
-        transaction.set(ref, {"claimed_at": None}, merge=True)
+        transaction.set(ref, {"claimed_at": None, "claim_hb": None}, merge=True)
     else:
         transaction.delete(ref)
     return True
@@ -297,7 +333,7 @@ def clear_bot_buffer(contact_id):
 
 
 def flush_stale_bot_buffers(
-    cutoff_iso, limit=10, max_claims=1, claim_ttl_seconds=180,
+    cutoff_iso, limit=10, max_claims=1, claim_ttl_seconds=None,
     max_item_age_seconds=_BOT_BUFFER_MAX_ITEM_AGE_SECONDS,
 ):
     """Claima buffers orfaos anteriores ao cutoff e devolve lotes drenados.
@@ -306,6 +342,8 @@ def flush_stale_bot_buffers(
     escalar oldest_at e ao claim transacional. `max_claims=1` permite ao cron
     verificar seu orcamento antes de assumir o proximo contato.
     """
+    if claim_ttl_seconds is None:
+        claim_ttl_seconds = bot_buffer_claim_ttl_seconds()
     query_limit = max(int(limit or 1), int(max_claims or 1))
     query = collection("bot_buffers").where(
         "oldest_at", "<", str(cutoff_iso),

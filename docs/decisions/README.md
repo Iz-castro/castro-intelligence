@@ -11,7 +11,7 @@ Formato sugerido:
 
 Boa opcao para ADRs simples ao longo da evolucao do projeto.
 
-## Indice dos ADRs (status em 2026-08-21)
+## Indice dos ADRs (status em 2026-09-14)
 
 | # | Titulo | Status |
 |---|---|---|
@@ -26,5 +26,6 @@ Boa opcao para ADRs simples ao longo da evolucao do projeto.
 | [0009](0009-modelos-crm-d1-d3-retorno-ao-bot.md) | Modelos de CRM: decisoes D1-D3 do retorno-ao-bot (clinica) | Aceito pelo PO (2026-08-01) |
 | [0010](0010-pool-mode-recepcao.md) | Modo Recepcao: pool compartilhada por tenant (`pool_mode`) | Aceito — EM PRODUCAO desde 2026-08-05 (promocao; varizemed real com pool_mode=reception desde 2026-08-06) |
 | [0011](0011-unread-derivado-das-threads-e-sons-por-caixa.md) | `unread_count` do contato derivado das threads; beep/alarme so sobre o que a caixa mostra | Aceito — EM PRODUCAO em 2026-08-21 (backfill aplicado) |
+| [0012](0012-buffer-debounce-bot-cx.md) | Buffer/debounce de mensagens picadas para o bot CX (Val): doc `bot_buffers`, claim com heartbeat, orcamento de parede | Aceito — implementado 2026-09-14, kill-switch DESLIGADO (ativar 1o no varizemed-test) |
 
 Estado por frente (o que falta em cada uma): [`docs/PENDENCIAS_E_ROADMAP.md`](../PENDENCIAS_E_ROADMAP.md).

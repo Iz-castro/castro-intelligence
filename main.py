@@ -3917,6 +3917,11 @@ async def cron_expire_takeovers(request: Request):
     summary: list[dict] = []
     total = 0
     buffer_flushed_total = 0
+    # Orcamento GLOBAL do request (Cloud Run mata em 300s) para o flush do
+    # buffer: conta desde a entrada e soma todos os tenants. Expire/close tem
+    # prioridade; o flush so INICIA claim novo antes de 150s (150 + pior turno
+    # ~135s < 300) e roda 1 turno por contato (revisao 2026-09-14, F03).
+    req_started = _monotonic()
     for tenant in list_tenants(active_only=True):
         tid = str(tenant.get("id") or "")
         if not tid:
@@ -3981,12 +3986,14 @@ async def cron_expire_takeovers(request: Request):
             total += len(closed)
 
             # Buffer do bot por ultimo: expire/close tem prioridade dentro dos
-            # 300s do request. Processa no maximo 10 contatos e so inicia um
-            # novo claim enquanto o orcamento best-effort de 60s nao acabou.
-            buffer_started = _monotonic()
+            # 300s do request. Teto de 10 contatos e orcamento de tempo sao
+            # GLOBAIS (somados entre tenants), nao por tenant.
             buffer_flushed = 0
             buffer_discarded = 0
-            while buffer_flushed < 10 and _monotonic() - buffer_started < 60:
+            while (
+                buffer_flushed_total + buffer_flushed < 10
+                and _monotonic() - req_started < 150
+            ):
                 batches = flush_stale_bot_buffers(
                     cutoff_iso=(fs_utcnow() - timedelta(minutes=5)).isoformat(),
                     limit=10,
@@ -4039,6 +4046,9 @@ async def cron_expire_takeovers(request: Request):
                     ).strip(),
                     channel_id=channel_b.get("id"),
                     channel_owner_user_id=channel_b.get("owner_user_id"),
+                    # 1 turno por contato no cron: itens que chegarem durante
+                    # o turno ficam para o handler deles / proximo tick.
+                    max_drain_loops=1,
                 )
             if buffer_flushed or buffer_discarded:
                 summary.append({

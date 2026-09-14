@@ -34,6 +34,7 @@ from database import (
     mark_contact_bot_done,
     append_bot_buffer, claim_and_drain_bot_buffer,
     drain_claimed_bot_buffer, release_bot_buffer_claim,
+    bot_buffer_claim_ttl_seconds,
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
@@ -686,7 +687,24 @@ async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
 _BUFFER_CLAIM_WAIT_SECONDS = 30.0
 _BUFFER_CLAIM_POLL_SECONDS = 2.0
 _BUFFER_MAX_DRAIN_LOOPS = 3
+# Orcamento de PAREDE por request (Cloud Run mata em 300s): janela + espera de
+# claim + turnos. Um turno novo (claim ou drain) so comeca se couber no PIOR
+# caso (timeout do CX + reenvio + envio httpx); senao os itens ficam no doc
+# para o proximo handler/cron (revisao 2026-09-14, F02/F03/F12).
+_BUFFER_REQUEST_BUDGET_SECONDS = 240.0
+_BUFFER_TURN_WORST_CASE_SECONDS = 2 * float(CX_DETECT_TIMEOUT_SECONDS) + 15.0
 _BUFFER_SETTLED = object()
+
+
+def _buffer_default_deadline():
+    return _buffer_monotonic() + _BUFFER_REQUEST_BUDGET_SECONDS
+
+
+def _buffer_fits_turn(deadline):
+    """True se ainda cabe um turno no pior caso antes do deadline."""
+    if deadline is None:
+        return True
+    return deadline - _buffer_monotonic() >= _BUFFER_TURN_WORST_CASE_SECONDS
 
 
 class _DeferredBotBuffer:
@@ -774,11 +792,19 @@ async def _run_bot_turn_and_send(
 async def process_claimed_bot_buffer(
     contact_id, claim_id, items, contact_name, wa_id, token, phone_id,
     channel_id=None, channel_owner_user_id=None,
+    deadline=None, max_drain_loops=None,
 ):
-    """Executa o lote ja claimado e absorve itens que chegam durante o turno."""
+    """Executa o lote ja claimado e absorve itens que chegam durante o turno.
+
+    deadline (monotonic) limita o drain-loop ao orcamento do request;
+    max_drain_loops permite ao cron rodar 1 turno por contato.
+    """
     current_items = list(items or [])
+    if deadline is None:
+        deadline = _buffer_default_deadline()
+    loops = max(1, int(max_drain_loops or _BUFFER_MAX_DRAIN_LOOPS))
     try:
-        for iteration in range(_BUFFER_MAX_DRAIN_LOOPS):
+        for iteration in range(loops):
             text = _join_bot_buffer_items(current_items)
             if text:
                 contact = get_wa_contact(contact_id)
@@ -794,10 +820,23 @@ async def process_claimed_bot_buffer(
                     channel_owner_user_id=channel_owner_user_id,
                 )
 
-            # No teto, libera o claim sem drenar novamente. Se chegou texto
-            # durante o 3o turno, o token/oldest_at ficam para o handler dele
-            # (ou para o cron), evitando um loop sem limite dentro do webhook.
-            if iteration + 1 >= _BUFFER_MAX_DRAIN_LOOPS:
+            # No teto (ou sem orcamento de parede), libera o claim SEM drenar:
+            # drenar sem rodar turno perderia os itens. Texto que chegou
+            # durante o ultimo turno fica no doc (token/oldest_at) para o
+            # handler dele ou para o cron — residuo aceito pelo desenho.
+            if iteration + 1 >= loops:
+                logger.info(
+                    "[BOT-BUFFER] teto de %d turno(s) no claim; itens novos ficam "
+                    "para o proximo handler/cron | contato=%s", loops, contact_id,
+                )
+                break
+            if not _buffer_fits_turn(deadline):
+                logger.warning(
+                    "[BOT-BUFFER] sem orcamento de parede para outro turno "
+                    "(%.0fs restantes); itens novos ficam para o proximo "
+                    "handler/cron | contato=%s",
+                    deadline - _buffer_monotonic(), contact_id,
+                )
                 break
             drained = drain_claimed_bot_buffer(contact_id, claim_id)
             if drained.get("status") != "drained":
@@ -820,17 +859,30 @@ async def process_claimed_bot_buffer(
             )
 
 
-async def _claim_buffer_waiting(contact_id, expected_token=None):
-    deadline = _buffer_monotonic() + _BUFFER_CLAIM_WAIT_SECONDS
+async def _claim_buffer_waiting(contact_id, expected_token=None, deadline=None):
+    """Claim com espera (~30s, poll 2s) — nunca alem do deadline do request.
+
+    Se nao cabe mais um turno no pior caso, NAO claima: os itens ficam no doc
+    (token intacto) para o proximo handler/cron em vez de estourar os 300s.
+    """
+    wait_deadline = _buffer_monotonic() + _BUFFER_CLAIM_WAIT_SECONDS
+    if deadline is not None:
+        wait_deadline = min(wait_deadline, deadline)
     while True:
+        if not _buffer_fits_turn(deadline):
+            logger.warning(
+                "[BOT-BUFFER] sem orcamento de parede para claimar; lote fica "
+                "para o proximo handler/cron | contato=%s", contact_id,
+            )
+            return {"status": "no_budget", "items": [], "discarded": 0}
         result = claim_and_drain_bot_buffer(
             contact_id,
             expected_token=expected_token,
-            claim_ttl_seconds=2 * CX_DETECT_TIMEOUT_SECONDS + 60,
+            claim_ttl_seconds=bot_buffer_claim_ttl_seconds(),
         )
         if result.get("status") != "busy":
             return result
-        remaining = deadline - _buffer_monotonic()
+        remaining = wait_deadline - _buffer_monotonic()
         if remaining <= 0:
             return result
         await _buffer_sleep(min(_BUFFER_CLAIM_POLL_SECONDS, remaining))
@@ -838,16 +890,17 @@ async def _claim_buffer_waiting(contact_id, expected_token=None):
 
 async def _run_immediate_bot_turn(
     contact_id, text, contact_name, wa_id, token, phone_id,
-    channel_id=None, channel_owner_user_id=None,
+    channel_id=None, channel_owner_user_id=None, deadline=None,
 ):
     """Interativa pos-LGPD: drena a rajada anterior e so depois roda o clique."""
-    claim = await _claim_buffer_waiting(contact_id, expected_token=None)
+    claim = await _claim_buffer_waiting(contact_id, expected_token=None, deadline=deadline)
     if claim.get("status") == "claimed":
         await process_claimed_bot_buffer(
             contact_id, claim.get("claim_id"), claim.get("items") or [],
             contact_name, wa_id, token, phone_id,
             channel_id=channel_id,
             channel_owner_user_id=channel_owner_user_id,
+            deadline=deadline,
         )
     elif claim.get("status") == "busy":
         # Nao perde uma acao explicita do paciente. O caso normal termina antes
@@ -867,7 +920,7 @@ async def _run_immediate_bot_turn(
 async def _buffered_bot_turn(
     contact_id, text, timestamp_iso, raw_msg_type, wait_for_quiet,
     buffer_seconds, contact_name, wa_id, token, phone_id,
-    channel_id=None, channel_owner_user_id=None,
+    channel_id=None, channel_owner_user_id=None, deadline=None,
 ):
     """Seleciona caminho atual, debounce ou turno interativo serializado."""
     if buffer_seconds <= 0:
@@ -902,6 +955,7 @@ async def _buffered_bot_turn(
                 contact_id, text, contact_name, wa_id, token, phone_id,
                 channel_id=channel_id,
                 channel_owner_user_id=channel_owner_user_id,
+                deadline=deadline,
             )
             return _BUFFER_SETTLED
         except Exception:
@@ -924,7 +978,9 @@ async def _buffered_bot_turn(
         if not wait_for_quiet:
             return _DeferredBotBuffer(my_token)
         await _buffer_sleep(buffer_seconds)
-        claim = await _claim_buffer_waiting(contact_id, expected_token=my_token)
+        claim = await _claim_buffer_waiting(
+            contact_id, expected_token=my_token, deadline=deadline,
+        )
         if claim.get("status") != "claimed":
             return _BUFFER_SETTLED
         await process_claimed_bot_buffer(
@@ -932,6 +988,7 @@ async def _buffered_bot_turn(
             contact_name, wa_id, token, phone_id,
             channel_id=channel_id,
             channel_owner_user_id=channel_owner_user_id,
+            deadline=deadline,
         )
     except Exception:
         logger.exception(
@@ -948,7 +1005,7 @@ async def _buffered_bot_turn(
     return _BUFFER_SETTLED
 
 
-async def _finish_deferred_payload_buffer(entry, buffer_seconds):
+async def _finish_deferred_payload_buffer(entry, buffer_seconds, deadline=None):
     """Da sleep/claim ao ultimo append real se o candidato previsto falhou.
 
     Exemplo: payload contem texto seguido de audio, mas o audio nao baixa ou
@@ -959,6 +1016,7 @@ async def _finish_deferred_payload_buffer(entry, buffer_seconds):
         await _buffer_sleep(buffer_seconds)
         claim = await _claim_buffer_waiting(
             entry["contact_id"], expected_token=entry["expected_token"],
+            deadline=deadline,
         )
         if claim.get("status") != "claimed":
             return
@@ -972,6 +1030,7 @@ async def _finish_deferred_payload_buffer(entry, buffer_seconds):
             phone_id=entry["phone_id"],
             channel_id=entry.get("channel_id"),
             channel_owner_user_id=entry.get("channel_owner_user_id"),
+            deadline=deadline,
         )
     except Exception:
         # O append ja e duravel e o cron ainda pode recuperar o lote.
@@ -1014,9 +1073,19 @@ async def _process_messages(value, ws_notify_callback, channel=None):
     channel_token = str(channel.get("access_token", "")).strip() if channel else ""
 
     messages = value.get("messages", [])
-    buffer_seconds = _tenant_bot_buffer_seconds()
-    last_buffer_candidate = _last_buffer_candidate_by_sender(messages, buffer_seconds)
+    # Pre-varredura fora do try/except por mensagem: qualquer erro aqui vira
+    # "sem buffer neste payload", nunca excecao no wrapper (pending + was_dup).
+    try:
+        buffer_seconds = _tenant_bot_buffer_seconds()
+        last_buffer_candidate = _last_buffer_candidate_by_sender(messages, buffer_seconds)
+    except Exception:
+        logger.exception("[BOT-BUFFER] pre-varredura falhou; payload segue sem buffer")
+        buffer_seconds = 0.0
+        last_buffer_candidate = {}
     deferred_payload_buffers = {}
+    # Um deadline de parede por request: vale para todos os remetentes do
+    # payload e para o fechamento dos appends deferidos (F02).
+    buffer_deadline = _buffer_default_deadline() if buffer_seconds > 0 else None
 
     for msg_index, msg in enumerate(messages):
         # Normaliza nono digito BR — Meta entrega numero ora com '9' ora sem
@@ -1362,6 +1431,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                         raw_msg_type=raw_msg_type,
                         wait_for_quiet=(last_buffer_candidate.get(wa_id) == msg_index),
                         buffer_seconds=buffer_seconds,
+                        deadline=buffer_deadline,
                         contact_name=contact_name,
                         wa_id=wa_id,
                         token=_bot_token,
@@ -1483,6 +1553,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                                         raw_msg_type=raw_msg_type,
                                         wait_for_quiet=(last_buffer_candidate.get(wa_id) == msg_index),
                                         buffer_seconds=buffer_seconds,
+                                        deadline=buffer_deadline,
                                         contact_name=contact_name,
                                         wa_id=wa_id,
                                         token=_bot_token,
@@ -1537,7 +1608,7 @@ async def _process_messages(value, ws_notify_callback, channel=None):
     # fecha em paralelo o ultimo append que realmente aconteceu por contato.
     if deferred_payload_buffers:
         await asyncio.gather(*(
-            _finish_deferred_payload_buffer(entry, buffer_seconds)
+            _finish_deferred_payload_buffer(entry, buffer_seconds, buffer_deadline)
             for entry in deferred_payload_buffers.values()
         ))
 
