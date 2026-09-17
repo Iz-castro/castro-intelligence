@@ -127,6 +127,9 @@ button { cursor: pointer; }
 }
 
 .crm-topbar {
+  /* O blur cria uma camada propria: eleve a barra para o menu cobrir o conteudo. */
+  position: relative;
+  z-index: 35;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
