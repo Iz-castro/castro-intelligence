@@ -100,6 +100,202 @@
         { "fieldPath": "contact_id", "order": "ASCENDING" },
         { "fieldPath": "created_at", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "qualification", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "qualification", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to", "order": "ASCENDING" },
+        { "fieldPath": "qualification", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "name_normalized", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "phone_e164_digits", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "phone_national", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "phone_local", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "wa_id_reversed", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "name_normalized", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "phone_e164_digits", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "phone_national", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "phone_local", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "wa_id_reversed", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "name_prefixes", "arrayConfig": "CONTAINS" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "name_prefixes", "arrayConfig": "CONTAINS" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "tags", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assigned_to_uid", "order": "ASCENDING" },
+        { "fieldPath": "is_archived", "order": "ASCENDING" },
+        { "fieldPath": "is_backup", "order": "ASCENDING" },
+        { "fieldPath": "tags", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "sort_key", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

@@ -24,7 +24,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field as PydanticField, field_validator
 
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
@@ -1214,6 +1214,334 @@ async def wa_contacts_all(
     total = len(rows)
     rows = rows[:limit]
     return {"contacts": rows, "total": total, "returned": len(rows)}
+
+
+# -- Picker v2.1 (F3): pagina alfabetica + busca indexada ---------------------
+# Spec: docs/PICKER_V2_1_AGENDA_PAGINADA.md. Toda query casa 1:1 com os 20
+# indices da F2c; escopo LGPD do operador = `assigned_to_uid in [uid, ""]`
+# (pos-backfill 2026-09-17 nao existe mais None/ausente — gate §11 provado).
+
+_PICKER_BUDGET = 50          # teto de docs de contato lidos por busca (§6)
+_PICKER_BRANCH_A_LIMIT = 25  # ramo prefixo-do-nome-efetivo
+_PICKER_RATE_WINDOW = 10.0   # janela do rate limit (segundos)
+_PICKER_RATE_MAX = 40        # requests do picker por usuario na janela
+_picker_rate_hits: dict = {}
+
+
+def _picker_throttle(user_key):
+    """Rate limit simples em memoria por usuario (§13) — 1 worker, entao um
+    dict basta. Cada busca custa ate ~50 reads; sem freio, um cliente
+    automatizado extrai a agenda inteira sem custo. Reinicio zera (e freio
+    de abuso, nao quota de billing)."""
+    import time
+    now = time.monotonic()
+    hits = [t for t in _picker_rate_hits.get(user_key, []) if now - t < _PICKER_RATE_WINDOW]
+    if len(hits) >= _PICKER_RATE_MAX:
+        _picker_rate_hits[user_key] = hits
+        raise HTTPException(status_code=429, detail="Muitas buscas seguidas — aguarde alguns segundos.")
+    hits.append(now)
+    _picker_rate_hits[user_key] = hits
+    if len(_picker_rate_hits) > 500:  # higiene: nunca crescer sem teto
+        _picker_rate_hits.clear()
+
+
+def _picker_scope_fp(tid, privileged, uid, owner_id, qualification):
+    """Fingerprint do cursor: amarra a pagina ao tenant + escopo + filtros.
+    Cursor de outro usuario/filtro/tenant vira 400 (IDOR de paginacao)."""
+    import hashlib
+    raw = f"{tid}|{'priv' if privileged else uid}|{owner_id if owner_id is not None else ''}|{qualification or ''}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+_PICKER_CURSOR_TTL = 86400  # 24h — cursor vazado nao vale pra sempre (§7.1)
+
+
+def _picker_cursor_encode(last_id, fp):
+    import base64
+    import json
+    import time
+    return base64.urlsafe_b64encode(
+        json.dumps({"v": 1, "id": last_id, "fp": fp,
+                    "exp": int(time.time()) + _PICKER_CURSOR_TTL}).encode("utf-8")).decode("ascii")
+
+
+def _picker_cursor_decode(cursor, fp_expected):
+    """Cursor opaco POSICIONAL: so {v, last_id, fp, exp} — nenhuma PII viaja
+    no token (emenda a §7.1 da spec; o start_after usa snapshot por 1 read).
+    Revisao F3: id so NUMERICO (id com "/" viraria path aninhado e ValueError
+    500), exp de 24h, e toda falha e o MESMO 400 (sem oraculo de existencia).
+    O ESCOPO do id e validado no start_after (guard de visibilidade em
+    picker_contacts_query) — id de lead alheio tambem cai no mesmo 400,
+    fechando a inferencia de sort_key por binaria com ids enumeraveis."""
+    import base64
+    import json
+    import re as _re
+    import time
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Cursor invalido")
+    if (not isinstance(data, dict) or data.get("v") != 1 or data.get("fp") != fp_expected
+            or not _re.fullmatch(r"[0-9]{1,32}", str(data.get("id") or ""))
+            or not isinstance(data.get("exp"), int) or data["exp"] < time.time()):
+        raise HTTPException(status_code=400, detail="Cursor invalido")
+    return str(data["id"])
+
+
+def _picker_classify_query(raw):
+    """('name', termo_normalizado) | ('phone', digitos) | ('invalid', motivo).
+    Letra em qualquer lugar = nome ('3M' e nome); so digitos+mascara = fone."""
+    import re as _re
+    s = str(raw or "").strip()
+    if not s:
+        return ("invalid", "Digite ao menos 2 letras ou 4 numeros.")
+    if any(ch.isalpha() for ch in s):
+        from database import normalize_search_text
+        norm = normalize_search_text(s)
+        if len(norm.replace(" ", "")) < 2:
+            return ("invalid", "Digite ao menos 2 letras ou 4 numeros.")
+        return ("name", norm)
+    if _re.fullmatch(r"[\d\s\+\-\(\)\.]+", s):
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 4:
+            return ("phone", digits)
+        return ("invalid", "Digite ao menos 2 letras ou 4 numeros.")
+    return ("invalid", "Busca nao reconhecida — use nome ou telefone.")
+
+
+def _picker_phone_plan(digits):
+    """(tenta_exato, [(campo, prefixo, match_kind), ...]) — §6.3: prefixo no
+    campo compativel com o formato digitado + SEMPRE o sufixo via invertido.
+    Revisao F3: 4-9 digitos sao AMBIGUOS (DDD+inicio OU parte local) -> os
+    DOIS ramos de prefixo; so o sufixo deixava `98344` sem resultado e
+    convidava a criar contato duplicado (padrao do incidente de 24/08).
+    12+ digitos (com ou sem 55) casam o prefixo do E.164 (nao-BR incluso)."""
+    plan = []
+    if len(digits) >= 12:
+        plan.append(("phone_e164_digits", digits, "phone_national_prefix"))
+    elif 10 <= len(digits) <= 11:
+        plan.append(("phone_national", digits, "phone_national_prefix"))
+    else:  # 4..9 digitos
+        plan.append(("phone_national", digits, "phone_national_prefix"))
+        plan.append(("phone_local", digits, "phone_local_prefix"))
+    plan.append(("wa_id_reversed", digits[::-1], "phone_suffix"))
+    return (len(digits) >= 10, plan)
+
+
+_PICKER_MATCH_PRIORITY = {
+    "phone_exact": 0, "declared_name_exact": 1, "whatsapp_profile_name_exact": 2,
+    "name_full_prefix": 3, "name_token_prefix": 4, "phone_national_prefix": 5,
+    "phone_local_prefix": 6, "phone_suffix": 7,
+}
+
+
+def _picker_rank(rows):
+    """Ordem deterministica da busca (§6.4): tier do match > sort_key > id."""
+    rows.sort(key=lambda r: (_PICKER_MATCH_PRIORITY.get(r.get("match_kind"), 9),
+                             str(r.get("sort_key") or ""), str(r.get("id"))))
+    return rows
+
+
+def _picker_name_match_kind(row, norm_q, words):
+    """match_kind do ramo de nome + validacao AND multi-palavra: toda palavra
+    digitada precisa ser prefixo de alguma palavra de algum alias."""
+    from database import normalize_search_text
+    alias_words = set()
+    declared = normalize_search_text(row.get("declared_name") or "")
+    wpn = normalize_search_text(row.get("whatsapp_profile_name") or "")
+    for alias in (declared, wpn, normalize_search_text(row.get("display_name") or "")):
+        alias_words.update(alias.split())
+    if not all(any(aw.startswith(t) for aw in alias_words) for t in words):
+        return None
+    if declared and declared == norm_q:
+        return "declared_name_exact"
+    if wpn and wpn == norm_q:
+        return "whatsapp_profile_name_exact"
+    if str(row.get("name_normalized") or "").startswith(norm_q):
+        return "name_full_prefix"
+    return "name_token_prefix"
+
+
+def _picker_row_visible(row, privileged, uid):
+    """MESMO predicado das queries (`assigned_to_uid in [uid, ""]`), aplicado
+    a docs vindos de LOOKUP direto (fone exato, cursor): numero existente sem
+    acesso = indistinguivel de inexistente. Revisao F3: uid None NAO e mais
+    visivel — a query tambem nao o retorna (pos-backfill nao existe None;
+    se um import futuro reintroduzir, as camadas negam JUNTAS em vez de o
+    lookup vazar o que a paginacao esconde)."""
+    if not row or int(row.get("is_archived") or 0) or row.get("is_backup"):
+        return False
+    if privileged:
+        return True
+    a = row.get("assigned_to_uid")
+    return a == uid or a == ""
+
+
+@app.get("/api/wa/contacts/picker")
+async def wa_contacts_picker(
+    response: Response,
+    page_size: int = Query(default=50, ge=1, le=50),
+    cursor: str = Query(default=""),
+    owner_id: int | None = Query(default=None),
+    qualification: str = Query(default=""),
+    current_user: dict = Depends(get_current_user),
+):
+    """Picker v2.1 — modo PAGINA: agenda alfabetica (sort_key: nomes antes de
+    telefones) em blocos de ate 50, cursor opaco. Filtros de dono (so
+    privilegiado) e qualificacao entram NA QUERY, antes do limit (§8)."""
+    from database import enrich_picker_rows, picker_contacts_query
+    # §13: pagina carrega nome+fone de ate 50 leads e as maquinas sao
+    # compartilhadas — nunca deixar o browser guardar em disco.
+    response.headers["Cache-Control"] = "private, no-store"
+    privileged = can_see_all_tenant(current_user)
+    uid = str(current_user.get("firebase_uid") or "")
+    if owner_id is not None and not privileged:
+        raise HTTPException(status_code=403, detail="Filtro de dono e restrito a supervisao.")
+    if not privileged and not uid:
+        raise HTTPException(status_code=403, detail="Sessao sem identidade de operador.")
+    _picker_throttle(f"page|{current_user.get('id')}")
+    qualification = qualification.strip()
+    if qualification and qualification not in set(QUALIFICATION_OPTIONS) | {"novo"}:
+        raise HTTPException(status_code=400, detail="Qualificacao invalida.")
+    from firestore_common import get_tenant_context as _get_tid
+    fp = _picker_scope_fp(_get_tid() or "", privileged, uid, owner_id, qualification)
+    start_after_id = _picker_cursor_decode(cursor, fp) if cursor else None
+    rows = picker_contacts_query(
+        scope_uid=None if privileged else uid,
+        owner_id=owner_id, qualification=qualification or None,
+        order_by_field="sort_key", start_after_id=start_after_id,
+        # Revisao F3: cursor com id de lead FORA do escopo = mesmo 400 do
+        # cursor invalido (senao ids enumeraveis viram oraculo de sort_key).
+        start_after_guard=(lambda row: _picker_row_visible(row, privileged, uid)),
+        limit=page_size + 1,
+    )
+    if rows is None:
+        raise HTTPException(status_code=400, detail="Cursor invalido")
+    has_more = len(rows) > page_size
+    rows = rows[:page_size]
+    next_cursor = _picker_cursor_encode(str(rows[-1]["id"]), fp) if (has_more and rows) else None
+    return {"contacts": enrich_picker_rows(rows), "next_cursor": next_cursor,
+            "has_more": has_more, "mode": "page"}
+
+
+class PickerSearchRequest(BaseModel):
+    # max_length e obrigatorio (revisao F3): o caminho normalize+match e CPU
+    # sincrono no worker UNICO que tambem da ACK no /webhook — um termo de
+    # MBs bloquearia o event loop alem da janela de reentrega da Meta (~23s).
+    q: str = PydanticField(min_length=1, max_length=120)
+    limit: int = 30
+
+
+@app.post("/api/wa/contacts/picker/search")
+async def wa_contacts_picker_search(
+    body: PickerSearchRequest,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+):
+    """Picker v2.1 — modo BUSCA (POST: termo nunca em URL/log — §13). Nome:
+    prefixo do nome efetivo + prefixo de palavra/alias (AND multi-palavra no
+    backend). Fone: exato (wa_contact_index) + prefixo por formato + sufixo.
+    Orcamento global de docs (~50) repartido entre os ramos; sem paginacao
+    (ate 50 melhores, truncated orienta a digitar mais). v1: sem filtros de
+    dono/qualificacao na busca (so no modo pagina)."""
+    from database import (enrich_picker_rows, normalize_search_text,
+                          picker_contacts_query, wa_id_variants)
+    from database import normalize_br_phone as _norm_fone
+    response.headers["Cache-Control"] = "private, no-store"  # §13
+    privileged = can_see_all_tenant(current_user)
+    uid = str(current_user.get("firebase_uid") or "")
+    if not privileged and not uid:
+        raise HTTPException(status_code=403, detail="Sessao sem identidade de operador.")
+    _picker_throttle(f"search|{current_user.get('id')}")
+    limit = max(1, min(int(body.limit or 30), 50))
+    mode, term = _picker_classify_query(body.q)
+    if mode == "invalid":
+        raise HTTPException(status_code=400, detail=term)
+    scope_uid = None if privileged else uid
+    seen: dict = {}
+    truncated = False
+
+    if mode == "name":
+        # Revisao F3: o [:15] vale SO pro alvo do array_contains (o indexador
+        # so grava prefixos ate 15); a validacao AND usa as palavras CRUAS —
+        # validar truncado aprovava "constantinopolaaa" via "constantinopol".
+        raw_words = term.split()[:6]
+        alvo = max((w[:15] for w in raw_words), key=len)
+        # Ramo A — prefixo do nome efetivo inteiro.
+        rows_a = picker_contacts_query(
+            scope_uid=scope_uid, range_field="name_normalized",
+            range_start=term, range_end=term + "",
+            limit=_PICKER_BRANCH_A_LIMIT,
+        ) or []
+        truncated = truncated or len(rows_a) >= _PICKER_BRANCH_A_LIMIT
+        # Ramo B — prefixo de QUALQUER palavra/alias: array_contains na
+        # palavra mais seletiva (mais longa); AND das demais no backend.
+        restante = max(1, _PICKER_BUDGET - len(rows_a))
+        rows_b = picker_contacts_query(
+            scope_uid=scope_uid, array_field="name_prefixes", array_value=alvo,
+            limit=restante,
+        ) or []
+        truncated = truncated or len(rows_b) >= restante
+        for r in rows_a + rows_b:
+            if r["id"] in seen:
+                continue
+            kind = _picker_name_match_kind(r, term, raw_words)
+            if kind is None:
+                continue  # nao casa todas as palavras (candidato do ramo B)
+            r["match_kind"] = kind
+            seen[r["id"]] = r
+    else:
+        digits = term
+        tenta_exato, plan = _picker_phone_plan(digits)
+        # Exato via wa_contact_index (variantes com/sem o 9): 2 point-reads
+        # por variante; numero sem acesso = como se nao existisse. Os reads
+        # auxiliares DEBITAM do orcamento (revisao F3: §6 conta point-reads).
+        gastos = 0
+        if tenta_exato:
+            completo = digits if digits.startswith("55") else f"55{digits}"
+            for cand in wa_id_variants(_norm_fone(completo)):
+                idx = fs_document("wa_contact_index", cand).get()
+                gastos += 1
+                if not idx.exists:
+                    continue
+                cid = (idx.to_dict() or {}).get("contact_id")
+                if cid is None or cid in seen:
+                    continue
+                snap = fs_document("wa_contacts", cid).get()
+                gastos += 1
+                row = snap.to_dict() if snap.exists else None
+                if row is not None:
+                    row.setdefault("id", cid)
+                if _picker_row_visible(row, privileged, uid):
+                    row["match_kind"] = "phone_exact"
+                    seen[row["id"]] = row
+        # Prefixo por formato + sufixo, repartindo o orcamento restante.
+        restante = max(0, _PICKER_BUDGET - gastos - len(seen))
+        por_ramo = max(1, restante // max(1, len(plan)))
+        for campo, prefixo, kind in plan:
+            if restante <= 0:
+                truncated = True  # sobrou ramo sem orcamento -> incompleto
+                break
+            lim = min(por_ramo, restante)
+            rows_r = picker_contacts_query(
+                scope_uid=scope_uid, range_field=campo,
+                range_start=prefixo, range_end=prefixo + "",
+                limit=lim,
+            ) or []
+            restante -= len(rows_r)
+            truncated = truncated or len(rows_r) >= lim
+            for r in rows_r:
+                if r["id"] not in seen:
+                    r["match_kind"] = kind
+                    seen[r["id"]] = r
+
+    ranked = _picker_rank(list(seen.values()))
+    truncated = truncated or len(ranked) > limit
+    ranked = ranked[:limit]
+    logger.info("picker-search: modo=%s ramos_ok resultados=%s truncated=%s",
+                mode, len(ranked), truncated)  # NUNCA logar o termo (§13)
+    return {"contacts": enrich_picker_rows(ranked), "mode": "search",
+            "truncated": truncated}
 
 
 @app.post("/api/wa/conversation/open")
@@ -4092,6 +4420,23 @@ def _validate_transfer_department(to_department_id):
         raise HTTPException(status_code=400, detail="Setor destino invalido ou inativo")
 
 
+def _require_target_user_with_uid(to_user_id):
+    """Guard LGPD (revisao F3): atribuir lead a usuario SEM firebase_uid
+    gravaria assigned_to_uid="" — e "" e POOL na query nova do picker
+    (`in [uid, ""]`) e no _require_contact_access, ou seja, o lead "com
+    dono" ficaria visivel/assumivel por TODA a equipe. Docs de usuario
+    nascem com uid vazio ate o primeiro login (sync_user_identity)."""
+    to_user = get_user_by_id(to_user_id)
+    if not to_user:
+        raise HTTPException(status_code=404, detail="Operador destino nao encontrado")
+    if not str(to_user.get("firebase_uid") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="O operador destino ainda nao fez o primeiro login no sistema — "
+                   "atribuir agora deixaria o lead visivel a toda a equipe.")
+    return to_user
+
+
 @app.post("/api/wa/transfer")
 async def wa_transfer(request: Request, current_user: dict = Depends(get_current_user)):
     ensure_permission(current_user, "transferir_atendimento")
@@ -4120,6 +4465,9 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
     _validate_transfer_department(to_department_id)
 
     conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
+    # Guard ANTES de qualquer write (depois do resolve: thread inexistente
+    # continua respondendo 404 primeiro).
+    _require_target_user_with_uid(to_user_id)
 
     # Fase 2C: transferencia atua na conversation. Quando vier so contact_id
     # (legado), assign_wa_contact espelha em todas as conversations do contato
@@ -4184,6 +4532,7 @@ async def admin_reassign_lead(request: Request, current_user: dict = Depends(get
     if not to_user_id:
         raise HTTPException(status_code=400, detail="Selecione o operador destino")
     _validate_transfer_department(to_department_id)
+    _require_target_user_with_uid(to_user_id)
     result = assign_wa_contact(contact_id, to_user_id, to_department_id, current_user["id"], reason, summary)
     if result is None:
         raise HTTPException(status_code=404, detail="Contato nao encontrado")

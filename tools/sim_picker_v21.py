@@ -144,6 +144,128 @@ def run():
           "update parcial recalcula do doc inteiro")
     check("aninha"[:2] in merged["name_prefixes"], "alias antigo preservado no recalculo")
 
+    # ------------------------------------------------------------------
+    # F3 — helpers puros dos endpoints do picker (main.py)
+    # ------------------------------------------------------------------
+    import main
+
+    print("\n== F3: classificador de busca ==")
+    check(main._picker_classify_query("João Silva") == ("name", "joao silva"),
+          "nome com acento normaliza")
+    check(main._picker_classify_query("3M") == ("name", "3m"), "3M e nome (tem letra)")
+    check(main._picker_classify_query("(31) 98344-0484")[0] == "phone"
+          and main._picker_classify_query("(31) 98344-0484")[1] == "31983440484",
+          "mascara de fone vira digitos")
+    check(main._picker_classify_query("0484")[0] == "phone", "4 digitos = fone")
+    check(main._picker_classify_query("048")[0] == "invalid", "3 digitos = invalido")
+    check(main._picker_classify_query("a")[0] == "invalid", "1 letra = invalido")
+    check(main._picker_classify_query("  ")[0] == "invalid", "vazio = invalido")
+    check(main._picker_classify_query("@#!")[0] == "invalid", "simbolos = invalido")
+
+    print("\n== F3: cursor opaco posicional ==")
+    import base64 as _b64
+    import json as _json
+    import time as _time
+    fp = main._picker_scope_fp("varizemed", False, "uidX", None, "")
+    cur = main._picker_cursor_encode("123", fp)
+    check(main._picker_cursor_decode(cur, fp) == "123", "roundtrip encode/decode")
+    # O token e posicional (id viaja, base64 nao e sigilo) — a defesa NAO e
+    # opacidade: e fp + id numerico + exp no decode, e o guard de visibilidade
+    # no start_after (id de lead alheio = mesmo 400). Nunca PII no token.
+    check("uidX" not in cur and "varizemed" not in cur,
+          "token nao carrega uid/tenant em claro (fp e hash)")
+
+    def _forja(patch):
+        data = _json.loads(_b64.urlsafe_b64decode(cur.encode("ascii")).decode("utf-8"))
+        data.update(patch)
+        return _b64.urlsafe_b64encode(_json.dumps(data).encode("utf-8")).decode("ascii")
+
+    fp2 = main._picker_scope_fp("varizemed", False, "uidX", 4, "")
+    casos = (
+        (cur, fp2, "cursor de OUTRO filtro (fp diverge) -> 400"),
+        ("lixo-nao-base64", fp, "cursor lixo -> 400"),
+        (_forja({"id": "abc/def"}), fp, "id nao-numerico/path -> 400 (nunca ValueError 500)"),
+        (_forja({"id": {"x": 1}}), fp, "id nao-string -> 400"),
+        (_forja({"exp": int(_time.time()) - 10}), fp, "cursor expirado -> 400"),
+        (_forja({"exp": "9999999999"}), fp, "exp nao-inteiro -> 400"),
+    )
+    for bad, fp_use, label in casos:
+        try:
+            main._picker_cursor_decode(bad, fp_use)
+            check(False, label)
+        except main.HTTPException as e:
+            check(e.status_code == 400, label)
+    check(main._picker_cursor_decode(_forja({"id": "9999"}), fp) == "9999",
+          "id adulterado NUMERICO passa o decode — e o guard de visibilidade "
+          "no start_after que nega (testado em _picker_row_visible)")
+    check(main._picker_scope_fp("hubloc", False, "uidX", None, "") != fp,
+          "fp amarra o tenant (cursor cross-tenant nao valida)")
+
+    print("\n== F3: plano de busca por fone ==")
+    ex, plan = main._picker_phone_plan("5531983440484")
+    check(ex and plan[0][0] == "phone_e164_digits" and plan[-1][0] == "wa_id_reversed",
+          "55+13dig: e164 + sufixo, tenta exato")
+    ex, plan = main._picker_phone_plan("441234567890")
+    check(ex and plan[0][0] == "phone_e164_digits",
+          "12+ digitos NAO-BR tambem casa prefixo do e164 (revisao F3)")
+    ex, plan = main._picker_phone_plan("31983440484")
+    check(ex and plan[0][0] == "phone_national", "DDD+local: national + exato")
+    # Revisao F3: 4-9 digitos sao ambiguos (DDD+inicio OU parte local) ->
+    # OS DOIS ramos de prefixo; so o sufixo deixava `98344` sem resultado.
+    ex, plan = main._picker_phone_plan("98344048")
+    check(not ex and [c for c, _p, _k in plan] == ["phone_national", "phone_local", "wa_id_reversed"],
+          "8 digitos: prefixo national + local + sufixo, sem exato")
+    ex, plan = main._picker_phone_plan("98344")
+    check(not ex and [c for c, _p, _k in plan] == ["phone_national", "phone_local", "wa_id_reversed"]
+          and plan[1][1] == "98344",
+          "5 digitos (comeco do numero): ramo de PREFIXO existe (guia promete)")
+    ex, plan = main._picker_phone_plan("0484")
+    check(not ex and len(plan) == 3 and plan[-1][0] == "wa_id_reversed"
+          and plan[-1][1] == "4840", "4 digitos: prefixos + sufixo invertido")
+
+    print("\n== F3: ranking deterministico ==")
+    rows = [
+        {"id": 3, "match_kind": "phone_suffix", "sort_key": "0_a"},
+        {"id": 1, "match_kind": "phone_exact", "sort_key": "0_z"},
+        {"id": 2, "match_kind": "name_full_prefix", "sort_key": "0_b"},
+        {"id": 4, "match_kind": "name_full_prefix", "sort_key": "0_a"},
+    ]
+    ranked = main._picker_rank(rows)
+    check([r["id"] for r in ranked] == [1, 4, 2, 3],
+          "fone exato > prefixo de nome (sort_key desempata) > sufixo")
+
+    print("\n== F3: match de nome multi-palavra + visibilidade ==")
+    row = {"declared_name": "João Silva", "whatsapp_profile_name": "Jo do Zap",
+           "display_name": "João Silva", "name_normalized": "joao silva"}
+    check(main._picker_name_match_kind(row, "joao silva", ["joao", "silva"]) == "declared_name_exact",
+          "igualdade com o declarado = exact")
+    check(main._picker_name_match_kind(row, "joao si", ["joao", "si"]) == "name_full_prefix",
+          "prefixo do nome efetivo")
+    check(main._picker_name_match_kind(row, "sil", ["sil"]) == "name_token_prefix",
+          "prefixo de sobrenome (via alias)")
+    check(main._picker_name_match_kind(row, "joao pereira", ["joao", "pereira"]) is None,
+          "AND multi-palavra: palavra sem match derruba o candidato")
+    # Revisao F3: validacao AND recebe a palavra CRUA (sem [:15]) — truncar
+    # aprovava 'constantinopolaa' (16 chars) por 'constantinopolis'.
+    row16 = {"declared_name": "Constantinopolis Ltda", "whatsapp_profile_name": "",
+             "display_name": "Constantinopolis Ltda",
+             "name_normalized": "constantinopolis ltda"}
+    check(main._picker_name_match_kind(row16, "constantinopolaa", ["constantinopolaa"]) is None,
+          "palavra 16+ chars valida INTEIRA (nao so os 15 do indice)")
+    check(main._picker_name_match_kind(row16, "constantinopolis", ["constantinopolis"]) is not None,
+          "palavra 16 chars correta segue casando")
+    check(main._picker_row_visible({"assigned_to_uid": ""}, False, "u1"), "pool visivel ao operador")
+    check(main._picker_row_visible({"assigned_to_uid": "u1"}, False, "u1"), "proprio visivel")
+    check(not main._picker_row_visible({"assigned_to_uid": "u2"}, False, "u1"),
+          "lead de colega INVISIVEL (fone exato nao vaza existencia)")
+    check(not main._picker_row_visible({"assigned_to_uid": None}, False, "u1"),
+          "uid None INVISIVEL (revisao F3: lookup alinhado a query `in [uid,\"\"]` "
+          "— se um import reintroduzir None, as camadas negam juntas)")
+    check(not main._picker_row_visible({"assigned_to_uid": "u2", "is_backup": True}, True, ""),
+          "backup invisivel ate pra privilegiado")
+    check(not main._picker_row_visible({"assigned_to_uid": "", "is_archived": 1}, True, ""),
+          "arquivado invisivel")
+
     print("\n" + "=" * 60)
     if FAILS:
         print(f"RESULTADO: {len(FAILS)} de {CHECKS} asserts FALHARAM:")

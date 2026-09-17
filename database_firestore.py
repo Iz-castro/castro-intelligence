@@ -13,6 +13,7 @@ from firestore_common import (
     collection,
     document,
     get_firestore_client,
+    get_tenant_context,
     next_sequence,
     normalize_record,
     utcnow,
@@ -379,28 +380,42 @@ def _sort_records(records, field_name, reverse=False):
     )
 
 
+# Caches de processo chaveados por (tenant, id): ids de usuario/setor saem de
+# contador POR TENANT, entao user 3 do hubloc e user 3 da varizemed colidem no
+# mesmo worker — chave so pelo id exibia nome de operadora de OUTRO tenant
+# (achado da revisao F3; o processo serve os 3 tenants ativos).
 _user_cache = {}
 _department_cache = {}
 
 
 def _user_map(user_ids):
+    tid = get_tenant_context() or ""
     unique_ids = {uid for uid in user_ids if uid}
-    missing = unique_ids - _user_cache.keys()
-    for user_id in missing:
-        user = _get_doc("users", user_id)
-        if user:
-            _user_cache[user_id] = user
-    return {uid: _user_cache[uid] for uid in unique_ids if uid in _user_cache}
+    out = {}
+    for user_id in unique_ids:
+        key = (tid, user_id)
+        if key not in _user_cache:
+            user = _get_doc("users", user_id)
+            if user:
+                _user_cache[key] = user
+        if key in _user_cache:
+            out[user_id] = _user_cache[key]
+    return out
 
 
 def _department_map(department_ids):
+    tid = get_tenant_context() or ""
     unique_ids = {did for did in department_ids if did}
-    missing = unique_ids - _department_cache.keys()
-    for department_id in missing:
-        department = _get_doc("departments", department_id)
-        if department:
-            _department_cache[department_id] = department
-    return {did: _department_cache[did] for did in unique_ids if did in _department_cache}
+    out = {}
+    for department_id in unique_ids:
+        key = (tid, department_id)
+        if key not in _department_cache:
+            department = _get_doc("departments", department_id)
+            if department:
+                _department_cache[key] = department
+        if key in _department_cache:
+            out[department_id] = _department_cache[key]
+    return out
 
 
 def invalidate_caches():
@@ -551,7 +566,7 @@ def update_department(department_id, name=None, description=None, is_active=None
         return False, "Nenhum campo para atualizar"
     fields["updated_at"] = utcnow()
     document("departments", department_id).set(fields, merge=True)
-    _department_cache.pop(department_id, None)
+    _department_cache.pop((get_tenant_context() or "", department_id), None)
     return True, None
 
 
@@ -560,7 +575,7 @@ def deactivate_department(department_id):
         "is_active": 0,
         "updated_at": utcnow(),
     }, merge=True)
-    _department_cache.pop(department_id, None)
+    _department_cache.pop((get_tenant_context() or "", department_id), None)
     return True
 
 
@@ -2773,6 +2788,83 @@ def count_wa_contacts_scoped_for_user(user_id):
         res = query.count(alias="n").get()
         total += int(res[0][0].value)
     return total
+
+
+def picker_contacts_query(scope_uid=None, owner_id=None, qualification=None,
+                          range_field=None, range_start=None, range_end=None,
+                          array_field=None, array_value=None,
+                          order_by_field=None, start_after_id=None,
+                          start_after_guard=None, limit=51):
+    """Executor UNICO das queries do picker v2.1 (F3). Toda query e:
+    igualdades fixas (is_archived==0 + is_backup==False) [+ escopo do
+    operador via `assigned_to_uid in [uid, ""]` — pos-backfill nao existe
+    mais None/ausente] [+ assigned_to ==] [+ qualification ==] + no maximo
+    1 array_contains + no maximo 1 range + orderBy — casando 1:1 com os 20
+    indices compostos da F2c (escopo COLLECTION). Cursor posicional por
+    snapshot (start_after) — o desempate por __name__ e implicito.
+
+    start_after_guard (revisao F3): predicado sobre o dict do doc do cursor;
+    False = trata como cursor invalido. O caller passa a visibilidade do
+    usuario — sem isso, trocar o id dentro de um cursor legitimo (fp e do
+    proprio escopo) posiciona a pagina por um lead ALHEIO e vaza o sort_key
+    (nome/telefone) dele por busca binaria.
+
+    Retorna lista de dicts crus (caller enriquece/formata) ou None se o
+    cursor nao serve (id inexistente, invisivel ou sem o campo de ordem —
+    o caller responde o MESMO 400 pra todos, sem oraculo)."""
+    col = collection("wa_contacts")
+    q = col.where("is_archived", "==", 0).where("is_backup", "==", False)
+    if scope_uid is not None:
+        q = q.where("assigned_to_uid", "in", [scope_uid, ""])
+    if owner_id is not None:
+        q = q.where("assigned_to", "==", owner_id)
+    if qualification:
+        q = q.where("qualification", "==", qualification)
+    if array_field:
+        q = q.where(array_field, "array_contains", array_value)
+    if range_field:
+        q = q.where(range_field, ">=", range_start).where(range_field, "<=", range_end)
+        q = q.order_by(range_field)
+    elif order_by_field:
+        q = q.order_by(order_by_field)
+    if start_after_id is not None:
+        snap = document("wa_contacts", start_after_id).get()
+        if not snap.exists:
+            return None
+        cursor_row = snap.to_dict() or {}
+        # Doc sem o campo de ordem quebraria o start_after com ValueError.
+        if (range_field or order_by_field) and cursor_row.get(range_field or order_by_field) is None:
+            return None
+        if start_after_guard is not None and not start_after_guard(cursor_row):
+            return None
+        q = q.start_after(snap)
+    rows = []
+    for snapshot in q.limit(limit).stream():
+        d = snapshot.to_dict() or {}
+        d.setdefault("id", snapshot.id)
+        rows.append(d)
+    return rows
+
+
+def enrich_picker_rows(rows):
+    """Payload MINIMO do card do picker (v2.1 §5.2): so o necessario pra
+    exibir e abrir a conversa — nunca notes/tags/consentimento. 1 lookup
+    de users por pagina (nao por linha)."""
+    users = _user_map([r.get("assigned_to") for r in rows])
+    out = []
+    for r in rows:
+        u = users.get(r.get("assigned_to"))
+        out.append({
+            "id": r.get("id"),
+            "display_name": r.get("display_name") or r.get("phone_formatted") or "",
+            "phone_formatted": r.get("phone_formatted") or "",
+            "qualification": r.get("qualification") or "novo",
+            "assigned_to": r.get("assigned_to"),
+            "assigned_name": (u or {}).get("display_name", "") if u else "",
+            "channel_id": r.get("channel_id"),
+            "match_kind": r.get("match_kind", ""),
+        })
+    return out
 
 
 def insert_transfer_system_message(contact_id, content, operator_id=None,
