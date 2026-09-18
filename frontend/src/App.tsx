@@ -204,7 +204,7 @@ function NavBar() {
 type ContactPickerMode = "list" | "create";
 
 function NewContactModal({ onClose }: { onClose: () => void }) {
-  const { createManualContact, busyCreateContact, channels, loadAllContacts, pickerPage, pickerSearch, countAllContacts, openConversationForContact, operators, sessionUser, canSeeAll, systemSettings, settingsLoaded } = useCrm();
+  const { createManualContact, busyCreateContact, channels, loadAllContacts, pickerPage, pickerSearch, pickerByTag, countAllContacts, openConversationForContact, operators, sessionUser, canSeeAll, can, systemSettings, userSettings, settingsLoaded } = useCrm();
   const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -252,6 +252,28 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
   const searchNowRef = useRef(false);
   // Recarga forcada da pagina 1 (cursor expirado no Ver mais -> 400).
   const [pageNonce, setPageNonce] = useState(0);
+  // Preserva o hint ("A lista expirou...") por UMA recarga — o effect de
+  // pagina limpava a mensagem no mesmo batch e ela nunca era lida.
+  const keepHintRef = useRef(false);
+  // F5: filtro por tag ("" = desligado). Tag e EXCLUSIVA com busca e com os
+  // filtros de dono/qualificacao (v1 nao tem indice combinando) — escolher
+  // um lado limpa o outro, simetricamente. Gate DUPLO (revisao F5): flag
+  // por tenant + toggle RBAC (tag pode ser dado de saude — agregacao so
+  // pra quem a supervisao liberar no perfil).
+  const [v2Tag, setV2Tag] = useState("");
+  const v2TagAllowed = pickerV2 && systemSettings.picker_tag_filter_enabled && can("filtrar_leads_por_tag");
+  // Mesmos helpers da sidebar/painel (precedencia global-vence-pessoal e
+  // rotulo) — revisao F5: a copia local divergiria em silencio.
+  const v2TagMeta = buildTagMeta(systemSettings.tags_global, userSettings.tags);
+  const v2TagOptions = buildTagOptions(systemSettings.tags_global, userSettings.tags);
+  const v2TagLabel = v2TagMeta.get(v2Tag)?.label || v2Tag;
+  // Guard do filtro fantasma (mesma licao da Revisao B na sidebar): se a
+  // tag selecionada deixa de ser selecionavel (registry mudou, flag/RBAC
+  // desligou), limpa em vez de filtrar sem controle visivel.
+  useEffect(() => {
+    if (v2Tag && (!v2TagAllowed || !v2TagOptions.some((t) => t.slug === v2Tag))) setV2Tag("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [v2Tag, v2TagAllowed, systemSettings.tags_global, userSettings.tags]);
 
   function v2ErrorText(e: unknown): string {
     if (e instanceof ApiError && e.status === 429) {
@@ -294,8 +316,10 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     const seq = ++v2PageSeq.current;
     setV2Rows([]); setV2Cursor(null); setV2HasMore(false);
     setLoadingList(true);
-    setV2Hint("");
-    void pickerPage({ ownerId: canSeeAll ? ownerFilter : null, qualification: qualFilter })
+    if (!keepHintRef.current) setV2Hint("");
+    keepHintRef.current = false;
+    // F5: com tag ativa a pagina vem do by-tag (POST, mesmo shape).
+    void (v2Tag ? pickerByTag(v2Tag) : pickerPage({ ownerId: canSeeAll ? ownerFilter : null, qualification: qualFilter }))
       .then((r) => {
         if (seq !== v2PageSeq.current) return;
         setV2Rows(r.contacts); setV2Cursor(r.next_cursor); setV2HasMore(r.has_more);
@@ -303,7 +327,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
       .catch((e) => { if (seq === v2PageSeq.current) setV2Hint(v2ErrorText(e)); })
       .finally(() => { setLoadingList(false); });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pickerV2, mode, ownerFilter, qualFilter, canSeeAll, pageNonce]);
+  }, [pickerV2, mode, ownerFilter, qualFilter, canSeeAll, pageNonce, v2Tag]);
 
   // v2: busca server-side com debounce (Enter = imediato via searchNonce).
   // Termo curto = so dica local (regra espelha o classificador do backend:
@@ -343,7 +367,9 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     const seq = ++v2PageSeq.current;
     setV2LoadingMore(true);
     try {
-      const r = await pickerPage({ cursor: v2Cursor, ownerId: canSeeAll ? ownerFilter : null, qualification: qualFilter });
+      const r = v2Tag
+        ? await pickerByTag(v2Tag, v2Cursor)
+        : await pickerPage({ cursor: v2Cursor, ownerId: canSeeAll ? ownerFilter : null, qualification: qualFilter });
       if (seq !== v2PageSeq.current) return;
       setV2Rows((prev) => { const ids = new Set(prev.map((x) => x.id)); return [...prev, ...r.contacts.filter((x) => !ids.has(x.id))]; });
       setV2Cursor(r.next_cursor); setV2HasMore(r.has_more);
@@ -352,6 +378,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
         if (e instanceof ApiError && e.status === 400) {
           // Cursor expirado (TTL 24h) ou de outro filtro: recomeca do A.
           setV2Hint("A lista expirou — recarregando do inicio.");
+          keepHintRef.current = true;
           setPageNonce((n) => n + 1);
         } else {
           setV2Hint(v2ErrorText(e));
@@ -448,16 +475,18 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             {pickerV2
               ? (v2SearchRows != null
                 ? `Resultados da busca (${v2List.length}${v2Truncated ? "+" : ""})`
-                : filtersActive
-                  ? `Filtrados (${v2List.length}${v2HasMore ? "+" : ""}) de ${total}`
-                  : `Total de contatos (${total})`)
+                : v2Tag
+                  ? `Com a tag "${v2TagLabel}" (${v2List.length}${v2HasMore ? "+" : ""})`
+                  : filtersActive
+                    ? `Filtrados (${v2List.length}${v2HasMore ? "+" : ""}) de ${total}`
+                    : `Total de contatos (${total})`)
               : `Total de contatos (${filtersActive ? visibleContacts.length : total})`}
           </p>
         </div>
-        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.75rem" }}>
           <input
             value={search}
-            onChange={(e) => setSearchLocal(e.target.value)}
+            onChange={(e) => { setSearchLocal(e.target.value); if (pickerV2 && v2Tag && e.target.value.trim()) setV2Tag(""); }}
             onKeyDown={(e) => {
               if (pickerV2 && e.key === "Enter") {
                 e.preventDefault();
@@ -469,9 +498,9 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             maxLength={120}
             aria-describedby={pickerV2 ? "picker-v2-hint" : undefined}
             autoFocus
-            style={{ flex: 1, minWidth: 0 }}
+            style={{ flex: 1, minWidth: "12rem" }}
           />
-          <select value={qualFilter} onChange={(e) => setQualFilter(e.target.value)} title="Filtrar por qualificacao" aria-label="Filtrar por qualificacao" style={{ width: "auto", flexShrink: 0 }}>
+          <select value={qualFilter} onChange={(e) => { setQualFilter(e.target.value); setV2Tag(""); }} title="Filtrar por qualificacao" aria-label="Filtrar por qualificacao" style={{ width: "auto", flexShrink: 0 }}>
             <option value="">Todos</option>
             <option value="novo">Novo</option>
             <option value="em_atendimento">Em atend.</option>
@@ -480,6 +509,27 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             <option value="convertido">Convertido</option>
             <option value="nao_convertido">Nao convertido</option>
           </select>
+          {v2TagAllowed && v2TagOptions.length > 0 ? (
+            <select
+              value={v2Tag}
+              onChange={(e) => {
+                const s = e.target.value;
+                setV2Tag(s);
+                if (s) {
+                  // Troca de modo no MESMO commit (revisao F5): sem isso um
+                  // frame renderiza a tag nova com o header da busca velha.
+                  setSearchLocal(""); setV2SearchRows(null); setV2Truncated(false);
+                  setOwnerFilter(null); setQualFilter("");
+                }
+              }}
+              title="Filtrar por tag (nao combina com busca nem com os outros filtros)"
+              aria-label="Filtrar por tag"
+              style={{ width: "auto", flexShrink: 0, maxWidth: "10rem" }}
+            >
+              <option value="">🏷 Todas as tags</option>
+              {v2TagOptions.map((t) => <option key={t.slug} value={t.slug}>{t.label || t.slug}</option>)}
+            </select>
+          ) : null}
         </div>
         <button
           type="button"
@@ -491,11 +541,11 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
         </button>
         {canSeeAll && operators.length > 0 ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", marginBottom: "0.6rem" }}>
-            <button type="button" className={ownerFilter === sessionUser?.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(sessionUser?.id ?? null)}>Meus</button>
+            <button type="button" className={ownerFilter === sessionUser?.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => { setOwnerFilter(sessionUser?.id ?? null); setV2Tag(""); }}>Meus</button>
             {operators.filter((o) => o.id !== sessionUser?.id).map((o) => (
-              <button key={o.id} type="button" className={ownerFilter === o.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(o.id)} title={o.display_name}>{o.display_name.split(" ")[0]}</button>
+              <button key={o.id} type="button" className={ownerFilter === o.id ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => { setOwnerFilter(o.id); setV2Tag(""); }} title={o.display_name}>{o.display_name.split(" ")[0]}</button>
             ))}
-            <button type="button" className={ownerFilter == null ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(null)}>Todos</button>
+            <button type="button" className={ownerFilter == null ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => { setOwnerFilter(null); setV2Tag(""); }}>Todos</button>
           </div>
         ) : null}
         {settingsPending ? (
@@ -504,7 +554,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
           </div>
         ) : pickerV2 ? (
           <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
-            <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>{v2SearchRows != null ? "Resultados" : "Agenda (A-Z)"}</p>
+            <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>{v2SearchRows != null ? "Resultados" : v2Tag ? `Tag: ${v2TagLabel} (A-Z)` : "Agenda (A-Z)"}</p>
             <div role="status" aria-live="polite" id="picker-v2-hint">
               {v2Hint ? <p className="sub" style={{ padding: "0.25rem 0", margin: 0 }}>{v2Hint}</p> : null}
               {v2SearchRows != null && v2Truncated ? (
@@ -513,7 +563,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
               {v2HiddenByFilters > 0 ? (
                 <p className="sub" style={{ padding: "0.25rem 0", margin: 0 }}>
                   {v2HiddenByFilters} resultado{v2HiddenByFilters > 1 ? "s" : ""} oculto{v2HiddenByFilters > 1 ? "s" : ""} pelos filtros.{" "}
-                  <button type="button" className="ghost" style={{ padding: "0.1rem 0.4rem", fontSize: "0.72rem" }} onClick={() => { setOwnerFilter(null); setQualFilter(""); }}>Limpar filtros</button>
+                  <button type="button" className="ghost" style={{ padding: "0.1rem 0.4rem", fontSize: "0.72rem" }} onClick={() => { setOwnerFilter(null); setQualFilter(""); setV2Tag(""); }}>Limpar filtros</button>
                 </p>
               ) : null}
               {loadingList && v2List.length > 0 ? (
@@ -523,7 +573,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             {loadingList && v2List.length === 0 ? (
               <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
             ) : v2List.length === 0 && !v2Hint && v2HiddenByFilters === 0 ? (
-              <p className="sub" style={{ padding: "0.5rem 0" }}>{v2SearchRows != null ? "Nenhum contato encontrado." : qualFilter ? "Nenhum contato com essa qualificacao." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato na agenda."}</p>
+              <p className="sub" style={{ padding: "0.5rem 0" }}>{v2SearchRows != null ? "Nenhum contato encontrado." : v2Tag ? "Nenhum contato com essa tag (no seu escopo)." : qualFilter ? "Nenhum contato com essa qualificacao." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato na agenda."}</p>
             ) : (
               <ul style={{ listStyle: "none", margin: 0, padding: 0, opacity: loadingList ? 0.6 : 1 }} aria-busy={loadingList}>
                 {v2List.map((r) => {
@@ -565,7 +615,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
                 {v2LoadingMore ? "Carregando..." : "Ver mais"}
               </button>
             ) : null}
-            <button type="button" className="ghost" style={{ width: "100%", margin: "0.25rem 0", fontSize: "0.72rem", opacity: 0.7 }} onClick={() => setLegacyOverride(true)}>
+            <button type="button" className="ghost" style={{ width: "100%", margin: "0.25rem 0", fontSize: "0.72rem", opacity: 0.7 }} onClick={() => { setV2Tag(""); setLegacyOverride(true); }}>
               Carregar agenda completa (modo antigo)
             </button>
           </div>
@@ -3229,6 +3279,13 @@ function AdminSettingsModal() {
                     </button>
                   ) : null}
                 </div>
+              </div>
+              <div className="settings-block">
+                <label className="settings-toggle">
+                  <input type="checkbox" checked={systemSettings.picker_tag_filter_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, picker_tag_filter_enabled: e.target.checked }))} />
+                  <span>Filtro por 🏷 tag na agenda nova</span>
+                </label>
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Mostra o seletor de tag no picker — só para perfis com a permissão "Filtrar a agenda por tag" (Perfis de acesso; padrão: supervisão). Tags podem revelar dado sensível: ligue por decisão consciente do tenant.</p>
               </div>
             </div>
             <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>

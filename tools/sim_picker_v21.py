@@ -200,6 +200,39 @@ def run():
           "no start_after que nega (testado em _picker_row_visible)")
     check(main._picker_scope_fp("hubloc", False, "uidX", None, "") != fp,
           "fp amarra o tenant (cursor cross-tenant nao valida)")
+    # F5: tag no fingerprint — cursor do modo tag nao vale na pagina e
+    # vice-versa; sem tag o fp e byte a byte o da F3 (cursores vivos com
+    # TTL de 24h sobrevivem ao deploy da F5).
+    fp_tag = main._picker_scope_fp("varizemed", False, "uidX", None, "", tag="pos-op")
+    check(fp_tag != fp, "fp com tag != fp da pagina (cursor nao cruza modos)")
+    check(main._picker_scope_fp("varizemed", False, "uidX", None, "", tag="") == fp,
+          "tag vazia = fp identico ao formato F3 (retrocompat de cursor vivo)")
+    check(main._picker_scope_fp("varizemed", False, "uidX", None, "", tag="outra") != fp_tag,
+          "tags diferentes = fps diferentes")
+
+    print("\n== F5: slug de tag + payload sem tags ==")
+    import database_firestore as dbf
+    check(dbf.normalize_tag_slug("Pós-Op") == "pos-op", "acento/caixa normalizam, hifen fica")
+    check(dbf.normalize_tag_slug("retorno cirurgia") == "retorno-cirurgia", "espaco vira hifen")
+    check(dbf.normalize_tag_slug("+++") == "", "so simbolos = vazio (400 no endpoint)")
+    check(dbf.normalize_tag_slug("---") == "---",
+          "so-pontuacao PASSA no normalize — o endpoint rejeita (exige alnum)")
+    check(not any(ch.isalnum() for ch in dbf.normalize_tag_slug("---")),
+          "guard do endpoint pega o caso: nenhum alnum -> Tag invalida")
+    check(dbf.normalize_tag_slug("x" * 200) == "x" * dbf._TAG_SLUG_MAX,
+          "teto de 40 chars do slug")
+    # Payload do card NUNCA emite tags/notes (dado sensivel fora do picker).
+    _real_user_map = dbf._user_map
+    dbf._user_map = lambda ids: {}
+    try:
+        _cards = dbf.enrich_picker_rows([{
+            "id": 1, "display_name": "Ana", "phone_formatted": "(31) 9...",
+            "tags": ["varizes"], "notes": "sigiloso", "assigned_to": None,
+        }])
+    finally:
+        dbf._user_map = _real_user_map
+    check(bool(_cards) and "tags" not in _cards[0] and "notes" not in _cards[0],
+          "enrich_picker_rows nao emite tags nem notes")
 
     print("\n== F3: plano de busca por fone ==")
     ex, plan = main._picker_phone_plan("5531983440484")

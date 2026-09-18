@@ -3842,7 +3842,10 @@ LEAD_TAGS_MAX = 12
 
 
 def normalize_tag_slug(raw):
-    """Slug canonico: minusculo, sem acento, so [a-z0-9_-]; espaco vira '-'."""
+    """Slug canonico: minusculo, sem acento, espaco vira '-'. Mantem
+    alfanumericos UNICODE (isalnum) + '_'/'-' — nao e restrito a ASCII
+    (docstring corrigida na revisao F5; slug so-pontuacao passa aqui e o
+    caller que consulta deve rejeitar)."""
     import unicodedata
     token = str(raw or "").strip().casefold()
     token = unicodedata.normalize("NFKD", token)
@@ -4029,6 +4032,11 @@ _DEFAULT_SYSTEM_SETTINGS = {
     # enabled (tenant inteiro). Kill-switch = PUT enabled=false + ids=[].
     "picker_v2_enabled": False,
     "picker_v2_user_ids": [],
+    # F5: filtro por tag no picker — flag PROPRIA (revisao F5): rollout e
+    # kill-switch independentes do picker_v2 (que ja esta ligado); e a tag
+    # pode ser dado de saude, entao alem da flag ha o toggle RBAC
+    # filtrar_leads_por_tag por perfil.
+    "picker_tag_filter_enabled": False,
 }
 
 
@@ -4052,7 +4060,7 @@ def save_system_settings(settings: dict):
     # bool("false") e True — um PUT cru com string (kill-switch de madrugada,
     # JSON a mao) falharia silenciosamente LIGADO. Espirito do pool_mode.
     for _bool_key in ("auto_close_enabled", "rating_request_enabled",
-                      "picker_v2_enabled"):
+                      "picker_v2_enabled", "picker_tag_filter_enabled"):
         if _bool_key in filtered:
             _raw_b = filtered[_bool_key]
             if isinstance(_raw_b, str):

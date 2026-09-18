@@ -1028,3 +1028,34 @@ telefones: esse lookup deve ser determinístico.
   <https://cloud.google.com/firestore/docs/query-explain>
 - Busca textual no Firestore Enterprise:
   <https://firebase.google.com/docs/firestore/enterprise/text-search>
+
+---
+
+## Adendo F5 (2026-09-17) — filtro por tag no picker
+
+Implementado depois do cutover da F4 (pedido do PO: a Varizemed usa tags).
+Nao previsto no corpo original desta spec; este adendo e a fonte de verdade.
+
+- **Endpoint**: `POST /api/wa/contacts/picker/by-tag` com body
+  `{tag, cursor?, page_size<=50}`. POST porque slug de tag pode ser dado de
+  saude (LGPD art. 11) — nunca em URL/log; parse MANUAL do body (nenhum
+  valor recebido e ecoado em resposta de erro; chave desconhecida = 400
+  nomeando so as chaves); telemetria por logger com contagens apenas
+  (audit formal de consulta por tag: frente de compliance).
+- **Dimensoes 7 e 8** (extensao da matriz do §9.1): privilegiado-por-tag e
+  operador-escopo-por-tag, servidas pelos indices da F2c
+  `[is_archived, is_backup, tags CONTAINS, sort_key]` e
+  `[assigned_to_uid, is_archived, is_backup, tags CONTAINS, sort_key]`.
+- **Cursor**: posicional (§7.1) com `tag:` no fingerprint SO quando presente
+  (retrocompat com cursores vivos do modo pagina); mesmo guard de
+  visibilidade e mesmo 400 unico.
+- **v1 nao combina** tag com dono/qualificacao/termo (sem indice composto;
+  candidatos a v2 se a operacao pedir — ex. "retorno + em_atendimento").
+- **Gates de ativacao (duplo)**: toggle RBAC `filtrar_leads_por_tag`
+  (seed ON supervisao/admin; operador por decisao explicita no perfil) E
+  flag por tenant `system_settings.picker_tag_filter_enabled` (default
+  false; rollout varizemed-test -> varizemed -> hubloc; kill-switch
+  independente do `picker_v2_enabled`).
+- **Cache**: `Cache-Control: private, no-store` carimbado por MIDDLEWARE
+  para todo o prefixo `/api/wa/contacts/picker` — inclusive respostas de
+  erro (HTTPException/422 descartam headers setados na rota).

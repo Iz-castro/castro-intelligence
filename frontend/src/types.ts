@@ -59,6 +59,7 @@ export type PermissionKey =
   | "editar_dono_lead"
   | "qualificar_lead"
   | "gerenciar_tags_globais"
+  | "filtrar_leads_por_tag"
   | "reabrir_em_lote"
   | "editar_declared_name"
   | "arquivar_lead"
@@ -402,6 +403,9 @@ export type SystemSettings = {
   // Canario: user_ids liga por usuario; enabled liga o tenant inteiro.
   picker_v2_enabled: boolean;
   picker_v2_user_ids: number[];
+  // F5: filtro por tag no picker — flag propria (rollout/kill-switch
+  // independentes do picker_v2; combina com o toggle RBAC por perfil).
+  picker_tag_filter_enabled: boolean;
 };
 
 // Linha do picker v2.1 — payload MINIMO do card (backend enrich_picker_rows):

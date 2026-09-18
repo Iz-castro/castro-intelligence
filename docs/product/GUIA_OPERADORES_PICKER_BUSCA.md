@@ -50,6 +50,18 @@ Acentos e maiúsculas não importam: `joao` acha `João`.
 - Se aparecer **"Muitos resultados. Digite mais caracteres."**, refine: mais
   letras do nome ou mais dígitos do telefone.
 
+## Filtrar por etiqueta (tag)
+
+- Se o seu time usa etiquetas **e o seu perfil tem essa permissão**, aparece
+  um filtro de **🏷 Tag** ao lado do de qualificação: escolha **uma** e a
+  agenda mostra, em ordem alfabética, os contatos **do seu escopo** (os seus
+  + a fila) com aquela etiqueta — mesmo os que nunca conversaram. O "Ver
+  mais" continua funcionando.
+- Só aparecem na lista as etiquetas da empresa + as que você mesma criou —
+  e uma etiqueta por vez.
+- O filtro de tag anda sozinho: escolher uma tag limpa a busca e os outros
+  filtros (e vice-versa).
+
 ## Dicas
 
 - O resultado mostra o **responsável** e o canal do contato — útil pra

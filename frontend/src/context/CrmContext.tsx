@@ -204,6 +204,10 @@ type CrmContextValue = {
     Promise<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }>;
   pickerSearch: (q: string, limit?: number) =>
     Promise<{ contacts: PickerRow[]; truncated: boolean }>;
+  // F5: pagina alfabetica filtrada por tag (POST — slug pode ser dado de
+  // saude, nunca em URL). Mesma forma de resposta do modo pagina.
+  pickerByTag: (tag: string, cursor?: string) =>
+    Promise<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }>;
   // Contador BARATO da agenda (aggregate count no backend, ~7 reads) — usado
   // pelo header da sidebar, que so exibe o numero. NAO carrega a lista.
   countAllContacts: () => Promise<number>;
@@ -372,6 +376,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   tags_global: [],
   picker_v2_enabled: false,
   picker_v2_user_ids: [],
+  picker_tag_filter_enabled: false,
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -2805,6 +2810,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       bundle.auth, "/api/wa/contacts/picker/search", { q: q.slice(0, 120), limit });
   }
 
+  async function pickerByTag(tag: string, cursor?: string):
+    Promise<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }> {
+    if (!bundle) return { contacts: [], next_cursor: null, has_more: false };
+    // POST de proposito: slug de tag pode ser dado de saude (F5 §13).
+    return sendJson<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }>(
+      bundle.auth, "/api/wa/contacts/picker/by-tag", { tag, cursor: cursor || "", page_size: 50 });
+  }
+
   async function loadConflicts(): Promise<ConflictLead[]> {
     if (!bundle) return [];
     const r = await getJson<{ conflicts: ConflictLead[] }>(bundle.auth, "/api/admin/conflicts");
@@ -3244,7 +3257,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
-    loadAllContacts, pickerPage, pickerSearch, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
+    loadAllContacts, pickerPage, pickerSearch, pickerByTag, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, returnContactToPool, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,

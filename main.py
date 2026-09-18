@@ -157,6 +157,13 @@ async def add_security_headers(request: Request, call_next):
     # de proposito: quebraria o carregamento de assets/sdk de terceiros.
     response = await call_next(request)
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
+    # Picker v2.1 (§13, revisao F5): nome+fone de leads (e, no by-tag, uma
+    # consulta sobre dado potencialmente sensivel) nunca podem parar no
+    # cache de disco de maquina compartilhada. Carimbado AQUI porque o
+    # header setado dentro da rota nao sobrevive a HTTPException/422 — os
+    # caminhos de ERRO saiam sem no-store.
+    if request.url.path.startswith("/api/wa/contacts/picker"):
+        response.headers["Cache-Control"] = "private, no-store"
     return response
 
 
@@ -1245,11 +1252,15 @@ def _picker_throttle(user_key):
         _picker_rate_hits.clear()
 
 
-def _picker_scope_fp(tid, privileged, uid, owner_id, qualification):
+def _picker_scope_fp(tid, privileged, uid, owner_id, qualification, tag=""):
     """Fingerprint do cursor: amarra a pagina ao tenant + escopo + filtros.
-    Cursor de outro usuario/filtro/tenant vira 400 (IDOR de paginacao)."""
+    Cursor de outro usuario/filtro/tenant vira 400 (IDOR de paginacao).
+    F5: tag entra no fp SO quando presente — cursores do modo pagina que ja
+    estao vivos (TTL 24h) continuam validos apos o deploy."""
     import hashlib
     raw = f"{tid}|{'priv' if privileged else uid}|{owner_id if owner_id is not None else ''}|{qualification or ''}"
+    if tag:
+        raw += f"|tag:{tag}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -1277,6 +1288,10 @@ def _picker_cursor_decode(cursor, fp_expected):
     import json
     import re as _re
     import time
+    # Teto ANTES do decode (revisao F5): cursor legitimo tem ~120 chars; um
+    # body de MBs aqui viraria b64decode+json no event loop do worker unico.
+    if len(cursor) > 512:
+        raise HTTPException(status_code=400, detail="Cursor invalido")
     try:
         data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
     except Exception:
@@ -1399,7 +1414,8 @@ async def wa_contacts_picker(
         raise HTTPException(status_code=403, detail="Filtro de dono e restrito a supervisao.")
     if not privileged and not uid:
         raise HTTPException(status_code=403, detail="Sessao sem identidade de operador.")
-    _picker_throttle(f"page|{current_user.get('id')}")
+    from firestore_common import get_tenant_context as _get_tid_p
+    _picker_throttle(f"page|{_get_tid_p() or ''}|{uid or current_user.get('id')}")
     qualification = qualification.strip()
     if qualification and qualification not in set(QUALIFICATION_OPTIONS) | {"novo"}:
         raise HTTPException(status_code=400, detail="Qualificacao invalida.")
@@ -1425,11 +1441,94 @@ async def wa_contacts_picker(
 
 
 class PickerSearchRequest(BaseModel):
-    # max_length e obrigatorio (revisao F3): o caminho normalize+match e CPU
-    # sincrono no worker UNICO que tambem da ACK no /webhook — um termo de
-    # MBs bloquearia o event loop alem da janela de reentrega da Meta (~23s).
-    q: str = PydanticField(min_length=1, max_length=120)
+    # SEM max_length no modelo (revisao F5): o 422 do Pydantic ecoa o valor
+    # em detail[].input — e `q` e nome/telefone de titular. O teto de 120
+    # (protecao do event loop, revisao F3) e checado NA ROTA com 400
+    # generico, antes de qualquer normalize/match.
+    q: str = ""
     limit: int = 30
+
+
+@app.post("/api/wa/contacts/picker/by-tag")
+async def wa_contacts_picker_by_tag(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Picker v2.1 — F5: pagina alfabetica FILTRADA POR TAG (agenda inteira,
+    nao so quem tem conversa). Serve os 2 indices [tags CONTAINS + sort_key]
+    da F2c ({base, assigned_to_uid}); a v1 NAO combina tag com dono/
+    qualificacao (nao ha indice — chave desconhecida no body e 400).
+
+    Revisao F5 — decisoes de protecao (tag pode ser dado de SAUDE, art. 11):
+    - POST (slug nunca em URL/log do Cloud Run);
+    - parse MANUAL do body: nenhum valor recebido e jamais ecoado na
+      resposta (o 422 do Pydantic devolve `input` — vazava o slug);
+    - gate DUPLO: toggle RBAC filtrar_leads_por_tag (agregacao nova de dado
+      sensivel — seed ON so supervisao) + flag por tenant
+      picker_tag_filter_enabled (rollout test->varizemed->hubloc e
+      kill-switch proprios, independentes do picker_v2);
+    - telemetria via logger com CONTAGENS apenas (audit formal de consulta
+      por tag fica pra frente de compliance — precisa de desenho proprio);
+    - payload do card nunca inclui tags (enrich_picker_rows)."""
+    from database import (enrich_picker_rows, get_system_settings,
+                          normalize_tag_slug, picker_contacts_query)
+    ensure_permission(current_user, "filtrar_leads_por_tag")
+    privileged = can_see_all_tenant(current_user)
+    uid = str(current_user.get("firebase_uid") or "")
+    if not privileged and not uid:
+        raise HTTPException(status_code=403, detail="Sessao sem identidade de operador.")
+    if not get_system_settings().get("picker_tag_filter_enabled"):
+        raise HTTPException(status_code=403, detail="Filtro por tag desativado neste tenant.")
+    from firestore_common import get_tenant_context as _get_tid
+    tid = _get_tid() or ""
+    _picker_throttle(f"page|{tid}|{uid or current_user.get('id')}")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body invalido.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body invalido.")
+    desconhecidas = sorted(set(body) - {"tag", "cursor", "page_size"})
+    if desconhecidas:
+        # So os NOMES das chaves — valores nunca voltam na resposta.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Parametros nao suportados: {', '.join(desconhecidas)}. "
+                   "O filtro por tag (v1) nao combina com outros filtros.")
+    raw_tag = body.get("tag")
+    if not isinstance(raw_tag, str) or not raw_tag.strip() or len(raw_tag) > 60:
+        raise HTTPException(status_code=400, detail="Tag invalida.")
+    slug = normalize_tag_slug(raw_tag)
+    # Slug de pontuacao pura ("---") passa no normalize mas nunca e uma tag
+    # real — corta antes de pagar round-trip vazio no Firestore.
+    if not slug or not any(ch.isalnum() for ch in slug):
+        raise HTTPException(status_code=400, detail="Tag invalida.")
+    cursor = body.get("cursor") or ""
+    if not isinstance(cursor, str):
+        raise HTTPException(status_code=400, detail="Cursor invalido")
+    try:
+        page_size = max(1, min(int(body.get("page_size") or 30), 50))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="page_size invalido.")
+    fp = _picker_scope_fp(tid, privileged, uid, None, "", tag=slug)
+    start_after_id = _picker_cursor_decode(cursor, fp) if cursor else None
+    rows = picker_contacts_query(
+        scope_uid=None if privileged else uid,
+        array_field="tags", array_value=slug,
+        order_by_field="sort_key", start_after_id=start_after_id,
+        start_after_guard=(lambda row: _picker_row_visible(row, privileged, uid)),
+        limit=page_size + 1,
+    )
+    if rows is None:
+        raise HTTPException(status_code=400, detail="Cursor invalido")
+    has_more = len(rows) > page_size
+    rows = rows[:page_size]
+    next_cursor = _picker_cursor_encode(str(rows[-1]["id"]), fp) if (has_more and rows) else None
+    # Contagens apenas — NUNCA o slug (potencial dado de saude, art. 11).
+    logger.info("picker-by-tag: resultados=%s has_more=%s pagina=%s",
+                len(rows), has_more, "inicial" if not cursor else "seguinte")
+    return {"contacts": enrich_picker_rows(rows), "next_cursor": next_cursor,
+            "has_more": has_more, "mode": "tag"}
 
 
 @app.post("/api/wa/contacts/picker/search")
@@ -1452,7 +1551,14 @@ async def wa_contacts_picker_search(
     uid = str(current_user.get("firebase_uid") or "")
     if not privileged and not uid:
         raise HTTPException(status_code=403, detail="Sessao sem identidade de operador.")
-    _picker_throttle(f"search|{current_user.get('id')}")
+    from firestore_common import get_tenant_context as _get_tid_s
+    # Chave do throttle COM tenant (revisao F5): ids de usuario sao contador
+    # POR TENANT — user 3 do hubloc e user 3 da varizemed dividiam o balde.
+    _picker_throttle(f"search|{_get_tid_s() or ''}|{uid or current_user.get('id')}")
+    # Teto do termo checado aqui (400 generico, nunca ecoa o valor) — ver
+    # comentario do PickerSearchRequest.
+    if not body.q.strip() or len(body.q) > 120:
+        raise HTTPException(status_code=400, detail="Digite ao menos 2 letras ou 4 numeros.")
     limit = max(1, min(int(body.limit or 30), 50))
     mode, term = _picker_classify_query(body.q)
     if mode == "invalid":

@@ -61,6 +61,7 @@ PERMISSION_CATALOG = [
     ("Lead", "editar_dono_lead", "Reatribuir dono do lead / devolver ao bot"),
     ("Lead", "qualificar_lead", "Qualificar lead"),
     ("Lead", "gerenciar_tags_globais", "Gerenciar tags globais do tenant"),
+    ("Lead", "filtrar_leads_por_tag", "Filtrar a agenda por tag (picker)"),
     ("Lead", "reabrir_em_lote", "Disparar reabertura em lote"),
     ("Lead", "editar_declared_name", "Editar nome declarado"),
     ("Lead", "arquivar_lead", "Arquivar lead"),
@@ -139,6 +140,10 @@ SEED_PERFIS = {
             "editar_dono_lead", "qualificar_lead", "editar_declared_name",
             "arquivar_lead", "adicionar_contato_manual", "exportar_contatos",
             "gerenciar_tags_globais", "reabrir_em_lote",
+            # F5: filtrar a agenda por tag agrega dado potencialmente
+            # sensivel (art. 11) — seed ON so supervisao; operador comum
+            # ganha por decisao explicita do admin no perfil.
+            "filtrar_leads_por_tag",
             # Canais (sem acoes destrutivas)
             "gerenciar_canais", "autorizar_coex_para_operador",
             # Auditoria
