@@ -648,6 +648,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingRequestRef = useRef<object | null>(null);
   const recordingTimerRef = useRef<number | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
@@ -676,6 +677,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [busyAssume, setBusyAssume] = useState(false);
   const [busyCreateContact, setBusyCreateContact] = useState(false);
   const [correctionTarget, setCorrectionTarget] = useState<ChatMessage | null>(null);
+  const correctionTargetRef = useRef<ChatMessage | null>(null);
+  const correctionInFlightRef = useRef(false);
 
   // -- Admin users --
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
@@ -1028,6 +1031,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (mediaStreamRef.current) { mediaStreamRef.current.getTracks().forEach((t) => t.stop()); mediaStreamRef.current = null; }
   }
   function discardRecording() {
+    recordingRequestRef.current = null;
     clearRecordingTimer();
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") { try { recorder.stop(); } catch { /* ignore */ } }
@@ -1288,6 +1292,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setChannels([]);
     setDraft("");
     setReplyTarget(null);
+    correctionTargetRef.current = null;
+    setCorrectionTarget(null);
     setSearch("");
     setQualificationFilter("");
     setTagFilter([]);
@@ -1490,6 +1496,20 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
     const timeoutId = window.setTimeout(() => setActiveThreadId(selectedThreadId), CONVERSATION_OPEN_DEBOUNCE_MS);
     return () => window.clearTimeout(timeoutId);
+  }, [selectedThreadId]);
+
+  // Uma correcao pertence a thread em que foi iniciada, inclusive quando
+  // o mesmo contato tem conversas em canais diferentes.
+  useEffect(() => {
+    if (correctionTargetRef.current) {
+      correctionTargetRef.current = null;
+      setCorrectionTarget(null);
+      setDraft("");
+    }
+    setReplyTarget(null);
+    setShowAttachMenu(false);
+    closeQuickSuggestions();
+    discardRecording();
   }, [selectedThreadId]);
 
   // Reset detail state on contact change (so o que NAO deriva do contato; os
@@ -2016,6 +2036,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function startReplyToMessage(message: ChatMessage) {
+    if (busySend || correctionInFlightRef.current) return;
+    if (correctionTargetRef.current) cancelCorrection();
     setReplyTarget(buildMessageReplyReference(message));
     setShowAttachMenu(false);
     closeQuickSuggestions();
@@ -2167,7 +2189,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   const [internalMode, setInternalMode] = useState(false);
   async function sendTextMessage() {
-    if (!bundle || !selectedContact || !draft.trim()) return;
+    if (!bundle || !selectedContact || !draft.trim() || busySend || busyAudio || busyUpload) return;
+    // Enter, botao e submit do formulario seguem o mesmo fluxo.
+    if (correctionTarget) { await correctMessage(correctionTarget.id, draft.trim()); return; }
     if (internalMode) { await sendInternalNote(); return; }
     try {
       setBusySend(true); setError(""); setNotice("");
@@ -2222,11 +2246,18 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function startRecording() {
-    if (!selectedContact) return;
+    if (!selectedContact || correctionTargetRef.current || recordingRequestRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === "undefined") { setError("O navegador nao oferece suporte para gravacao de audio."); return; }
+    const request = {};
+    recordingRequestRef.current = request;
     try {
       setError(""); setNotice(""); setShowAttachMenu(false);
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Corrigir ou trocar de thread cancela inclusive a permissao pendente.
+      if (recordingRequestRef.current !== request) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       mediaStreamRef.current = stream;
       audioChunksRef.current = [];
       let recorder: MediaRecorder;
@@ -2237,7 +2268,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       recorder.start(250);
       setRecording(true); setRecordingSeconds(0); clearRecordingTimer();
       recordingTimerRef.current = window.setInterval(() => setRecordingSeconds((c) => c + 1), 1000);
-    } catch (e) { setError(errorText(e)); discardRecording(); }
+    } catch (e) {
+      if (recordingRequestRef.current === request) { setError(errorText(e)); discardRecording(); }
+    } finally {
+      if (recordingRequestRef.current === request) recordingRequestRef.current = null;
+    }
   }
 
   async function sendRecordedAudio() {
@@ -2412,6 +2447,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function handlePrimaryAction() {
     if (busyComposerAction) return;
+    if (correctionTarget) { if (hasDraft) void sendTextMessage(); return; }
     // Modo interno e texto-only: nunca grava audio (que iria pra Meta).
     if (internalMode) { if (hasDraft) void sendTextMessage(); return; }
     if (recording) { void sendRecordedAudio(); return; }
@@ -2569,30 +2605,56 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function startCorrection(message: ChatMessage) {
+    if (busySend || busyAudio || busyUpload || recording || correctionInFlightRef.current) return;
+    if (!selectedContact || message.contact_id !== selectedContact.id
+      || (message.conversation_id && message.conversation_id !== selectedThreadId)) return;
+    discardRecording();
+    correctionTargetRef.current = message;
     setCorrectionTarget(message);
+    setReplyTarget(null);
+    setInternalMode(false);
+    setShowAttachMenu(false);
+    closeQuickSuggestions();
     setDraft(message.content || "");
     composerInputRef.current?.focus();
   }
 
   function cancelCorrection() {
+    correctionTargetRef.current = null;
     setCorrectionTarget(null);
     setDraft("");
+    closeQuickSuggestions();
   }
 
   async function correctMessage(messageId: number, newContent: string): Promise<boolean> {
-    if (!bundle) return false;
+    const target = correctionTargetRef.current;
+    const content = newContent.trim();
+    if (!bundle || !selectedContact || !target || target.id !== messageId || !content
+      || target.contact_id !== selectedContact.id
+      || (target.conversation_id && target.conversation_id !== selectedThreadId)
+      || busySend || busyAudio || busyUpload || correctionInFlightRef.current) return false;
+    // Ref bloqueia dois disparos antes de o React publicar busySend.
+    correctionInFlightRef.current = true;
     try {
-      setBusySend(true); setError("");
-      const res = await sendJson(bundle.auth, "/api/wa/correct-message", { message_id: messageId, new_content: newContent }) as { corrected_message_id: number };
+      setBusySend(true); setError(""); setNotice("");
+      const res = await sendJson(bundle.auth, "/api/wa/correct-message", { message_id: messageId, new_content: content }) as { corrected_message_id: number; new_message_id: number };
       // Marcar mensagem original como corrigida no state local
-      setMessages(prev => prev.map(m => m.id === res.corrected_message_id ? { ...m, is_corrected: true } : m));
-      setCorrectionTarget(null);
-      setDraft("");
-      setNotice("Correcao enviada.");
+      setMessages(prev => prev.map(m => m.id === res.corrected_message_id ? { ...m, is_corrected: true, corrected_by_message_id: res.new_message_id } : m));
+      // A resposta pode chegar depois de o operador trocar de conversa.
+      if (correctionTargetRef.current === target) {
+        cancelCorrection();
+        setNotice("Correção enviada como resposta à mensagem original.");
+      }
       if (!snapshotMode) await refreshPollingViews();
       return true;
-    } catch (e) { setError(errorText(e)); return false; }
-    finally { setBusySend(false); }
+    } catch (e) {
+      if (correctionTargetRef.current === target) setError(errorText(e));
+      return false;
+    } finally {
+      correctionInFlightRef.current = false;
+      setBusySend(false);
+      requestAnimationFrame(() => composerInputRef.current?.focus());
+    }
   }
 
   // useCallback: o BillingHealthBanner depende da IDENTIDADE desta funcao no

@@ -3207,11 +3207,20 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
     """Envia uma nova mensagem corrigindo uma mensagem anterior.
 
     Marca a mensagem original como corrigida e envia a nova mensagem
-    como reply da original, prefixada com indicador de correcao.
+    como reply da original, preservando sua autoria na citacao.
     """
     original = get_wa_message_by_id(body.message_id)
     if not original:
         raise HTTPException(status_code=404, detail="Mensagem original nao encontrada")
+    original_author_id = original.get("sender_user_id")
+    if original_author_id is None:
+        original_author_id = original.get("operator_id")
+    try:
+        is_author = original_author_id is not None and int(original_author_id) == int(current_user["id"])
+    except (TypeError, ValueError):
+        is_author = False
+    if not is_author and not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
+        raise HTTPException(status_code=403, detail="Apenas o autor ou a supervisao podem corrigir esta mensagem")
     if original.get("direction") != "outbound":
         raise HTTPException(status_code=400, detail="Apenas mensagens outbound podem ser corrigidas")
     if original.get("msg_type") != "text":
@@ -3219,20 +3228,38 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
     if original.get("is_corrected"):
         raise HTTPException(status_code=400, detail="Mensagem ja foi corrigida")
 
-    # Resolve thread original — preferimos conversation_id da mensagem
+    # Resolve thread original: preferimos conversation_id da mensagem
     # (denormalizado no save_wa_message) para nao confundir threads do
     # mesmo contato em canais distintos.
+    original_conv_id = original.get("conversation_id")
+    if not original_conv_id and original.get("channel_id") is not None:
+        original_contact = get_wa_contact(original.get("contact_id"))
+        if not original_contact:
+            raise HTTPException(status_code=404, detail="Contato da mensagem original nao encontrado")
+        original_wa_id = original_contact.get("wa_id")
+        if not original_wa_id:
+            raise HTTPException(status_code=400, detail="Contato da mensagem original sem wa_id")
+        # Legado sem conversation_id: o canal da MENSAGEM e historico;
+        # contact.channel_id pode ter mudado apos outra thread ser aberta.
+        original_conv_id = f"{original['channel_id']}__{normalize_br_phone(original_wa_id)}"
     conv, contact, channel = _resolve_send_target(
-        original.get("conversation_id"),
+        original_conv_id,
         original.get("contact_id"),
     )
-    # Mesmo gate de thread dos demais envios (era o unico caminho de texto
-    # sem ele); retorno "intervention" descartado como nos outros callers.
-    _check_conv_send_permission(conv, current_user, contact, channel=channel)
+    # O gate da thread cobre tambem takeover e perfis sem permissao de envio.
+    send_mode = _check_conv_send_permission(conv, current_user, contact, channel=channel)
+    # Correcao deve sair pelo numero original. Nao permite que o fallback
+    # legado de credenciais envie por outro canal se este foi desativado.
+    if (channel is None and conv.get("channel_id") is not None) or (channel or {}).get("is_active") is False:
+        raise HTTPException(status_code=503, detail="Canal da mensagem original indisponivel")
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
     )
     _check_24h_window(contact)
+    content = body.new_content
+    if send_mode == "intervention":
+        supervisor_name = (current_user.get("display_name") or "Supervisao").split()[0]
+        content = f"[Supervisao - {supervisor_name}]: {content}"
 
     # Enviar nova mensagem como reply da original
     wa_id = _wa_target(contact["wa_id"])
@@ -3244,7 +3271,7 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
         reply_context = {"context": {"message_id": orig_wa_id}}
     payload = {
         "messaging_product": "whatsapp", "to": wa_id, "type": "text",
-        "text": {"body": body.new_content},
+        "text": {"body": content},
         **reply_context,
     }
 
@@ -3258,10 +3285,13 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
 
     wa_msg_id = result.get("messages", [{}])[0].get("id", "")
     original_preview = (original.get("content") or "")[:80]
+    original_sender = str(original.get("sent_by_name") or "").strip()
+    if not original_sender:
+        original_sender = _fallback_reply_sender({**original, "operator_id": original_author_id})
 
     new_msg_id = save_wa_message(
         wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
-        msg_type="text", content=body.new_content, status="sent",
+        msg_type="text", content=content, status="sent",
         timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
         channel_id=channel["id"] if channel else conv.get("channel_id"),
@@ -3271,7 +3301,7 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         reply_to_message_id=body.message_id,
         reply_to_preview=original_preview,
-        reply_to_sender_name=current_user.get("display_name", "Operador"),
+        reply_to_sender_name=original_sender.strip()[:80] or "Equipe",
     )
 
     # Marcar original como corrigida

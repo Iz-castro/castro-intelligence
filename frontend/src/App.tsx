@@ -1095,7 +1095,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 
 function ChatPanel() {
   const ctx = useCrm();
-  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, quickSelectedIndex, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, correctMessage, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
+  const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, quickSelectedIndex, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
   // contato, evitando WABA mismatch #132001 em cenarios de transferencia
@@ -1400,8 +1400,8 @@ function ChatPanel() {
                       <div className={`bubble-menu attach-menu ${openMessageMenuDirection === "up" ? "open-upward" : ""}`}>
                         <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }}><span>Responder</span></button>
                         <button type="button" className="attach-option" onClick={() => { void copyMessageText(message); setOpenMessageMenuId(null); }}><span>Copiar</span></button>
-                        {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && (message.operator_id === sessionUser?.id || isManager) ? (
-                          <button type="button" className="attach-option" onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }}><span>Corrigir</span></button>
+                        {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && ((message.sender_user_id ?? message.operator_id) === sessionUser?.id || isManager) ? (
+                          <button type="button" className="attach-option" disabled={busySend || busyAudio || busyUpload || recording} onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }}><span>Corrigir</span></button>
                         ) : null}
                       </div>
                     ) : null}
@@ -1458,14 +1458,15 @@ function ChatPanel() {
             <div className="sub" style={{ textAlign: "center", width: "100%" }}>Janela de 24h indisponivel. Use o menu de templates para iniciar a conversa.</div>
           </div>
         ) : (
-        <form className="composer" onSubmit={correctionTarget ? (e) => { e.preventDefault(); if (draft.trim()) void correctMessage(correctionTarget.id, draft.trim()); } : submitText}>
+        <form className="composer" onSubmit={submitText}>
           {correctionTarget ? (
             <div className="composer-reply-preview" style={{ borderLeft: "3px solid var(--warm)" }}>
               <div style={{ flex: 1 }}>
                 <span className="sub" style={{ fontWeight: 600, color: "var(--warm)" }}>Corrigindo mensagem</span>
                 <p style={{ margin: "0.2rem 0 0", fontSize: "0.85rem" }}>{(correctionTarget.content || "").slice(0, 100)}</p>
+                <span className="sub">Envia uma nova mensagem como resposta à original.</span>
               </div>
-              <button type="button" className="reply-preview-close" onClick={cancelCorrection} aria-label="Cancelar correcao">x</button>
+              <button type="button" className="reply-preview-close" onClick={cancelCorrection} disabled={busySend} aria-label="Cancelar correcao">x</button>
             </div>
           ) : replyTarget ? (
             <div className="composer-reply-preview">
@@ -1475,9 +1476,9 @@ function ChatPanel() {
           ) : null}
           <div className={`composer-shell ${recording ? "is-recording" : ""}`}>
             <div className="composer-menu" ref={attachMenuRef}>
-              <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busyUpload || busyAudio} aria-label="Abrir menu de anexos"><PlusIcon /></button>
+              <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busySend || busyUpload || busyAudio || Boolean(correctionTarget)} aria-label="Abrir menu de anexos"><PlusIcon /></button>
               {ctx.can("enviar_nota_interna") ? (
-                <button type="button" className="composer-icon" onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
+                <button type="button" className="composer-icon" disabled={busySend || Boolean(correctionTarget)} onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
               ) : null}
               {showAttachMenu ? (
                 <div className="attach-menu">
@@ -1492,10 +1493,10 @@ function ChatPanel() {
               <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden />
             </div>
             <div className="composer-field">
-              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title="Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia" disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
+              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={correctionTarget ? "Digite o texto corrigido" : internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title="Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia" disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
             </div>
-            <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={!selectedContact || busyUpload || busyComposerAction} aria-label={recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"}>
-              {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : recording || hasDraft ? <SendIcon /> : <MicIcon />}
+            <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={!selectedContact || busyUpload || busyComposerAction || (Boolean(correctionTarget) && !hasDraft)} aria-label={correctionTarget ? "Enviar correção" : recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"}>
+              {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : correctionTarget || recording || hasDraft ? <SendIcon /> : <MicIcon />}
             </button>
           </div>
         </form>
