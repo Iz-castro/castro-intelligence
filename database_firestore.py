@@ -4024,6 +4024,11 @@ _DEFAULT_SYSTEM_SETTINGS = {
     # lugar do env global): admin liga/desliga na aba Sistema sem deploy.
     # Default False — liga por decisao explicita de cada empresa.
     "rating_request_enabled": False,
+    # Picker v2.1 (F4): agenda paginada + busca indexada no modal de contatos.
+    # Canario em 3 estagios SEM deploy: user_ids (1 usuario de cada vez) ->
+    # enabled (tenant inteiro). Kill-switch = PUT enabled=false + ids=[].
+    "picker_v2_enabled": False,
+    "picker_v2_user_ids": [],
 }
 
 
@@ -4046,7 +4051,8 @@ def save_system_settings(settings: dict):
     # Coercao fechada dos toggles booleanos (revisao 2026-09-01):
     # bool("false") e True — um PUT cru com string (kill-switch de madrugada,
     # JSON a mao) falharia silenciosamente LIGADO. Espirito do pool_mode.
-    for _bool_key in ("auto_close_enabled", "rating_request_enabled"):
+    for _bool_key in ("auto_close_enabled", "rating_request_enabled",
+                      "picker_v2_enabled"):
         if _bool_key in filtered:
             _raw_b = filtered[_bool_key]
             if isinstance(_raw_b, str):
@@ -4054,6 +4060,24 @@ def save_system_settings(settings: dict):
                     "false", "0", "no", "off", "")
             else:
                 filtered[_bool_key] = bool(_raw_b)
+    if "picker_v2_user_ids" in filtered:
+        # Lista fechada de ints (canario por usuario): lixo/duplicata cai
+        # fora em vez de quebrar o includes() do frontend; bool nao e int.
+        _ids = filtered["picker_v2_user_ids"]
+        _clean_ids: list = []
+        for _i in (_ids if isinstance(_ids, list) else []):
+            # float inteiro (7.0) e valido — JSON nao distingue 7 de 7.0.
+            if isinstance(_i, bool) or not isinstance(_i, (int, float, str)):
+                continue
+            if isinstance(_i, float) and not _i.is_integer():
+                continue
+            try:
+                _n = int(_i)
+            except (TypeError, ValueError):
+                continue
+            if _n > 0 and _n not in _clean_ids:
+                _clean_ids.append(_n)
+        filtered["picker_v2_user_ids"] = _clean_ids[:100]
     if "quick_messages_global" in filtered:
         filtered["quick_messages_global"] = _clean_quick_messages(
             filtered["quick_messages_global"], "Mensagens globais")

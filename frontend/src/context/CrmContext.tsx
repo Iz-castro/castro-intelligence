@@ -9,7 +9,7 @@ import type {
   MessageReplyReference, Operator, PermissionKey, ProtocolSearchResult, SessionPerfil, SessionUser,
   SettingsPage, SystemSettings, TemplateSendComponent, TransportMode, UserSettings, WhatsAppTemplate,
 } from "../types";
-import type { QuickMessage, TagDef } from "../types";
+import type { PickerRow, QuickMessage, TagDef } from "../types";
 import { quickMessagesProblem } from "../utils/quickMessages";
 import { errorText } from "../utils/errors";
 import { firebaseReady } from "../utils/firebase-helpers";
@@ -198,6 +198,12 @@ type CrmContextValue = {
   // Contact picker — lista TODOS contatos do tenant (inclui state_sync da agenda).
   // Cache em memoria do provider (zera no logout/fechar aba — LGPD-safe).
   loadAllContacts: (q?: string) => Promise<{ contacts: Contact[]; total: number }>;
+  // Picker v2.1 (F4): pagina alfabetica (cursor opaco) + busca indexada
+  // server-side. Escopo LGPD e do backend; aqui e so transporte.
+  pickerPage: (opts: { cursor?: string; ownerId?: number | null; qualification?: string }) =>
+    Promise<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }>;
+  pickerSearch: (q: string, limit?: number) =>
+    Promise<{ contacts: PickerRow[]; truncated: boolean }>;
   // Contador BARATO da agenda (aggregate count no backend, ~7 reads) — usado
   // pelo header da sidebar, que so exibe o numero. NAO carrega a lista.
   countAllContacts: () => Promise<number>;
@@ -277,6 +283,9 @@ type CrmContextValue = {
   showSettings: SettingsPage;
   setShowSettings: (v: SettingsPage) => void;
   systemSettings: SystemSettings;
+  // true depois que /api/settings/system respondeu na sessao — gate do
+  // picker v2 (F4): sem isso o modal decidiria o modo com os DEFAULTS.
+  settingsLoaded: boolean;
   setSystemSettings: React.Dispatch<React.SetStateAction<SystemSettings>>;
   userSettings: UserSettings;
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
@@ -361,6 +370,8 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   auto_close_enabled: true,
   rating_request_enabled: false,
   tags_global: [],
+  picker_v2_enabled: false,
+  picker_v2_user_ids: [],
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -2771,6 +2782,29 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return { contacts: base, total: totalFromBackend };
   }
 
+  // Picker v2.1 (F4): transporte fino dos endpoints da F3. O escopo LGPD, o
+  // cursor e o orcamento de reads sao TODOS do backend — aqui nada e cacheado
+  // (cada pagina e viva; a "memoria" do modal e estado local do componente).
+  async function pickerPage(opts: { cursor?: string; ownerId?: number | null; qualification?: string }):
+    Promise<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }> {
+    if (!bundle) return { contacts: [], next_cursor: null, has_more: false };
+    const params = new URLSearchParams();
+    if (opts.cursor) params.set("cursor", opts.cursor);
+    if (opts.ownerId != null) params.set("owner_id", String(opts.ownerId));
+    if (opts.qualification) params.set("qualification", opts.qualification);
+    const qs = params.toString();
+    return getJson<{ contacts: PickerRow[]; next_cursor: string | null; has_more: boolean }>(
+      bundle.auth, `/api/wa/contacts/picker${qs ? `?${qs}` : ""}`);
+  }
+
+  async function pickerSearch(q: string, limit = 30): Promise<{ contacts: PickerRow[]; truncated: boolean }> {
+    if (!bundle) return { contacts: [], truncated: false };
+    // POST de proposito: o termo (nome/telefone de titular) nunca em URL/log.
+    // slice(0,120) espelha o max_length do endpoint (paste gigante viraria 422).
+    return sendJson<{ contacts: PickerRow[]; truncated: boolean }>(
+      bundle.auth, "/api/wa/contacts/picker/search", { q: q.slice(0, 120), limit });
+  }
+
   async function loadConflicts(): Promise<ConflictLead[]> {
     if (!bundle) return [];
     const r = await getJson<{ conflicts: ConflictLead[] }>(bundle.auth, "/api/admin/conflicts");
@@ -3210,14 +3244,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
-    loadAllContacts, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
+    loadAllContacts, pickerPage, pickerSearch, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, returnContactToPool, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
     editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
-    showSettings, setShowSettings, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
+    showSettings, setShowSettings, systemSettings, settingsLoaded, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, saveContactTags, saveGlobalTags, saveUserTags, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,

@@ -9,9 +9,9 @@ import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
-import { getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
+import { ApiError, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
@@ -204,7 +204,7 @@ function NavBar() {
 type ContactPickerMode = "list" | "create";
 
 function NewContactModal({ onClose }: { onClose: () => void }) {
-  const { createManualContact, busyCreateContact, channels, loadAllContacts, openConversationForContact, operators, sessionUser, canSeeAll } = useCrm();
+  const { createManualContact, busyCreateContact, channels, loadAllContacts, pickerPage, pickerSearch, countAllContacts, openConversationForContact, operators, sessionUser, canSeeAll, systemSettings, settingsLoaded } = useCrm();
   const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -217,17 +217,53 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
   const [busyOpen, setBusyOpen] = useState(false);
   // Filtro de agenda por operador atribuido (so privilegiado ve a agenda toda):
   // null = Todos; sessionUser.id = "Meus"; outro id = carteira daquele operador.
-  // Client-side sobre os contatos ja carregados — sem leitura extra no Firestore.
+  // v2: vira owner_id NA QUERY (modo pagina); legado: client-side no cache.
   const [ownerFilter, setOwnerFilter] = useState<number | null>(null);
-  // Filtro por qualificacao (pedido do PO 2026-08-17): client-side sobre a
-  // agenda ja carregada — sem leitura extra. Aqui entra tambem
-  // "nao_qualificado" (a agenda e a lista completa; nao ha caixa N/Q separada
-  // como na sidebar). Vazio conta como "novo" (mesmo fallback do chip).
+  // Filtro por qualificacao (pedido do PO 2026-08-17). v2: vai na query do
+  // modo pagina; na busca e client-side sobre os resultados (v1 da busca nao
+  // filtra no servidor). Vazio conta como "novo" (mesmo fallback do chip).
   const [qualFilter, setQualFilter] = useState("");
 
-  // Carrega contatos quando entra no modo list ou quando search muda (debounce).
+  // Picker v2.1 (F4): agenda paginada + busca indexada, sob flag por tenant
+  // (picker_v2_enabled) com canario por usuario (picker_v2_user_ids). O
+  // escape hatch volta pro modo antigo NESTA abertura do modal (estado
+  // local — fechar e reabrir volta pro v2). settingsLoaded no gate (revisao
+  // F4): sem ele, a janela de boot decidiria o modo pelos DEFAULTS e um
+  // tenant v2 pagaria o full-scan legado por corrida.
+  const [legacyOverride, setLegacyOverride] = useState(false);
+  const settingsPending = !settingsLoaded && mode === "list";
+  const pickerV2 = !legacyOverride && settingsLoaded && (systemSettings.picker_v2_enabled
+    || (sessionUser != null && (systemSettings.picker_v2_user_ids || []).includes(sessionUser.id)));
+  const [v2Rows, setV2Rows] = useState<PickerRow[]>([]);
+  const [v2Cursor, setV2Cursor] = useState<string | null>(null);
+  const [v2HasMore, setV2HasMore] = useState(false);
+  // null = modo pagina; array (mesmo vazio) = busca ativa mostrando resultados.
+  const [v2SearchRows, setV2SearchRows] = useState<PickerRow[] | null>(null);
+  const [v2Truncated, setV2Truncated] = useState(false);
+  const [v2Hint, setV2Hint] = useState("");
+  const [v2LoadingMore, setV2LoadingMore] = useState(false);
+  // Guardas de request stale SEPARADAS por concern (revisao F4: o seq unico
+  // fazia o early-return da busca vazia descartar a resposta da 1a pagina no
+  // mount — modal abria "vazio" sempre). Pagina e busca nunca se invalidam.
+  const v2PageSeq = useRef(0);
+  const v2SearchSeq = useRef(0);
+  // Enter no campo dispara a busca sem esperar o debounce (guia promete).
+  const [searchNonce, setSearchNonce] = useState(0);
+  const searchNowRef = useRef(false);
+  // Recarga forcada da pagina 1 (cursor expirado no Ver mais -> 400).
+  const [pageNonce, setPageNonce] = useState(0);
+
+  function v2ErrorText(e: unknown): string {
+    if (e instanceof ApiError && e.status === 429) {
+      return "Muitas buscas seguidas — aguarde alguns segundos e tente de novo.";
+    }
+    return e instanceof Error ? e.message : String(e);
+  }
+
+  // (legado) Carrega contatos quando entra no modo list ou quando search muda.
+  // Gate de settingsPending: nao rodar o full-scan antes de saber o modo.
   useEffect(() => {
-    if (mode !== "list") return;
+    if (mode !== "list" || pickerV2 || settingsPending) return;
     let disposed = false;
     setLoadingList(true);
     const handle = window.setTimeout(async () => {
@@ -238,7 +274,95 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
       setLoadingList(false);
     }, search ? 250 : 0);
     return () => { disposed = true; window.clearTimeout(handle); };
-  }, [mode, search, loadAllContacts]);
+  }, [mode, search, loadAllContacts, pickerV2, settingsPending]);
+
+  // v2: total do header via aggregate count (~7 reads), 1x por abertura.
+  useEffect(() => {
+    if (!pickerV2 || mode !== "list") return;
+    let disposed = false;
+    void countAllContacts().then((n) => { if (!disposed) setTotal(n); });
+    return () => { disposed = true; };
+  }, [pickerV2, mode, countAllContacts]);
+
+  // v2: primeira pagina (e recarga ao trocar dono/qualificacao). Zera lista/
+  // cursor ANTES do fetch (spec §12: troca de filtro nao pode exibir lista
+  // velha como se fosse a nova, nem deixar "Ver mais" com cursor de outro
+  // fingerprint). pickerPage fica FORA dos deps de proposito (nao e
+  // memoizada; a identidade muda por render — licao do loadAllContacts).
+  useEffect(() => {
+    if (!pickerV2 || mode !== "list") return;
+    const seq = ++v2PageSeq.current;
+    setV2Rows([]); setV2Cursor(null); setV2HasMore(false);
+    setLoadingList(true);
+    setV2Hint("");
+    void pickerPage({ ownerId: canSeeAll ? ownerFilter : null, qualification: qualFilter })
+      .then((r) => {
+        if (seq !== v2PageSeq.current) return;
+        setV2Rows(r.contacts); setV2Cursor(r.next_cursor); setV2HasMore(r.has_more);
+      })
+      .catch((e) => { if (seq === v2PageSeq.current) setV2Hint(v2ErrorText(e)); })
+      .finally(() => { setLoadingList(false); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickerV2, mode, ownerFilter, qualFilter, canSeeAll, pageNonce]);
+
+  // v2: busca server-side com debounce (Enter = imediato via searchNonce).
+  // Termo curto = so dica local (regra espelha o classificador do backend:
+  // 2+ letras ou 4+ digitos). Os returns cedo bumpam SO o seq DA BUSCA —
+  // nunca o da pagina (era o bug da 1a pagina descartada).
+  useEffect(() => {
+    if (!pickerV2 || mode !== "list") return;
+    const t = search.trim();
+    if (!t) { v2SearchSeq.current++; setV2SearchRows(null); setV2Truncated(false); setV2Hint(""); return; }
+    const hasLetter = /\p{L}/u.test(t);
+    const digitCount = (t.match(/\d/g) || []).length;
+    const ready = hasLetter ? t.replace(/[^\p{L}\p{N}]+/gu, "").length >= 2 : digitCount >= 4;
+    if (!ready) {
+      v2SearchSeq.current++; setV2SearchRows(null); setV2Truncated(false);
+      setV2Hint("Digite ao menos 2 letras ou 4 numeros.");
+      return;
+    }
+    const seq = ++v2SearchSeq.current;
+    setV2Hint("");
+    const delay = searchNowRef.current ? 0 : 300;
+    searchNowRef.current = false;
+    const handle = window.setTimeout(() => {
+      if (seq !== v2SearchSeq.current) return;
+      setLoadingList(true);
+      void pickerSearch(t, 50)
+        .then((r) => { if (seq !== v2SearchSeq.current) return; setV2SearchRows(r.contacts); setV2Truncated(r.truncated); })
+        // Erro NAO apaga resultado valido anterior (spec §12) — so avisa.
+        .catch((e) => { if (seq === v2SearchSeq.current) setV2Hint(v2ErrorText(e)); })
+        .finally(() => { setLoadingList(false); });
+    }, delay);
+    return () => window.clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickerV2, mode, search, searchNonce]);
+
+  async function handleV2More() {
+    if (!v2Cursor || v2LoadingMore) return;
+    const seq = ++v2PageSeq.current;
+    setV2LoadingMore(true);
+    try {
+      const r = await pickerPage({ cursor: v2Cursor, ownerId: canSeeAll ? ownerFilter : null, qualification: qualFilter });
+      if (seq !== v2PageSeq.current) return;
+      setV2Rows((prev) => { const ids = new Set(prev.map((x) => x.id)); return [...prev, ...r.contacts.filter((x) => !ids.has(x.id))]; });
+      setV2Cursor(r.next_cursor); setV2HasMore(r.has_more);
+    } catch (e) {
+      if (seq === v2PageSeq.current) {
+        if (e instanceof ApiError && e.status === 400) {
+          // Cursor expirado (TTL 24h) ou de outro filtro: recomeca do A.
+          setV2Hint("A lista expirou — recarregando do inicio.");
+          setPageNonce((n) => n + 1);
+        } else {
+          setV2Hint(v2ErrorText(e));
+        }
+      }
+    } finally {
+      // Flag de spinner reseta SEMPRE (revisao F4: gatear pelo seq deixava o
+      // botao preso em "Carregando..." apos qualquer recarga concorrente).
+      setV2LoadingMore(false);
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -259,10 +383,32 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function handlePickRow(row: PickerRow) {
+    if (busyOpen) return;
+    setBusyOpen(true);
+    try {
+      const channel = row.channel_id || (availableChannels.length === 1 ? availableChannels[0].id : undefined);
+      const convId = await openConversationForContact(row.id, channel ?? undefined);
+      if (convId) onClose();
+    } finally {
+      setBusyOpen(false);
+    }
+  }
+
   const visibleContacts = allContacts.filter((c) =>
     (ownerFilter == null || (c.assigned_to ?? null) === ownerFilter)
     && (!qualFilter || (c.qualification || "novo") === qualFilter));
   const filtersActive = ownerFilter != null || Boolean(qualFilter);
+  // v2: modo pagina ja vem filtrado do servidor; na busca os filtros de
+  // dono/qualificacao sao client-side sobre os (ate 50) resultados — e o
+  // corte NUNCA e silencioso (revisao F4: "Nenhum contato encontrado" com
+  // filtro esquecido = convite a criar lead duplicado, incidente de 24/08).
+  const v2List = v2SearchRows != null
+    ? v2SearchRows.filter((r) =>
+        (ownerFilter == null || (r.assigned_to ?? null) === ownerFilter)
+        && (!qualFilter || (r.qualification || "novo") === qualFilter))
+    : v2Rows;
+  const v2HiddenByFilters = v2SearchRows != null ? v2SearchRows.length - v2List.length : 0;
 
   if (mode === "create") {
     return (
@@ -298,13 +444,30 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" style={{ width: "min(520px, 92vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.5rem" }}>
-          <p className="eyebrow" style={{ margin: 0 }}>Total de contatos ({filtersActive ? visibleContacts.length : total})</p>
+          <p className="eyebrow" style={{ margin: 0 }}>
+            {pickerV2
+              ? (v2SearchRows != null
+                ? `Resultados da busca (${v2List.length}${v2Truncated ? "+" : ""})`
+                : filtersActive
+                  ? `Filtrados (${v2List.length}${v2HasMore ? "+" : ""}) de ${total}`
+                  : `Total de contatos (${total})`)
+              : `Total de contatos (${filtersActive ? visibleContacts.length : total})`}
+          </p>
         </div>
         <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
           <input
             value={search}
             onChange={(e) => setSearchLocal(e.target.value)}
-            placeholder="Buscar contato por nome ou telefone"
+            onKeyDown={(e) => {
+              if (pickerV2 && e.key === "Enter") {
+                e.preventDefault();
+                searchNowRef.current = true;
+                setSearchNonce((n) => n + 1);
+              }
+            }}
+            placeholder={pickerV2 ? "Nome (pelo comeco) ou telefone (completo, comeco ou final)" : "Buscar contato por nome ou telefone"}
+            maxLength={120}
+            aria-describedby={pickerV2 ? "picker-v2-hint" : undefined}
             autoFocus
             style={{ flex: 1, minWidth: 0 }}
           />
@@ -335,6 +498,78 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             <button type="button" className={ownerFilter == null ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} onClick={() => setOwnerFilter(null)}>Todos</button>
           </div>
         ) : null}
+        {settingsPending ? (
+          <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
+            <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
+          </div>
+        ) : pickerV2 ? (
+          <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
+            <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>{v2SearchRows != null ? "Resultados" : "Agenda (A-Z)"}</p>
+            <div role="status" aria-live="polite" id="picker-v2-hint">
+              {v2Hint ? <p className="sub" style={{ padding: "0.25rem 0", margin: 0 }}>{v2Hint}</p> : null}
+              {v2SearchRows != null && v2Truncated ? (
+                <p className="sub" style={{ padding: "0.25rem 0", margin: 0 }}>Muitos resultados. Digite mais caracteres.</p>
+              ) : null}
+              {v2HiddenByFilters > 0 ? (
+                <p className="sub" style={{ padding: "0.25rem 0", margin: 0 }}>
+                  {v2HiddenByFilters} resultado{v2HiddenByFilters > 1 ? "s" : ""} oculto{v2HiddenByFilters > 1 ? "s" : ""} pelos filtros.{" "}
+                  <button type="button" className="ghost" style={{ padding: "0.1rem 0.4rem", fontSize: "0.72rem" }} onClick={() => { setOwnerFilter(null); setQualFilter(""); }}>Limpar filtros</button>
+                </p>
+              ) : null}
+              {loadingList && v2List.length > 0 ? (
+                <p className="sub" style={{ padding: "0.25rem 0", margin: 0 }}>{v2SearchRows != null ? "Buscando..." : "Atualizando..."}</p>
+              ) : null}
+            </div>
+            {loadingList && v2List.length === 0 ? (
+              <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
+            ) : v2List.length === 0 && !v2Hint && v2HiddenByFilters === 0 ? (
+              <p className="sub" style={{ padding: "0.5rem 0" }}>{v2SearchRows != null ? "Nenhum contato encontrado." : qualFilter ? "Nenhum contato com essa qualificacao." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato na agenda."}</p>
+            ) : (
+              <ul style={{ listStyle: "none", margin: 0, padding: 0, opacity: loadingList ? 0.6 : 1 }} aria-busy={loadingList}>
+                {v2List.map((r) => {
+                  const chLabel = availableChannels.length > 1 && r.channel_id != null
+                    ? (channels.find((ch) => ch.id === r.channel_id)?.label || `Canal ${r.channel_id}`)
+                    : "";
+                  return (
+                  <li key={r.id}>
+                    <button
+                      type="button"
+                      onClick={() => handlePickRow(r)}
+                      disabled={busyOpen}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        padding: "0.5rem 0.75rem",
+                        background: "transparent",
+                        border: "none",
+                        borderBottom: "1px solid var(--border-soft, #1c2029)",
+                        color: "inherit",
+                        cursor: busyOpen ? "default" : "pointer",
+                      }}
+                    >
+                      <div style={{ fontWeight: 500 }}>{r.display_name || r.phone_formatted}</div>
+                      <div className="sub" style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                        <span>{r.phone_formatted}</span>
+                        <span className="chip" style={{ fontSize: "0.65rem" }}>{r.qualification || "novo"}</span>
+                        {r.assigned_name ? <span className="chip" style={{ fontSize: "0.65rem" }}>{r.assigned_name}</span> : null}
+                        {chLabel ? <span className="chip" style={{ fontSize: "0.65rem" }}>{chLabel}</span> : null}
+                      </div>
+                    </button>
+                  </li>
+                  );
+                })}
+              </ul>
+            )}
+            {v2SearchRows == null && v2HasMore ? (
+              <button type="button" className="ghost" style={{ width: "100%", margin: "0.5rem 0" }} onClick={() => void handleV2More()} disabled={v2LoadingMore}>
+                {v2LoadingMore ? "Carregando..." : "Ver mais"}
+              </button>
+            ) : null}
+            <button type="button" className="ghost" style={{ width: "100%", margin: "0.25rem 0", fontSize: "0.72rem", opacity: 0.7 }} onClick={() => setLegacyOverride(true)}>
+              Carregar agenda completa (modo antigo)
+            </button>
+          </div>
+        ) : (
         <div style={{ flex: 1, overflowY: "auto", borderTop: "1px solid var(--border, #2a2f3a)", paddingTop: "0.5rem" }}>
           <p className="eyebrow" style={{ marginBottom: "0.5rem" }}>Contatos Salvos</p>
           {loadingList && allContacts.length === 0 ? (
@@ -371,6 +606,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             </ul>
           )}
         </div>
+        )}
       </div>
     </div>
   );
@@ -2961,6 +3197,38 @@ function AdminSettingsModal() {
                   </select>
                 </label>
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>No modo Recepção, qualquer operador responde threads sem dono (canal Cloud API) sem assumir; a autoria fica registrada por mensagem e o fechamento devolve o lead à fila.</p>
+              </div>
+            </div>
+            <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+              <h3>Agenda de contatos (picker novo)</h3>
+              <div className="settings-block">
+                <label className="settings-toggle">
+                  <input type="checkbox" checked={systemSettings.picker_v2_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, picker_v2_enabled: e.target.checked }))} />
+                  <span>Ativar a agenda nova (ordem alfabética + busca profunda) para TODOS</span>
+                </label>
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Abre em páginas de 50 (sem carregar a agenda inteira) e busca em toda a base por começo de nome ou telefone. Desmarcar desliga para todos, EXCETO quem estiver no canário abaixo — pra reverter tudo, desmarque E limpe o canário.</p>
+              </div>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Canário — ligar só para usuários específicos (vale mesmo com o geral desligado):</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem" }}>
+                  {operators.map((o) => {
+                    const ids = systemSettings.picker_v2_user_ids || [];
+                    const on = ids.includes(o.id);
+                    return (
+                      <button key={o.id} type="button" className={on ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} title={o.display_name}
+                        onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: on ? (prev.picker_v2_user_ids || []).filter((i) => i !== o.id) : [...(prev.picker_v2_user_ids || []), o.id] }))}>
+                        {o.display_name.split(" ")[0]}
+                      </button>
+                    );
+                  })}
+                  {(systemSettings.picker_v2_user_ids || []).length > 0 ? (
+                    <button type="button" className="ghost" style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }}
+                      title="Zera a lista inteira — inclusive ids de usuarios desativados que nao aparecem como chip"
+                      onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: [] }))}>
+                      Limpar canário ({(systemSettings.picker_v2_user_ids || []).length})
+                    </button>
+                  ) : null}
+                </div>
               </div>
             </div>
             <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>

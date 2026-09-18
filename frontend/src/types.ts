@@ -398,6 +398,23 @@ export type SystemSettings = {
   rating_request_enabled: boolean;
   // Frente B: tags GLOBAIS do tenant (supervisor/admin gerenciam).
   tags_global: TagDef[];
+  // Picker v2.1 (F4): agenda paginada + busca indexada no modal de contatos.
+  // Canario: user_ids liga por usuario; enabled liga o tenant inteiro.
+  picker_v2_enabled: boolean;
+  picker_v2_user_ids: number[];
+};
+
+// Linha do picker v2.1 — payload MINIMO do card (backend enrich_picker_rows):
+// nunca notes/tags. match_kind so vem no modo busca.
+export type PickerRow = {
+  id: number;
+  display_name: string;
+  phone_formatted: string;
+  qualification: string;
+  assigned_to: number | null;
+  assigned_name: string;
+  channel_id: number | null;
+  match_kind: string;
 };
 
 // Tag de lead (Frente B): slug canonico + rotulo de exibicao + cor opcional.
