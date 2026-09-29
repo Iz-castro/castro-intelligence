@@ -32,6 +32,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   API, exercita o código real, 56 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (173).
   Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (173).
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (56).
+  Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em

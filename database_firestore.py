@@ -1627,6 +1627,150 @@ def close_stale_attendances(max_idle_hours, unattended_release_days=7,
     return closed
 
 
+# =========================================================================
+# Aviso de espera na pool (PO 2026-09-29)
+# =========================================================================
+# Lead que aceitou a LGPD cai na pool sem dono (handoff do bot grava
+# handoff_at nas threads). Se ninguem assumir nem responder em N minutos, o
+# cron de 5 min manda UMA mensagem configurada pelo tenant (ex.: "ligue para
+# ..."). Mesma deteccao de ciclo do Modo Recepcao: comparacao de timestamps,
+# sem reset — handoff novo abre ciclo novo e rearma o aviso sozinho.
+#
+# Regras (todas fail-closed: em duvida NAO envia — mensagem automatica
+# indevida ao cliente e pior que um aviso que nao saiu):
+#   - so thread aberta, sem dono, fora de backup, em canal nao-coex;
+#   - so o ciclo do handoff das ultimas 24h (aviso atrasado de dias seria
+#     estranho e a janela da Meta ja fechou);
+#   - relogio conta do handoff, ou da ABERTURA seguinte se o lead chegou
+#     com o expediente fechado (o bot ja prometeu "retornaremos as 8h");
+#   - so envia com o expediente aberto e dentro da janela de 24h do ultimo
+#     inbound (texto livre fora dela = erro 131047 da Meta);
+#   - resposta humana apos o handoff (last_human_outbound_at) = atendido.
+
+_POOL_WAIT_NOTICE_CYCLE_HOURS = 24
+# Folga contra a borda da janela de 24h da Meta (relogio/latencia).
+_POOL_WAIT_NOTICE_WINDOW_MARGIN = timedelta(minutes=10)
+
+
+def _aware(value):
+    """datetime aware (UTC) ou None. Naive/lixo = None (em duvida nao envia)."""
+    value = _coerce_timestamp(value)
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    return value
+
+
+def pool_wait_notice_due_at(conv, minutes, tenant_id):
+    """Quando o aviso de espera vence para esta thread (None = nunca).
+
+    Conta a partir do handoff; se o handoff caiu com o expediente fechado,
+    conta a partir da abertura seguinte. Tenant sem tabela de horario conta
+    do handoff (business_hours nunca afirma "fechado" sem tabela)."""
+    from business_hours import is_open, next_opening
+    handoff_at = _aware(conv.get("handoff_at"))
+    if handoff_at is None:
+        return None
+    start = handoff_at
+    if is_open(tenant_id, handoff_at) is False:
+        start = next_opening(tenant_id, handoff_at)
+        if start is None:
+            return None
+    return start + timedelta(minutes=int(minutes))
+
+
+def pool_wait_notice_eligible(conv, minutes, tenant_id, now=None):
+    """True se a THREAD (sem olhar o contato) deve receber o aviso agora."""
+    from business_hours import is_open
+    now = now or utcnow()
+    if conv.get("is_backup"):
+        return False
+    if conv.get("attendance_status") != "aberto":
+        return False
+    if conv.get("assigned_to"):
+        return False  # alguem assumiu: atendimento em curso
+    # channel_type e re-denormalizado do canal VIVO a cada upsert; o
+    # source_channel_type pode ter vindo do CONTATO (1o canal dele) na criacao
+    # da thread — lead nascido em coex e devolvido ao bot ficaria sem aviso no
+    # standard (revisao 2026-09-29). O endpoint ainda confere o canal vivo.
+    ch_type = str(conv.get("channel_type") or conv.get("source_channel_type") or "")
+    if ch_type == "coexistence" or conv.get("channel_active") is False:
+        return False
+    handoff_at = _aware(conv.get("handoff_at"))
+    if handoff_at is None:
+        return False
+    if now - handoff_at > timedelta(hours=_POOL_WAIT_NOTICE_CYCLE_HOURS):
+        return False
+    human_at = _coerce_timestamp(conv.get("last_human_outbound_at"))
+    if isinstance(human_at, datetime):
+        if _aware(human_at) is None:
+            return False  # naive: nao da pra comparar, nao arrisca
+        if human_at > handoff_at:
+            return False  # ja teve resposta humana neste ciclo
+    notice_at = _coerce_timestamp(conv.get("pool_wait_notice_at"))
+    if isinstance(notice_at, datetime):
+        if _aware(notice_at) is None or notice_at >= handoff_at:
+            return False  # aviso deste ciclo ja saiu
+    last_in = _aware(conv.get("last_inbound_at"))
+    if last_in is None:
+        return False
+    if now - last_in > timedelta(hours=24) - _POOL_WAIT_NOTICE_WINDOW_MARGIN:
+        return False  # janela de 24h da Meta fechada/fechando
+    due = pool_wait_notice_due_at(conv, minutes, tenant_id)
+    if due is None or now < due:
+        return False
+    if is_open(tenant_id, now) is False:
+        return False
+    return True
+
+
+def find_pool_wait_notice_candidates(minutes, tenant_id, now=None, limit=30):
+    """Threads que devem receber o aviso de espera AGORA (tenant_context atual).
+
+    Leitura server-side por range em handoff_at (indice single-field
+    automatico): so os handoffs das ultimas 24h — dezenas de docs por tick,
+    nunca a colecao inteira. Uma thread por contato (a de inbound mais
+    recente). O contato e lido so dos candidatos: tem que seguir na pool
+    (sem dono, bot concluido) e sem revogacao LGPD.
+
+    Retorna [{"conversation": conv, "contact": contact}]."""
+    now = now or utcnow()
+    since = now - timedelta(hours=_POOL_WAIT_NOTICE_CYCLE_HOURS)
+    best = {}
+    for snap in collection("wa_conversations").where("handoff_at", ">=", since).stream():
+        conv = snap.to_dict() or {}
+        conv.setdefault("id", snap.id)
+        if not pool_wait_notice_eligible(conv, minutes, tenant_id, now):
+            continue
+        cid = conv.get("contact_id")
+        if cid is None:
+            continue
+        cur = best.get(cid)
+        if cur is None or _aware(conv.get("last_inbound_at")) > _aware(cur.get("last_inbound_at")):
+            best[cid] = conv
+    out = []
+    for cid, conv in best.items():
+        contact = _get_doc("wa_contacts", cid)
+        # Espelha o filtro da caixa Novos (CrmContext novosConversations): lead
+        # marcado N/Q sai da fila sem assumir e nao pode ser convidado a ligar
+        # (revisao 2026-09-29). Arquivado tambem nao esta na fila.
+        if (not contact or contact.get("assigned_to") or not contact.get("bot_completed")
+                or contact.get("lgpd_revoked")
+                or contact.get("qualification") == "nao_qualificado"
+                or int(contact.get("is_archived") or 0) != 0):
+            continue
+        out.append({"conversation": conv, "contact": contact})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def mark_pool_wait_notice_sent(conversation_id, at=None):
+    """Carimba o aviso do ciclo ANTES do envio (no maximo 1 por ciclo: falha
+    de envio nao re-tenta — preferimos perder um aviso a mandar dois)."""
+    document("wa_conversations", conversation_id).set(
+        {"pool_wait_notice_at": at or utcnow()}, merge=True)
+
+
 def set_attendance_status(conversation_id, status, clear_takeover=False):
     """Define o attendance_status manualmente (Fase 4 — fechar/reabrir).
     status: 'aberto' | 'fechado_manual'. clear_takeover encerra a sessao
@@ -4037,7 +4181,21 @@ _DEFAULT_SYSTEM_SETTINGS = {
     # pode ser dado de saude, entao alem da flag ha o toggle RBAC
     # filtrar_leads_por_tag por perfil.
     "picker_tag_filter_enabled": False,
+    # Aviso de espera na pool (PO 2026-09-29, reuniao Hubloc): lead que
+    # aceitou a LGPD e ficou N minutos na pool sem operador assumir/responder
+    # recebe UMA mensagem por ciclo (ex.: "ligue para ..."). Cron de 5 min
+    # (/api/internal/cron/pool-wait-notice), so dentro do horario comercial
+    # do tenant e da janela de 24h. Texto POR TENANT, sem default: cada
+    # empresa tem o proprio telefone — um default aqui vazaria o numero de
+    # um cliente pro outro. Ligado sem texto = 400 no save.
+    "pool_wait_notice_enabled": False,
+    "pool_wait_notice_minutes": 15,
+    "pool_wait_notice_text": "",
 }
+
+POOL_WAIT_NOTICE_MIN_MINUTES = 5
+POOL_WAIT_NOTICE_MAX_MINUTES = 240
+POOL_WAIT_NOTICE_MAX_CHARS = 1000
 
 
 def get_system_settings():
@@ -4060,7 +4218,8 @@ def save_system_settings(settings: dict):
     # bool("false") e True — um PUT cru com string (kill-switch de madrugada,
     # JSON a mao) falharia silenciosamente LIGADO. Espirito do pool_mode.
     for _bool_key in ("auto_close_enabled", "rating_request_enabled",
-                      "picker_v2_enabled", "picker_tag_filter_enabled"):
+                      "picker_v2_enabled", "picker_tag_filter_enabled",
+                      "pool_wait_notice_enabled"):
         if _bool_key in filtered:
             _raw_b = filtered[_bool_key]
             if isinstance(_raw_b, str):
@@ -4068,6 +4227,29 @@ def save_system_settings(settings: dict):
                     "false", "0", "no", "off", "")
             else:
                 filtered[_bool_key] = bool(_raw_b)
+    if "pool_wait_notice_minutes" in filtered:
+        # Inteiro fechado no intervalo; lixo degrada pro default (15) em vez
+        # de gravar algo que o cron nao saberia interpretar.
+        try:
+            _mins = int(float(filtered["pool_wait_notice_minutes"]))
+        except (TypeError, ValueError):
+            _mins = _DEFAULT_SYSTEM_SETTINGS["pool_wait_notice_minutes"]
+        filtered["pool_wait_notice_minutes"] = max(
+            POOL_WAIT_NOTICE_MIN_MINUTES, min(POOL_WAIT_NOTICE_MAX_MINUTES, _mins))
+    if "pool_wait_notice_text" in filtered:
+        _txt = str(filtered["pool_wait_notice_text"] or "").strip()
+        if len(_txt) > POOL_WAIT_NOTICE_MAX_CHARS:
+            raise ValueError(
+                f"Mensagem de espera longa demais (maximo {POOL_WAIT_NOTICE_MAX_CHARS} caracteres)")
+        filtered["pool_wait_notice_text"] = _txt
+    if "pool_wait_notice_enabled" in filtered or "pool_wait_notice_text" in filtered:
+        # Estado EFETIVO pos-save (PUT parcial mistura com o gravado): ligado
+        # sem texto seria um cron que nunca envia, silenciosamente.
+        _cur = get_system_settings()
+        _on = filtered.get("pool_wait_notice_enabled", _cur.get("pool_wait_notice_enabled"))
+        _text = filtered.get("pool_wait_notice_text", _cur.get("pool_wait_notice_text"))
+        if _on and not str(_text or "").strip():
+            raise ValueError("Informe o texto da mensagem de espera antes de ligar o aviso")
     if "picker_v2_user_ids" in filtered:
         # Lista fechada de ints (canario por usuario): lixo/duplicata cai
         # fora em vez de quebrar o includes() do frontend; bool nao e int.

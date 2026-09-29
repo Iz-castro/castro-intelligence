@@ -377,6 +377,9 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   picker_v2_enabled: false,
   picker_v2_user_ids: [],
   picker_tag_filter_enabled: false,
+  pool_wait_notice_enabled: false,
+  pool_wait_notice_minutes: 15,
+  pool_wait_notice_text: "",
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {

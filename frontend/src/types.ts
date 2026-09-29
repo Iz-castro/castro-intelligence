@@ -406,6 +406,11 @@ export type SystemSettings = {
   // F5: filtro por tag no picker — flag propria (rollout/kill-switch
   // independentes do picker_v2; combina com o toggle RBAC por perfil).
   picker_tag_filter_enabled: boolean;
+  // Aviso de espera na pool: lead sem operador apos N minutos recebe UMA
+  // mensagem por ciclo (cron de 5 min, so no expediente e na janela de 24h).
+  pool_wait_notice_enabled: boolean;
+  pool_wait_notice_minutes: number;
+  pool_wait_notice_text: string;
 };
 
 // Linha do picker v2.1 — payload MINIMO do card (backend enrich_picker_rows):

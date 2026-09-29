@@ -3251,6 +3251,27 @@ function AdminSettingsModal() {
               </div>
             </div>
             <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+              <h3>Aviso de espera na fila</h3>
+              <p className="sub" style={{ marginBottom: "0.6rem", fontSize: "0.8rem" }}>Quando o lead aceita a LGPD e entra na fila, se nenhum operador assumir ou responder dentro do tempo abaixo, o sistema envia esta mensagem uma única vez. A checagem roda a cada 5 minutos, só dentro do horário de atendimento e da janela de 24h do WhatsApp. Lead que chega fora do expediente começa a contar na abertura.</p>
+              <div className="settings-block">
+                <label className="settings-toggle">
+                  <input type="checkbox" checked={systemSettings.pool_wait_notice_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_enabled: e.target.checked }))} />
+                  <span>Enviar aviso quando o lead esperar demais na fila</span>
+                </label>
+              </div>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Minutos de espera antes do aviso (5 a 240):</span>
+                <input type="number" min={5} max={240} value={systemSettings.pool_wait_notice_minutes} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_minutes: Number(e.target.value) || 0 }))} style={{ width: 100 }} />
+              </div>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagem enviada ao cliente:</span>
+                <textarea value={systemSettings.pool_wait_notice_text} maxLength={1000} rows={4} style={{ width: "100%", resize: "vertical" }}
+                  placeholder="Ex.: Oi! Estamos com um volume de mensagens acima do normal e ainda não conseguimos te atender por aqui. Para agilizar, você pode ligar para +55 XX XXXX-XXXX..."
+                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_text: e.target.value }))} />
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.75rem" }}>Escreva o telefone com +55 e DDD para o WhatsApp deixá-lo clicável. {(systemSettings.pool_wait_notice_text || "").length}/1000</p>
+              </div>
+            </div>
+            <div className="settings-section" style={{ marginTop: "1.2rem" }}>
               <h3>Agenda de contatos (picker novo)</h3>
               <div className="settings-block">
                 <label className="settings-toggle">

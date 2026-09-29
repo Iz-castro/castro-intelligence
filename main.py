@@ -4536,6 +4536,102 @@ async def cron_expire_takeovers(request: Request):
     }
 
 
+@app.post("/api/internal/cron/pool-wait-notice")
+async def cron_pool_wait_notice(request: Request):
+    """Cloud Scheduler a cada 5 min (job castro-crm-pool-wait-notice).
+
+    Aviso de espera na pool (PO 2026-09-29): lead que aceitou a LGPD e ficou
+    pool_wait_notice_minutes na fila sem operador assumir/responder recebe
+    UMA vez por ciclo o texto do tenant (system_settings). Regras de
+    elegibilidade em database_firestore.pool_wait_notice_eligible. Tenant com
+    o toggle desligado ou expediente fechado nao le nenhuma thread.
+    """
+    _verify_cron_auth(request)
+    from firestore_common import set_tenant_context, reset_tenant_context
+    from tenant_service import list_tenants
+    from channel_service import get_channel as _get_notice_channel
+    from business_hours import is_open as _bh_is_open
+    from bot_sender import send_bot_reply
+    from database import (
+        find_pool_wait_notice_candidates, mark_pool_wait_notice_sent,
+    )
+
+    started = _monotonic()
+    summary: list[dict] = []
+    sent_total = 0
+    for tenant in list_tenants(active_only=True):
+        tid = str(tenant.get("id") or "")
+        if not tid:
+            continue
+        # Orcamento do request (Cloud Run mata em 300s; envio tem timeout
+        # de 15s): tenant que nao cabe fica pro proximo tick de 5 min.
+        if _monotonic() - started > 150:
+            summary.append({"tenant_id": tid, "skipped": "sem_orcamento"})
+            continue
+        token = set_tenant_context(tid)
+        try:
+            settings = get_system_settings()
+            if not settings.get("pool_wait_notice_enabled"):
+                continue
+            text = str(settings.get("pool_wait_notice_text") or "").strip()
+            if not text:
+                logger.warning("pool-wait-notice: tenant %s ligado sem texto — nada enviado", tid)
+                continue
+            if _bh_is_open(tid) is False:
+                continue
+            minutes = int(settings.get("pool_wait_notice_minutes") or 15)
+            sent = failed = 0
+            for cand in find_pool_wait_notice_candidates(minutes, tid):
+                if _monotonic() - started > 200:
+                    break
+                conv = cand["conversation"]
+                contact = cand["contact"]
+                conv_id = str(conv.get("id") or "")
+                channel = _get_notice_channel(conv.get("channel_id"))                     if conv.get("channel_id") is not None else None
+                if not channel or not conv_id:
+                    logger.warning(
+                        "pool-wait-notice: canal indisponivel | tenant=%s channel=%s",
+                        tid, conv.get("channel_id"),
+                    )
+                    continue
+                if str(channel.get("channel_type") or "") == "coexistence":
+                    # Fonte da verdade e o canal vivo: nunca manda o aviso
+                    # pelo numero pessoal de um operador (coex).
+                    continue
+                wa_id = str(conv.get("wa_id") or contact.get("wa_id") or "")
+                if not wa_id:
+                    continue
+                # Carimbo ANTES do envio: no maximo 1 aviso por ciclo, mesmo
+                # com tick sobreposto ou falha no meio.
+                mark_pool_wait_notice_sent(conv_id)
+                ok = await send_bot_reply(
+                    wa_id, text, contact.get("id"),
+                    str(channel.get("access_token") or WHATSAPP_TOKEN or "").strip(),
+                    str(channel.get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID or "").strip(),
+                    channel_id=channel.get("id"),
+                    channel_owner_user_id=channel.get("owner_user_id"),
+                )
+                if ok:
+                    sent += 1
+                else:
+                    failed += 1
+                log_audit(
+                    None,
+                    "POOL_WAIT_NOTICE_SENT" if ok else "POOL_WAIT_NOTICE_FAILED",
+                    f"conv={conv_id} minutos={minutes}",
+                )
+            if sent or failed:
+                summary.append({"tenant_id": tid, "sent": sent, "failed": failed})
+            sent_total += sent
+        except Exception as exc:
+            logger.error("pool-wait-notice tenant %s falhou: %s", tid, exc)
+            summary.append({"tenant_id": tid, "error": str(exc)})
+        finally:
+            reset_tenant_context(token)
+
+    return {"status": "ok", "sent_total": sent_total, "tenants": summary}
+
+
 @app.get("/api/wa/contact/{contact_id}")
 async def wa_contact_detail(contact_id: int, current_user: dict = Depends(get_current_user)):
     contact = get_wa_contact(contact_id)
