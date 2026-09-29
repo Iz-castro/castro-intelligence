@@ -21,6 +21,7 @@ from config import (
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN,
     RATING_CAPTURE_HOURS,
     BOT_BUFFER_SECONDS, BOT_BUFFER_MAX_CHARS, CX_DETECT_TIMEOUT_SECONDS,
+    WEBHOOK_RAW_DEBUG_CHANNELS, WEBHOOK_RAW_DEBUG_TTL_DAYS,
 )
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit, flag_conversation_takeover,
@@ -594,6 +595,44 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
         reset_tenant_context(ctx_token)
 
 
+def _log_raw_webhook_debug(payload, value, channel):
+    """Log TEMPORARIO do payload cru (descoberta do referral de anuncio).
+
+    Desligado por default (WEBHOOK_RAW_DEBUG_CHANNELS vazio). So grava change
+    com mensagem inbound de canal listado, ja com tenant resolvido — nunca em
+    colecao flat. Nunca propaga excecao: o log nao pode derrubar o webhook.
+    """
+    if not WEBHOOK_RAW_DEBUG_CHANNELS or channel is None:
+        return
+    try:
+        channel_id = channel.get("id")
+        if str(channel_id) not in WEBHOOK_RAW_DEBUG_CHANNELS:
+            return
+        if not get_tenant_context():
+            return
+        messages = [m for m in (value.get("messages") or []) if isinstance(m, dict)]
+        first_id = str(messages[0].get("id") or "").strip() if messages else ""
+        if not first_id:
+            return
+        # Doc id deterministico + create(): a reentrega da Meta (~23s sem ACK)
+        # bate no mesmo doc e falha com AlreadyExists em vez de duplicar ou
+        # sobrescrever o received_at original.
+        doc_id = hashlib.sha1(first_id.encode("utf-8")).hexdigest()
+        now = utcnow()
+        document("webhook_raw_debug", doc_id).create({
+            "received_at": now,
+            "expire_at": now + timedelta(days=WEBHOOK_RAW_DEBUG_TTL_DAYS),
+            "channel_id": channel_id,
+            "wa_message_id": first_id,
+            "has_referral": any("referral" in m for m in messages),
+            "payload": payload,
+        })
+    except Exception as exc:
+        if type(exc).__name__ in ("AlreadyExists", "Conflict"):
+            return
+        logger.warning("[RAW-DEBUG] falha ao gravar payload cru: %s", type(exc).__name__)
+
+
 async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
     """Implementacao do processamento. Tenant_context ja setado pelo wrapper.
 
@@ -678,6 +717,7 @@ async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
             else:
                 # Webhooks padrao da Cloud API (messages, statuses)
                 if "messages" in value:
+                    _log_raw_webhook_debug(payload, value, channel)
                     await _process_messages(value, ws_notify_callback, channel=channel)
 
                 if "statuses" in value and FEATURE_MESSAGE_STATUS:

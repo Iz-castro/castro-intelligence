@@ -135,6 +135,19 @@ FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
 # Contador de "assumidas sem resposta" (bloqueia assume com 2+ pendentes).
 # Desligado a pedido do cliente; religar via env sem mudar codigo.
 FEATURE_ASSUME_COUNTER = _bool_env("FEATURE_ASSUME_COUNTER", "false")
+
+# -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
+# CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em
+# tenants/{tid}/webhook_raw_debug com expire_at (TTL policy do Firestore no
+# collection group). Payload cru tem PII (telefone/nome/texto): ligar so pelo
+# periodo da descoberta e desligar por env depois.
+WEBHOOK_RAW_DEBUG_CHANNELS = frozenset(
+    part.strip()
+    for part in os.getenv("WEBHOOK_RAW_DEBUG_CHANNELS", "").split(",")
+    if part.strip()
+)
+WEBHOOK_RAW_DEBUG_TTL_DAYS = 30
+
 STT_LANGUAGE_CODE = os.getenv("STT_LANGUAGE_CODE", "pt-BR").strip()
 STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30.0"))
 STT_FALLBACK_TEXT = os.getenv("STT_FALLBACK_TEXT", "").strip()
