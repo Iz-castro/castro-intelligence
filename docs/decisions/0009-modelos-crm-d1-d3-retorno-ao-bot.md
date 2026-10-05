@@ -41,6 +41,10 @@ texto novo = todo mundo re-aceita à toa.
 
 ## D2 — Fechamento pelo cliente (botão "Encerrar") também devolve ao bot: SIM
 
+> **Emenda 2026-09-23 (PO, ADR 0013):** o opt-out de reabertura do D2 **deixa de ser permanente**. Qualquer mensagem nova do
+> cliente limpa `reopen_opt_out` no mesmo ponto do webhook que zera `reopen_attempts`. O clique em Encerrar continua carimbando
+> o opt-out e o envio pontual continua bloqueando enquanto ele estiver ativo. Ver `docs/decisions/0013-publicos-reabertura-lote.md`.
+
 Uniforme com "vale para todo fechamento". O clique curto-circuita o bot no
 próprio turno, então não há ping-pong.
 

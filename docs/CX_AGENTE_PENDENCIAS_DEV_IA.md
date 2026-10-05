@@ -135,3 +135,31 @@ apontar o environment de volta pra versão anterior.
 read-only do Firestore de prod). Referências no CRM: conector
 `bot_engine_dialogflow.py` (unwrap + montagem do agent_path), resumo
 `bot_service._cx_handoff_details`, temperatura `lead_temperature.py`.*
+
+---
+
+## 4. Retomada em lote pelo público Bot (2026-09-23) — param `origem=retomada_lote` e mídia
+
+> **Contexto:** o CRM vai ganhar reabertura em lote por público (`docs/PLANO_REABERTURA_LOTE_BOT_RECEPCAO.md`, ADR 0013).
+> Lead **em fase de bot** (consentido, sem dono) recebe um template UTILITY com botões [Continuar]/[Encerrar]. Ao clicar
+> **Continuar**, o CRM dispara um turno do CX para a Val responder. Duas coisas dependem do agente:
+
+1. **Parâmetro de sessão `origem=retomada_lote`** (string), enviado junto dos params de horário já existentes, só nesse turno.
+   O texto do turno é o rótulo do botão clicado (ex.: "Continuar"). A sessão CX já expirou e o `cx_snapshot` foi zerado quando
+   o lead voltou ao bot, então sem tratamento a Val recomeça do zero (apresentação, nome). Esperado: cumprimentar quem voltou e
+   perguntar no que pode ajudar, sem reapresentação completa. Não escrever o texto do template na resposta.
+2. **Mídia em fase de bot:** hoje foto/documento/vídeo/figurinha/localização não chegam ao agente. O CRM passará a mandar um
+   turno com texto `[cliente enviou imagem]` (ou `documento`, `vídeo`, `figurinha`, `localização`) e o param `midia_tipo`. Esperado: pedir a descrição
+   em texto ou encaminhar, conforme o playbook; nunca tratar o colchete como pergunta literal.
+
+3. **Desfecho do atendimento da Val (`desfecho_bot`)** — pedido de 24/09. O lote de retomada de 23/09 mandou "seu atendimento
+   não foi concluído" a pacientes que a Val já tinha atendido e que agendaram pelo link `marcaconsultas.com.br` sem falar com
+   humano (dos 71 que clicaram Encerrar, 46 tinham conversa de agendamento com a Val). O CRM não tem como saber. Esperado: a Val
+   setar um session param `desfecho_bot` com um destes valores, no turno em que acontece: `link_enviado` (mandou o link de
+   agendamento), `agendado` (paciente confirmou que agendou), `duvida_respondida` (pergunta simples resolvida, sem agendamento),
+   `sem_interesse`. Escalar, nao struct (mesma higiene do item 1). O CRM vai persistir no contato e tirar esses leads da retomada
+   em lote do público Bot. Se preferir outro nome/valores, me avise antes de publicar.
+
+Teste no `varizemed-test` (Draft) antes de publicar environment. Quem aciona no CRM: Rafael.
+
+> **05/10:** pedido consolidado, com contrato, exemplos e roteiro de teste: `docs/CX_RETOMADA_LOTE_DEV_IA.md`.
