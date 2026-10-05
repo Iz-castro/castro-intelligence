@@ -3102,10 +3102,21 @@ function DashboardModal() {
 function AdminSettingsModal() {
   const {
     bundle, setShowSettings, departments, channels, operators,
-    systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction,
-    setError, setNotice,
+    systemSettings, setSystemSettings, savedSystemSettings, busySettings, saveSystemSettingsAction,
+    setError, setNotice, error, notice,
   } = useCrm();
   const [adminTab, setAdminTab] = useState<"system" | "departments" | "channels" | "notifications">("system");
+
+  // -- Privacidade (LGPD, P2b): data da politica vigente --
+  // "Hoje" em Brasilia (UTC-3 fixo, como o backend): teto do seletor de data;
+  // o backend rejeita data futura com 400 de qualquer forma.
+  const lgpdTodayBr = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const lgpdDateDraft = systemSettings.lgpd_policy_date || "";
+  const lgpdDateSaved = savedSystemSettings.lgpd_policy_date || "";
+  const lgpdDateBr = (iso: string) => {
+    const [y, m, d] = iso.split("-");
+    return y && m && d ? `${d}/${m}/${y}` : iso;
+  };
 
   // -- Department state --
   const [depts, setDepts] = useState<Department[]>(departments);
@@ -3238,6 +3249,39 @@ function AdminSettingsModal() {
               </div>
             </div>
             <div className="settings-section" style={{ marginTop: "1.2rem" }}>
+              <h3>Privacidade (LGPD)</h3>
+              <p className="sub" style={{ marginBottom: "0.6rem", fontSize: "0.8rem" }}>Aviso de privacidade que o assistente virtual envia antes de começar a conversa, com os botões Sim / Não. Campos vazios mantêm o aviso e o link usados hoje.</p>
+              <div className="settings-block">
+                <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
+                  <span>Data da política de privacidade em vigor</span>
+                  <input type="date" value={lgpdDateDraft} max={lgpdTodayBr} style={{ width: 180 }}
+                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_policy_date: e.target.value }))} />
+                </label>
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Use a data de publicação da política que está no ar, não a data de hoje. Quem aceitou antes dessa data verá o aviso de novo na próxima mensagem.</p>
+                {lgpdDateDraft !== lgpdDateSaved ? (
+                  <div className="alert" role="status" style={{ marginTop: "0.4rem", fontSize: "0.8rem", background: "rgba(154, 89, 39, 0.12)", color: "var(--warm)" }}>
+                    <span>{lgpdDateDraft
+                      ? `Ao salvar, a política em vigor passa a ser a de ${lgpdDateBr(lgpdDateDraft)}. Quem aceitou antes de ${lgpdDateBr(lgpdDateDraft)} verá o aviso de privacidade de novo na próxima mensagem ao assistente.`
+                      : `Ao salvar sem data${lgpdDateSaved ? ` (hoje: ${lgpdDateBr(lgpdDateSaved)})` : ""}, o sistema deixa de usar a regra por data. Quem aceitou enquanto a data estava configurada pode ver o aviso de novo.`}</span>
+                  </div>
+                ) : null}
+              </div>
+              <div className="settings-block">
+                <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
+                  <span>Link da política</span>
+                  <input type="url" value={systemSettings.lgpd_privacy_url || ""} placeholder="https://... (vazio = usa o link atual)"
+                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_privacy_url: e.target.value }))} />
+                </label>
+              </div>
+              <div className="settings-block">
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Texto do aviso:</span>
+                <textarea value={systemSettings.lgpd_notice || ""} maxLength={900} rows={5} style={{ width: "100%", resize: "vertical" }}
+                  placeholder="Vazio = usa o texto atual do aviso."
+                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_notice: e.target.value }))} />
+                <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.75rem" }}>O sistema acrescenta ao final o link da política e a pergunta "Podemos continuar?". {(systemSettings.lgpd_notice || "").length}/900</p>
+              </div>
+            </div>
+            <div className="settings-section" style={{ marginTop: "1.2rem" }}>
               <h3>Fila de novos leads</h3>
               <div className="settings-block">
                 <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
@@ -3310,6 +3354,9 @@ function AdminSettingsModal() {
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Mostra o seletor de tag no picker — só para perfis com a permissão "Filtrar a agenda por tag" (Perfis de acesso; padrão: supervisão). Tags podem revelar dado sensível: ligue por decisão consciente do tenant.</p>
               </div>
             </div>
+            {/* Erro do save (ex.: 400 da politica LGPD) visivel DENTRO do modal — o alerta global fica atras do lightbox. */}
+            {error ? <div className="alert danger" role="alert" style={{ marginTop: "1rem" }}><span>{error}</span><button type="button" className="alert-close" onClick={() => setError("")} aria-label="Fechar">&#10005;</button></div> : null}
+            {notice ? <div className="alert success" style={{ marginTop: "1rem" }}><span>{notice}</span><button type="button" className="alert-close" onClick={() => setNotice("")} aria-label="Fechar">&#10005;</button></div> : null}
             <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
           </>
         )}
@@ -3421,7 +3468,7 @@ function AdminSettingsModal() {
 }
 
 function NotificationsTab() {
-  const { bundle, departments, systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction, setError, setNotice } = useCrm();
+  const { bundle, departments, systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction, setError, setNotice, error, notice } = useCrm();
   const [uploadingNotif, setUploadingNotif] = useState(false);
   const [uploadingAlarm, setUploadingAlarm] = useState(false);
   const notifFileRef = useRef<HTMLInputElement | null>(null);
@@ -3542,6 +3589,9 @@ function NotificationsTab() {
         </div>
       </div>
 
+      {/* Mesmo save da aba Sistema (objeto inteiro): o 400 aparece aqui tambem. */}
+      {error ? <div className="alert danger" role="alert" style={{ marginTop: "1rem" }}><span>{error}</span><button type="button" className="alert-close" onClick={() => setError("")} aria-label="Fechar">&#10005;</button></div> : null}
+      {notice ? <div className="alert success" style={{ marginTop: "1rem" }}><span>{notice}</span><button type="button" className="alert-close" onClick={() => setNotice("")} aria-label="Fechar">&#10005;</button></div> : null}
       <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
     </>
   );

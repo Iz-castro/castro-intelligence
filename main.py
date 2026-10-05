@@ -1044,6 +1044,28 @@ async def delete_perfil_acesso(perfil_id: str, current_user: dict = Depends(get_
 
 # -- API: Configuracoes do sistema --
 
+_LGPD_AUDIT_KEYS = ("lgpd_policy_date", "lgpd_privacy_url", "lgpd_notice")
+
+
+def _lgpd_policy_audit_detail(before: dict, after: dict) -> str:
+    """Detalhe do LGPD_POLICY_UPDATE: data antiga -> nova e se link/aviso
+    mudaram, SEM o texto (P2b). Vazio quando nada LGPD mudou — o frontend
+    regrava tudo a cada save de sons/toggles e isso nao e troca de politica."""
+    def _v(src, key):
+        return str((src or {}).get(key) or "").strip()
+
+    old_date, new_date = _v(before, "lgpd_policy_date"), _v(after, "lgpd_policy_date")
+    link_changed = _v(before, "lgpd_privacy_url") != _v(after, "lgpd_privacy_url")
+    notice_changed = _v(before, "lgpd_notice") != _v(after, "lgpd_notice")
+    if old_date == new_date and not link_changed and not notice_changed:
+        return ""
+    return (
+        f"data {old_date or '(vazia)'} -> {new_date or '(vazia)'}"
+        f" | link {'alterado' if link_changed else 'mantido'}"
+        f" | aviso {'alterado' if notice_changed else 'mantido'}"
+    )
+
+
 @app.get("/api/settings/system")
 async def get_settings_system(current_user: dict = Depends(get_current_user)):
     return get_system_settings()
@@ -1059,11 +1081,27 @@ async def update_settings_system(request: Request, current_user: dict = Depends(
     # stale apagava/revertia o registry que um supervisor editou no meio.
     if isinstance(body, dict):
         body.pop("tags_global", None)
+    # P2b: conteudo LGPD do aviso (data/link/texto) e editado aqui, com a
+    # MESMA permissao da aba Sistema. Estado anterior lido so quando o body
+    # traz alguma chave LGPD (o frontend manda o objeto inteiro: 1 leitura
+    # por save de admin) para auditar a troca de politica.
+    _lgpd_before = (get_system_settings()
+                    if isinstance(body, dict) and any(k in body for k in _LGPD_AUDIT_KEYS)
+                    else None)
     try:
         result = save_system_settings(body)
-    except ValueError as exc:  # mensagem rapida vazia/atalho repetido
+    except ValueError as exc:  # mensagem rapida vazia/atalho repetido/LGPD invalido
         raise HTTPException(status_code=400, detail=str(exc))
-    log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(body))
+    _audit_body = body
+    if isinstance(body, dict) and "lgpd_notice" in body:
+        # Texto do aviso nao vai inteiro pro audit (so o tamanho).
+        _audit_body = dict(body)
+        _audit_body["lgpd_notice"] = f"<{len(str(body.get('lgpd_notice') or ''))} caracteres>"
+    log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(_audit_body))
+    if _lgpd_before is not None:
+        _lgpd_detail = _lgpd_policy_audit_detail(_lgpd_before, result)
+        if _lgpd_detail:
+            log_audit(current_user["id"], "LGPD_POLICY_UPDATE", _lgpd_detail)
     return result
 
 

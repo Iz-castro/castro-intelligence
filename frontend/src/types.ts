@@ -411,6 +411,13 @@ export type SystemSettings = {
   pool_wait_notice_enabled: boolean;
   pool_wait_notice_minutes: number;
   pool_wait_notice_text: string;
+  // P2b: conteudo LGPD do aviso do bot, editado pela clinica. Vazio = o bot
+  // usa o fallback (settings.ai no CX; texto/link fixos no builtin).
+  // lgpd_policy_date = AAAA-MM-DD da politica vigente: aceite anterior e
+  // reperguntado. Backend rejeita data futura, link sem https:// e aviso > 900.
+  lgpd_policy_date: string;
+  lgpd_privacy_url: string;
+  lgpd_notice: string;
 };
 
 // Linha do picker v2.1 — payload MINIMO do card (backend enrich_picker_rows):

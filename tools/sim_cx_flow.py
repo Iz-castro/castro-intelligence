@@ -1135,6 +1135,200 @@ finally:
     _cx.detect_intent_text = _det_bak
     _real.httpx = _httpx  # restaura o modulo real no conector carregado por spec
 
+print("\n=== w: P2b — politica LGPD como DATA + conteudo da aba Sistema (system_settings) ===")
+# A clinica edita data/link/aviso na aba Sistema (system_settings). Datas
+# RELATIVAS a hoje (Brasilia): o sim passa em qualquer dia. bot_service
+# importou get_system_settings por nome — o patch e no modulo bot.
+import lgpd_bot  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+_BR = timezone(timedelta(hours=-3))
+_HOJE_BR = datetime.now(_BR).date()
+_DATA_POL = (_HOJE_BR - timedelta(days=10)).isoformat()
+_ACEITE_ANTIGO = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+_ACEITE_RECENTE = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+_SYS = {"bot_enabled": True}
+_sys_bak = bot.get_system_settings
+bot.get_system_settings = lambda: dict(_SYS)
+try:
+    # (a) sem data e sem campos: aviso e versao exatamente como antes.
+    _cfg0 = bot.lgpd_policy_config({"bot_enabled": True}, _AI_CFG, cx=True)
+    check(_cfg0["aviso"] == (_AI_CFG["lgpd_notice"] + "\n(Política de Privacidade: "
+                             + _AI_CFG["lgpd_privacy_url"] + ")\n\nPodemos continuar?"),
+          "sem campos na aba Sistema: aviso CX identico ao formato antigo (settings.ai)")
+    check(_cfg0["policy_date"] is None and _cfg0["version"] == "varizemed-test-2026-07",
+          "sem data: versao gravada segue a do settings.ai")
+    novo_contato(60, wa_id="5571960000001", lgpd_consent=True, lgpd_consent_at=_ACEITE_ANTIGO,
+                 lgpd_policy_version="varizemed-test-2026-07")
+    STORE["bot_states"]["60"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    CX_SCRIPT.append(_cx_ok("Sem data configurada, sigo normal."))
+    _n = len(CX_CALLS)
+    r = envia(60, "oi de novo")
+    check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+          "sem data: aceite antigo com estado aceito vai direto ao agente (nada muda no deploy)")
+
+    # (b) data ANTERIOR ao aceite: passa direto, sem aviso.
+    _SYS["lgpd_policy_date"] = _DATA_POL
+    novo_contato(61, wa_id="5571960000002", lgpd_consent=True, lgpd_consent_at=_ACEITE_RECENTE,
+                 lgpd_policy_version="varizemed-test-2026-07")
+    STORE["bot_states"]["61"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    CX_SCRIPT.append(_cx_ok("Claro, temos horario na terca."))
+    _n = len(CX_CALLS)
+    r = envia(61, "tem horario terca?")
+    check(isinstance(r, str) and "terca" in r and len(CX_CALLS) == _n + 1
+          and CX_CALLS[-1]["text"] == "tem horario terca?",
+          "data anterior ao aceite: segue direto pro agente, sem aviso")
+    # Hidratacao (ciclo novo, bot_states sem lgpd_*): com data vale a regra por
+    # data — versao de texto diferente NAO repergunta mais.
+    novo_contato(62, wa_id="5571960000003", lgpd_consent=True, lgpd_consent_at=_ACEITE_RECENTE,
+                 lgpd_policy_version="varizemed-velha-2020")
+    CX_SCRIPT.append(_cx_ok("Bem-vindo de volta."))
+    _n = len(CX_CALLS)
+    r = envia(62, "voltei")
+    check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+          "hidratacao com data: aceite posterior a politica vale mesmo com versao de texto diferente")
+    check(STORE["bot_states"]["62"].get("lgpd_consent") is True, "estado hidratado persistido")
+
+    # (c) data POSTERIOR ao aceite com estado "aceito": aviso reaparece, a
+    # mensagem vira user_first_input; novo "sim" grava versao = data e segue.
+    novo_contato(63, wa_id="5571960000004", lgpd_consent=True, lgpd_consent_at=_ACEITE_ANTIGO,
+                 lgpd_policy_version="varizemed-test-2026-07")
+    STORE["bot_states"]["63"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx",
+                                 "user_first_input": "mensagem velha do 1o aceite"}
+    _n = len(CX_CALLS)
+    r = envia(63, "quero remarcar minha consulta")
+    check(isinstance(r, dict) and r.get("type") == "interactive_buttons"
+          and "Podemos continuar?" in r.get("body", ""),
+          "aceite anterior a politica: aviso LGPD reaparece (botoes)")
+    check([b.get("id") for b in r.get("buttons", [])] == ["lgpd_aceitar", "lgpd_recusar"]
+          if isinstance(r, dict) else False, "aviso com os botoes Sim/Nao de sempre")
+    check(len(CX_CALLS) == _n, "agente NAO e chamado enquanto o aceite esta desatualizado")
+    _st63 = STORE["bot_states"]["63"]
+    check(_st63.get("lgpd_consent") is None and _st63.get("lgpd_status") == "awaiting",
+          "estado rebaixado e persistido (lgpd_consent None, aguardando)")
+    check(_st63.get("user_first_input") == "quero remarcar minha consulta",
+          "mensagem atual guardada como user_first_input")
+    check(bot.lgpd_consent_resolved(_st63, STORE["wa_contacts"]["63"]) is False,
+          "buffer: consentimento nao resolvido enquanto aguarda o novo aceite")
+    _audit_n = len(AUDIT)
+    CX_SCRIPT.append(_cx_ok("Vamos remarcar! Qual dia fica melhor?"))
+    r = envia(63, "sim")
+    _c63 = STORE["wa_contacts"]["63"]
+    check(_c63.get("lgpd_policy_version") == _DATA_POL, "novo aceite grava versao = data da politica")
+    check(lgpd_bot.data_aceite_br(_c63.get("lgpd_consent_at")) == _HOJE_BR,
+          "novo aceite carimba lgpd_consent_at de agora")
+    check(any(a["action"] == "LGPD_CONSENT_ACCEPTED" and _DATA_POL in a["detail"]
+              for a in AUDIT[_audit_n:]), "audit do novo aceite cita a data da politica")
+    check(len(CX_CALLS) == _n + 1 and CX_CALLS[-1]["text"] == "quero remarcar minha consulta",
+          "apos o aceite, o agente recebe o user_first_input")
+    check(isinstance(r, str) and "Vamos remarcar" in r, "resposta do agente chega ao paciente")
+    CX_SCRIPT.append(_cx_ok("Terca as 10h esta livre."))
+    r = envia(63, "pode ser terca")
+    check(isinstance(r, str) and "Terca" in r and len(CX_CALLS) == _n + 2,
+          "turno seguinte vai direto (sem loop de reconsentimento)")
+
+    # (d) aviso e link da aba Sistema substituem os do settings.ai — campo a campo.
+    _SYS["lgpd_notice"] = "Aviso novo da clinica: tratamos seus dados de saude conforme a LGPD."
+    _SYS["lgpd_privacy_url"] = "https://clinica.example/politica-2026"
+    novo_contato(64, wa_id="5571960000005")
+    r = envia(64, "oi")
+    _body = r.get("body", "") if isinstance(r, dict) else ""
+    check(_body == (_SYS["lgpd_notice"] + "\n(Política de Privacidade: "
+                    + _SYS["lgpd_privacy_url"] + ")\n\nPodemos continuar?"),
+          "aviso e link da aba Sistema no formato do CX")
+    check(_AI_CFG["lgpd_notice"] not in _body and _AI_CFG["lgpd_privacy_url"] not in _body,
+          "nada do settings.ai quando a aba Sistema esta preenchida")
+    _SYS["lgpd_privacy_url"] = ""
+    novo_contato(65, wa_id="5571960000006")
+    r = envia(65, "oi")
+    _body = r.get("body", "") if isinstance(r, dict) else ""
+    check(_SYS["lgpd_notice"] in _body and _AI_CFG["lgpd_privacy_url"] in _body,
+          "link vazio na aba Sistema: cai no link do settings.ai (precedencia por campo)")
+    _SYS["lgpd_notice"] = ""
+
+    # (e) lgpd_consent_resolved (buffer do webhook) com a regra por data.
+    _ctt_old = {"lgpd_consent": True, "lgpd_consent_at": _ACEITE_ANTIGO,
+                "lgpd_policy_version": "varizemed-test-2026-07"}
+    _ctt_new = {"lgpd_consent": True, "lgpd_consent_at": _ACEITE_RECENTE,
+                "lgpd_policy_version": "outra-versao"}
+    _sys_dt = {"lgpd_policy_date": _DATA_POL}
+    _acc = {"lgpd_consent": True, "lgpd_status": "accepted"}
+    check(bot.lgpd_consent_resolved(_acc, _ctt_old, _AI_CFG, _sys_dt) is False,
+          "resolved: estado aceito + aceite desatualizado -> False")
+    check(bot.lgpd_consent_resolved(_acc, _ctt_old, _AI_CFG, {}) is True,
+          "resolved: sem data, estado aceito vale como sempre")
+    check(bot.lgpd_consent_resolved(_acc, _ctt_new, _AI_CFG, _sys_dt) is True,
+          "resolved: aceite em dia com a politica -> True")
+    check(bot.lgpd_consent_resolved({}, _ctt_old, _AI_CFG, _sys_dt) is False
+          and bot.lgpd_consent_resolved({}, _ctt_new, _AI_CFG, _sys_dt) is True,
+          "resolved: hidratacao pela data (antigo nao, recente sim mesmo com outra versao)")
+    check(bot.lgpd_consent_resolved({}, _ctt_new, _AI_CFG, {}) is False,
+          "resolved: sem data, hidratacao segue exigindo a versao de texto")
+    check(bot.lgpd_consent_resolved({"lgpd_consent": False}, _ctt_new, _AI_CFG, _sys_dt) is False,
+          "resolved: recusa no estado nunca vale")
+    check(bot.lgpd_consent_resolved(_acc, _ctt_old, _AI_CFG) is False,
+          "resolved: sem sys_settings explicito le system_settings (1 leitura) e aplica a data")
+    _sys_fut = {"lgpd_policy_date": (_HOJE_BR + timedelta(days=3)).isoformat()}
+    check(bot.lgpd_consent_resolved(_acc, _ctt_old, _AI_CFG, _sys_fut) is True,
+          "data futura gravada fora da UI e ignorada (sem loop de reconsentimento)")
+
+    # (f) aceite legado sem lgpd_consent_at continua valido.
+    _ctt_leg = {"lgpd_consent": True, "lgpd_policy_version": "varizemed-velha-2020"}
+    check(bot.lgpd_consent_resolved(_acc, _ctt_leg, _AI_CFG, _sys_dt) is True,
+          "resolved: aceite legado sem lgpd_consent_at vale")
+    novo_contato(66, wa_id="5571960000007", lgpd_consent=True)
+    STORE["bot_states"]["66"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    CX_SCRIPT.append(_cx_ok("Ola! Em que posso ajudar?"))
+    _n = len(CX_CALLS)
+    r = envia(66, "oi")
+    check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+          "turno: aceite legado sem carimbo segue direto pro agente")
+    novo_contato(67, wa_id="5571960000008", lgpd_consent=True, lgpd_consent_at=_ACEITE_RECENTE,
+                 lgpd_revoked=True)
+    r = envia(67, "oi")
+    check(isinstance(r, dict) and r.get("type") == "interactive_buttons",
+          "revogado nunca hidrata, com data tambem (guard J-3)")
+    CX_SCRIPT.clear()
+finally:
+    bot.get_system_settings = _sys_bak
+
+print("\n=== x: P2b — validacao do save da aba Sistema (funcao pura) ===")
+
+
+def _rejeita(campos, hoje=None, atual=None):
+    try:
+        lgpd_bot.validar_config_lgpd(campos, hoje or _HOJE_BR, atual)
+    except ValueError:
+        return True
+    return False
+
+
+check(_rejeita({"lgpd_policy_date": (_HOJE_BR + timedelta(days=1)).isoformat()}),
+      "data futura (amanha em Brasilia) e rejeitada")
+check(not _rejeita({"lgpd_policy_date": _HOJE_BR.isoformat()}), "data de hoje e aceita")
+check(_rejeita({"lgpd_policy_date": "01/07/2026"}) and _rejeita({"lgpd_policy_date": "2026-02-30"}),
+      "data fora do formato AAAA-MM-DD ou inexistente e rejeitada")
+check(_rejeita({"lgpd_privacy_url": "http://clinica.example/politica"})
+      and _rejeita({"lgpd_privacy_url": "https://"})
+      and _rejeita({"lgpd_privacy_url": "https://clinica .example"}),
+      "link sem https://, so o esquema ou com espaco e rejeitado")
+check(_rejeita({"lgpd_notice": "x" * 901}) and not _rejeita({"lgpd_notice": "x" * 900}),
+      "aviso: 901 caracteres rejeitado, 900 aceito")
+check(_rejeita({"lgpd_notice": "x" * 900, "lgpd_privacy_url": "https://e.x/" + "p" * 100}),
+      "aviso + link que passam de 1024 no corpo do WhatsApp sao rejeitados")
+check(_rejeita({"lgpd_privacy_url": "https://e.x/" + "p" * 100}, atual={"lgpd_notice": "x" * 900}),
+      "PUT parcial: link novo conferido contra o aviso ja gravado")
+_ok = lgpd_bot.validar_config_lgpd(
+    {"lgpd_policy_date": f" {_DATA_POL} ", "lgpd_privacy_url": " https://c.example/p ",
+     "lgpd_notice": " linha 1\r\nlinha 2 "}, _HOJE_BR)
+check(_ok == {"lgpd_policy_date": _DATA_POL, "lgpd_privacy_url": "https://c.example/p",
+              "lgpd_notice": "linha 1\nlinha 2"},
+      "valores validos normalizados (trim, quebra de linha)")
+check(lgpd_bot.validar_config_lgpd(
+    {"lgpd_policy_date": "", "lgpd_privacy_url": None, "lgpd_notice": ""}, _HOJE_BR)
+      == {"lgpd_policy_date": "", "lgpd_privacy_url": "", "lgpd_notice": ""},
+      "campos vazios sao validos (voltam ao fallback)")
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")

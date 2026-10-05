@@ -445,6 +445,109 @@ def cenario_horario_comercial():
           "sem tabela -> params neutros (nunca afirma fechado)")
 
 
+def cenario_p2b_lgpd_builtin():
+    """P2b (plano de reabertura 3.4): o builtin tambem le aviso/link/data da
+    aba Sistema (system_settings). Datas RELATIVAS a hoje em Brasilia."""
+    titulo("CENARIO 8 — P2b: aviso/link/data da politica LGPD da aba Sistema no builtin")
+    from datetime import timedelta
+    import lgpd_bot
+
+    BR = timezone(timedelta(hours=-3))
+    hoje = datetime.now(BR).date()
+    data_pol = (hoje - timedelta(days=10)).isoformat()
+    antigo = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    recente = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    sys_settings = {"bot_enabled": True}
+    bak = bot.get_system_settings
+    # bot_service importou get_system_settings por nome: patch no modulo bot.
+    bot.get_system_settings = lambda: dict(sys_settings)
+    try:
+        # (a) aba Sistema vazia: aviso historico identico + versao fixa.
+        _novo_contato(20)
+        reply, payload, _ = cliente_envia(20, text="oi")
+        check(isinstance(reply, dict) and reply.get("body") == lgpd_bot._AVISO_LGPD,
+              "aba Sistema vazia: aviso historico da Hub Loc, identico ao de antes")
+        cliente_envia(20, text="sim")
+        check(STORE["wa_contacts"]["20"].get("lgpd_policy_version") == bot.LGPD_POLICY_VERSION,
+              "sem data: versao gravada segue a fixa (hubloc-2026-06)")
+
+        # (d) texto + link customizados substituem os fixos (formato do CX).
+        aviso = "Olá! Aqui é a Hub Loc. Tratamos seu nome e telefone conforme a LGPD."
+        link = "https://hubloc.com.br/privacidade-2026/"
+        sys_settings.update(lgpd_notice=aviso, lgpd_privacy_url=link)
+        _novo_contato(21)
+        reply, payload, _ = cliente_envia(21, text="oi")
+        body = payload["interactive"]["body"]["text"] if payload else ""
+        check(body == f"{aviso}\n(Política de Privacidade: {link})\n\nPodemos continuar?",
+              "texto e link da aba Sistema no formato do CX (texto + link + pergunta)")
+        check(lgpd_bot.LINK_PRIVACIDADE_BUILTIN not in body and "Que bom ter você" not in body,
+              "nada do aviso/link fixo quando a aba Sistema esta preenchida")
+        btns = payload["interactive"]["action"]["buttons"] if payload else []
+        check([b["reply"]["id"] for b in btns] == ["lgpd_aceitar", "lgpd_recusar"]
+              and [b["reply"]["title"] for b in btns] == ["Sim", "Não"],
+              "aviso customizado mantem os botoes Sim / Nao")
+        # So o link customizado: texto historico com o link novo.
+        sys_settings["lgpd_notice"] = ""
+        _novo_contato(22)
+        reply, payload, _ = cliente_envia(22, text="oi")
+        body = payload["interactive"]["body"]["text"] if payload else ""
+        check("Que bom ter você na Hub Loc" in body
+              and f"(Nossa Política de Privacidade: {link})" in body
+              and lgpd_bot.LINK_PRIVACIDADE_BUILTIN not in body,
+              "so o link customizado: texto historico com o link novo")
+        sys_settings["lgpd_privacy_url"] = ""
+
+        # (c) data POSTERIOR ao aceite com estado aceito (estado legado
+        # ask_sector, o unico em que o builtin guarda aceite em bot_states).
+        sys_settings["lgpd_policy_date"] = data_pol
+        _contato_legado_ask_sector(23, "conv23")
+        STORE["wa_contacts"]["23"].update(lgpd_consent=True, lgpd_consent_at=antigo,
+                                          lgpd_policy_version="hubloc-2026-06")
+        reply, _, _ = cliente_envia(23, text="quero alugar uma betoneira")
+        check(isinstance(reply, dict) and reply.get("type") == "interactive_buttons",
+              "aceite anterior a data da politica: aviso reaparece")
+        st = STORE["bot_states"].get("23", {})
+        check(st.get("lgpd_consent") is None and st.get("lgpd_status") == "awaiting"
+              and st.get("user_first_input") == "quero alugar uma betoneira",
+              "estado rebaixado e persistido; mensagem guardada como user_first_input")
+        check(STORE["wa_contacts"]["23"].get("bot_completed") is not True,
+              "sem novo aceite o bot nao encaminha")
+        reply, _, _ = cliente_envia(23, text="sim")
+        c23 = STORE["wa_contacts"]["23"]
+        check(c23.get("lgpd_policy_version") == data_pol,
+              "novo aceite grava versao = data da politica")
+        check(lgpd_bot.data_aceite_br(c23.get("lgpd_consent_at")) == hoje,
+              "novo aceite carimba lgpd_consent_at de agora")
+        check(c23.get("bot_completed") is True and c23.get("department_id") == 1
+              and isinstance(reply, str) and "comercial" in reply.lower(),
+              "apos o novo aceite segue o fluxo normal (fila do Comercial)")
+
+        # (b) data ANTERIOR ao aceite: sem aviso, escolha legada honrada.
+        _contato_legado_ask_sector(24, "conv24")
+        STORE["wa_contacts"]["24"].update(lgpd_consent=True, lgpd_consent_at=recente)
+        reply, _, _ = cliente_envia(24, text="preciso trocar um equipamento com defeito")
+        check(reply is None and STORE["wa_contacts"]["24"].get("department_id") == 2,
+              "aceite em dia com a politica: sem aviso, fluxo segue")
+
+        # (f) aceite legado sem lgpd_consent_at continua valido.
+        _contato_legado_ask_sector(25, "conv25")
+        STORE["wa_contacts"]["25"].update(lgpd_consent=True)
+        reply, _, _ = cliente_envia(25, text="preciso trocar um equipamento com defeito")
+        check(reply is None and STORE["wa_contacts"]["25"].get("department_id") == 2,
+              "aceite legado sem lgpd_consent_at vale (sem aviso)")
+
+        # Lead novo com data configurada: versao gravada = data (audit tambem).
+        _novo_contato(26)
+        cliente_envia(26, text="oi")
+        cliente_envia(26, button_id="lgpd_aceitar", button_title="Sim")
+        check(STORE["wa_contacts"]["26"].get("lgpd_policy_version") == data_pol
+              and any(a["action"] == "LGPD_CONSENT_ACCEPTED" and data_pol in a["detail"]
+                      for a in AUDIT),
+              "lead novo: aceite gravado e auditado com a data da politica")
+    finally:
+        bot.get_system_settings = bak
+
+
 def main():
     cenario_fluxo_feliz_botoes()
     cenario_recusa_reconsentimento()
@@ -453,6 +556,7 @@ def main():
     cenario_legado_invalida_vai_comercial()
     cenario_limites_payload()
     cenario_horario_comercial()
+    cenario_p2b_lgpd_builtin()
 
     print("\n" + "=" * 70)
     if FAILS:

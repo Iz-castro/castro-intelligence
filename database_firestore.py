@@ -18,6 +18,7 @@ from firestore_common import (
     normalize_record,
     utcnow,
 )
+from lgpd_bot import hoje_br, validar_config_lgpd
 from rbac import default_perfil_for_role
 
 logger = logging.getLogger("castro_crm.database")
@@ -4191,7 +4192,18 @@ _DEFAULT_SYSTEM_SETTINGS = {
     "pool_wait_notice_enabled": False,
     "pool_wait_notice_minutes": 15,
     "pool_wait_notice_text": "",
+    # Conteudo LGPD do aviso do bot (P2b, plano de reabertura 3.4): a clinica
+    # (controladora) edita na aba Sistema. Vazio = fallback no READ pelo
+    # bot_service (settings.ai no CX, texto/link/versao fixos no builtin) —
+    # nada muda no deploy. lgpd_policy_date (AAAA-MM-DD) e a data de
+    # publicacao da politica vigente: aceite ANTERIOR a ela e reperguntado
+    # na proxima mensagem ao bot. Validados em save_system_settings.
+    "lgpd_policy_date": "",
+    "lgpd_privacy_url": "",
+    "lgpd_notice": "",
 }
+
+_LGPD_SETTINGS_KEYS = ("lgpd_policy_date", "lgpd_privacy_url", "lgpd_notice")
 
 POOL_WAIT_NOTICE_MIN_MINUTES = 5
 POOL_WAIT_NOTICE_MAX_MINUTES = 240
@@ -4250,6 +4262,19 @@ def save_system_settings(settings: dict):
         _text = filtered.get("pool_wait_notice_text", _cur.get("pool_wait_notice_text"))
         if _on and not str(_text or "").strip():
             raise ValueError("Informe o texto da mensagem de espera antes de ligar o aviso")
+    _lgpd_present = [k for k in _LGPD_SETTINGS_KEYS if k in filtered]
+    if _lgpd_present:
+        # P2b: data vazia ou AAAA-MM-DD nao futura (Brasilia) — futura seria
+        # loop de reconsentimento; link vazio ou https://; aviso <= 900 chars
+        # (corpo interativo = 1024 com link + pergunta). ValueError -> 400.
+        # PUT parcial (so texto OU so link) le o gravado pra checar o corpo
+        # composto; o frontend manda tudo, entao nao paga a leitura.
+        _lgpd_cur = (None if len(_lgpd_present) == len(_LGPD_SETTINGS_KEYS)
+                     else get_system_settings())
+        filtered.update(validar_config_lgpd(
+            {k: filtered[k] for k in _lgpd_present},
+            hoje=hoje_br(utcnow()), atual=_lgpd_cur,
+        ))
     if "picker_v2_user_ids" in filtered:
         # Lista fechada de ints (canario por usuario): lixo/duplicata cai
         # fora em vez de quebrar o includes() do frontend; bool nao e int.

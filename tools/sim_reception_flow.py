@@ -1472,6 +1472,88 @@ def cenario_unread_sync():
           "valor igual -> nenhuma escrita (idempotente)")
     restore_dbf()
 
+# =========================================================================
+# Cenario — P2b: conteudo LGPD na aba Sistema (save real + PUT + audit)
+# =========================================================================
+
+ADMIN = {"id": 9, "role": "admin", "tenant_id": "hubloc",
+         "display_name": "Admin", "firebase_uid": "uid9"}
+
+
+def cenario_lgpd_politica_sistema():
+    titulo("CENARIO — P2b: politica LGPD na aba Sistema (validacao no save + PUT + audit)")
+    import lgpd_bot
+    patch_store()
+    reset_rbac()
+    audits = []
+    real_audit = main.log_audit
+    main.log_audit = lambda uid, action, detail="", *a, **k: audits.append((uid, action, detail))
+    hoje = lgpd_bot.hoje_br(datetime.now(timezone.utc))
+    amanha = (hoje + timedelta(days=1)).isoformat()
+    data_pol = (hoje - timedelta(days=90)).isoformat()
+    data_pol2 = (hoje - timedelta(days=30)).isoformat()
+    aviso = "Aviso da clinica: seus dados de saude sao tratados conforme a LGPD."
+    try:
+        s = dbf.get_system_settings()
+        check(s.get("lgpd_policy_date") == "" and s.get("lgpd_privacy_url") == ""
+              and s.get("lgpd_notice") == "",
+              "defaults vazios no READ (bot cai no fallback: nada muda no deploy)")
+        for campos, rotulo in (
+            ({"lgpd_policy_date": amanha}, "data futura"),
+            ({"lgpd_privacy_url": "http://clinica.example/politica"}, "link sem https"),
+            ({"lgpd_notice": "x" * 901}, "aviso com 901 caracteres"),
+        ):
+            try:
+                dbf.save_system_settings(campos)
+                levantou = False
+            except ValueError:
+                levantou = True
+            doc = STORE.get("system_settings", {}).get("chat", {})
+            check(levantou and not any(k in doc for k in campos),
+                  f"save real rejeita {rotulo} (ValueError) e nao grava nada")
+
+        exc = expect_http(lambda: asyncio.run(main.update_settings_system(
+            _FakeRequest({"lgpd_policy_date": amanha}), current_user=dict(ADMIN))),
+            400, "PUT com data futura")
+        check(exc is not None and "futura" in str(exc.detail),
+              "detalhe do 400 legivel (explica que a data nao pode ser futura)")
+        expect_http(lambda: asyncio.run(main.update_settings_system(
+            _FakeRequest({"lgpd_policy_date": data_pol}), current_user=dict(SUPERVISOR))),
+            403, "supervisor sem gerenciar_config_sistema nao edita a politica")
+
+        # Objeto INTEIRO, como o frontend manda.
+        body = dict(dbf.get_system_settings())
+        body.update(lgpd_policy_date=data_pol, lgpd_privacy_url=" https://clinica.example/politica ",
+                    lgpd_notice=aviso)
+        res = asyncio.run(main.update_settings_system(_FakeRequest(body), current_user=dict(ADMIN)))
+        check(res.get("lgpd_policy_date") == data_pol
+              and res.get("lgpd_privacy_url") == "https://clinica.example/politica"
+              and res.get("lgpd_notice") == aviso,
+              "PUT valido persiste os 3 campos (link normalizado)")
+        lg = [a for a in audits if a[1] == "LGPD_POLICY_UPDATE"]
+        check(len(lg) == 1 and lg[0][0] == ADMIN["id"]
+              and lg[0][2] == f"data (vazia) -> {data_pol} | link alterado | aviso alterado",
+              "LGPD_POLICY_UPDATE: data antiga -> nova + link/aviso alterados")
+        check(all(aviso not in a[2] for a in audits),
+              "texto do aviso nao vai inteiro para nenhum audit")
+
+        body2 = dict(res)
+        body2["alarm_enabled"] = False
+        asyncio.run(main.update_settings_system(_FakeRequest(body2), current_user=dict(ADMIN)))
+        check(len([a for a in audits if a[1] == "LGPD_POLICY_UPDATE"]) == 1,
+              "save de outro campo (objeto inteiro) nao registra troca de politica")
+
+        body3 = dict(res)
+        body3["lgpd_policy_date"] = data_pol2
+        asyncio.run(main.update_settings_system(_FakeRequest(body3), current_user=dict(ADMIN)))
+        lg = [a for a in audits if a[1] == "LGPD_POLICY_UPDATE"]
+        check(len(lg) == 2 and lg[-1][2] == f"data {data_pol} -> {data_pol2} | link mantido | aviso mantido",
+              "troca so da data: audit com data antiga -> nova, link/aviso mantidos")
+    finally:
+        main.log_audit = real_audit
+        restore_dbf()
+
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -1501,6 +1583,7 @@ def run():
     cenario_assume_carimba_threads_orfas()
     cenario_open_picker_nao_rouba_pool()
     cenario_unread_sync()
+    cenario_lgpd_politica_sistema()
 
     print("\n" + "=" * 70)
     if FAILS:

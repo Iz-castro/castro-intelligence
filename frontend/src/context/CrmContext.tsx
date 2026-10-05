@@ -291,6 +291,10 @@ type CrmContextValue = {
   // picker v2 (F4): sem isso o modal decidiria o modo com os DEFAULTS.
   settingsLoaded: boolean;
   setSystemSettings: React.Dispatch<React.SetStateAction<SystemSettings>>;
+  // Ultimo estado vindo do SERVIDOR (load/save). systemSettings e o rascunho
+  // editado na tela; comparar os dois diz o que ainda nao foi salvo (ex.:
+  // aviso de troca da data da politica LGPD na aba Sistema).
+  savedSystemSettings: SystemSettings;
   userSettings: UserSettings;
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
@@ -380,6 +384,9 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   pool_wait_notice_enabled: false,
   pool_wait_notice_minutes: 15,
   pool_wait_notice_text: "",
+  lgpd_policy_date: "",
+  lgpd_privacy_url: "",
+  lgpd_notice: "",
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -698,6 +705,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // -- Settings --
   const [showSettings, setShowSettings] = useState<SettingsPage>(false);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>(DEFAULT_SYSTEM_SETTINGS);
+  // Copia do ultimo estado do servidor: atualizada junto com setSystemSettings
+  // em TODO load/save vindo da API (nunca na edicao local).
+  const [savedSystemSettings, setSavedSystemSettings] = useState<SystemSettings>(DEFAULT_SYSTEM_SETTINGS);
   // true depois que /api/settings/system respondeu na sessao atual. Os efeitos
   // de som so armam com isso true: os DEFAULTS do frontend (beep ON, alarme ON)
   // nao podem valer enquanto as settings reais do tenant nao chegaram.
@@ -1265,6 +1275,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // Settings sao POR TENANT: nao deixar bot_enabled/pool_mode/alarme do
     // usuario anterior regerem as caixas do proximo (PC compartilhado).
     setSystemSettings(DEFAULT_SYSTEM_SETTINGS);
+    setSavedSystemSettings(DEFAULT_SYSTEM_SETTINGS);
     setUserSettings(DEFAULT_USER_SETTINGS);
     setTenantName("");
     setContacts([]);
@@ -1359,7 +1370,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // falha, os sons ficam desarmados ate o proximo refresh de token
         // (~1h, que re-executa este handler) ou ate abrir Configuracoes.
         getJson<SystemSettings>(bundle.auth, "/api/settings/system")
-          .then((sys) => { setSystemSettings(sys); setSettingsLoaded(true); })
+          .then((sys) => { setSystemSettings(sys); setSavedSystemSettings(sys); setSettingsLoaded(true); })
           .catch((e) => { console.warn("settings/system indisponivel — sons desarmados:", errorText(e)); });
         getJson<UserSettings>(bundle.auth, "/api/settings/user").then((usr) => setUserSettings(usr)).catch(() => {});
       } catch (e) { setError(errorText(e)); await signOut(bundle.auth); }
@@ -2540,7 +2551,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusySettings(true); setError(""); setNotice("");
       const r = await putJson(bundle.auth, "/api/settings/tags-global", { tags_global: tags }) as SystemSettings;
-      setSystemSettings(r); setSettingsLoaded(true);
+      setSystemSettings(r); setSavedSystemSettings(r); setSettingsLoaded(true);
       setNotice("Tags globais salvas.");
       return true;
     } catch (e) { setError(errorText(e)); return false; }
@@ -3271,7 +3282,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusySettings(true);
       const [sys, usr] = await Promise.all([getJson<SystemSettings>(bundle.auth, "/api/settings/system"), getJson<UserSettings>(bundle.auth, "/api/settings/user")]);
-      setSystemSettings(sys); setUserSettings(usr); setSettingsLoaded(true); setShowSettings(page);
+      setSystemSettings(sys); setSavedSystemSettings(sys); setUserSettings(usr); setSettingsLoaded(true); setShowSettings(page);
     } catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
@@ -3281,8 +3292,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // Trava: mensagem global sem titulo/atalho/texto ou atalho repetido nao salva.
     const problem = quickMessagesProblem(systemSettings.quick_messages_global, "Mensagens globais");
     if (problem) { setError(problem); return; }
-    try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
-    catch (e) { setError(errorText(e)); }
+    // setError("") antes: o modal de Administracao mostra o erro inline (o 400
+    // do backend, ex.: data da politica LGPD futura) — sem limpar, um erro
+    // velho ficaria la depois de um save que deu certo.
+    try { setBusySettings(true); setError(""); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSavedSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
+    catch (e) { setNotice(""); setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
 
@@ -3329,7 +3343,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
-    showSettings, setShowSettings, systemSettings, settingsLoaded, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
+    showSettings, setShowSettings, systemSettings, settingsLoaded, setSystemSettings, savedSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, saveContactTags, saveGlobalTags, saveUserTags, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,

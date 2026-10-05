@@ -27,7 +27,7 @@ import re
 import logging
 import time
 import unicodedata
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional, Union
 
 from config import CX_DETECT_TIMEOUT_SECONDS
@@ -36,7 +36,10 @@ from database import (
     get_wa_contact, get_system_settings, get_all_departments,
     save_wa_message, log_audit,
 )
-from lgpd_bot import handle_lgpd
+from lgpd_bot import (
+    handle_lgpd, aceite_cobre_data, aceite_vigente, aviso_lgpd_builtin,
+    hoje_br, montar_aviso_lgpd, parse_data_politica, LINK_PRIVACIDADE_BUILTIN,
+)
 from lead_temperature import classify_lead_temperature, signal_keys
 from business_hours import builtin_expediente_notice, cx_hours_params
 
@@ -273,20 +276,142 @@ def _msg_pos_aceite(prefixo: str = "") -> str:
 
 
 def is_bot_enabled() -> bool:
+    """Leitura avulsa do toggle. Os turnos (process_bot_message e
+    _process_cx_message) leem system_settings UMA vez e reaproveitam o mesmo
+    dict para o toggle e para o conteudo LGPD — nao chamar isto no turno."""
     settings = get_system_settings()
     return bool(settings.get("bot_enabled", False))
 
 
 LGPD_POLICY_VERSION = "hubloc-2026-06"
 
+# Aviso generico do CX quando nem a aba Sistema nem o settings.ai trazem texto.
+_CX_LGPD_NOTICE_FALLBACK = (
+    "Olá! Para seguir com o atendimento, precisamos tratar seus "
+    "dados pessoais conforme a LGPD."
+)
+
+
+def _read_system_settings_safe() -> dict:
+    """system_settings para quem NAO esta no turno (pre-checagem do buffer).
+    Falha de leitura = sem data de politica (regra antiga); o turno, que le
+    de verdade, continua sendo a palavra final."""
+    try:
+        settings = get_system_settings()
+    except Exception as exc:
+        logger.warning(
+            "[LGPD] leitura de system_settings falhou (%s) — sem data de politica",
+            type(exc).__name__,
+        )
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def _lgpd_policy_date(sys_settings) -> Optional[date]:
+    """Data da politica vigente (system_settings.lgpd_policy_date) ou None.
+
+    O save da aba Sistema ja valida; aqui e defesa em profundidade contra
+    escrita fora da UI: valor invalido ou FUTURO e ignorado (com log) e vale
+    a regra sem data — data futura reperguntaria ate quem acabou de aceitar,
+    em loop."""
+    raw = str((sys_settings or {}).get("lgpd_policy_date") or "").strip()
+    if not raw:
+        return None
+    policy_date = parse_data_politica(raw)
+    if policy_date is None:
+        logger.warning("[LGPD] lgpd_policy_date invalida em system_settings (%r) — ignorada", raw)
+        return None
+    if policy_date > hoje_br(utcnow()):
+        logger.warning(
+            "[LGPD] lgpd_policy_date futura em system_settings (%s) — ignorada "
+            "(evita loop de reconsentimento)", raw,
+        )
+        return None
+    return policy_date
+
+
+def lgpd_policy_config(sys_settings=None, ai_cfg=None, cx: bool = False) -> dict:
+    """Fonte UNICA do conteudo LGPD de um turno (P2b, plano 3.4).
+
+    Devolve {"aviso", "url", "policy_date", "version"}:
+      - aviso: corpo pronto da mensagem com os botoes Sim/Nao;
+      - url: link efetivo da politica ("" se nenhum, so no CX);
+      - policy_date: date da politica vigente ou None (sem data);
+      - version: rotulo a gravar no aceite (lgpd_policy_version do contato).
+    Precedencia, campo a campo: system_settings (aba Sistema, editado pela
+    clinica) se preenchido -> settings.ai (SO tenant CX) -> constantes do
+    builtin (SO builtin). Com data, a versao gravada passa a ser a data
+    (AAAA-MM-DD); sem data, o rotulo de hoje (settings.ai.lgpd_policy_version
+    no CX, LGPD_POLICY_VERSION no builtin). Puro: quem chama passa o
+    system_settings que ja leu no turno (nenhuma leitura aqui). Substitui o
+    antigo _cx_lgpd_notice (mesmo formato e mesmo texto generico no CX)."""
+    sys_settings = sys_settings if isinstance(sys_settings, dict) else {}
+    ai_cfg = ai_cfg if isinstance(ai_cfg, dict) else {}
+    notice = str(sys_settings.get("lgpd_notice") or "").strip()
+    url = str(sys_settings.get("lgpd_privacy_url") or "").strip()
+    policy_date = _lgpd_policy_date(sys_settings)
+    if cx:
+        notice = notice or str(ai_cfg.get("lgpd_notice") or "").strip()
+        url = url or str(ai_cfg.get("lgpd_privacy_url") or "").strip()
+        aviso = montar_aviso_lgpd(notice or _CX_LGPD_NOTICE_FALLBACK, url)
+        version = (policy_date.isoformat() if policy_date
+                   else _cx_policy_version(ai_cfg, warn=False))
+    else:
+        aviso = aviso_lgpd_builtin(notice, url)
+        url = url or LINK_PRIVACIDADE_BUILTIN
+        version = policy_date.isoformat() if policy_date else LGPD_POLICY_VERSION
+    return {"aviso": aviso, "url": url, "policy_date": policy_date, "version": version}
+
+
+def _demote_outdated_consent(contact_id: int, state: dict, contact: dict,
+                             policy_date: Optional[date]) -> bool:
+    """Aceite anterior a politica vigente: rebaixa o estado para o gate
+    reperguntar (P2b).
+
+    Com data configurada, estado True so vale se o CONTATO guarda aceite nao
+    anterior a data (legado sem carimbo vale). Rebaixado (lgpd_consent e
+    lgpd_status None), handle_lgpd cai no ramo de primeiro contato: mostra o
+    aviso novo e guarda a mensagem atual como user_first_input. A gravacao em
+    bot_states e a do proprio caminho do aviso (_set_bot_state logo apos o
+    handle_lgpd, mesma escrita). Sem data: nada muda. Revogacao nao e
+    avaliada aqui (portao proprio)."""
+    if policy_date is None or state.get("lgpd_consent") is not True:
+        return False
+    if aceite_cobre_data(contact, policy_date):
+        return False
+    state["lgpd_consent"] = None
+    state["lgpd_status"] = None
+    logger.info(
+        "[LGPD] aceite anterior a politica vigente (%s) — aviso de novo | contato=%s",
+        policy_date.isoformat(), contact_id,
+    )
+    return True
+
+
+def _contact_consent_hydrates(contact: dict, policy_date: Optional[date], ai_cfg) -> bool:
+    """A prova guardada no CONTATO dispensa o aviso quando bot_states nao tem
+    lgpd_consent (ciclo novo apos release_lead_to_bot).
+
+    Com data: regra por data (consentiu, nao revogou, aceite nao anterior a
+    politica). Sem data: regra de sempre, intacta — versao igual a vigente do
+    tenant por texto (ADR 0009 D1)."""
+    contact = contact if isinstance(contact, dict) else {}
+    if policy_date is not None:
+        return aceite_vigente(contact, policy_date)
+    return bool(
+        contact.get("lgpd_consent") is True
+        and not contact.get("lgpd_revoked")
+        and str(contact.get("lgpd_policy_version") or "").strip() == _cx_policy_version(ai_cfg)
+    )
+
 
 def _record_lgpd_consent(contact_id: int, policy_version: str = ""):
     """Prova de consentimento LGPD: grava no contato (quando + versao da
     politica) E no audit_log. Best-effort: nunca quebra o fluxo do bot.
 
-    policy_version: versao da politica exibida ao titular. Default = a do
-    fluxo builtin (Hubloc); o caminho CX passa a versao do tenant
-    (settings.ai.lgpd_policy_version).
+    policy_version: versao da politica exibida ao titular, vinda de
+    lgpd_policy_config (a DATA da politica quando configurada na aba Sistema;
+    sem data, o rotulo de sempre). Default vazio = a do fluxo builtin.
     """
     version = (policy_version or "").strip() or LGPD_POLICY_VERSION
     now = utcnow().isoformat()
@@ -319,7 +444,9 @@ def process_bot_message(
         dict  -> mensagem interativa (botoes LGPD); o webhook deve
                  enviar como interactive/button via WhatsApp Cloud API.
     """
-    if not is_bot_enabled():
+    # UMA leitura de system_settings por turno: toggle do bot + conteudo LGPD.
+    sys_settings = get_system_settings()
+    if not bool(sys_settings.get("bot_enabled", False)):
         return None
 
     contact = get_wa_contact(contact_id)
@@ -335,13 +462,18 @@ def process_bot_message(
     # =================================================================
     # LGPD Gate - executa antes de qualquer coleta de dados
     # =================================================================
-    lgpd_response = handle_lgpd(state, text)
+    # Aviso/link/versao da aba Sistema (P2b), com o texto historico da Hub
+    # Loc como default. Aceite anterior a data da politica vigente rebaixa o
+    # estado e o aviso novo sai neste turno.
+    lgpd_cfg = lgpd_policy_config(sys_settings, cx=False)
+    _demote_outdated_consent(contact_id, state, contact, lgpd_cfg["policy_date"])
+    lgpd_response = handle_lgpd(state, text, aviso_text=lgpd_cfg["aviso"])
 
     if lgpd_response is not None:
         lgpd_status = state.get("lgpd_status")
 
         if lgpd_status == "accepted":
-            _record_lgpd_consent(contact_id)
+            _record_lgpd_consent(contact_id, policy_version=lgpd_cfg["version"])
             # Sem menu de setores: o aceite ja finaliza o bot e poe o lead,
             # sem dono, na fila do Comercial (pool "Novos Leads").
             _finalize_bot(contact_id, state, SETOR_COMERCIAL)
@@ -609,51 +741,64 @@ def _tenant_is_active() -> bool:
     return tenant.get("is_active", True) is not False
 
 
-def _cx_policy_version(ai_cfg: dict) -> str:
+def _cx_policy_version(ai_cfg: dict, warn: bool = True) -> str:
     """Versao de politica LGPD do tenant para a prova de consentimento.
 
     NUNCA cai na constante do builtin (LGPD_POLICY_VERSION = Hubloc): para um
     tenant CX (ex.: clinica, dado sensivel) isso carimbaria o consentimento com
     a politica de OUTRO tenant (achado alta da revisao). Sem versao configurada,
-    usa um marcador neutro do proprio tenant e loga aviso.
+    usa um marcador neutro do proprio tenant e loga aviso (warn=False so para
+    o calculo antecipado de lgpd_policy_config, que roda todo turno).
     """
     from firestore_common import get_tenant_context
 
-    version = str(ai_cfg.get("lgpd_policy_version") or "").strip()
+    version = str((ai_cfg or {}).get("lgpd_policy_version") or "").strip()
     if version:
         return version
     tid = get_tenant_context() or "tenant"
-    logger.warning(
-        "[BOT-CX] lgpd_policy_version vazio no tenant %s — configure "
-        "settings.ai.lgpd_policy_version (usando marcador neutro)", tid,
-    )
+    if warn:
+        logger.warning(
+            "[BOT-CX] lgpd_policy_version vazio no tenant %s — configure "
+            "settings.ai.lgpd_policy_version (usando marcador neutro)", tid,
+        )
     return f"{tid}-sem-versao"
 
 
-def lgpd_consent_resolved(state, contact, ai_cfg=None) -> bool:
+def lgpd_consent_resolved(state, contact, ai_cfg=None, sys_settings=None) -> bool:
     """True se o consentimento LGPD deste contato ja esta resolvido.
 
-    Mesma regra da hidratacao em _process_cx_message: estado True vale; estado
-    False (recusa) nunca vale; estado AUSENTE vale se o contato guarda a prova
-    (lgpd_consent=True, nao revogado, policy_version vigente). Usado pelo
-    buffer do webhook para decidir se pode fazer debounce ANTES do turno:
-    apos release_lead_to_bot o bot_states nasce sem lgpd_* e, sem esta regra,
-    a 1a mensagem do ciclo novo rodava turno direto e a seguinte virava
-    resposta dupla (canario varizemed-test 2026-09-14).
+    Mesma regra do turno em _process_cx_message: estado False (recusa) nunca
+    vale; estado AUSENTE vale se o contato guarda a prova (hidratacao); estado
+    True vale — EXCETO, com data de politica configurada na aba Sistema (P2b),
+    quando o aceite do contato e anterior a ela (o turno vai rebaixar o estado
+    e mostrar o aviso novo). Sem data, a regra de sempre, intacta (inclusive a
+    versao por igualdade de texto na hidratacao). Usado pelo buffer do webhook
+    para decidir se pode fazer debounce ANTES do turno: apos
+    release_lead_to_bot o bot_states nasce sem lgpd_* e, sem esta regra, a 1a
+    mensagem do ciclo novo rodava turno direto e a seguinte virava resposta
+    dupla (canario varizemed-test 2026-09-14).
+
+    sys_settings: o webhook nao tem a leitura do turno em maos, entao a data
+    e lida aqui (1 leitura, so quando ha consentimento a validar); falha de
+    leitura = sem data. contact ausente com estado True e data configurada =
+    nao resolvido (turno direto, que decide com o contato fresco).
     """
     state = state if isinstance(state, dict) else {}
     contact = contact if isinstance(contact, dict) else {}
-    if state.get("lgpd_consent") is True:
-        return True
-    if state.get("lgpd_consent") is not None:
+    consent_state = state.get("lgpd_consent")
+    if consent_state is not None and consent_state is not True:
         return False
-    if ai_cfg is None:
+    if consent_state is not True and not (
+            contact.get("lgpd_consent") is True and not contact.get("lgpd_revoked")):
+        return False  # sem prova no contato: nada a hidratar
+    if sys_settings is None:
+        sys_settings = _read_system_settings_safe()
+    policy_date = _lgpd_policy_date(sys_settings)
+    if consent_state is True:
+        return policy_date is None or aceite_cobre_data(contact, policy_date)
+    if policy_date is None and ai_cfg is None:
         ai_cfg = _get_tenant_ai_config()
-    return bool(
-        contact.get("lgpd_consent") is True
-        and not contact.get("lgpd_revoked")
-        and str(contact.get("lgpd_policy_version") or "").strip() == _cx_policy_version(ai_cfg)
-    )
+    return _contact_consent_hydrates(contact, policy_date, ai_cfg)
 
 
 async def process_bot_message_async(
@@ -696,21 +841,6 @@ async def process_bot_message_async(
     return None
 
 
-def _cx_lgpd_notice(ai_cfg: dict) -> str:
-    """Aviso LGPD do tenant (settings.ai) com fallback seguro generico."""
-    notice = str(ai_cfg.get("lgpd_notice") or "").strip()
-    url = str(ai_cfg.get("lgpd_privacy_url") or "").strip()
-    if not notice:
-        notice = (
-            "Olá! Para seguir com o atendimento, precisamos tratar seus "
-            "dados pessoais conforme a LGPD."
-        )
-    if url:
-        notice += f"\n(Política de Privacidade: {url})"
-    notice += "\n\nPodemos continuar?"
-    return notice
-
-
 async def _process_cx_message(
     contact_id: int, text: str, ai_cfg: dict
 ) -> Optional[Union[str, dict]]:
@@ -718,7 +848,9 @@ async def _process_cx_message(
     import bot_engine_dialogflow
     from firestore_common import get_tenant_context
 
-    if not is_bot_enabled():
+    # UMA leitura de system_settings por turno: toggle do bot + conteudo LGPD.
+    sys_settings = get_system_settings()
+    if not bool(sys_settings.get("bot_enabled", False)):
         return None
 
     contact = get_wa_contact(contact_id)
@@ -735,17 +867,27 @@ async def _process_cx_message(
     if state.get("human_active"):
         return None
 
+    # Conteudo LGPD do turno (P2b): aviso/link/data da aba Sistema, com
+    # fallback no settings.ai. Puro — reaproveita a leitura do toggle acima.
+    lgpd_cfg = lgpd_policy_config(sys_settings, ai_cfg, cx=True)
+    policy_date = lgpd_cfg["policy_date"]
+
+    # P2b: estado "aceito" com aceite do contato ANTERIOR a data da politica
+    # vigente -> rebaixa; o gate abaixo mostra o aviso novo e guarda esta
+    # mensagem como user_first_input. Sem data configurada, nada muda.
+    _demote_outdated_consent(contact_id, state, contact, policy_date)
+
     # Hidratacao da prova pelo CONTATO (PLANO_MODELOS Fase 2 item 9): apos o
     # release_lead_to_bot (fechamento devolve ao agente), o bot_states do
     # ciclo anterior ja foi limpo — sem isto o paciente re-toma o aviso LGPD
-    # a cada retorno. A prova do contato vale se a policy_version bater com
-    # a vigente (ADR 0009 D1: bump de versao re-pergunta); recusa registrada
-    # em bot_states tem precedencia (guarda is None); revogado (J-3 D8)
-    # nunca hidrata. NAO re-chama _record_lgpd_consent (prova ja existe).
+    # a cada retorno. Sem data de politica, a prova do contato vale se a
+    # policy_version bater com a vigente (ADR 0009 D1: bump de versao
+    # re-pergunta); com data (P2b), vale se o aceite nao for anterior a ela.
+    # Recusa registrada em bot_states tem precedencia (guarda is None);
+    # revogado (J-3 D8) nunca hidrata. NAO re-chama _record_lgpd_consent
+    # (prova ja existe).
     if state.get("lgpd_consent") is None \
-            and contact.get("lgpd_consent") is True \
-            and not contact.get("lgpd_revoked") \
-            and str(contact.get("lgpd_policy_version") or "").strip() == _cx_policy_version(ai_cfg):
+            and _contact_consent_hydrates(contact, policy_date, ai_cfg):
         state["lgpd_consent"] = True
         state["lgpd_status"] = "accepted"
 
@@ -754,14 +896,17 @@ async def _process_cx_message(
     # (contato + audit + versao) fica no CRM; o agente CX recebe
     # lgpd_consent=true e nunca refaz a pergunta (flow neutralizado).
     # ------------------------------------------------------------------
-    lgpd_response = handle_lgpd(state, text, aviso_text=_cx_lgpd_notice(ai_cfg))
+    lgpd_response = handle_lgpd(state, text, aviso_text=lgpd_cfg["aviso"])
 
     first_cx_text = None
     if lgpd_response is not None:
         if state.get("lgpd_status") == "accepted":
+            # Com data: versao = data da politica. Sem data: rotulo do
+            # settings.ai (chamada com aviso de config ausente, como sempre).
             _record_lgpd_consent(
                 contact_id,
-                policy_version=_cx_policy_version(ai_cfg),
+                policy_version=(lgpd_cfg["version"] if policy_date
+                                else _cx_policy_version(ai_cfg)),
             )
             state["step"] = "cx"
             state.setdefault("started_at", utcnow().isoformat())
