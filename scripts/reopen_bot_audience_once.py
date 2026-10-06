@@ -67,7 +67,7 @@ from firestore_common import (  # noqa: E402
     collection_name,
 )
 from channel_service import get_channel, get_send_credentials  # noqa: E402
-from database import save_wa_message, log_audit, next_sequence  # noqa: E402
+from database import save_wa_message, log_audit, next_sequence, reopen_batch_sends  # noqa: E402
 
 REOPEN_TEMPLATE_NAME = os.getenv("REOPEN_TEMPLATE_NAME", "atualizao_de_solicitao")
 REOPEN_DAILY_CAP = int(os.getenv("REOPEN_DAILY_CAP", "250"))
@@ -104,22 +104,6 @@ def _mask_conv(conv_id):
         return _mask(s)
     ch, wa = s.split("__", 1)
     return f"{ch}__{_mask(wa)}"
-
-
-def _sent_timestamps(contact):
-    """Envios em lote ja feitos ao contato: le o formato legado
-    (`reopen_bot_sent_at`, lista ISO) e o do plano v2.2 (`reopen_batch_sent_at`,
-    lista de {at, audience}). Dedup pelo timestamp."""
-    raw = list(contact.get("reopen_bot_sent_at") or [])
-    for item in (contact.get("reopen_batch_sent_at") or []):
-        raw.append(item.get("at") if isinstance(item, dict) else item)
-    seen, out = set(), []
-    for x in raw:
-        d = _ts(x)
-        if d is not None and d.isoformat() not in seen:
-            seen.add(d.isoformat())
-            out.append(d)
-    return out
 
 
 def _val_sent_link(contact_id, conv_id, needle, limit=40):
@@ -252,7 +236,6 @@ def _select(tenant_id, args):
     now = _now()
     cold_cut = now - timedelta(hours=args.min_cold_hours)
     cooldown_cut = now - timedelta(hours=REOPEN_COOLDOWN_HOURS)
-    window_cut = now - timedelta(days=REOPEN_BOT_WINDOW_DAYS)
     max_age_cut = (now - timedelta(days=args.max_age_days)) if args.max_age_days else None
     only = set(x.strip() for x in (args.only or "").split(",") if x.strip())
     skips = Counter()
@@ -291,7 +274,9 @@ def _select(tenant_id, args):
             skip("cooldown"); continue
         if int(c.get("reopen_attempts") or 0) >= 1 or c.get("reopen_resolved_at"):
             skip("tentativa_pendente_ou_resolvido"); continue
-        sent = [d for d in _sent_timestamps(c) if d >= window_cut]
+        # Teto por contato: leitura unificada do CRM (reopen_batch_sent_at +
+        # legado reopen_bot_sent_at, dedup pelo instante, janela >= now - N dias).
+        sent = reopen_batch_sends(c, window_days=REOPEN_BOT_WINDOW_DAYS, now=now)
         if len(sent) >= REOPEN_BOT_MAX_PER_CONTACT:
             skip("teto_bot_contato"); continue
         ch_id = c.get("channel_id")
@@ -441,6 +426,7 @@ def main():
                         document("wa_contacts", c["id"]).set({
                             "reopen_attempts": int(c.get("reopen_attempts") or 0) + 1,
                             "last_reopen_template_at": now_iso,
+                            "last_reopen_at": now_iso,
                             "last_reopen_audience": "bot",
                             "last_reopen_conversation_id": conv["id"],
                             "last_reopen_channel_id": ch["id"],

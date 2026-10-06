@@ -1132,6 +1132,21 @@ async def _process_cx_message(
     if snapshot and snapshot != (state.get("cx_snapshot") or {}):
         _set_bot_state(contact_id, {"cx_snapshot": snapshot})
 
+    # Desfecho com a Val (P5, plano de reabertura 2.2.5): o agente seta o
+    # param de sessao desfecho_bot no turno em que acontece; o contato guarda
+    # o ultimo valor. Grava SO quando muda (o param persiste na sessao CX e
+    # volta em todo turno seguinte) — nada de write por turno. Falha aqui
+    # nunca cala o cliente. release/return ao bot zeram os dois campos.
+    outcome = _cx_bot_outcome(result.get("parameters"), contact_id)
+    if outcome and outcome != contact.get("bot_outcome"):
+        try:
+            document("wa_contacts", contact_id).set(
+                {"bot_outcome": outcome, "bot_outcome_at": utcnow()}, merge=True)
+            logger.info("[BOT-CX] desfecho_bot gravado | contato=%d | desfecho=%s",
+                        contact_id, outcome)
+        except Exception:
+            logger.exception("[BOT-CX] falha ao gravar desfecho_bot | contato=%d", contact_id)
+
     # conversation_complete sem handoff: cliente pode voltar a falar com o
     # bot depois. NAO limpa o estado (preservaria re-pergunta da LGPD) —
     # a sessao do CX expira sozinha no Dialogflow (~30min).
@@ -1178,6 +1193,45 @@ def _cx_snapshot(params, signals=None) -> dict:
             continue
         snap[key] = value
     return snap
+
+
+# Contrato do param de sessao desfecho_bot (docs/CX_RETOMADA_LOTE_DEV_IA.md,
+# pedido 3): escalar, vocabulario FECHADO. Lido exatamente com estes nomes.
+BOT_OUTCOME_VALUES = ("link_enviado", "agendado", "duvida_respondida", "sem_interesse")
+_BOT_OUTCOME_SAFE_RE = re.compile(r"[a-z0-9_]{1,40}")
+
+
+def _cx_bot_outcome(params, contact_id=None) -> Optional[str]:
+    """Valor de desfecho_bot nos params do turno, ou None (ausente, vazio,
+    null ou fora do contrato). Struct {desfecho_bot: valor} e desembrulhado
+    pelo MESMO helper do conector (_unwrap_struct_params — regressao de
+    2026-07-29, agente em DRAFT devolvendo params embrulhados); o conector ja
+    desembrulha na origem, isto e defesa em profundidade. Valor fora da lista
+    e ignorado com log (o valor so aparece no log se tiver cara de enum — o
+    param e livre no agente e nao pode vazar texto do paciente)."""
+    if not isinstance(params, dict) or params.get("desfecho_bot") is None:
+        return None
+    raw = params.get("desfecho_bot")
+    if isinstance(raw, dict):
+        import bot_engine_dialogflow
+        raw = bot_engine_dialogflow._unwrap_struct_params({"desfecho_bot": raw}).get("desfecho_bot")
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        # Struct de 2+ chaves (o unwrap so abre 1 entrada) ou lista: fora do contrato.
+        shown = f"<{type(raw).__name__}>"
+    else:
+        value = str(raw).strip().lower()
+        if value in ("", "null", "none"):
+            return None
+        if value in BOT_OUTCOME_VALUES:
+            return value
+        shown = value if _BOT_OUTCOME_SAFE_RE.fullmatch(value) else f"<{type(raw).__name__}>"
+    logger.warning(
+        "[BOT-CX] desfecho_bot fora do contrato ignorado | contato=%s | valor=%s",
+        contact_id, shown,
+    )
+    return None
 
 
 def _persist_lead_temperature(

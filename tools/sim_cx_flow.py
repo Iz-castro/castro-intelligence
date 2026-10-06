@@ -229,6 +229,14 @@ async def _fake_detect_intent(cfg, session_id, text, session_params=None, timeou
 
 _cx = types.ModuleType("bot_engine_dialogflow")
 _cx.detect_intent_text = _fake_detect_intent
+# Desembrulho de struct REAL do conector (o bot_service reusa no desfecho_bot):
+# carregado por spec, sem rede (o conector so importa config/httpx/pii).
+import importlib.util as _ilu_stub  # noqa: E402
+_spec_unwrap = _ilu_stub.spec_from_file_location(
+    "bot_engine_dialogflow_unwrap", os.path.join(ROOT, "bot_engine_dialogflow.py"))
+_mod_unwrap = _ilu_stub.module_from_spec(_spec_unwrap)
+_spec_unwrap.loader.exec_module(_mod_unwrap)
+_cx._unwrap_struct_params = _mod_unwrap._unwrap_struct_params
 sys.modules["bot_engine_dialogflow"] = _cx
 
 
@@ -1328,6 +1336,85 @@ check(lgpd_bot.validar_config_lgpd(
     {"lgpd_policy_date": "", "lgpd_privacy_url": None, "lgpd_notice": ""}, _HOJE_BR)
       == {"lgpd_policy_date": "", "lgpd_privacy_url": "", "lgpd_notice": ""},
       "campos vazios sao validos (voltam ao fallback)")
+
+print("\n=== y: desfecho_bot do agente -> bot_outcome no contato (P5, reabertura 2.2.5) ===")
+# Contrato: docs/CX_RETOMADA_LOTE_DEV_IA.md, pedido 3. O param persiste na
+# sessao CX e volta em todo turno seguinte: o CRM so grava quando MUDA.
+import logging as _logging  # noqa: E402
+
+
+class _ListHandler(_logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+_lh = _ListHandler()
+_bot_logger = _logging.getLogger("castro_crm.bot")
+_bot_logger.addHandler(_lh)
+try:
+    novo_contato(70, wa_id="5571970000001")
+    STORE["bot_states"]["70"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+
+    # (a) escalar do contrato -> gravado com carimbo datetime.
+    CX_SCRIPT.append(_cx_ok("Segue o link para agendar: marcaconsultas.com.br/Varizemed",
+                            parameters={"desfecho_bot": "link_enviado"}))
+    r = envia(70, "quero agendar")
+    _c70 = STORE["wa_contacts"]["70"]
+    check(isinstance(r, str) and "marcaconsultas" in r, "resposta da Val segue normal no turno do desfecho")
+    check(_c70.get("bot_outcome") == "link_enviado" and isinstance(_c70.get("bot_outcome_at"), datetime),
+          "desfecho_bot escalar gravado no contato (bot_outcome + bot_outcome_at datetime)")
+
+    # (b) mesmo valor no turno seguinte (sessao CX persiste o param) -> sem write.
+    STORE["wa_contacts"]["70"]["bot_outcome_at"] = "SENTINELA"
+    CX_SCRIPT.append(_cx_ok("Qualquer duvida estou aqui.", parameters={"desfecho_bot": "link_enviado"}))
+    envia(70, "obrigado")
+    check(STORE["wa_contacts"]["70"].get("bot_outcome_at") == "SENTINELA",
+          "mesmo desfecho repetido NAO regrava o contato (sem write por turno)")
+
+    # (c) struct {desfecho_bot: valor} (regressao de 2026-07-29) -> desembrulhado.
+    CX_SCRIPT.append(_cx_ok("Que otimo, consulta marcada!",
+                            parameters={"desfecho_bot": {"desfecho_bot": "agendado"}}))
+    envia(70, "ja marquei minha consulta")
+    _c70 = STORE["wa_contacts"]["70"]
+    check(_c70.get("bot_outcome") == "agendado" and isinstance(_c70.get("bot_outcome_at"), datetime),
+          "desfecho_bot em struct e desembrulhado pelo helper do conector e gravado")
+
+    # (d) valor fora da lista -> ignorado com log; o gravado fica intacto.
+    STORE["wa_contacts"]["70"]["bot_outcome_at"] = "SENTINELA"
+    _lh.records.clear()
+    CX_SCRIPT.append(_cx_ok("Certo.", parameters={"desfecho_bot": "marcou_talvez"}))
+    envia(70, "talvez")
+    _c70 = STORE["wa_contacts"]["70"]
+    check(_c70.get("bot_outcome") == "agendado" and _c70.get("bot_outcome_at") == "SENTINELA",
+          "desfecho fora do contrato e ignorado (contato intacto)")
+    _warn = [x.getMessage() for x in _lh.records
+             if x.levelno == _logging.WARNING and "desfecho_bot fora do contrato" in x.getMessage()]
+    check(len(_warn) == 1 and "marcou_talvez" in _warn[0],
+          "valor fora do contrato gera 1 log de aviso (valor com cara de enum aparece)")
+    _lh.records.clear()
+    CX_SCRIPT.append(_cx_ok("Certo.", parameters={"desfecho_bot": "Maria Souza 31 99999-0000"}))
+    envia(70, "meu nome")
+    _warn = [x.getMessage() for x in _lh.records if "desfecho_bot fora do contrato" in x.getMessage()]
+    check(len(_warn) == 1 and "Maria" not in _warn[0] and "<str>" in _warn[0],
+          "valor livre fora do contrato NAO vaza no log (so o tipo)")
+
+    # (e) param ausente ou null -> nada muda, sem aviso.
+    _lh.records.clear()
+    CX_SCRIPT.append(_cx_ok("Ok.", parameters={"desfecho_bot": None}))
+    envia(70, "ok")
+    CX_SCRIPT.append(_cx_ok("Ok."))
+    envia(70, "ok de novo")
+    _c70 = STORE["wa_contacts"]["70"]
+    check(_c70.get("bot_outcome") == "agendado" and _c70.get("bot_outcome_at") == "SENTINELA"
+          and not [x for x in _lh.records if "desfecho_bot" in x.getMessage()],
+          "param null ou ausente nao mexe no contato nem loga")
+    CX_SCRIPT.clear()
+finally:
+    _bot_logger.removeHandler(_lh)
 
 print("\n" + "=" * 70)
 if FAILS:

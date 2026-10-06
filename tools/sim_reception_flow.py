@@ -107,6 +107,9 @@ def titulo(txt):
 # =========================================================================
 
 STORE = {}
+# Log de writes (coll, doc_id, campos) — prova "no MESMO write" nos cenarios
+# da reabertura. Zerado pelo cenario que o le.
+WRITES = []
 
 
 class _Snap:
@@ -135,10 +138,24 @@ class _DocRef:
 
     def set(self, data, merge=False):
         coll = STORE.setdefault(self.coll, {})
+        cur = coll.get(self.doc_id) if merge else None
+        resolved = {}
+        for k, v in data.items():
+            # Sentinela firestore.ArrayUnion (teto por contato da reabertura):
+            # resolve como o servidor — acrescenta so o que ainda nao existe.
+            if type(v).__name__ == "ArrayUnion":
+                base = list((cur or {}).get(k) or [])
+                for item in v.values:
+                    if item not in base:
+                        base.append(item)
+                resolved[k] = base
+            else:
+                resolved[k] = v
+        WRITES.append((self.coll, self.doc_id, dict(resolved)))
         if merge and self.doc_id in coll:
-            coll[self.doc_id].update(data)
+            coll[self.doc_id].update(resolved)
         else:
-            coll[self.doc_id] = dict(data)
+            coll[self.doc_id] = dict(resolved)
 
     def create(self, data):
         # Claim atomico (wa_message_index / wa_contact_index): falha se existe.
@@ -672,14 +689,18 @@ def cenario_auto_close_toggle():
 def cenario_release_to_bot():
     titulo("CENARIO 11 — release_lead_to_bot: fechamento devolve ao agente (PO 2026-08-05)")
     patch_store()
+    _antes = datetime.now(timezone.utc)
     STORE["wa_contacts"] = {
         "20": {"id": 20, "assigned_to": 3, "assigned_to_uid": "uid3",
                "bot_completed": True, "department_id": 5, "qualification": "novo",
                "attendance_protocol": "20260805-20-REC", "sale_owner_user_id": 3,
-               "lead_temperature": "morno"},
+               "lead_temperature": "morno",
+               "bot_outcome": "agendado", "bot_outcome_at": _antes - timedelta(days=3)},
         "21": {"id": 21, "assigned_to": 3, "lgpd_revoked": True},
-        "22": {"id": 22, "assigned_to": 3, "bot_completed": True},
+        "22": {"id": 22, "assigned_to": 3, "bot_completed": True,
+               "bot_outcome": "link_enviado", "bot_outcome_at": _antes - timedelta(days=1)},
     }
+    WRITES.clear()
     STORE["wa_conversations"] = {
         "T1": {"id": "T1", "contact_id": 20, "assigned_to": 3, "assigned_to_uid": "uid3"},
         "T2": {"id": "T2", "contact_id": 20, "assigned_to": None,
@@ -713,11 +734,36 @@ def cenario_release_to_bot():
           "bot_states: ciclo CX zerado, prova LGPD preservada")
     check("20" not in STORE.get("bot_buffers", {}),
           "release_lead_to_bot limpa o buffer do ciclo fechado")
-    check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None,
-          "guard J-3: lgpd_revoked NAO volta pro funil (release=None)")
+    # Plano de reabertura (etapa 2): marco de ciclo + desfecho zerado.
+    _rel = c.get("bot_released_at")
+    check(isinstance(_rel, datetime) and _rel.tzinfo is not None and _rel >= _antes,
+          "release grava bot_released_at datetime UTC (marco de ciclo, mesmo tipo de handoff_at)")
+    check(c.get("bot_outcome") is None and c.get("bot_outcome_at") is None
+          and "bot_outcome" in c and "bot_outcome_at" in c,
+          "release zera bot_outcome e bot_outcome_at")
+    _w20 = [w for w in WRITES if w[0] == "wa_contacts" and w[1] == "20"]
+    check(len(_w20) == 1 and _w20[0][2].get("bot_completed") is False
+          and "bot_released_at" in _w20[0][2] and "bot_outcome" in _w20[0][2],
+          "release: marco e desfecho vao no MESMO write do commit-point (1 write no contato)")
+    _hand = dbf._coerce_timestamp(_ts(1))
+    try:
+        _cmp_ok = isinstance(_rel > _hand, bool)
+    except TypeError:
+        _cmp_ok = False
+    check(_cmp_ok, "bot_released_at compara com handoff_at coagido (_coerce_timestamp) sem TypeError")
+    check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None
+          and "bot_released_at" not in STORE["wa_contacts"]["21"],
+          "guard J-3: lgpd_revoked NAO volta pro funil (release=None, sem marco)")
+    WRITES.clear()
     check(dbf.return_contact_to_bot(22, 7) is True
           and "22" not in STORE.get("bot_buffers", {}),
           "return_contact_to_bot tambem limpa o buffer anterior")
+    c22 = STORE["wa_contacts"]["22"]
+    _w22 = [w for w in WRITES if w[0] == "wa_contacts" and w[1] == "22"]
+    check(isinstance(c22.get("bot_released_at"), datetime)
+          and c22.get("bot_outcome") is None and c22.get("bot_outcome_at") is None
+          and len(_w22) == 1 and "bot_released_at" in _w22[0][2],
+          "return_contact_to_bot: marco datetime + desfecho zerado no mesmo write do contato")
     restore_dbf()
 
 
@@ -1181,9 +1227,25 @@ def cenario_worker_lote():
         c31 = STORE["wa_contacts"]["31"]
         check(int(c31.get("reopen_attempts") or 0) == 1 and c31.get("last_reopen_template_at"),
               "envio 200: attempts+cooldown carimbados no contato")
+        # Plano de reabertura (etapa 2): campos por tentativa + teto por contato.
+        check(c31.get("last_reopen_at") == c31.get("last_reopen_template_at")
+              and isinstance(c31.get("last_reopen_at"), str),
+              "lote: last_reopen_at (ISO) = mesmo instante do last_reopen_template_at")
+        check(c31.get("last_reopen_audience") == "reception"
+              and c31.get("last_reopen_conversation_id") == "6__5531911112222"
+              and c31.get("last_reopen_channel_id") == 6,
+              "lote: audiencia reception + thread {channel_id}__{wa_id} + canal do envio")
+        check(c31.get("reopen_batch_sent_at") == [{"at": c31.get("last_reopen_at"),
+                                                   "audience": "reception"}],
+              "lote: reopen_batch_sent_at recebe {at, audience: reception} (ArrayUnion)")
         th31 = STORE["wa_conversations"].get("6__5531911112222") or {}
         check(not th31.get("last_human_outbound_at"),
               "template de lote NAO carimba last_human_outbound_at (valvula reception)")
+        check(th31.get("id") == c31.get("last_reopen_conversation_id"),
+              "thread carimbada no contato e a mesma que o save da mensagem usou")
+        check("reopen_human_active_at" not in c31 and "bot_released_at" not in c31
+              and c31.get("bot_completed") is None and c31.get("assigned_to") is None,
+              "template do lote nao muda o balde (sem reopen_human_active_at, marco, dono ou bot_completed)")
         check(STORE["wa_conversations"]["6__5531933334444"].get("attendance_status") == "fechado_inatividade",
               "auto-resolve: thread aberta do lead ja-tentado fecha (fs_coll vivo)")
         c32 = STORE["wa_contacts"]["32"]
@@ -1220,6 +1282,233 @@ def cenario_worker_lote():
         main._resolve_channel_creds_by_id = real_creds
         main._close_daily_and_send_protocol = real_close_daily
         restore_dbf()
+
+
+def cenario_reabertura_pontual_carimbo():
+    titulo("CENARIO 22b — Reabertura pontual: campos por tentativa (audiencia manual, sem teto)")
+    patch_store()
+    _legado = [{"at": "2026-09-23T12:00:00+00:00", "audience": "bot"}]
+    STORE["wa_contacts"] = {"34": {"id": 34, "wa_id": "5531977771111", "channel_id": 6,
+                                   "reopen_attempts": 0, "reopen_batch_sent_at": list(_legado)}}
+    # Kill-switch do LOTE desligado: a pontual nao pode ser afetada.
+    STORE["system_settings"] = {"chat": {"reopen_batch_enabled": False}}
+    enviados = []
+
+    async def _fake_send(body=None, current_user=None):
+        enviados.append(body)
+        return {"status": "sent"}
+
+    async def _fake_tpls(channel):
+        return {"templates": []}
+
+    real = (main._resolve_send_target, main._check_conv_send_permission,
+            main.wa_send_template, main._load_approved_templates_for_channel, main.log_audit)
+    main._resolve_send_target = lambda cid, ch: (
+        {"id": cid, "contact_id": 34, "channel_id": 6},
+        dict(STORE["wa_contacts"]["34"]),
+        {"id": 6, "channel_type": "standard"},
+    )
+    main._check_conv_send_permission = lambda *a, **k: None
+    main.wa_send_template = _fake_send
+    main._load_approved_templates_for_channel = _fake_tpls
+    main.log_audit = lambda *a, **k: None
+    try:
+        res = asyncio.run(main.wa_reopen_conversation("6__5531977771111", body=None,
+                                                      current_user=dict(SUPERVISOR)))
+        c34 = STORE["wa_contacts"]["34"]
+        check(res.get("status") == "sent" and len(enviados) == 1,
+              "pontual segue enviando com reopen_batch_enabled=False (kill-switch e so do lote)")
+        check(c34.get("reopen_attempts") == 1
+              and c34.get("last_reopen_at") == c34.get("last_reopen_template_at")
+              and isinstance(c34.get("last_reopen_at"), str),
+              "pontual: attempts+1, last_reopen_at = last_reopen_template_at (ISO)")
+        check(c34.get("last_reopen_audience") == "manual"
+              and c34.get("last_reopen_conversation_id") == "6__5531977771111"
+              and c34.get("last_reopen_channel_id") == 6,
+              "pontual: audiencia manual + conversa da rota + canal da thread")
+        check(c34.get("reopen_batch_sent_at") == _legado,
+              "pontual NAO acrescenta item em reopen_batch_sent_at (teto so p/ envio em massa)")
+    finally:
+        (main._resolve_send_target, main._check_conv_send_permission,
+         main.wa_send_template, main._load_approved_templates_for_channel, main.log_audit) = real
+        restore_dbf()
+
+
+def cenario_reopen_human_active():
+    titulo("CENARIO 22c — reopen_human_active_at: outbound HUMANO apos template de retomada")
+    patch_store()
+    _now = datetime.now(timezone.utc)
+    STORE["wa_contacts"] = {
+        "60": {"id": 60, "wa_id": "5531960000001", "qualification": "em_atendimento",
+               "last_reopen_template_at": (_now - timedelta(hours=2)).isoformat(),
+               "reopen_attempts": 1, "source_channel_type": "standard"},
+        "61": {"id": 61, "wa_id": "5531960000002", "qualification": "em_atendimento",
+               "source_channel_type": "standard"},
+    }
+
+    def _msg(cid, ts=None, **kw):
+        contato = dict(STORE["wa_contacts"][str(cid)])
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=cid, direction="outbound", msg_type="text",
+            content="x", status="sent", timestamp_wa=(ts or _now).isoformat(),
+            channel_id=6, conversation_id=f"6__{contato['wa_id']}", contact=contato, **kw,
+        )
+        return STORE["wa_contacts"][str(cid)]
+
+    c = _msg(60, ts=_now - timedelta(minutes=100))  # bot: sem sender_user_id
+    check("reopen_human_active_at" not in c, "resposta do BOT apos o template nao grava")
+    c = _msg(60, ts=_now - timedelta(minutes=90), sender_user_id=7, human_outbound=False)
+    check("reopen_human_active_at" not in c,
+          "outbound com human_outbound=False (template de lote) nao grava")
+    WRITES.clear()
+    _t_h = _now - timedelta(hours=1)
+    c = _msg(60, ts=_t_h, sender_user_id=7)
+    check(c.get("reopen_human_active_at") == _t_h,
+          "outbound HUMANO apos o template grava reopen_human_active_at = data real da mensagem")
+    _w60 = [w for w in WRITES if w[0] == "wa_contacts" and w[1] == "60"]
+    check(len(_w60) == 1 and "reopen_human_active_at" in _w60[0][2]
+          and "last_message_at" in _w60[0][2],
+          "carimbo vai no MESMO write do contato que o save ja fazia (sem write novo)")
+    check(c.get("reopen_attempts") == 1, "outbound humano NAO zera reopen_attempts")
+    c = _msg(60, ts=_now - timedelta(hours=5), sender_user_id=7)
+    check(c.get("reopen_human_active_at") == _t_h, "replay mais antigo nao recua o carimbo")
+    c61 = _msg(61, sender_user_id=7)
+    check("reopen_human_active_at" not in c61,
+          "contato sem template de retomada: outbound humano NAO grava")
+    restore_dbf()
+
+
+def cenario_kill_switch_lote():
+    titulo("CENARIO 22d — reopen_batch_enabled=False: previa e disparo do lote -> 409")
+    from fastapi import BackgroundTasks
+    patch_store()
+    reset_rbac()
+    varreduras = []
+    _scan_vazio = {"enviaveis": [], "auto_resolve": [], "pulados": {}, "por_setor": {}}
+
+    async def _fake_plan():
+        varreduras.append(1)
+        return dict(_scan_vazio), [], {}, {}
+
+    real_plan = main._plan_reopen_batch
+    main._plan_reopen_batch = _fake_plan
+    try:
+        res = asyncio.run(main.reopen_batch_preview(current_user=dict(SUPERVISOR)))
+        check(res.get("enviaveis") == 0 and varreduras == [1],
+              "default (doc ausente): lote ligado, previa roda normal")
+        STORE["system_settings"] = {"chat": {"reopen_batch_enabled": False}}
+        varreduras.clear()
+        exc = expect_http(lambda: asyncio.run(main.reopen_batch_preview(current_user=dict(SUPERVISOR))),
+                          409, "flag desligada: previa -> 409")
+        check(exc is not None and exc.detail == "Reabertura em lote desligada para esta empresa.",
+              "detalhe do 409 legivel para o admin")
+        bt = BackgroundTasks()
+        expect_http(lambda: asyncio.run(main.reopen_batch_execute(
+            _FakeRequest({"max_sends": 10}), bt, current_user=dict(SUPERVISOR))),
+            409, "flag desligada: disparo -> 409")
+        check(varreduras == [] and not STORE.get("reopen_batches") and not bt.tasks,
+              "409 antes de qualquer varredura: sem scan, sem doc de lote, sem worker")
+        expect_http(lambda: asyncio.run(main.reopen_batch_preview(current_user=dict(OPERADOR))),
+                    403, "permissao segue antes da flag (operador sem reabrir_em_lote -> 403)")
+        STORE["system_settings"]["chat"]["reopen_batch_enabled"] = True
+        expect_http(lambda: asyncio.run(main.reopen_batch_execute(
+            _FakeRequest({}), BackgroundTasks(), current_user=dict(SUPERVISOR))),
+            400, "flag religada: disparo volta ao fluxo normal (400 sem elegiveis)")
+        check(varreduras == [1], "flag religada: o scan voltou a rodar")
+    finally:
+        main._plan_reopen_batch = real_plan
+        restore_dbf()
+
+
+def cenario_flags_reabertura_settings():
+    titulo("CENARIO 22e — flags da reabertura em system_settings (defaults + coercao no PUT)")
+    patch_store()
+    reset_rbac()
+    real_audit = main.log_audit
+    main.log_audit = lambda *a, **k: None
+    try:
+        s = dbf.get_system_settings()
+        check(s.get("reopen_batch_enabled") is True
+              and s.get("reopen_bot_audience_enabled") is False
+              and s.get("bot_media_turn_enabled") is False,
+              "defaults no READ: lote ligado, publico Bot e midia desligados")
+        # Gravacao pela camada de dados (caminho do script da Castro): coage para bool.
+        dbf.save_system_settings({
+            "reopen_batch_enabled": "false", "reopen_bot_audience_enabled": "1",
+            "bot_media_turn_enabled": 0,
+        })
+        doc = STORE.get("system_settings", {}).get("chat", {})
+        check(doc.get("reopen_batch_enabled") is False
+              and doc.get("reopen_bot_audience_enabled") is True
+              and doc.get("bot_media_turn_enabled") is False,
+              "save_system_settings coage as 3 chaves para bool ('false'->False, '1'->True, 0->False)")
+        dbf.save_system_settings({
+            "reopen_batch_enabled": True, "reopen_bot_audience_enabled": "off",
+            "bot_media_turn_enabled": "TRUE",
+        })
+        doc = STORE["system_settings"]["chat"]
+        check(doc.get("reopen_batch_enabled") is True
+              and doc.get("reopen_bot_audience_enabled") is False
+              and doc.get("bot_media_turn_enabled") is True,
+              "segunda gravacao: True/'off'/'TRUE' -> True/False/True")
+        # PUT da UI (objeto inteiro, aba stale) NAO consegue mexer nas flags da Castro.
+        dbf.save_system_settings({"reopen_batch_enabled": False})
+        res = asyncio.run(main.update_settings_system(_FakeRequest({
+            "reopen_batch_enabled": True, "reopen_bot_audience_enabled": True,
+            "bot_media_turn_enabled": True, "alarm_threshold_minutes": 7,
+        }), current_user=dict(ADMIN)))
+        doc = STORE["system_settings"]["chat"]
+        check(doc.get("reopen_batch_enabled") is False
+              and doc.get("reopen_bot_audience_enabled") is False
+              and doc.get("bot_media_turn_enabled") is True,
+              "PUT da UI descarta as flags da Castro (aba stale nao religa o lote)")
+        check(res.get("alarm_threshold_minutes") == 7,
+              "o resto do PUT da UI continua sendo gravado")
+    finally:
+        main.log_audit = real_audit
+        restore_dbf()
+
+
+def cenario_teto_contato_helper():
+    titulo("CENARIO 22f — teto por contato: leitura unificada (reopen_batch_sent_at + legado)")
+    _now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+    _A = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    _B = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+    _C = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    _D = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+    contato = {
+        "reopen_batch_sent_at": [
+            {"at": _A.isoformat(), "audience": "bot"},          # script grava nas 2 listas
+            {"at": _B.isoformat(), "audience": "reception"},
+            {"at": _C.isoformat(), "audience": "reception"},    # fora da janela de 90d
+            {"at": "lixo", "audience": "bot"},
+            {"audience": "reception"},                          # sem at
+        ],
+        "reopen_bot_sent_at": [
+            _A.isoformat(),                                     # duplicata exata
+            "2026-09-23T12:00:00Z",                             # mesmo instante, outro formato
+            "2026-09-23T09:00:00-03:00",                        # mesmo instante, offset BR
+            "2026-09-30T08:00:00",                              # naive = UTC, so no legado
+            _B.isoformat(),                                     # dup de item com audiencia explicita
+            None,
+        ],
+    }
+    r = dbf.reopen_batch_sends(contato, window_days=90, now=_now)
+    check([(s["at"], s["audience"]) for s in r] == [(_A, "bot"), (_D, "bot"), (_B, "reception")],
+          "janela 90d: 3 envios unicos em ordem; dedup pelo instante; legado lido como bot")
+    check(len(dbf.reopen_batch_sends(contato, now=_now)) == 4,
+          "sem janela: inclui o envio antigo (4 unicos), ignora lixo/None/sem at")
+    _borda = {"reopen_bot_sent_at": [(_now - timedelta(days=90)).isoformat(),
+                                     (_now - timedelta(days=90, seconds=1)).isoformat()]}
+    check(len(dbf.reopen_batch_sends(_borda, window_days=90, now=_now)) == 1,
+          "borda da janela: at == now-90d entra, 1s antes fica fora")
+    check(dbf.reopen_batch_sends({}, window_days=90) == [] and dbf.reopen_batch_sends(None) == [],
+          "contato sem listas (ou None) -> lista vazia")
+    import importlib
+    _script = importlib.import_module("scripts.reopen_bot_audience_once")
+    check(_script.reopen_batch_sends is dbf.reopen_batch_sends
+          and not hasattr(_script, "_sent_timestamps"),
+          "script one-off usa o helper unificado do CRM no teto por contato")
 
 
 def cenario_recibo_nao_reabre():
@@ -1575,6 +1864,11 @@ def run():
     cenario_reabertura_travas()
     cenario_scan_reabertura()
     cenario_worker_lote()
+    cenario_reabertura_pontual_carimbo()
+    cenario_reopen_human_active()
+    cenario_kill_switch_lote()
+    cenario_flags_reabertura_settings()
+    cenario_teto_contato_helper()
     cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()

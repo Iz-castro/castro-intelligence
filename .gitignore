@@ -85,3 +85,6 @@ docs/lista temp.md
 # Undos de scripts de manutencao (dados operacionais, nunca versionar)
 scripts/_cleanup_rating_undo_*.json
 scripts/_backfill_undo_*.json
+
+# Codigo de servicos da Val recebido para consulta (outro projeto, nao versionar)
+temp services/

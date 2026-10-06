@@ -1046,6 +1046,9 @@ async def delete_perfil_acesso(perfil_id: str, current_user: dict = Depends(get_
 
 _LGPD_AUDIT_KEYS = ("lgpd_policy_date", "lgpd_privacy_url", "lgpd_notice")
 
+# Flags da reabertura em lote: so a Castro liga/desliga (script), nunca o PUT da UI.
+_CASTRO_ONLY_SETTINGS = ("reopen_batch_enabled", "reopen_bot_audience_enabled", "bot_media_turn_enabled")
+
 
 def _lgpd_policy_audit_detail(before: dict, after: dict) -> str:
     """Detalhe do LGPD_POLICY_UPDATE: data antiga -> nova e se link/aviso
@@ -1081,6 +1084,13 @@ async def update_settings_system(request: Request, current_user: dict = Depends(
     # stale apagava/revertia o registry que um supervisor editou no meio.
     if isinstance(body, dict):
         body.pop("tags_global", None)
+        # Chaves da reabertura (plano v2.2 secao 7) sao da CASTRO, nao do
+        # admin do tenant: so scripts/set_reopen_flags.py grava. Mesmo motivo
+        # do tags_global: o frontend manda o objeto INTEIRO e uma aba Sistema
+        # aberta antes do desligamento religaria o lote (ex.: Hubloc) ao
+        # salvar qualquer outra coisa.
+        for _castro_key in _CASTRO_ONLY_SETTINGS:
+            body.pop(_castro_key, None)
     # P2b: conteudo LGPD do aviso (data/link/texto) e editado aqui, com a
     # MESMA permissao da aba Sistema. Estado anterior lido so quando o body
     # traz alguma chave LGPD (o frontend manda o objeto inteiro: 1 leitura
@@ -2869,11 +2879,16 @@ async def wa_reopen_conversation(
     result = await wa_send_template(body=send_body, current_user=current_user)
     # Frente C1: contador do auto-resolve do lote (legado REOPEN_MAX_ATTEMPTS)
     # + cooldown. So no SUCESSO do envio (wa_send_template levanta em falha).
+    # Plano de reabertura (secao 6): mesmos campos por tentativa do lote, com
+    # audiencia "manual" e a conversa da rota; SEM item em reopen_batch_sent_at
+    # (o teto por contato vale so para envio em massa).
     try:
-        fs_document("wa_contacts", contact["id"]).set({
-            "reopen_attempts": int(contact.get("reopen_attempts") or 0) + 1,
-            "last_reopen_template_at": fs_utcnow().isoformat(),
-        }, merge=True)
+        from database import build_reopen_attempt_stamp, REOPEN_AUDIENCE_MANUAL
+        fs_document("wa_contacts", contact["id"]).set(build_reopen_attempt_stamp(
+            contact, REOPEN_AUDIENCE_MANUAL, conversation_id,
+            (conv or {}).get("channel_id"),
+            mass_send=False,
+        ), merge=True)
     except Exception as exc:
         logger.warning("reopen: carimbo de tentativa falhou contato=%s: %s", contact.get("id"), exc)
     log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} template={template_name} nome={nome} data={data}")
@@ -2882,6 +2897,16 @@ async def wa_reopen_conversation(
 
 
 # -- Frente C2: Reabertura em lote (o "botao" do sistema antigo, com freios) --
+
+def _ensure_reopen_batch_enabled():
+    """Kill-switch do lote INTEIRO por tenant (system_settings.
+    reopen_batch_enabled, plano de reabertura secao 7): desligado -> 409 na
+    previa e no disparo, ANTES de qualquer varredura. A reabertura pontual
+    (/api/wa/conversation/{id}/reopen) nao passa por aqui."""
+    if not get_system_settings().get("reopen_batch_enabled", True):
+        raise HTTPException(status_code=409,
+                            detail="Reabertura em lote desligada para esta empresa.")
+
 
 async def _plan_reopen_batch():
     """Scan (database.scan_reopen_candidates) + resolucao de canal/template
@@ -2928,6 +2953,7 @@ async def reopen_batch_preview(current_user: dict = Depends(get_current_user)):
     """Dry-run do lote (paridade com o preview do legado + exigencia D3 do
     ADR 0009: mostrar em qual SETOR as retomadas vao cair ANTES do disparo)."""
     ensure_permission(current_user, "reabrir_em_lote")
+    _ensure_reopen_batch_enabled()
     scan, plano, _canais, _tpls = await _plan_reopen_batch()
     from database import get_all_departments as _get_deps
     dep_nome = {d.get("id"): d.get("name") for d in _get_deps(include_inactive=True)}
@@ -2959,6 +2985,7 @@ async def reopen_batch_execute(request: Request, background_tasks: BackgroundTas
     aqui e a fonte da verdade (o preview pode ter envelhecido); execucao
     assincrona via BackgroundTasks com pacing + circuit breakers."""
     ensure_permission(current_user, "reabrir_em_lote")
+    _ensure_reopen_batch_enabled()
     try:
         body = await request.json()
     except Exception:
@@ -3037,6 +3064,7 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
     que silenciaria a Val (mark_contact_bot_done) — e sem avancar recencia
     (mil threads no topo do listener esconderiam as conversas reais)."""
     from firestore_common import set_tenant_context, reset_tenant_context
+    from database import build_reopen_attempt_stamp, REOPEN_AUDIENCE_RECEPTION
     token_ctx = set_tenant_context(tenant_id)
     enviados = resolvidos = falhas = consecutivas = 0
     abortado = ""
@@ -3117,11 +3145,15 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                     # Carimbo PRIMEIRO (revisao adversarial C2): o template
                     # pago JA saiu — se o save da mensagem falhar ou a
                     # instancia morrer aqui, cooldown/attempts impedem que o
-                    # proximo lote reenvie pro mesmo cliente.
-                    fs_document("wa_contacts", c["id"]).set({
-                        "reopen_attempts": int(c.get("reopen_attempts") or 0) + 1,
-                        "last_reopen_template_at": fs_utcnow().isoformat(),
-                    }, merge=True)
+                    # proximo lote reenvie pro mesmo cliente. Plano de
+                    # reabertura (secao 6): + campos por tentativa e item
+                    # {at, audience} no teto por contato. A thread e a que o
+                    # save abaixo deriva do canal do envio (mesma regra
+                    # deterministica do webhook: {channel_id}__{wa_id}).
+                    fs_document("wa_contacts", c["id"]).set(build_reopen_attempt_stamp(
+                        c, REOPEN_AUDIENCE_RECEPTION,
+                        f"{ch['id']}__{normalize_br_phone(c['wa_id'])}", ch["id"],
+                    ), merge=True)
                     try:
                         _rbody = resp.json()
                     except Exception:
