@@ -21,6 +21,7 @@ from fastapi import (
     FastAPI, Request, BackgroundTasks,
     HTTPException, Depends, Query, UploadFile, File, Form,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +37,8 @@ from config import (
     QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS, ATTENDANCE_AUTOCLOSE_HOURS,
     RATING_TEMPLATE_NAME, RATING_TEMPLATE_LANG, RATING_REASK_DAYS, CLOSE_TEMPLATE_NAME,
     REOPEN_MAX_ATTEMPTS, REOPEN_COOLDOWN_HOURS, REOPEN_BATCH_MAX_SENDS,
+    REOPEN_DAILY_CAP, REOPEN_MAX_PER_CONTACT, REOPEN_WINDOW_DAYS,
+    REOPEN_MAX_IDLE_DAYS, REOPEN_SCAN_MAX, REOPEN_DESFECHO_LINK,
     RECEPTION_UNATTENDED_RELEASE_DAYS,
     CX_DETECT_TIMEOUT_SECONDS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
@@ -2897,85 +2900,226 @@ async def wa_reopen_conversation(
 
 
 # -- Frente C2: Reabertura em lote (o "botao" do sistema antigo, com freios) --
+# Plano v2.2 (docs/PLANO_REABERTURA_LOTE_BOT_RECEPCAO.md), etapa 3: um scan
+# unico reparte os candidatos em dois publicos — Recepcao (atendimento
+# humano) e Bot (fase de bot) — e o disparo escolhe qual balde sai.
 
-def _ensure_reopen_batch_enabled():
+def _ensure_reopen_batch_enabled(sys_settings=None):
     """Kill-switch do lote INTEIRO por tenant (system_settings.
     reopen_batch_enabled, plano de reabertura secao 7): desligado -> 409 na
     previa e no disparo, ANTES de qualquer varredura. A reabertura pontual
-    (/api/wa/conversation/{id}/reopen) nao passa por aqui."""
-    if not get_system_settings().get("reopen_batch_enabled", True):
+    (/api/wa/conversation/{id}/reopen) nao passa por aqui. Devolve o
+    system_settings lido (o caller reaproveita a leitura)."""
+    settings = sys_settings if isinstance(sys_settings, dict) else get_system_settings()
+    if not settings.get("reopen_batch_enabled", True):
         raise HTTPException(status_code=409,
                             detail="Reabertura em lote desligada para esta empresa.")
+    return settings
 
 
-async def _plan_reopen_batch():
-    """Scan (database.scan_reopen_candidates) + resolucao de canal/template
-    por candidato. Retorna (scan_ajustado, plano, canais, tpl_por_canal)."""
-    from database import scan_reopen_candidates
-    from channel_service import get_channel as _get_ch
-    scan = scan_reopen_candidates(
-        max_attempts=REOPEN_MAX_ATTEMPTS,
-        cooldown_hours=REOPEN_COOLDOWN_HOURS,
-        window_hours=24,
-    )
-    plano, canais, tpl_por_canal = [], {}, {}
+# Cache da previa por tenant (plano secao 4): a classificacao de uma previa
+# vale 90s e e reaproveitada na troca de publico; uma previa em voo por
+# tenant (a segunda espera a primeira e sai do cache). O DISPARO nunca usa o
+# cache — o re-scan no execute e a verdade — e invalida a entrada do tenant.
+_REOPEN_PREVIEW_TTL_S = 90.0
+_reopen_preview_cache: dict = {}   # tid -> (monotonic, classificacao)
+_reopen_preview_locks: dict = {}   # tid -> (loop, asyncio.Lock)
 
-    def _desclassifica(c, motivo):
-        scan["pulados"][motivo] = scan["pulados"].get(motivo, 0) + 1
-        dep = c.get("department_id") or 0
-        if scan["por_setor"].get(dep):
-            scan["por_setor"][dep] -= 1
 
-    for c in scan["enviaveis"]:
-        ch_id = c.get("channel_id")
-        if ch_id is None:
-            _desclassifica(c, "canal_invalido")
-            continue
-        if ch_id not in canais:
-            canais[ch_id] = _get_ch(ch_id) or {}
-        ch = canais[ch_id]
-        # So canal standard ativo — mesmo guard do send_template_bulk
-        # (campanha NUNCA sai por numero coexistence).
+def _reopen_tenant_id(current_user=None) -> str:
+    from firestore_common import get_tenant_context as _get_tid
+    return str(_get_tid() or (current_user or {}).get("tenant_id") or "")
+
+
+def _reopen_preview_invalidate(tenant_id) -> None:
+    _reopen_preview_cache.pop(str(tenant_id or ""), None)
+
+
+def _reopen_bot_availability(sys_settings) -> dict:
+    """Publico Bot disponivel (plano secoes 5 e 7) = criterio 2.2.1 (motor
+    dialogflow_cx ativo + bot_enabled) E flag reopen_bot_audience_enabled.
+    cx_ok alimenta a CLASSIFICACAO (fase de bot existe); disponivel so libera
+    o DISPARO do publico Bot. Indisponivel ainda mostra as contagens."""
+    from bot_service import _get_tenant_ai_config
+    from database import reopen_bot_engine_status
+    cx_ok, motivo = reopen_bot_engine_status(sys_settings, _get_tenant_ai_config())
+    disponivel = bool(cx_ok and (sys_settings or {}).get("reopen_bot_audience_enabled", False))
+    if cx_ok and not disponivel:
+        motivo = "publico Bot ainda nao liberado para esta empresa"
+    return {"cx_ok": bool(cx_ok), "disponivel": disponivel,
+            "motivo": "" if disponivel else motivo}
+
+
+async def _reopen_standard_channels():
+    """Canais STANDARD ATIVOS do tenant e o template de retomada de cada um
+    (plano 2.1: coexistence fica fora; so canal com template compativel).
+    Resolvido ANTES do scan (sincrono, em threadpool): poucos canais por
+    tenant e o loader de templates tem cache proprio (60s)."""
+    from channel_service import get_all_active_channels as _active_channels
+    canais, tpls = {}, {}
+    for ch in _active_channels():
         if not ch or not ch.get("is_active") or ch.get("channel_type") != "standard":
-            _desclassifica(c, "canal_invalido")
             continue
-        if ch_id not in tpl_por_canal:
-            tpl_por_canal[ch_id] = await _resolve_reopen_template(ch)
-        if not tpl_por_canal[ch_id]:
-            _desclassifica(c, "sem_template")
+        ch_id = ch.get("id")
+        if ch_id is None:
             continue
-        plano.append(c)
-    return scan, plano, canais, tpl_por_canal
+        canais[ch_id] = ch
+        tpls[ch_id] = await _resolve_reopen_template(ch)
+    return canais, tpls
 
 
-@app.post("/api/admin/reopen-batch/preview")
-async def reopen_batch_preview(current_user: dict = Depends(get_current_user)):
-    """Dry-run do lote (paridade com o preview do legado + exigencia D3 do
-    ADR 0009: mostrar em qual SETOR as retomadas vao cair ANTES do disparo)."""
-    ensure_permission(current_user, "reabrir_em_lote")
-    _ensure_reopen_batch_enabled()
-    scan, plano, _canais, _tpls = await _plan_reopen_batch()
-    from database import get_all_departments as _get_deps
-    dep_nome = {d.get("id"): d.get("name") for d in _get_deps(include_inactive=True)}
+async def _plan_reopen_batch(sys_settings=None):
+    """Classificacao do lote (plano v2.2, 2.1-2.3): canais/templates do
+    tenant + scan unico com dois baldes (database.scan_reopen_audiences)
+    rodando FORA do event loop. Retorna {"scan", "canais", "tpls",
+    "availability"}; cada enviavel leva _reopen_target (thread candidata)."""
+    from database import scan_reopen_audiences
+    from bot_service import _lgpd_policy_date
+    from firestore_common import set_tenant_context, reset_tenant_context
+    sys_settings = sys_settings if isinstance(sys_settings, dict) else get_system_settings()
+    availability = _reopen_bot_availability(sys_settings)
+    canais, tpls = await _reopen_standard_channels()
+    channels_ok = {ch_id: bool(tpls.get(ch_id)) for ch_id in canais}
+    # P2b: mesma regra por data do gate LGPD do bot (data invalida/futura = sem data).
+    policy_date = _lgpd_policy_date(sys_settings)
+    tid = _reopen_tenant_id()
+
+    def _job():
+        # Contexto de tenant setado explicitamente na thread do pool.
+        token = set_tenant_context(tid or None)
+        try:
+            return scan_reopen_audiences(
+                channels_ok, availability["cx_ok"], policy_date,
+                max_attempts=REOPEN_MAX_ATTEMPTS,
+                cooldown_hours=REOPEN_COOLDOWN_HOURS,
+                window_hours=24,
+                max_per_contact=REOPEN_MAX_PER_CONTACT,
+                window_days=REOPEN_WINDOW_DAYS,
+                max_idle_days=REOPEN_MAX_IDLE_DAYS,
+                scan_max=REOPEN_SCAN_MAX,
+                desfecho_link=REOPEN_DESFECHO_LINK,
+            )
+        finally:
+            reset_tenant_context(token)
+
+    scan = await run_in_threadpool(_job)
+    return {"scan": scan, "canais": canais, "tpls": tpls, "availability": availability}
+
+
+def _reopen_daily_cap(tenant_id) -> dict:
+    """Teto diario do portfolio (D7, plano 2.3): {cap, usados_24h,
+    disponiveis}. Soma os lotes das ultimas 24h de todos os tenants ativos
+    (database.reopen_daily_usage). Sincrono: o caller usa threadpool."""
+    from database import reopen_daily_usage
+    uso = reopen_daily_usage(include_tenant_ids=(tenant_id,) if tenant_id else ())
+    usados = int(uso.get("usados") or 0)
+    return {"cap": REOPEN_DAILY_CAP, "usados_24h": usados,
+            "disponiveis": max(0, REOPEN_DAILY_CAP - usados)}
+
+
+def _reopen_audience_payload(view: dict, dep_nome: dict) -> dict:
+    """Uma visao da previa com as MESMAS chaves da previa antiga (a tela atual
+    le o balde Recepcao no topo; o seletor da etapa 6 le audiences)."""
+    plano = view.get("enviaveis") or []
     por_setor = [
         {"department_id": k or None,
          "department_name": dep_nome.get(k) or "Sem setor",
          "count": v}
-        for k, v in sorted(scan["por_setor"].items(), key=lambda kv: -kv[1]) if v > 0
+        for k, v in sorted((view.get("por_setor") or {}).items(), key=lambda kv: -kv[1]) if v > 0
     ]
     amostra = [{
         "contact_id": c.get("id"),
         "nome": c.get("display_name") or c.get("phone_formatted") or "",
         "department_id": c.get("department_id"),
+        "conversation_id": (c.get("_reopen_target") or {}).get("conversation_id"),
+        "channel_id": (c.get("_reopen_target") or {}).get("channel_id"),
     } for c in plano[:20]]
     return {
         "enviaveis": len(plano),
-        "auto_resolve": len(scan["auto_resolve"]),
-        "pulados": scan["pulados"],
+        "auto_resolve": len(view.get("auto_resolve") or []),
+        "pulados": dict(view.get("pulados") or {}),
         "por_setor": por_setor,
         "amostra": amostra,
         "max_sends_default": REOPEN_BATCH_MAX_SENDS,
     }
+
+
+async def _reopen_classify_for_preview(sys_settings) -> dict:
+    """Classificacao resumida (o que a previa mostra) — o que vai pro cache."""
+    from database import REOPEN_AUDIENCES, get_all_departments as _get_deps
+    plan = await _plan_reopen_batch(sys_settings)
+    scan = plan["scan"]
+    dep_nome = {d.get("id"): d.get("name") for d in _get_deps(include_inactive=True)}
+    return {
+        "audiences": {aud: _reopen_audience_payload(scan["audiences"][aud], dep_nome)
+                      for aud in REOPEN_AUDIENCES},
+        "criteria_version": scan.get("criteria_version"),
+        "total": scan.get("total"),
+        "excedente": scan.get("excedente"),
+    }
+
+
+@app.post("/api/admin/reopen-batch/preview")
+async def reopen_batch_preview(request: Request = None,
+                               current_user: dict = Depends(get_current_user)):
+    """Dry-run do lote (paridade com o preview do legado + exigencia D3 do
+    ADR 0009: mostrar em qual SETOR as retomadas vao cair ANTES do disparo).
+
+    Plano v2.2 (secao 5): devolve os DOIS publicos em `audiences`
+    (reception/bot, mesmas chaves da previa antiga), `bot_disponivel` +
+    `bot_indisponivel_motivo` e `daily_cap` {cap, usados_24h, disponiveis}.
+    Os campos antigos do topo continuam = balde Recepcao (tela atual intacta
+    ate a etapa 6). Corpo opcional {"refresh": true} ignora o cache."""
+    ensure_permission(current_user, "reabrir_em_lote")
+    sys_settings = _ensure_reopen_batch_enabled()
+    refresh = False
+    if request is not None:
+        try:
+            _body = await request.json()
+        except Exception:
+            _body = None
+        refresh = bool(_body.get("refresh")) if isinstance(_body, dict) else False
+    tid = _reopen_tenant_id(current_user)
+    _loop = asyncio.get_running_loop()
+    _entry = _reopen_preview_locks.get(tid)
+    if _entry is None or _entry[0] is not _loop:
+        # Lock e por event loop (prod: um so; simuladores: um por asyncio.run).
+        _entry = _reopen_preview_locks[tid] = (_loop, asyncio.Lock())
+    lock = _entry[1]
+    async with lock:
+        cached = _reopen_preview_cache.get(tid)
+        if cached and not refresh and (_monotonic() - cached[0]) < _REOPEN_PREVIEW_TTL_S:
+            classif, cache_hit = cached[1], True
+        else:
+            classif, cache_hit = await _reopen_classify_for_preview(sys_settings), False
+            _reopen_preview_cache[tid] = (_monotonic(), classif)
+    availability = _reopen_bot_availability(sys_settings)
+    try:
+        daily_cap = await run_in_threadpool(_reopen_daily_cap, tid)
+    except Exception as exc:
+        logger.warning("reopen-batch preview: teto diario indisponivel: %s", exc)
+        daily_cap = {"cap": REOPEN_DAILY_CAP, "usados_24h": None, "disponiveis": None}
+    return {
+        **classif["audiences"]["reception"],
+        "audiences": classif["audiences"],
+        "bot_disponivel": availability["disponivel"],
+        "bot_indisponivel_motivo": availability["motivo"],
+        "daily_cap": daily_cap,
+        "criteria_version": classif.get("criteria_version"),
+        "cache_hit": cache_hit,
+    }
+
+
+def _parse_reopen_audience(raw) -> str:
+    """Publico do disparo: ausente/null = reception (tela atual); fora do
+    vocabulario = 422 (plano secao 5)."""
+    from database import REOPEN_AUDIENCES, REOPEN_AUDIENCE_RECEPTION
+    if raw is None:
+        return REOPEN_AUDIENCE_RECEPTION
+    if isinstance(raw, str) and raw.strip().lower() in REOPEN_AUDIENCES:
+        return raw.strip().lower()
+    raise HTTPException(status_code=422,
+                        detail="Publico invalido: use 'reception' (Recepcao) ou 'bot'.")
 
 
 @app.post("/api/admin/reopen-batch")
@@ -2983,17 +3127,31 @@ async def reopen_batch_execute(request: Request, background_tasks: BackgroundTas
                                current_user: dict = Depends(get_current_user)):
     """Dispara o lote (supervisor/admin — toggle reabrir_em_lote). O RE-SCAN
     aqui e a fonte da verdade (o preview pode ter envelhecido); execucao
-    assincrona via BackgroundTasks com pacing + circuit breakers."""
+    assincrona via BackgroundTasks com pacing + circuit breakers.
+
+    Plano v2.2: corpo {"audience": "reception"|"bot", "max_sends": n}
+    (audience ausente = reception; invalido = 422; bot indisponivel = 409).
+    Teto diario do portfolio (D7) checado aqui: planejados = min(enviaveis,
+    max_sends, disponiveis); disponivel zero = 409. Etapa 3: com audience=bot
+    o lote SO envia — o auto-resolve silencioso do Bot (D9) e da etapa 5."""
     ensure_permission(current_user, "reabrir_em_lote")
-    _ensure_reopen_batch_enabled()
+    sys_settings = _ensure_reopen_batch_enabled()
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
+    audience = _parse_reopen_audience(body.get("audience"))
     try:
         max_sends = max(1, min(int(body.get("max_sends") or REOPEN_BATCH_MAX_SENDS), 250))
     except Exception:
         max_sends = REOPEN_BATCH_MAX_SENDS
+    if audience == "bot":
+        _avail = _reopen_bot_availability(sys_settings)
+        if not _avail["disponivel"]:
+            raise HTTPException(status_code=409,
+                                detail=f"Publico Bot indisponivel: {_avail['motivo']}.")
     # Trava de execucao unica (revisao adversarial C2): dois lotes em paralelo
     # (dois admins, ou fechar/reabrir o modal) mandariam o MESMO template pago
     # 2x pro mesmo lead. Lote "executando" com progresso recente bloqueia;
@@ -3008,33 +3166,62 @@ async def reopen_batch_execute(request: Request, background_tasks: BackgroundTas
                 detail=f"Lote {_bd.get('id')} ainda em execucao. Aguarde ele terminar.",
             )
         fs_document("reopen_batches", _bs.id).set({"status": "interrompido"}, merge=True)
-    scan, plano, canais, tpls = await _plan_reopen_batch()
-    if not plano and not scan["auto_resolve"]:
+    # Teto diario do portfolio (D7): fail-closed — sem saber o uso, nao dispara.
+    tid = _reopen_tenant_id(current_user)
+    try:
+        daily_cap = await run_in_threadpool(_reopen_daily_cap, tid)
+    except Exception as exc:
+        logger.warning("reopen-batch: teto diario indisponivel: %s", exc)
+        raise HTTPException(status_code=503,
+                            detail="Nao foi possivel conferir o teto diario de reaberturas. Tente de novo.")
+    if daily_cap["disponiveis"] <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Teto diario de reaberturas atingido ({daily_cap['usados_24h']} de "
+                    f"{daily_cap['cap']} nas ultimas 24h, somando todas as empresas). "
+                    "Tente de novo mais tarde."),
+        )
+    plan = await _plan_reopen_batch(sys_settings)
+    scan, canais, tpls = plan["scan"], plan["canais"], plan["tpls"]
+    view = scan["audiences"][audience]
+    plano = view["enviaveis"]
+    # Etapa 3: o auto-resolve do Bot (fechamento silencioso, D9) fica fora do
+    # disparo e so aparece na previa.
+    auto_resolve = view["auto_resolve"] if audience == "reception" else []
+    if not plano and not auto_resolve:
         raise HTTPException(status_code=400, detail="Nenhum lead elegivel para reabertura agora.")
+    planejados = min(len(plano), max_sends, daily_cap["disponiveis"])
     from database import next_sequence as _next_seq
-    from firestore_common import get_tenant_context as _get_tid
     batch_id = _next_seq("reopen_batches")
-    tid = _get_tid() or str(current_user.get("tenant_id") or "")
     fs_document("reopen_batches", batch_id).set({
         "id": batch_id, "status": "executando",
+        "audience": audience,
+        "criteria_version": scan.get("criteria_version"),
         "started_by": current_user["id"],
         "started_at": fs_utcnow().isoformat(),
-        "planejados": min(len(plano), max_sends),
-        "auto_resolve_planejados": len(scan["auto_resolve"]),
+        # Reserva do teto diario (max(enviados, planejados) enquanto executa).
+        "planejados": planejados,
+        "auto_resolve_planejados": len(auto_resolve),
+        "auto_resolve_fora_do_disparo": len(view["auto_resolve"]) - len(auto_resolve),
         "max_sends": max_sends,
-        "pulados_scan": scan["pulados"],
+        "elegiveis": len(plano),
+        "pulados_scan": view["pulados"],
+        "teto_diario": {"cap": daily_cap["cap"], "usados_24h": daily_cap["usados_24h"]},
         "enviados": 0, "resolvidos": 0, "falhas": 0,
         "last_progress_at": fs_utcnow().isoformat(),
     })
     log_audit(current_user["id"], "REOPEN_BATCH_START",
-              f"batch={batch_id} planejados={min(len(plano), max_sends)} auto_resolve={len(scan['auto_resolve'])} max={max_sends}")
+              f"batch={batch_id} audience={audience} planejados={planejados} "
+              f"auto_resolve={len(auto_resolve)} max={max_sends} "
+              f"teto_usado={daily_cap['usados_24h']}/{daily_cap['cap']}")
     background_tasks.add_task(
-        _run_reopen_batch, tid, batch_id, plano[:max_sends],
-        scan["auto_resolve"], canais, tpls, current_user["id"],
+        _run_reopen_batch, tid, batch_id, plano[:planejados],
+        auto_resolve, canais, tpls, current_user["id"], audience,
     )
-    return {"status": "ok", "batch_id": batch_id,
-            "planejados": min(len(plano), max_sends),
-            "auto_resolve": len(scan["auto_resolve"])}
+    _reopen_preview_invalidate(tid)
+    return {"status": "ok", "batch_id": batch_id, "audience": audience,
+            "planejados": planejados,
+            "auto_resolve": len(auto_resolve)}
 
 
 @app.get("/api/admin/reopen-batch/{batch_id}")
@@ -3054,9 +3241,15 @@ async def reopen_batch_status(batch_id: int, current_user: dict = Depends(get_cu
     return d
 
 
-async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tpls, starter_id):
+async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tpls, starter_id,
+                            audience="reception"):
     """Executa o lote FORA do request (BackgroundTasks). Re-seta o contexto de
     tenant (o middleware ja resetou o do request — mesmo padrao do cron).
+
+    audience = publico do lote (plano v2.2): vai no carimbo da tentativa
+    (last_reopen_audience + reopen_batch_sent_at). Cada item do plano leva a
+    thread candidata em _reopen_target (canal do envio); sem ela (chamada
+    antiga), cai no canal do contato e em {channel_id}__{wa_id}.
 
     Freios portados do scripts/send_template_bulk.py: pacing 1.5s, aborta em
     5 falhas consecutivas e em held_for_quality_assessment. Envio pelo
@@ -3064,7 +3257,7 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
     que silenciaria a Val (mark_contact_bot_done) — e sem avancar recencia
     (mil threads no topo do listener esconderiam as conversas reais)."""
     from firestore_common import set_tenant_context, reset_tenant_context
-    from database import build_reopen_attempt_stamp, REOPEN_AUDIENCE_RECEPTION
+    from database import build_reopen_attempt_stamp
     token_ctx = set_tenant_context(tenant_id)
     enviados = resolvidos = falhas = consecutivas = 0
     abortado = ""
@@ -3119,13 +3312,19 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
             await asyncio.sleep(0.05)
         # 2) ENVIOS com pacing
         for i, c in enumerate(plano):
-            ch = canais.get(c.get("channel_id")) or {}
-            tpl = tpls.get(c.get("channel_id")) or {}
+            # Canal da THREAD CANDIDATA (plano 2.2), nao mais contact.channel_id.
+            _target = c.get("_reopen_target") or {}
+            _ch_id = _target.get("channel_id", c.get("channel_id"))
+            ch = canais.get(_ch_id) or {}
+            tpl = tpls.get(_ch_id) or {}
             try:
                 token, phone_id, api_base = _resolve_channel_creds_by_id(ch["id"])
                 wa_id = _wa_target(c["wa_id"])
+                _conv_id = (_target.get("conversation_id")
+                            or f"{ch['id']}__{normalize_br_phone(c['wa_id'])}")
                 nome = _reopen_first_name(c)
-                data = _reopen_last_conv_date(None, c)
+                data = _reopen_last_conv_date(
+                    {"last_message_at": _target.get("last_message_at")} if _target else None, c)
                 params = _reopen_template_params(tpl, nome, data)
                 payload = {
                     "messaging_product": "whatsapp", "to": wa_id, "type": "template",
@@ -3147,12 +3346,11 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                     # instancia morrer aqui, cooldown/attempts impedem que o
                     # proximo lote reenvie pro mesmo cliente. Plano de
                     # reabertura (secao 6): + campos por tentativa e item
-                    # {at, audience} no teto por contato. A thread e a que o
-                    # save abaixo deriva do canal do envio (mesma regra
-                    # deterministica do webhook: {channel_id}__{wa_id}).
+                    # {at, audience} no teto por contato, com o PUBLICO DO
+                    # LOTE. A thread e a candidata do scan — a mesma que o
+                    # save abaixo recebe explicitamente.
                     fs_document("wa_contacts", c["id"]).set(build_reopen_attempt_stamp(
-                        c, REOPEN_AUDIENCE_RECEPTION,
-                        f"{ch['id']}__{normalize_br_phone(c['wa_id'])}", ch["id"],
+                        c, audience, _conv_id, ch["id"],
                     ), merge=True)
                     try:
                         _rbody = resp.json()
@@ -3167,6 +3365,7 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                             operator_id=starter_id, sender_user_id=starter_id,
                             channel_id=ch.get("id"),
                             channel_owner_user_id=ch.get("owner_user_id"),
+                            conversation_id=_conv_id,
                             template_category=str(tpl.get("category") or "utility").lower(),
                             promote_qualification=False,
                             reopen_attendance=False,  # reabre so quando o CLIENTE responder
@@ -3232,7 +3431,9 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
             "finished_at": fs_utcnow().isoformat(),
         }, merge=True)
         log_audit(None, "REOPEN_BATCH_END",
-                  f"batch={batch_id} enviados={enviados} resolvidos={resolvidos} falhas={falhas} abort={abortado or '-'}")
+                  f"batch={batch_id} audience={audience} enviados={enviados} resolvidos={resolvidos} falhas={falhas} abort={abortado or '-'}")
+        # Previa feita durante o lote nao pode sobreviver ao fim dele.
+        _reopen_preview_invalidate(tenant_id)
         reset_tenant_context(token_ctx)
 
 

@@ -2599,6 +2599,22 @@ const REOPEN_SKIP_LABELS: Record<string, string> = {
   backup: "Lead da Caixa Backup",
   canal_invalido: "Canal inativo ou coexistence",
   sem_template: "Canal sem template de retomada aprovado",
+  // Reabertura por publico (plano v2.2, secao 5)
+  consentimento_ausente: "Sem aceite LGPD (aviso pendente ou recusado)",
+  politica_desatualizada: "Aceite LGPD anterior a politica vigente",
+  fase_bot: "Lead com a assistente virtual (publico Bot)",
+  atendimento_humano: "Lead com a equipe (publico Recepcao)",
+  aguardando_bot: "Aguardando o bot (empresa sem assistente com fase de conversa)",
+  sem_thread_standard: "Sem conversa em canal standard ativo",
+  mais_antigo_que_limite: "Lead novo (pos-handoff) parado alem do limite de dias",
+  teto_contato: "Limite de retomadas por contato no periodo atingido",
+  teto_diario: "Teto diario de reaberturas atingido",
+  desfecho_bot: "Ja teve desfecho com a assistente virtual (agendou ou recebeu o link)",
+  bot_indisponivel: "Publico Bot indisponivel",
+  estado_alterado: "Mudou de situacao entre a previa e o envio",
+  tentativa_outro_publico: "Retomada pendente do outro publico",
+  atendimento_pos_retomada: "Atendido pela equipe depois da retomada",
+  limite_varredura: "Alem do limite de leads avaliados por previa",
 };
 
 function ReopenBatchModal() {

@@ -16,9 +16,11 @@ from firestore_common import (
     get_tenant_context,
     next_sequence,
     normalize_record,
+    reset_tenant_context,
+    set_tenant_context,
     utcnow,
 )
-from lgpd_bot import hoje_br, validar_config_lgpd
+from lgpd_bot import aceite_cobre_data, hoje_br, validar_config_lgpd
 from rbac import default_perfil_for_role
 
 logger = logging.getLogger("castro_crm.database")
@@ -4191,7 +4193,12 @@ def build_reopen_attempt_stamp(contact, audience, conversation_id, channel_id,
 
 
 def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
-    """Frente C2: varre leads "em_atendimento" e classifica pro lote de
+    """Frente C2 (classificacao v1, LEGADA): o lote passou a usar
+    scan_reopen_audiences (plano v2.2). Mantida intacta SO como referencia da
+    conciliacao (tools/reopen_conciliation.py, plano 11.1) — nao chamar do
+    runtime.
+
+    Varre leads "em_atendimento" e classifica pro lote de
     reabertura. Query server-side por IGUALDADE (indice automatico, sem
     composto — mesma dieta do close_stale_attendances); demais filtros em
     Python. O caller (main) valida canal/template e executa.
@@ -4266,6 +4273,411 @@ def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
 
     return {"enviaveis": enviaveis, "auto_resolve": auto_resolve,
             "pulados": pulados, "por_setor": por_setor}
+
+
+# ---------------------------------------------------------------------------
+# Reabertura por publico (plano v2.2, secoes 2 e 4): scan unico, dois baldes
+# ---------------------------------------------------------------------------
+
+# Gravado no doc do lote (auditoria): muda quando a regra de selecao muda.
+REOPEN_CRITERIA_VERSION = "v2.2"
+REOPEN_AUDIENCES = (REOPEN_AUDIENCE_RECEPTION, REOPEN_AUDIENCE_BOT)
+# Desfecho terminal fica fora pela propria query (so estas entram no scan).
+_REOPEN_SCAN_QUALIFICATIONS = ["em_atendimento", "novo"]
+# Mensagens da thread candidata olhadas pela heuristica do P5.
+REOPEN_DESFECHO_SCAN_MESSAGES = 40
+# Motivo de quem esta no OUTRO balde, visto de cada publico (cada visao soma
+# o total varrido: enviaveis + auto_resolve + pulados).
+_REOPEN_OTHER_AUDIENCE_SKIP = {
+    REOPEN_AUDIENCE_RECEPTION: "fase_bot",          # visao Recepcao: lead do Bot
+    REOPEN_AUDIENCE_BOT: "atendimento_humano",      # visao Bot: lead da Recepcao
+}
+
+
+def reopen_bot_engine_status(sys_settings, ai_cfg):
+    """Criterio 2.2.1 (bot disponivel no tenant): motor dialogflow_cx com
+    status active E system_settings.bot_enabled. Retorna (ok, motivo); o
+    motivo e legivel pro admin. NAO olha a flag reopen_bot_audience_enabled:
+    desligada, a classificacao nao muda (plano secao 7) — so o disparo do
+    publico Bot e bloqueado (main)."""
+    ai_cfg = ai_cfg if isinstance(ai_cfg, dict) else {}
+    sys_settings = sys_settings if isinstance(sys_settings, dict) else {}
+    engine = str(ai_cfg.get("bot_engine") or "").strip().lower()
+    if engine != "dialogflow_cx":
+        return False, "a empresa nao tem assistente virtual com fase de conversa (motor CX)"
+    status = str(ai_cfg.get("status") or "active").strip().lower()
+    if status != "active":
+        return False, f"motor do assistente virtual pausado (status={status})"
+    if not bool(sys_settings.get("bot_enabled", False)):
+        return False, "bot desligado nas configuracoes da empresa"
+    return True, ""
+
+
+def _reopen_int_key(value):
+    """Id comparavel (int quando possivel): channel_id de thread antiga e doc
+    id de contato podem vir como string."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _reopen_thread_rank(thread):
+    """Ordem da thread candidata (plano 2.2): maior last_message_at primeiro;
+    empate (ou sem data) pelo MENOR channel_id."""
+    ts = _reopen_sent_at_utc(thread.get("last_message_at"))
+    ch = _reopen_int_key(thread.get("channel_id"))
+    ch_key = (0, ch) if isinstance(ch, int) else (1, str(ch))
+    return (0 if ts is not None else 1, -(ts.timestamp()) if ts is not None else 0.0, ch_key)
+
+
+def _reopen_in_bot_phase(contact, threads, state):
+    """Criterios 2.2.3 e 2.2.4 (o caller ja garantiu 2.2.1 e 2.2.2).
+
+    2.2.3: bot_states.human_active falso.
+    2.2.4: nenhuma thread NAO-backup do contato com last_human_outbound_at
+    POSTERIOR ao marco de ciclo (bot_released_at). Marco ausente (estoque
+    pre-deploy) = criterio ignorado. O template do lote e as respostas do bot
+    nao carimbam last_human_outbound_at, entao nao entram na comparacao."""
+    if (state or {}).get("human_active"):
+        return False
+    marco = _reopen_sent_at_utc(contact.get("bot_released_at"))
+    if marco is None:
+        return True
+    for t in threads:
+        lho = _reopen_sent_at_utc(t.get("last_human_outbound_at"))
+        if lho is not None and lho > marco:
+            return False
+    return True
+
+
+def _reopen_val_sent_link(contact_id, conversation_id, needle, marco=None,
+                          limit=REOPEN_DESFECHO_SCAN_MESSAGES):
+    """Heuristica provisoria do P5 (ate o agente expor desfecho_bot): True se,
+    entre as ultimas `limit` mensagens da thread, alguma resposta do BOT
+    (outbound sem operador, fora o template de retomada) contem `needle`.
+    Mesma forma de query do script one-off e da abertura da conversa
+    (contact_id + conversation_id + timestamp_wa desc). Com marco de ciclo,
+    so conta mensagem POSTERIOR a ele (P5 vale "no ciclo"; o release zera o
+    bot_outcome pelo mesmo motivo); data ilegivel conta (lado seguro)."""
+    q = (collection("wa_messages")
+         .where("contact_id", "==", contact_id)
+         .where("conversation_id", "==", conversation_id)
+         .order_by("timestamp_wa", direction="DESCENDING")
+         .limit(limit))
+    for snap in q.stream():
+        m = snap.to_dict() or {}
+        if m.get("direction") != "outbound" or m.get("sender_user_id") is not None:
+            continue
+        content = str(m.get("content") or "")
+        if m.get("msg_type") == "template" or content.startswith("[Reabertura"):
+            continue
+        if marco is not None:
+            ts = _reopen_sent_at_utc(m.get("timestamp_wa"))
+            if ts is not None and ts <= marco:
+                continue
+        if needle in content.lower():
+            return True
+    return False
+
+
+def scan_reopen_audiences(channels_ok, cx_available, policy_date=None, *,
+                          max_attempts=1, cooldown_hours=24, window_hours=24,
+                          max_per_contact=2, window_days=90, max_idle_days=30,
+                          scan_max=2000, desfecho_link="", now=None,
+                          with_detail=False):
+    """Scan UNICO da reabertura em lote com dois baldes (plano v2.2, 2.1-2.3).
+
+    Sincrono e so-leitura: o caller roda em threadpool com o tenant setado.
+    channels_ok = {channel_id: bool} dos canais STANDARD ATIVOS do tenant
+    (True = template de retomada compativel); coexistence/inativo nem entram.
+    cx_available = criterio 2.2.1 (reopen_bot_engine_status).
+    policy_date = data da politica LGPD vigente (P2b) ou None.
+
+    Ordem de custo: query por qualification in (em_atendimento, novo) ->
+    filtros de contato em memoria -> ordenacao 2.3 e corte scan_max -> so os
+    sobreviventes pagam 1 query de threads e, quando o criterio 2.2.2 passa
+    (tenant CX), 1 get de bot_states; a heuristica do P5 (1 query de
+    mensagens) so para quem ja seria enviavel no Bot.
+
+    Cada contato cai em EXATAMENTE um destino: enviavel ou auto_resolve de
+    UM publico, ou pulado. Cada visao (reception/bot) soma o total varrido;
+    quem esta no outro balde aparece como fase_bot (visao Recepcao),
+    atendimento_humano (visao Bot) ou tentativa_outro_publico (auto-resolve).
+
+    Retorna {"criteria_version", "cx_available", "total", "sobreviventes"
+    (candidatos antes do corte), "excedente", "leituras", "audiences": {aud:
+    {"enviaveis", "auto_resolve", "pulados", "por_setor"}}, "detalhe"
+    (with_detail: {contact_id: estado por visao + via})}. Enviavel leva
+    "_reopen_target" = {conversation_id, channel_id, last_message_at} da
+    thread candidata. scan_max=None = sem corte (conciliacao).
+    """
+    now = _reopen_sent_at_utc(now) or datetime.now(timezone.utc)
+    janela_cut = now - timedelta(hours=window_hours)
+    cooldown_cut = now - timedelta(hours=cooldown_hours)
+    idle_cut = now - timedelta(days=max_idle_days)
+    needle = str(desfecho_link or "").strip().lower()
+    channels_ok = {_reopen_int_key(k): bool(v) for k, v in (channels_ok or {}).items()}
+
+    views = {aud: {"enviaveis": [], "auto_resolve": [], "pulados": {}, "por_setor": {}}
+             for aud in REOPEN_AUDIENCES}
+    detail = {} if with_detail else None
+    leituras = {"contatos": 0, "threads": 0, "bot_states": 0, "mensagens": 0}
+
+    def _count(aud, motivo):
+        p = views[aud]["pulados"]
+        p[motivo] = p.get(motivo, 0) + 1
+
+    def _note(c, rec, bot, via=None):
+        if detail is not None:
+            detail[c.get("id")] = {
+                "reception": rec, "bot": bot,
+                "qualification": c.get("qualification"),
+                "bot_completed": bool(c.get("bot_completed")),
+                "assigned": bool(c.get("assigned_to")),
+                # Por que o enviavel da Recepcao NAO esta em fase de bot:
+                # dono | bot_completed | human_active | humano_pos_marco.
+                "via": via,
+            }
+
+    def _skip(c, motivo_rec, motivo_bot=None):
+        motivo_bot = motivo_bot or motivo_rec
+        _count(REOPEN_AUDIENCE_RECEPTION, motivo_rec)
+        _count(REOPEN_AUDIENCE_BOT, motivo_bot)
+        _note(c, motivo_rec, motivo_bot)
+
+    def _place(c, aud, kind, motivo_outro, via=None):
+        # Destino num balde; na visao do outro publico conta como pulado.
+        views[aud][kind].append(c)
+        outro = REOPEN_AUDIENCE_BOT if aud == REOPEN_AUDIENCE_RECEPTION else REOPEN_AUDIENCE_RECEPTION
+        _count(outro, motivo_outro)
+        estado = {aud: "enviavel" if kind == "enviaveis" else "auto_resolve", outro: motivo_outro}
+        _note(c, estado[REOPEN_AUDIENCE_RECEPTION], estado[REOPEN_AUDIENCE_BOT], via)
+
+    def _send(c, aud, target, via=None):
+        c["_reopen_target"] = target
+        dep = c.get("department_id") or 0
+        views[aud]["por_setor"][dep] = views[aud]["por_setor"].get(dep, 0) + 1
+        outro = REOPEN_AUDIENCE_BOT if aud == REOPEN_AUDIENCE_RECEPTION else REOPEN_AUDIENCE_RECEPTION
+        _place(c, aud, "enviaveis", _REOPEN_OTHER_AUDIENCE_SKIP[outro], via)
+
+    def _resolve(c, aud):
+        _place(c, aud, "auto_resolve", "tentativa_outro_publico")
+
+    def _sem_dono_no_bot(c):
+        # Criterio 2.2.2 (no CONTATO): sem dono e bot_completed falso/ausente.
+        return not c.get("assigned_to") and not c.get("bot_completed")
+
+    # 1) Filtros de contato (sem leitura extra).
+    survivors = []
+    total = 0
+    for snap in collection("wa_contacts").where(
+            "qualification", "in", list(_REOPEN_SCAN_QUALIFICATIONS)).stream():
+        c = snap.to_dict() or {}
+        if str(c.get("qualification") or "") not in _REOPEN_SCAN_QUALIFICATIONS:
+            continue  # defesa: a query ja filtra
+        if "id" not in c:
+            c["id"] = _reopen_int_key(snap.id)
+        total += 1
+        if int(c.get("is_archived") or 0):
+            _skip(c, "arquivado")
+            continue
+        if c.get("is_backup"):
+            _skip(c, "backup")
+            continue
+        if c.get("reopen_opt_out"):
+            _skip(c, "opt_out")
+            continue
+        if c.get("lgpd_revoked"):
+            _skip(c, "lgpd_revogado")
+            continue
+        li = _reopen_sent_at_utc(c.get("last_inbound_at"))
+        if li is None:
+            _skip(c, "janela_desconhecida")
+            continue
+        if li > janela_cut:
+            _skip(c, "janela_aberta")
+            continue
+        lrt = _reopen_sent_at_utc(c.get("last_reopen_template_at"))
+        if lrt is not None and lrt > cooldown_cut:
+            _skip(c, "cooldown")
+            continue
+        sort_key = (0 if c.get("qualification") == "em_atendimento" else 1, -li.timestamp())
+        if int(c.get("reopen_attempts") or 0) >= max_attempts:
+            # Tentativa pendente -> auto-resolve (fecha sem enviar). Vem ANTES
+            # das regras de ENVIO (consentimento, teto, P4): elas decidem quem
+            # recebe template, nao a faxina de uma tentativa ja feita.
+            if c.get("reopen_resolved_at"):
+                _skip(c, "ja_resolvido")
+                continue
+            # Outbound humano depois da tentativa (plano 3): nao encerra quem
+            # a equipe esta atendendo. Ancora = last_reopen_at, fallback
+            # last_reopen_template_at; sem ancora = sem supressao.
+            rha = _reopen_sent_at_utc(c.get("reopen_human_active_at"))
+            anchor = _reopen_sent_at_utc(c.get("last_reopen_at")) or lrt
+            if rha is not None and anchor is not None and rha > anchor:
+                _skip(c, "atendimento_pos_retomada")
+                continue
+            survivors.append((sort_key, c, "resolve"))
+            continue
+        if c.get("lgpd_consent") is not True:
+            _skip(c, "consentimento_ausente")  # D1: sem aceite (pendente/recusado)
+            continue
+        if policy_date is not None and not aceite_cobre_data(c, policy_date):
+            _skip(c, "politica_desatualizada")  # P2b: aceite anterior a politica
+            continue
+        if len(reopen_batch_sends(c, window_days=window_days, now=now)) >= max_per_contact:
+            _skip(c, "teto_contato")  # D8 + P1
+            continue
+        if c.get("qualification") == "novo" and c.get("bot_completed") and li < idle_cut:
+            # P4 (so Recepcao): novo pos-handoff parado ha mais de N dias.
+            # Visto do Bot, e lead da equipe (bot_completed).
+            _skip(c, "mais_antigo_que_limite", "atendimento_humano")
+            continue
+        if _sem_dono_no_bot(c) and not cx_available:
+            # 2.2.1: sem motor CX nao ha fase de bot pos-consentimento; o lead
+            # que espera o bot nao vai para a Recepcao.
+            _skip(c, "aguardando_bot")
+            continue
+        survivors.append((sort_key, c, "send"))
+
+    # 2) Ordem 2.3 (em_atendimento antes de novo; ultimo inbound mais recente
+    # primeiro) e corte. O excedente nao paga leitura nenhuma.
+    survivors.sort(key=lambda s: s[0])
+    sobreviventes = len(survivors)
+    excedente = 0
+    if scan_max is not None and len(survivors) > scan_max:
+        excedente = len(survivors) - scan_max
+        for _k, c, _kind in survivors[scan_max:]:
+            _skip(c, "limite_varredura")
+        survivors = survivors[:scan_max]
+        logger.warning("reopen scan: %s candidatos alem do limite de %s (limite_varredura)",
+                       excedente, scan_max)
+
+    def _threads(cid):
+        leituras["threads"] += 1
+        rows = []
+        for snap in collection("wa_conversations").where("contact_id", "==", cid).stream():
+            t = snap.to_dict() or {}
+            if t.get("is_backup"):
+                continue
+            t.setdefault("id", snap.id)
+            rows.append(t)
+        return rows
+
+    def _state(cid):
+        leituras["bot_states"] += 1
+        return document("bot_states", cid).get().to_dict() or {}
+
+    # 3) Sobreviventes: threads (+ bot_states) e destino final.
+    for _k, c, kind in survivors:
+        cid = c["id"]
+        if kind == "resolve":
+            # Balde do publico da TENTATIVA; ausente/manual/desconhecido =
+            # reclassificar pelo estado (fase de bot = criterios 2.2.1-2.2.4).
+            aud = str(c.get("last_reopen_audience") or "")
+            if aud not in REOPEN_AUDIENCES:
+                aud = REOPEN_AUDIENCE_RECEPTION
+                if cx_available and _sem_dono_no_bot(c) and _reopen_in_bot_phase(
+                        c, _threads(cid), _state(cid)):
+                    aud = REOPEN_AUDIENCE_BOT
+            _resolve(c, aud)
+            continue
+        threads = _threads(cid)
+        std = [t for t in threads if _reopen_int_key(t.get("channel_id")) in channels_ok]
+        if not std:
+            _skip(c, "sem_thread_standard")
+            continue
+        with_tpl = [t for t in std if channels_ok[_reopen_int_key(t.get("channel_id"))]]
+        if not with_tpl:
+            _skip(c, "sem_template")
+            continue
+        cand = sorted(with_tpl, key=_reopen_thread_rank)[0]
+        target = {
+            "conversation_id": cand.get("id"),
+            "channel_id": _reopen_int_key(cand.get("channel_id")),
+            "last_message_at": cand.get("last_message_at"),
+        }
+        # Fase de bot (2.2.2-2.2.4). Aqui cx_available e verdadeiro sempre que
+        # 2.2.2 passa (o filtro aguardando_bot ja tirou o resto).
+        if c.get("assigned_to"):
+            via = "dono"
+        elif c.get("bot_completed"):
+            via = "bot_completed"
+        else:
+            state = _state(cid)
+            via = ("human_active" if state.get("human_active")
+                   else None if _reopen_in_bot_phase(c, threads, state)
+                   else "humano_pos_marco")
+        if via is None:
+            # P5: desfecho com a Val tira do publico Bot (sem ir para a
+            # Recepcao). Campo do agente primeiro; heuristica so se preciso.
+            if c.get("bot_outcome"):
+                _skip(c, _REOPEN_OTHER_AUDIENCE_SKIP[REOPEN_AUDIENCE_RECEPTION], "desfecho_bot")
+                continue
+            if needle:
+                leituras["mensagens"] += 1
+                if _reopen_val_sent_link(cid, target["conversation_id"], needle,
+                                         marco=_reopen_sent_at_utc(c.get("bot_released_at"))):
+                    _skip(c, _REOPEN_OTHER_AUDIENCE_SKIP[REOPEN_AUDIENCE_RECEPTION], "desfecho_bot")
+                    continue
+            _send(c, REOPEN_AUDIENCE_BOT, target)
+            continue
+        _send(c, REOPEN_AUDIENCE_RECEPTION, target, via)
+
+    leituras["contatos"] = total
+    return {
+        "criteria_version": REOPEN_CRITERIA_VERSION,
+        "cx_available": bool(cx_available),
+        "total": total,
+        "sobreviventes": sobreviventes,
+        "excedente": excedente,
+        "leituras": leituras,
+        "audiences": views,
+        "detalhe": detail,
+    }
+
+
+def reopen_daily_usage(hours=24, now=None, include_tenant_ids=()):
+    """Uso do teto diario POR PORTFOLIO (plano 2.3, D7): soma, em TODOS os
+    tenants ativos, os lotes com started_at nas ultimas `hours` horas —
+    max(enviados, planejados) para lote "executando" (planejados = reserva) e
+    enviados para os demais. Inclui os lotes do script one-off (mesma
+    colecao). Le cada tenant com set/reset_tenant_context em try/finally.
+    include_tenant_ids: tenants somados mesmo fora da lista de ativos (o do
+    request, se o cache de tenants estiver stale).
+    Retorna {"usados": int, "por_tenant": {tid: int}}. Levanta em falha de
+    leitura (o disparo decide fail-closed)."""
+    from tenant_service import list_tenants
+    tids = []
+    for t in list_tenants(active_only=True):
+        tid = str((t or {}).get("id") or "").strip()
+        if tid and tid not in tids:
+            tids.append(tid)
+    for tid in include_tenant_ids or ():
+        tid = str(tid or "").strip()
+        if tid and tid not in tids:
+            tids.append(tid)
+    cutoff = ((_reopen_sent_at_utc(now) or utcnow()) - timedelta(hours=hours)).isoformat()
+    total = 0
+    por_tenant = {}
+    for tid in tids:
+        token = set_tenant_context(tid)
+        try:
+            n = 0
+            for snap in collection("reopen_batches").where("started_at", ">=", cutoff).stream():
+                b = snap.to_dict() or {}
+                enviados = int(b.get("enviados") or 0)
+                if b.get("status") == "executando":
+                    n += max(enviados, int(b.get("planejados") or 0))
+                else:
+                    n += enviados
+        finally:
+            reset_tenant_context(token)
+        if n:
+            por_tenant[tid] = n
+        total += n
+    return {"usados": total, "por_tenant": por_tenant}
 
 
 _DEFAULT_SYSTEM_SETTINGS = {

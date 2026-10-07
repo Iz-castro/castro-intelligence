@@ -67,13 +67,19 @@ from firestore_common import (  # noqa: E402
     collection_name,
 )
 from channel_service import get_channel, get_send_credentials  # noqa: E402
-from database import save_wa_message, log_audit, next_sequence, reopen_batch_sends  # noqa: E402
+from database import (  # noqa: E402
+    save_wa_message, log_audit, next_sequence, reopen_batch_sends, reopen_daily_usage,
+)
+# Tetos e heuristica do P5 vem do config do CRM (plano v2.2 secao 7, mesmos
+# envs do lote da UI): REOPEN_DAILY_CAP, REOPEN_MAX_PER_CONTACT,
+# REOPEN_WINDOW_DAYS, REOPEN_COOLDOWN_HOURS, REOPEN_DESFECHO_LINK. Os envs
+# antigos REOPEN_BOT_MAX_PER_CONTACT/REOPEN_BOT_WINDOW_DAYS nao valem mais.
+from config import (  # noqa: E402
+    REOPEN_COOLDOWN_HOURS, REOPEN_DAILY_CAP, REOPEN_DESFECHO_LINK,
+    REOPEN_MAX_PER_CONTACT, REOPEN_WINDOW_DAYS,
+)
 
 REOPEN_TEMPLATE_NAME = os.getenv("REOPEN_TEMPLATE_NAME", "atualizao_de_solicitao")
-REOPEN_DAILY_CAP = int(os.getenv("REOPEN_DAILY_CAP", "250"))
-REOPEN_BOT_MAX_PER_CONTACT = int(os.getenv("REOPEN_BOT_MAX_PER_CONTACT", "2"))
-REOPEN_BOT_WINDOW_DAYS = int(os.getenv("REOPEN_BOT_WINDOW_DAYS", "90"))
-REOPEN_COOLDOWN_HOURS = int(os.getenv("REOPEN_COOLDOWN_HOURS", "24"))
 CODIGOS_PERMANENTES = {100, 131026, 131047, 131049, 131051, 132000, 132001, 132005, 132007, 132012}
 BR_TZ = timezone(timedelta(hours=-3))
 
@@ -200,20 +206,12 @@ def _resolve_template(channel):
             or (cands[0] if cands else None))
 
 
-def _daily_cap_used():
-    """Soma 'enviados' dos lotes das ultimas 24h em TODOS os tenants (limite e por portfolio)."""
-    cutoff = (_now() - timedelta(hours=24)).isoformat()
-    client = get_firestore_client()
-    total, detalhe = 0, {}
-    for tdoc in client.collection(collection_name("tenants")).stream():
-        sub = tdoc.reference.collection("reopen_batches")
-        n = 0
-        for b in sub.where("started_at", ">=", cutoff).stream():
-            n += int((b.to_dict() or {}).get("enviados") or 0)
-        if n:
-            detalhe[tdoc.id] = n
-        total += n
-    return total, detalhe
+def _daily_cap_used(tenant_id):
+    """Teto diario do portfolio: a MESMA soma do disparo do CRM
+    (database.reopen_daily_usage — tenants ativos, ultimas 24h,
+    max(enviados, planejados) para lote em execucao)."""
+    uso = reopen_daily_usage(include_tenant_ids=(tenant_id,))
+    return int(uso.get("usados") or 0), dict(uso.get("por_tenant") or {})
 
 
 def _bot_available(tenant_id):
@@ -276,8 +274,8 @@ def _select(tenant_id, args):
             skip("tentativa_pendente_ou_resolvido"); continue
         # Teto por contato: leitura unificada do CRM (reopen_batch_sent_at +
         # legado reopen_bot_sent_at, dedup pelo instante, janela >= now - N dias).
-        sent = reopen_batch_sends(c, window_days=REOPEN_BOT_WINDOW_DAYS, now=now)
-        if len(sent) >= REOPEN_BOT_MAX_PER_CONTACT:
+        sent = reopen_batch_sends(c, window_days=REOPEN_WINDOW_DAYS, now=now)
+        if len(sent) >= REOPEN_MAX_PER_CONTACT:
             skip("teto_bot_contato"); continue
         ch_id = c.get("channel_id")
         if ch_id is None:
@@ -346,7 +344,7 @@ def main():
     p.add_argument("--min-cold-hours", type=int, default=24)
     p.add_argument("--max-age-days", type=int, default=0, help="ignora leads com ultimo inbound mais antigo que N dias (0 = sem limite)")
     p.add_argument("--only", default="", help="wa_ids separados por virgula (canario)")
-    p.add_argument("--desfecho-link", default="marcaconsultas",
+    p.add_argument("--desfecho-link", default=REOPEN_DESFECHO_LINK,
                    help="trecho do link de agendamento da Val; quem recebeu fica fora (vazio = desliga)")
     p.add_argument("--sleep", type=float, default=1.5)
     p.add_argument("--user-id", type=int, default=None, help="id do operador para auditoria (opcional)")
@@ -364,7 +362,7 @@ def main():
         ok, motivo = _bot_available(args.tenant)
         if not ok:
             raise SystemExit(f"publico Bot indisponivel no tenant {args.tenant}: {motivo}")
-        used, detalhe = _daily_cap_used()
+        used, detalhe = _daily_cap_used(args.tenant)
         disponiveis = max(0, REOPEN_DAILY_CAP - used)
         print(f"teto diario do portfolio: {REOPEN_DAILY_CAP} | usados nas ultimas 24h: {used} {detalhe} | disponiveis: {disponiveis}")
         efetivo = min(max_sends, disponiveis)
