@@ -6121,6 +6121,15 @@ class EmbeddedSignupExchange(BaseModel):
     waba_id: str = ""
 
 
+def _coex_phone_key(raw) -> str:
+    """Forma canonica p/ comparar numero coex: so digitos, DDI 55 quando veio
+    so DDD+numero (10-11 digitos, inclusive DDD 55) e 9o digito BR normalizado."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) in (10, 11):
+        digits = "55" + digits
+    return normalize_br_phone(digits)
+
+
 def _meta_error_detail(resp: httpx.Response) -> str:
     """Extrai mensagem de erro estruturada de uma resposta da Graph API."""
     try:
@@ -6154,6 +6163,36 @@ async def embedded_signup_exchange(
         raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     if not META_APP_ID or not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
+
+    is_privileged = has_permission(current_user, "gerenciar_canais")
+    # Signup EM NOME de outro operador: admin/supervisor conecta o coex no
+    # celular do operador sem precisar da senha dele. O dono tem que ter o
+    # numero coex autorizado (Usuarios > Coex) — o numero conectado e
+    # conferido contra o coex_phone DELE (passo 4), nao contra o do admin.
+    # Valida aqui, antes de queimar o code na Meta.
+    delegated_owner = None
+    if (
+        body.channel_type == "coexistence"
+        and is_privileged
+        and body.owner_user_id
+        and body.owner_user_id != current_user["id"]
+    ):
+        delegated_owner = get_user_by_id(body.owner_user_id)
+        if not delegated_owner:
+            raise HTTPException(status_code=404, detail="Operador dono nao encontrado ou inativo.")
+        if not delegated_owner.get("coex_authorized") or not str(delegated_owner.get("coex_phone") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Autorize antes o numero coexistence desse operador (Usuarios > Coex).",
+            )
+        # LGPD: sem firebase_uid (nunca entrou no CRM) o webhook carimba
+        # assigned_to_uid="" no historico/agenda do celular — a pool que todo
+        # operador le — e o primeiro login nao corrige depois.
+        if not str(delegated_owner.get("firebase_uid") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="O operador precisa entrar no CRM uma vez antes de conectar o coexistence dele.",
+            )
 
     # 1. Trocar code por access token
     token_url = (
@@ -6299,7 +6338,18 @@ async def embedded_signup_exchange(
         logger.warning("Embedded Signup: nenhum numero encontrado no WABA %s", waba_id)
         raise HTTPException(status_code=400, detail="Nenhum numero de telefone encontrado na conta")
 
-    phone_info = phone_numbers[0]
+    # WABA com mais de um numero: usa o numero da session-info do popup (o que
+    # acabou de ser conectado); sem ele, cai no primeiro (comportamento antigo).
+    session_phone_id = (body.phone_number_id or "").strip()
+    phone_info = next(
+        (p for p in phone_numbers if session_phone_id and str(p.get("id", "")) == session_phone_id),
+        phone_numbers[0],
+    )
+    if session_phone_id and str(phone_info.get("id", "")) != session_phone_id:
+        logger.warning(
+            "Embedded Signup: phone_number_id da sessao (%s) nao esta na WABA %s (%d numeros) — usando o primeiro",
+            session_phone_id, waba_id, len(phone_numbers),
+        )
     phone_number_id = phone_info.get("id", "")
     display_phone = phone_info.get("display_phone_number", "")
     verified_name = phone_info.get("verified_name", "")
@@ -6318,7 +6368,6 @@ async def embedded_signup_exchange(
     # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
     is_coexistence = body.channel_type == "coexistence"
     channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
-    is_privileged = has_permission(current_user, "gerenciar_canais")
     # Operador autorizado so conecta canal COEX do PROPRIO numero: ignora
     # owner_user_id do body (so admin/supervisor atribui canal a outro user) e
     # nao pode criar canal standard.
@@ -6328,20 +6377,45 @@ async def embedded_signup_exchange(
         owner_id = body.owner_user_id if (is_privileged and body.owner_user_id) else current_user["id"]
     else:
         owner_id = None
-    # Validacao do numero pre-autorizado: se o usuario tem numero coex autorizado
-    # pelo admin, o numero conectado no signup TEM que bater (LGPD + politica de
-    # numeros corporativos). normalize_br_phone trata o 9o digito BR.
-    expected_phone = "".join(ch for ch in str(current_user.get("coex_phone") or "") if ch.isdigit())
+    # Validacao do numero pre-autorizado: se o DONO do canal tem numero coex
+    # autorizado pelo admin, o numero conectado no signup TEM que bater (LGPD +
+    # politica de numeros corporativos). Signup em nome de outro operador
+    # confere contra o coex_phone do operador, nao do admin. normalize_br_phone
+    # trata o 9o digito BR.
+    phone_owner = delegated_owner or current_user
+    expected_phone = "".join(ch for ch in str(phone_owner.get("coex_phone") or "") if ch.isdigit())
     if is_coexistence and expected_phone:
         got_phone = "".join(ch for ch in str(display_phone or "") if ch.isdigit())
-        if normalize_br_phone(expected_phone) != normalize_br_phone(got_phone):
+        if _coex_phone_key(expected_phone) != _coex_phone_key(got_phone):
+            owner_hint = f" para {delegated_owner.get('display_name', 'o operador')}" if delegated_owner else ""
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Numero conectado (...{got_phone[-4:] or '????'}) difere do autorizado "
+                    f"Numero conectado (...{got_phone[-4:] or '????'}) difere do autorizado{owner_hint} "
                     f"(...{expected_phone[-4:]}). Conecte o numero cadastrado pelo admin."
                 ),
             )
+    elif is_coexistence and is_privileged:
+        # Admin/supervisor SEM numero proprio autorizado conectando "como ele
+        # mesmo": se o numero conectado esta autorizado para OUTRO usuario, o
+        # canal (e o historico/agenda do celular) iria pro admin. Recusa e pede
+        # pra escolher o dono certo.
+        got_key = _coex_phone_key(display_phone)
+        for u in get_all_users():
+            if (
+                u.get("id") != current_user["id"]
+                and u.get("is_active", 1)
+                and u.get("coex_authorized")
+                and str(u.get("coex_phone") or "").strip()
+                and _coex_phone_key(u.get("coex_phone")) == got_key
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Este numero esta autorizado para {u.get('display_name', 'outro operador')}. "
+                        "Selecione-o como dono do numero e conecte de novo."
+                    ),
+                )
 
     # 5. Registrar webhook do app no WABA com os fields apropriados
     if is_coexistence:
@@ -6532,7 +6606,7 @@ async def embedded_signup_exchange(
     log_audit(
         current_user["id"],
         "EMBEDDED_SIGNUP_REBIND" if rebound else "EMBEDDED_SIGNUP",
-        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} rebound={rebound} syncs={list(sync_results.keys())}",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} rebound={rebound} owner={owner_id} delegated={bool(delegated_owner)} syncs={list(sync_results.keys())}",
     )
 
     return {
@@ -6540,6 +6614,8 @@ async def embedded_signup_exchange(
         "channel_id": new_channel_id,
         "rebound": rebound,
         "channel_type": channel_type,
+        "owner_user_id": owner_id,
+        "owner_display_name": (owner_user or {}).get("display_name", ""),
         "access_token": access_token,
         "token_expires_at": token_expires_at_iso,
         "waba_id": waba_id,

@@ -2180,8 +2180,20 @@ type SignupDiag = {
 };
 
 function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "coexistence" | "standard" }) {
-  const { bundle, setShowSettings } = useCrm();
+  const { bundle, setShowSettings, operators, sessionUser, can } = useCrm();
   const isStandard = channelType === "standard";
+  // Admin/supervisor conecta o coex NO CELULAR de outro operador (sem a senha
+  // dele): escolhe aqui o dono do numero. So entram operadores com numero coex
+  // autorizado (Usuarios > Coex); o backend confere o numero conectado contra o
+  // autorizado desse operador. Operador comum so conecta o proprio numero.
+  // "Eu mesmo(a)" so com numero proprio autorizado: sem ele o backend nao tem
+  // contra o que conferir e um clique errado jogaria o celular de outro
+  // operador (historico + agenda) pro admin. Operador que nunca entrou no CRM
+  // fica desabilitado (sem firebase_uid as conversas cairiam na pool — LGPD).
+  const canPickOwner = !isStandard && can("gerenciar_canais");
+  const coexOwnerOptions = operators.filter((op) => !!op.coex_authorized && op.id !== sessionUser?.id);
+  const selfCoexPhone = sessionUser?.coex_authorized ? (sessionUser.coex_phone || "") : "";
+  const [ownerChoice, setOwnerChoice] = useState("");
   const [step, setStep] = useState<"loading" | "ready" | "signing" | "exchanging" | "done" | "error">("loading");
   const [signupConfig, setSignupConfig] = useState<{ app_id: string; config_id: string; graph_api_version: string } | null>(null);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
@@ -2266,6 +2278,10 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
 
   const launchSignup = useCallback(() => {
     if (!window.FB || !signupConfig) return;
+    if (canPickOwner && !ownerChoice) return;
+    // Dono fixado no clique: o callback do FB.login roda depois e nao pode
+    // enxergar uma troca do select feita com o popup aberto.
+    const ownerUserId = canPickOwner && ownerChoice !== "self" ? Number(ownerChoice) : null;
     // Zera o diagnostico da tentativa anterior — senao um retry bem-sucedido
     // ainda exibiria o erro da vez passada.
     diagRef.current = null;
@@ -2294,7 +2310,13 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
           return;
         }
         setStep("exchanging");
-        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", { code, channel_type: channelType, phone_number_id: sessionInfoRef.current.phone_number_id || "", waba_id: sessionInfoRef.current.waba_id || "" })
+        sendJson<Record<string, unknown>>(bundle?.auth ?? null, "/api/admin/embedded-signup/exchange", {
+          code,
+          channel_type: channelType,
+          phone_number_id: sessionInfoRef.current.phone_number_id || "",
+          waba_id: sessionInfoRef.current.waba_id || "",
+          ...(ownerUserId ? { owner_user_id: ownerUserId } : {}),
+        })
           .then((data) => { setResult(data); setStep("done"); })
           .catch((e) => { setErrorMsg(String(e.message || e)); setStep("error"); });
       },
@@ -2307,7 +2329,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
           : { setup: {}, featureType: "whatsapp_business_app_onboarding", sessionInfoVersion: "3" },
       },
     );
-  }, [signupConfig, bundle, channelType, isStandard]);
+  }, [signupConfig, bundle, channelType, isStandard, canPickOwner, ownerChoice]);
 
   return (
     <div className="lightbox" role="dialog" aria-modal="true" aria-label={isStandard ? "Conectar numero (Cloud API)" : "WhatsApp Coexistence"} onClick={() => setShowSettings(false)}>
@@ -2380,7 +2402,26 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
                 </div>
               </>
             )}
-            <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup}>
+            {canPickOwner && (
+              <div style={{ marginBottom: "1rem" }}>
+                <label htmlFor="coex-owner" style={{ display: "block", fontWeight: 600, marginBottom: "0.35rem" }}>De quem e o numero que sera conectado?</label>
+                <select id="coex-owner" value={ownerChoice} onChange={(e) => setOwnerChoice(e.target.value)} style={{ width: "100%" }}>
+                  <option value="">Selecione o operador dono do numero...</option>
+                  {coexOwnerOptions.map((op) => (
+                    <option key={op.id} value={String(op.id)} disabled={!op.firebase_uid}>
+                      {op.display_name}{op.coex_phone ? ` (final ${op.coex_phone.slice(-4)})` : ""}{op.firebase_uid ? "" : " - ainda nao entrou no CRM"}
+                    </option>
+                  ))}
+                  <option value="self" disabled={!selfCoexPhone}>
+                    {selfCoexPhone ? `Eu mesmo(a) - meu numero (final ${selfCoexPhone.slice(-4)})` : "Eu mesmo(a) - autorize antes seu numero em Usuarios > Coex"}
+                  </option>
+                </select>
+                <p className="sub" style={{ fontSize: "0.78rem", margin: "0.35rem 0 0" }}>
+                  O canal e as conversas do celular (historico e agenda) vao para o dono escolhido. O numero escaneado tem que ser o autorizado para ele em Usuarios &gt; Coex.
+                </p>
+              </div>
+            )}
+            <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup} disabled={canPickOwner && !ownerChoice}>
               {isStandard ? "Conectar numero (Cloud API)" : "Iniciar Embedded Signup"}
             </button>
           </div>
@@ -2407,6 +2448,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             <table style={{ width: "100%", fontSize: "0.9rem", borderCollapse: "collapse" }}>
               <tbody>
                 {[
+                  ...(isStandard ? [] : [["Operador dono", result.owner_display_name]]),
                   ["WABA ID", result.waba_id],
                   ["Phone Number ID", result.phone_number_id],
                   ["Numero", result.display_phone_number],
