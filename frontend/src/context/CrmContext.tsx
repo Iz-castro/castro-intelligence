@@ -35,6 +35,10 @@ type CrmContextValue = {
   sessionUser: SessionUser | null;
   // Nome do tenant (dado no super-admin) — branding do topbar por tenant.
   tenantName: string;
+  // Monitor de atendimento (monitor_service.py): o TENANT tem monitor. Com o
+  // toggle ver_monitor_atendimento (can(), ao vivo) o item "Dashboard" do
+  // menu vira "Monitor".
+  monitorEnabled: boolean;
   operators: Operator[];
   departments: Department[];
   channels: Channel[];
@@ -299,7 +303,7 @@ type CrmContextValue = {
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
   toggleSettingsMenu: () => void;
-  openSettingsPage: (page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
+  openSettingsPage: (page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard" | "monitor") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
   settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -420,6 +424,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
   const [tenantName, setTenantName] = useState("");
+  const [monitorEnabled, setMonitorEnabled] = useState(false);
   // Perfil RBAC efetivo da sessao (M-B2). Nasce do /api/session (toggles ja
   // resolvidos com fallback de role) e e atualizado ao vivo pelo snapshot do
   // doc perfis_acesso/{id} do tenant.
@@ -1278,6 +1283,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setSavedSystemSettings(DEFAULT_SYSTEM_SETTINGS);
     setUserSettings(DEFAULT_USER_SETTINGS);
     setTenantName("");
+    setMonitorEnabled(false);
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
@@ -1336,6 +1342,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           user: SessionUser;
           tenant_id?: string;
           tenant?: { id: string; name?: string; plan?: string; modules?: string[] };
+          monitor?: { enabled?: boolean };
           firestore_collections?: Record<string, string>;
           perfil?: SessionPerfil;
         }>(bundle.auth, "/api/session");
@@ -1348,6 +1355,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // Branding por tenant: o nome dado no super-admin (tenant.name) vira o
         // titulo do topbar. Fallback = tenant_id (o backend ja faz isso).
         setTenantName(session.tenant?.name || "");
+        setMonitorEnabled(!!session.monitor?.enabled);
         setPerfil(session.perfil ?? null);
         setOperators(ops);
         setDepartments(deps.departments);
@@ -3273,9 +3281,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
-  async function openSettingsPage(page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") {
+  async function openSettingsPage(page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard" | "monitor") {
     if (!bundle) return;
-    if (page === "whatsapp" || page === "whatsapp-standard" || page === "perfis" || page === "reopen") {
+    if (page === "whatsapp" || page === "whatsapp-standard" || page === "perfis" || page === "reopen" || page === "monitor") {
       setShowSettings(page);
       return;
     }
@@ -3314,7 +3322,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, tenantName, operators, departments, channels, booting, busyLogin, snapshotMode,
+    config, bundle, firebaseUser, sessionUser, tenantName, monitorEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,

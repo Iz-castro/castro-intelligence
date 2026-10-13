@@ -564,7 +564,13 @@ async def session_info(current_user: dict = Depends(get_current_user)):
         logger.warning("session_info: get_tenant(%s) falhou: %s", tenant_id, exc)
         tenant_doc = {}
     tenant_plan = normalize_plan(tenant_doc.get("plan"))
+    # Monitor de atendimento: o tenant TEM monitor? O menu troca "Dashboard"
+    # por "Monitor" quando isto e o toggle ver_monitor_atendimento (can() do
+    # frontend, ao vivo pelo snapshot do perfil) estao ligados — conceder o
+    # toggle a outro perfil vale sem relogin.
+    from monitor_service import monitor_config
     return {
+        "monitor": {"enabled": bool(monitor_config(tenant_id))},
         "user": current_user,
         "auth_mode": AUTH_MODE,
         "tenant_id": tenant_id,
@@ -5981,6 +5987,103 @@ async def dashboard_ratings(
     ensure_permission(current_user, "ver_dashboard_uso")
     ratings = get_all_ratings(date_from or None, date_to or None)
     return {"ratings": ratings}
+
+
+# -- API: Monitor de atendimento (monitor_service.py) --
+# Fila de espera, metricas, origem e auditoria por atendente. So admin por
+# default (toggle ver_monitor_atendimento) e so tenants em MONITOR_TENANTS.
+# Tudo so-leitura; o unico write e o log_audit do export.
+
+
+def _monitor_tenant(current_user):
+    """(tenant_id, cfg) do monitor ou 403/404."""
+    import monitor_service
+    ensure_permission(current_user, "ver_monitor_atendimento")
+    tid = str(current_user.get("tenant_id") or "")
+    cfg = monitor_service.monitor_config(tid)
+    if not cfg:
+        raise HTTPException(status_code=404, detail="Monitor nao habilitado para esta empresa")
+    return tid, cfg
+
+
+async def _monitor_in_tenant(tid, fn, *args, **kwargs):
+    """Roda fn em threadpool com o tenant setado na thread (Firestore sincrono)."""
+    from firestore_common import set_tenant_context, reset_tenant_context
+
+    def _job():
+        token = set_tenant_context(tid or None)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            reset_tenant_context(token)
+
+    return await run_in_threadpool(_job)
+
+
+@app.get("/api/admin/monitor/fila")
+async def monitor_fila(current_user: dict = Depends(get_current_user)):
+    import monitor_service
+    tid, cfg = _monitor_tenant(current_user)
+    return await _monitor_in_tenant(tid, monitor_service.fila_de_espera, tid, cfg)
+
+
+@app.get("/api/admin/monitor/metricas")
+async def monitor_metricas(
+    dias: int = Query(14, ge=1, le=31),
+    refresh: bool = Query(False),
+    current_user: dict = Depends(get_current_user),
+):
+    import monitor_service
+    tid, cfg = _monitor_tenant(current_user)
+    payload = await _monitor_in_tenant(tid, monitor_service.metricas, tid, cfg, dias, refresh)
+    return {**payload, "rotulo": cfg.get("rotulo") or tid,
+            "origem_ativa": bool(cfg.get("origem")),
+            "exportar_auditoria": bool(cfg.get("exportar_auditoria"))}
+
+
+@app.get("/api/admin/monitor/auditoria")
+async def monitor_auditoria(
+    operador_id: int = Query(...),
+    inicio: str = Query(...),
+    fim: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Download .txt das conversas em que o atendente respondeu no periodo
+    (dias BR inclusivos), cliente anonimizado. Auditado (LGPD)."""
+    import monitor_service
+    tid, cfg = _monitor_tenant(current_user)
+    if not cfg.get("exportar_auditoria"):
+        raise HTTPException(status_code=403, detail="Exportacao de auditoria desabilitada para esta empresa")
+    try:
+        d_ini = datetime.strptime(inicio, "%Y-%m-%d").date()
+        d_fim = datetime.strptime(fim, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Datas no formato AAAA-MM-DD")
+    hoje = datetime.now(monitor_service.BR_TZ).date()
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="A data final e anterior a inicial")
+    if (d_fim - d_ini).days + 1 > monitor_service.AUDITORIA_MAX_DIAS:
+        raise HTTPException(status_code=400, detail=f"Periodo maximo de {monitor_service.AUDITORIA_MAX_DIAS} dias")
+    if (hoje - d_ini).days > monitor_service.AUDITORIA_MAX_IDADE_DIAS:
+        raise HTTPException(status_code=400, detail=f"Inicio ate {monitor_service.AUDITORIA_MAX_IDADE_DIAS} dias atras")
+    alvo = get_user_by_id(operador_id)
+    if not alvo:
+        raise HTTPException(status_code=404, detail="Atendente nao encontrado")
+    res = await _monitor_in_tenant(
+        tid, monitor_service.auditoria_atendente, tid, cfg, operador_id, d_ini, d_fim)
+    log_audit(current_user["id"], "MONITOR_AUDITORIA_EXPORT",
+              f"operador={operador_id} periodo={d_ini.isoformat()}..{d_fim.isoformat()} "
+              f"conversas={res['conversas']} truncado={res['truncado']}")
+    nome_arq = (f"auditoria_{monitor_service.slug(tid)}_{monitor_service.slug(res['nome'])}_"
+                f"{d_ini:%Y%m%d}_{d_fim:%Y%m%d}.txt")
+    return PlainTextResponse(
+        res["texto"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{nome_arq}"',
+            "Cache-Control": "no-store",
+            "X-Conversas": str(res["conversas"]),
+        },
+    )
 
 
 # -- API: Usage mensal per-tenant (Fase 2.10.4) --

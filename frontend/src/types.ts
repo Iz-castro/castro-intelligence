@@ -70,6 +70,7 @@ export type PermissionKey =
   | "autorizar_coex_para_operador"
   | "ver_painel_conflitos"
   | "ver_dashboard_uso"
+  | "ver_monitor_atendimento"
   | "buscar_protocolo"
   | "gerenciar_usuarios"
   | "desativar_usuarios"
@@ -446,7 +447,7 @@ export type UserSettings = {
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard" | "monitor";
 
 // Mensagem rapida (global do tenant ou pessoal do operador). `title` e o nome
 // que identifica a mensagem nas configuracoes e na lista do compositor.

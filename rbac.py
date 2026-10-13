@@ -72,6 +72,10 @@ PERMISSION_CATALOG = [
     ("Canais", "autorizar_coex_para_operador", "Autorizar coexistence para operador"),
     ("Auditoria", "ver_painel_conflitos", "Ver painel de conflitos"),
     ("Auditoria", "ver_dashboard_uso", "Ver dashboard e uso (billing)"),
+    # Monitor de atendimento (monitor_service.py): seed SO no perfil_admin
+    # (PO 2026-10-13). Exporta conversas de atendentes — liberar para outro
+    # perfil e decisao explicita do admin na tela de perfis.
+    ("Auditoria", "ver_monitor_atendimento", "Ver monitor de atendimento (fila, metricas e auditoria de conversas)"),
     ("Auditoria", "buscar_protocolo", "Buscar protocolo de atendimento"),
     ("Gestao", "gerenciar_usuarios", "Criar e editar usuarios"),
     ("Gestao", "desativar_usuarios", "Desativar usuarios"),

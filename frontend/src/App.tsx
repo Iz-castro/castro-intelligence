@@ -5,6 +5,7 @@ import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messa
 import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
+import { MonitorModal } from "./components/monitor/MonitorModal";
 import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
@@ -114,7 +115,7 @@ function LoginScreen() {
 }
 
 function TopBar() {
-  const { sessionUser, tenantName, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout, can } = useCrm();
+  const { sessionUser, tenantName, monitorEnabled, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout, can } = useCrm();
   const [gcOpen, setGcOpen] = useState(false);
   useClickOutside(settingsMenuRef, showSettings === "menu", () => setShowSettings(false));
   if (!sessionUser) return null;
@@ -149,7 +150,11 @@ function TopBar() {
               {can("gerenciar_perfis_acesso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("perfis")}><span>🛡️</span><span>Perfis de acesso</span></button>}
               {(can("gerenciar_canais") || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
               {can("gerenciar_canais") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp-standard")}><span>☁️</span><span>Conectar numero (Cloud API)</span></button>}
-              {can("ver_dashboard_uso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
+              {/* Monitor (admin da hubloc) substitui o Dashboard; quem nao tem o
+                  monitor (supervisao, outros tenants) segue com o Dashboard. */}
+              {monitorEnabled && can("ver_monitor_atendimento")
+                ? <button type="button" className="attach-option" onClick={() => void openSettingsPage("monitor")}><span>📈</span><span>Monitor</span></button>
+                : can("ver_dashboard_uso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
             </div>
           )}
         </div>
@@ -2488,7 +2493,7 @@ WHATSAPP_WABA_ID=${result.waba_id || "???"}`}
 }
 
 function SettingsModals() {
-  const { showSettings, setShowSettings, sessionUser, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, saveUserSettingsAction, saveSystemSettingsAction, can } = useCrm();
+  const { showSettings, setShowSettings, sessionUser, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, saveUserSettingsAction, saveSystemSettingsAction, can, monitorEnabled } = useCrm();
   if (!sessionUser) return null;
   return (
     <>
@@ -2544,6 +2549,9 @@ function SettingsModals() {
       {showSettings === "perfis" && can("gerenciar_perfis_acesso") ? <PerfisAcessoModal /> : null}
 
       {showSettings === "dashboard" && can("ver_dashboard_uso") ? <DashboardModal /> : null}
+      {showSettings === "monitor" && monitorEnabled && can("ver_monitor_atendimento")
+        ? <MonitorModal dashboard={can("ver_dashboard_uso") ? <DashboardBody /> : null} />
+        : null}
     </>
   );
 }
@@ -2991,7 +2999,22 @@ function PerfisAcessoModal() {
 // ---------------------------------------------------------------------------
 
 function DashboardModal() {
-  const { bundle, setShowSettings, operators, setError } = useCrm();
+  const { setShowSettings } = useCrm();
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Dashboard" onClick={() => setShowSettings(false)}>
+      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 750, maxHeight: "90vh", overflow: "auto" }}>
+        <h2 style={{ margin: "0 0 0.8rem" }}>Dashboard de Auditoria</h2>
+        <DashboardBody />
+      </div>
+    </div>
+  );
+}
+
+// Conteudo do dashboard (agregado diario, avaliacoes, CSV) — tambem aparece
+// no fim do Monitor de atendimento para o admin.
+function DashboardBody() {
+  const { bundle, operators, setError } = useCrm();
   const [dateFrom, setDateFrom] = useState(() => {
     const d = new Date(); d.setDate(d.getDate() - 30);
     return d.toISOString().slice(0, 10);
@@ -3042,11 +3065,7 @@ function DashboardModal() {
   const opsData = (summary?.operators || []) as { user_id: unknown; inbound: number; outbound: number; leads_assumed: number; first_activity: string | null; last_activity: string | null }[];
 
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Dashboard" onClick={() => setShowSettings(false)}>
-      <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
-      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 750, maxHeight: "90vh", overflow: "auto" }}>
-        <h2 style={{ margin: "0 0 0.8rem" }}>Dashboard de Auditoria</h2>
-
+    <>
         {/* Date range */}
         <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "1rem", flexWrap: "wrap" }}>
           <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
@@ -3148,8 +3167,7 @@ function DashboardModal() {
         ) : loading ? (
           <p className="sub">Carregando...</p>
         ) : null}
-      </div>
-    </div>
+    </>
   );
 }
 

@@ -33,6 +33,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (285).
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (59).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
+  Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (69).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -163,6 +164,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | Bot builtin + dispatcher builtin/CX | `bot_service.py` |
 | Envio de resposta automática WhatsApp | `bot_sender.py` |
 | Horário comercial por tenant (aviso builtin + params CX) | `business_hours.py` |
+| Monitor de atendimento (porte do painel do Izael; so-leitura, so admin por default) | `monitor_service.py`, `frontend/src/components/monitor/MonitorModal.tsx` — ver `docs/MONITOR_ATENDIMENTO.md` |
 | Redação de PII em logs | `pii_redaction.py` |
 | Frontend (estado central + listeners) | `frontend/src/context/CrmContext.tsx`, `App.tsx` |
 

@@ -135,6 +135,10 @@ FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
 # Contador de "assumidas sem resposta" (bloqueia assume com 2+ pendentes).
 # Desligado a pedido do cliente; religar via env sem mudar codigo.
 FEATURE_ASSUME_COUNTER = _bool_env("FEATURE_ASSUME_COUNTER", "false")
+# Monitor de atendimento (monitor_service.py): fila de espera, metricas,
+# origem e auditoria por atendente para admins dos tenants em MONITOR_TENANTS.
+# Kill-switch sem deploy: FEATURE_MONITOR=false volta o menu ao Dashboard.
+FEATURE_MONITOR = _bool_env("FEATURE_MONITOR", "true")
 
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
 # CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em

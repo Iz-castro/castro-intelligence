@@ -1774,6 +1774,68 @@ def mark_pool_wait_notice_sent(conversation_id, at=None):
         {"pool_wait_notice_at": at or utcnow()}, merge=True)
 
 
+# ---------------------------------------------------------------------------
+# Monitor de atendimento (monitor_service.py) — SO LEITURA
+#
+# Custo (hubloc, 13/10/2026): handoffs de 72h = dezenas de threads por
+# consulta da fila; mensagens de 14 dias ~14,4k docs por calculo de metrica
+# (sob demanda, cache de 10 min no monitor_service). Nunca full-scan de
+# wa_conversations nem de wa_contacts.
+# ---------------------------------------------------------------------------
+
+# Campos que as regras do monitor usam: o select() corta o payload (o custo
+# por documento lido e o mesmo).
+_MONITOR_MESSAGE_FIELDS = (
+    "direction", "msg_type", "status", "content", "sender_user_id", "operator_id",
+    "conversation_id", "contact_id", "channel_id", "protocol_id",
+    "created_at", "timestamp_wa",
+)
+
+
+def monitor_queue_threads(since):
+    """Threads com handoff_at >= since (range em campo unico, indice
+    automatico — a mesma leitura do aviso de espera na pool). Backup fora."""
+    out = []
+    for snap in collection("wa_conversations").where("handoff_at", ">=", since).stream():
+        conv = snap.to_dict() or {}
+        if conv.get("is_backup"):
+            continue
+        conv.setdefault("id", snap.id)
+        out.append(conv)
+    return out
+
+
+def monitor_get_contacts(contact_ids):
+    """{contact_id: doc} dos contatos pedidos (le so os candidatos da fila)."""
+    return {cid: _get_doc("wa_contacts", cid) for cid in contact_ids if cid is not None}
+
+
+def monitor_thread_messages(contact_id, conversation_id, limit=25):
+    """Ultimas mensagens da thread, mais recente primeiro (mesmo indice
+    composto da abertura da conversa: contact_id + conversation_id +
+    timestamp_wa desc)."""
+    q = (collection("wa_messages")
+         .where("contact_id", "==", contact_id)
+         .where("conversation_id", "==", conversation_id)
+         .order_by("timestamp_wa", direction="DESCENDING")
+         .limit(limit))
+    return [snap.to_dict() or {} for snap in q.stream()]
+
+
+def monitor_messages_between(start, end, limit):
+    """Mensagens com created_at em [start, end), em ordem de gravacao.
+    Retorna (lista, truncado). Range + order_by no MESMO campo: dispensa
+    indice composto. limit+1 detecta o teto sem uma consulta extra."""
+    q = (collection("wa_messages")
+         .where("created_at", ">=", start)
+         .where("created_at", "<", end)
+         .order_by("created_at")
+         .select(list(_MONITOR_MESSAGE_FIELDS))
+         .limit(int(limit) + 1))
+    rows = [snap.to_dict() or {} for snap in q.stream()]
+    return rows[:limit], len(rows) > limit
+
+
 def set_attendance_status(conversation_id, status, clear_takeover=False):
     """Define o attendance_status manualmente (Fase 4 — fechar/reabrir).
     status: 'aberto' | 'fechado_manual'. clear_takeover encerra a sessao
