@@ -1936,7 +1936,9 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       auto_assign_user_id=None,
                       from_message_event=True,
                       skip_conversation_upsert=False,
-                      control_click=False):
+                      control_click=False,
+                      inbound_event=True,
+                      created_source=None):
     """Cria ou atualiza um contato WhatsApp.
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
@@ -1954,14 +1956,26 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     normalizar.
 
     `from_message_event=True` (default): caller veio de evento real de
-    mensagem (_process_messages, _process_smb_message_echoes,
-    _process_history). Atualiza `last_message_at`/`last_inbound_at` e
+    mensagem AO VIVO (_process_messages, _process_smb_message_echoes).
+    Atualiza `last_message_at`/`last_inbound_at` com a hora corrente e
     cria/atualiza a `wa_conversation` correspondente.
 
     `from_message_event=False`: caller e o `_process_smb_app_state_sync`
-    (sincronizacao da agenda telefonica do dono). Nao popula timestamps
-    de mensagem nem cria conversation — contato fica disponivel pra
-    busca/seleção, mas só vira thread quando houver mensagem real.
+    (sincronizacao da agenda telefonica do dono) ou o `_process_history`
+    (import de mensagens ANTIGAS do celular). Nao popula timestamps de
+    mensagem nem cria conversation — contato fica disponivel pra
+    busca/seleção, e a thread/recencia nascem dos save_wa_message com o
+    timestamp_wa REAL de cada mensagem. Carimbar "agora" no history fazia
+    centenas de conversas antigas parecerem recentes (janela top-50 do Meus
+    tomada e janela de 24h aberta em contato antigo — incidente 2026-10-14).
+
+    `inbound_event=False`: evento de mensagem real que NAO e do cliente (eco
+    smb_message_echoes = outbound enviado pelo celular do dono). Recencia
+    sobe, mas last_inbound_at nao: a janela de 24h da Meta so abre com
+    mensagem DO CLIENTE (o eco liberava texto livre que a Meta recusa).
+
+    `created_source`: rotulo do contato NOVO (default: "webhook" em evento
+    de mensagem, "state_sync" na agenda; o history passa "history").
 
     `skip_conversation_upsert=True`: caller chama save_wa_message logo em
     seguida (que ja upserta a mesma conversation com message_at correto).
@@ -1976,6 +1990,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             source_channel_type, auto_assign_user_id, from_message_event, now,
             skip_conversation_upsert=skip_conversation_upsert,
             control_click=control_click,
+            inbound_event=inbound_event,
         )
 
     phone_formatted = format_phone_br(wa_id)
@@ -1986,7 +2001,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "display_name": _resolve_display_name("", display_name, phone_formatted),
         "declared_name": "",
         "whatsapp_profile_name": display_name or "",
-        "created_source": "webhook" if from_message_event else "state_sync",
+        "created_source": created_source or ("webhook" if from_message_event else "state_sync"),
         "created_by_user_id": None,
         "phone_formatted": phone_formatted,
         "profile_picture_url": "",
@@ -2012,11 +2027,12 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
         "is_backup": False,
         "unread_count": 0,
         "first_seen_at": now,
-        # Timestamps de mensagem so populados quando vem de evento real.
-        # state_sync (agenda telefonica) deixa null pra contato nao aparecer
-        # no orderBy("last_message_at") da sidebar.
+        # Timestamps de mensagem so populados quando vem de evento real AO
+        # VIVO. state_sync (agenda) e history deixam null pra contato nao
+        # aparecer no orderBy("last_message_at") da sidebar com data falsa;
+        # eco (outbound) nao abre a janela de 24h.
         "last_message_at": now if from_message_event else None,
-        "last_inbound_at": now if from_message_event else None,
+        "last_inbound_at": now if (from_message_event and inbound_event) else None,
     }
     # Picker v2.1: campos de busca derivados no MESMO write da criacao.
     new_contact.update(build_contact_search_fields(new_contact))
@@ -2053,6 +2069,7 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 source_channel_type, auto_assign_user_id, from_message_event, now,
                 skip_conversation_upsert=skip_conversation_upsert,
                 control_click=control_click,
+                inbound_event=inbound_event,
             )
         logger.warning(
             "wa_contact_index %s aponta p/ contato inexistente (%s) — recriando",
@@ -2079,7 +2096,8 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
                                 phone_number_id, source_channel_type,
                                 auto_assign_user_id, from_message_event, now,
                                 skip_conversation_upsert=False,
-                                control_click=False):
+                                control_click=False,
+                                inbound_event=True):
     """Aplica updates a um contato JA existente. Usado pelo caminho normal
     (achado por wa_id) e pelo fallback do claim atomico (corrida perdida).
     Retorna o contact_id.
@@ -2092,9 +2110,12 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
     if from_message_event:
         if not control_click:
             updates["last_message_at"] = now
-        # last_inbound_at sobe SEMPRE em evento de mensagem: e a verdade da
-        # janela de 24h da Meta (clique de botao tambem abre/renova janela).
-        updates["last_inbound_at"] = now
+        # last_inbound_at sobe em todo evento de mensagem DO CLIENTE: e a
+        # verdade da janela de 24h da Meta (clique de botao tambem abre/renova
+        # janela). Eco do celular do dono (inbound_event=False) e outbound e
+        # NAO abre janela.
+        if inbound_event:
+            updates["last_inbound_at"] = now
     # Canonizar wa_id do contato pra forma com 9 (Brasil pos-2012).
     # Se o contato foi achado via variante (ex: 12-dig sem 9 mas o
     # webhook chegou com 13-dig), o doc fica preso na forma antiga e
@@ -2171,6 +2192,32 @@ def _maybe_upsert_conversation_for_existing_contact(existing_contact, channel_id
         phone_number_id=phone_number_id or existing_contact.get("phone_number_id", ""),
         auto_assign_user_id=auto_assign_user_id,
     )
+
+
+def bump_contact_last_inbound_at(contact_id, inbound_at):
+    """Avanca wa_contacts.last_inbound_at para `inbound_at` (data REAL de uma
+    mensagem do cliente) se for mais recente que o valor atual. Monotonico:
+    nunca recua. Retorna True se gravou.
+
+    Uso: import de history. A janela de 24h da Meta conta da ultima mensagem
+    REAL do cliente — mensagem antiga importada nao abre janela, mas uma
+    inbound real das ultimas 24h (fase 0 do history) abre de verdade."""
+    inbound_at = _coerce_timestamp(inbound_at)
+    if contact_id is None or not isinstance(inbound_at, datetime):
+        return False
+    if inbound_at.tzinfo is None:
+        inbound_at = inbound_at.replace(tzinfo=timezone.utc)
+    contact = _get_doc("wa_contacts", contact_id)
+    if not contact:
+        return False
+    cur = _coerce_timestamp(contact.get("last_inbound_at"))
+    try:
+        if isinstance(cur, datetime) and cur >= inbound_at:
+            return False
+    except TypeError:
+        return False  # naive x aware: nao arrisca recuar a janela
+    document("wa_contacts", contact_id).set({"last_inbound_at": inbound_at}, merge=True)
+    return True
 
 
 def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_admin_override=False,

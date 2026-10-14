@@ -34,6 +34,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (59).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (69).
+  History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -134,6 +135,11 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   lead em fase de bot invisível ao operador). Não reintroduza zeramento só da thread.
 - **Resolução de canal no webhook:** `phone_number_id` sem canal **ativo** vai pra pending —
   nunca cai no canal default (número coex desconectado vazaria pro standard).
+- **History sync do coex NÃO é mensagem ao vivo:** `_process_history` usa a data REAL de cada mensagem
+  (contato com `from_message_event=False`; thread criada pelo pré-passe com o **dono do número**;
+  mensagem antiga não reabre atendimento) e o eco (`smb_message_echoes`) não mexe em `last_inbound_at`
+  (janela de 24h é só mensagem DO CLIENTE). Carimbar "agora" encheu o top-50 do Meus de conversas
+  antigas (incidente Roberta, 2026-10-14). Reparo de dados: `scripts/repair_recency_channels.py` (dry-run default).
 - **Reentrega da Meta:** `POST /webhook` só responde 200 **depois** do turno do bot (CX tem
   orçamento de `CX_DETECT_TIMEOUT_SECONDS`, 60s, por TURNO; read-timeout da chamada principal
   reenvia 1x com o teto inteiro — `CX_READ_TIMEOUT_RETRY`, default true, pior caso ~2min) e a Meta

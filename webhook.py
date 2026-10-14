@@ -25,7 +25,7 @@ from config import (
 )
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit, flag_conversation_takeover,
-    update_wa_message_transcription,
+    update_wa_message_transcription, bump_contact_last_inbound_at, upsert_wa_conversation,
     get_user_by_id, get_wa_message_by_wa_message_id, get_wa_contact,
     assign_wa_contact, update_wa_contact_qualification,
     is_reception_mode,
@@ -1793,6 +1793,9 @@ async def _process_smb_message_echoes(value, ws_notify_callback=None, channel=No
             source_channel_type=channel_type_outer,
             auto_assign_user_id=channel_owner_outer if channel_type_outer == CHANNEL_TYPE_COEXISTENCE else None,
             skip_conversation_upsert=True,
+            # Eco = outbound do celular do dono: nao abre a janela de 24h
+            # (last_inbound_at e so mensagem DO CLIENTE).
+            inbound_event=False,
         )
 
         # Extrair conteudo conforme tipo de mensagem
@@ -2087,14 +2090,54 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 continue
 
             normalized_thread_phone = normalize_br_phone(thread_phone)
+            # History NAO e evento de mensagem ao vivo: nao carimba
+            # last_message_at/last_inbound_at com a hora da importacao nem cria
+            # a conversa com "agora". Cada fase/re-entrega do history fazia
+            # centenas de conversas antigas parecerem recentes — tomavam a
+            # janela top-50 do Meus e abriam a janela de 24h de contato antigo
+            # (incidente Roberta/hubloc 2026-10-14). Conversa e recencia nascem
+            # dos save_wa_message abaixo, com o timestamp_wa REAL (monotonico).
             contact_id = upsert_wa_contact(
                 normalized_thread_phone, "",
                 channel_id=hist_channel_id,
                 phone_number_id=hist_channel_phone,
                 source_channel_type=hist_channel_type,
                 auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+                from_message_event=False,
+                created_source="history",
             )
             messages = thread.get("messages", [])
+            # Ultima inbound REAL do cliente nesta thread: alimenta a janela de
+            # 24h (bump monotonico apos o loop) — so abre se o cliente de fato
+            # escreveu nas ultimas 24h.
+            thread_last_inbound_at = None
+            # Datas REAIS da thread (unix da Meta; timestamp invalido nao conta
+            # — o fallback de _parse_unix_timestamp e "agora").
+            _thread_ts = []
+            for _m in messages:
+                try:
+                    _thread_ts.append(datetime.fromtimestamp(int(_m.get("timestamp", "")), tz=timezone.utc))
+                except (TypeError, ValueError, OSError):
+                    pass
+            if messages and hist_channel_id is not None:
+                # Garante que a thread NASCE com o DONO DO NUMERO (coex) e com a
+                # recencia REAL — o que o upsert do contato fazia antes, so que
+                # com "agora". Sem isto a 1a save_wa_message criaria a thread
+                # herdando o Dono do LEAD: o historico do celular pessoal de um
+                # operador iria pro colega dono do lead (LGPD). Thread que ja tem
+                # dono nao muda; recencia so avanca (monotonico) e so com data
+                # real. Depois de criada, a posse segue as regras normais (ex.:
+                # fechamento por inatividade reverte ao sale_owner — ADR 0008).
+                upsert_wa_conversation(
+                    contact_id=contact_id,
+                    wa_id=normalized_thread_phone,
+                    channel_id=hist_channel_id,
+                    source_channel_type=hist_channel_type,
+                    phone_number_id=hist_channel_phone,
+                    auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+                    message_at=max(_thread_ts) if _thread_ts else None,
+                    advance_recency=bool(_thread_ts),
+                )
 
             # Normaliza business_phone uma vez (nono digito BR) — comparacao
             # com msg_from/msg_to crus dava direction errada quando empresa
@@ -2119,6 +2162,16 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 # Determinar direcao: se 'from' e o telefone da empresa, e outbound
                 is_outbound = (msg_from == business_phone_normalized) or bool(msg_to)
                 direction = "outbound" if is_outbound else "inbound"
+                # Data REAL da mensagem (unix da Meta). Invalida = None: nao
+                # avanca recencia nem abre a janela de 24h (o fallback de
+                # _parse_unix_timestamp e "agora").
+                try:
+                    _msg_at = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+                except (TypeError, ValueError, OSError):
+                    _msg_at = None
+                if direction == "inbound" and _msg_at and (
+                        thread_last_inbound_at is None or _msg_at > thread_last_inbound_at):
+                    thread_last_inbound_at = _msg_at
 
                 # media_placeholder: midia sera enviada em webhook separado
                 if msg_type == "media_placeholder":
@@ -2135,6 +2188,10 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                         phone_number_id=hist_channel_phone,
                         channel_owner_user_id=hist_channel_owner,
                         sender_user_id=hist_channel_owner if direction == "outbound" else None,
+                        # Mensagem ANTIGA importada: nao reabre atendimento
+                        # fechado e so mexe na recencia com data real.
+                        advance_recency=_msg_at is not None,
+                        reopen_attendance=False,
                     )
                     continue
 
@@ -2244,11 +2301,21 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                     phone_number_id=hist_channel_phone,
                     channel_owner_user_id=hist_channel_owner,
                     sender_user_id=hist_channel_owner if direction == "outbound" else None,
+                    # Mensagem ANTIGA importada: nao reabre atendimento fechado
+                    # e so mexe na recencia com data real.
+                    advance_recency=_msg_at is not None,
+                    reopen_attendance=False,
                 )
+
+            if thread_last_inbound_at is not None:
+                try:
+                    bump_contact_last_inbound_at(contact_id, thread_last_inbound_at)
+                except Exception as exc:
+                    logger.warning("[HISTORY] bump last_inbound_at falhou | contact=%s: %s", contact_id, exc)
 
             logger.info(
                 "[HISTORY] Thread processada | phone=%s msgs=%d phase=%s",
-                thread_phone, len(messages), phase,
+                redact_phone(thread_phone), len(messages), phase,
             )
 
         if progress == 100:
