@@ -1,12 +1,13 @@
 # Docs
 
-> **Status em 2026-08-22:** para retomar qualquer frente, comece por
+> **Retomada (links de Ver como atualizados em 2026-10-14):** para retomar qualquer frente, comece por
 > [COMO_RETOMAR.md](COMO_RETOMAR.md); o mapa vivo das frentes (o que esta feito, o que esta em
 > prod e o que continua pendente) e [PENDENCIAS_E_ROADMAP.md](PENDENCIAS_E_ROADMAP.md).
 > Deploy de rotina do CRM = [deploy/DEPLOY_CLOUDRUN_A.md](deploy/DEPLOY_CLOUDRUN_A.md)
 > (prod = projeto `project-4a851bf9-f475-418c-800`, regiao `us-west1`; trafego PINADO
-> por revisao). Ultimo ADR: [0011](decisions/0011-unread-derivado-das-threads-e-sons-por-caixa.md);
-> diario mais recente: [internal/2026-08-21-diagnostico-alarme-sonoro.md](internal/2026-08-21-diagnostico-alarme-sonoro.md).
+> por revisao). Ultimo ADR: [0014](decisions/0014-impersonate-somente-leitura.md)
+> (identidade e HTTP/polling de 15 s implementados/validados localmente, feature desligada);
+> diario de referencia: [internal/2026-08-21-diagnostico-alarme-sonoro.md](internal/2026-08-21-diagnostico-alarme-sonoro.md).
 > `internal/RETOMAR.md` e `internal/resumo.md` sao HISTORICO pre-cutover de Oregon —
 > nao rode os comandos `gcloud` de la (apontam pro projeto/regiao antigos de SP).
 
@@ -52,6 +53,9 @@ A leitura recomendada agora e:
 - [Runbook de Cutover Prod](deploy/RUNBOOK_CUTOVER_PROD.md) — ⚠️ STALE (cita SP/`southamerica-east1`); so referencia historica
 
 ### Planos e refactors
+- [Ver como: identidade separada](REVISAO_IMPERSONATE_IDENTIDADE_SEPARADA.md) — contrato aprovado e implementado com transporte HTTP; gates locais aprovados, feature desligada e staging posterior
+- [Ver como: TTL por backend](REVISAO_IMPERSONATE_TTL_BACKEND.md) — revisao APROVADA e validada localmente: HTTP/polling de 15 s, janelas e revalidacao final
+- [Ver como: diagnostico local](../tools/impersonate_emulators/DIAGNOSTICO.md) — gate reprovado; 149 verificacoes positivas e 24 observacoes indevidas de backup, sem verificacao de producao
 - [Plano Reabertura em lote — Recepção e Bot (v2)](PLANO_REABERTURA_LOTE_BOT_RECEPCAO.md) — 2026-09-23: decisões fechadas do PO, públicos por estado, 24 casos de aceitação; ADR 0013
 - [Retomada em lote pela Val — pedido ao dev de IA](CX_RETOMADA_LOTE_DEV_IA.md) — 2026-10-05: params `origem`, `midia_tipo`, `desfecho_bot`, roteiro de teste e nome de exibição da Hubloc
 - [Pendencias e Roadmap](PENDENCIAS_E_ROADMAP.md) — estado por frente (revisado em 2026-08-21)
