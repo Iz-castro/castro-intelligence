@@ -18,6 +18,9 @@ export type ClientConfig = {
   media_storage_backend: string;
   feature_message_status: boolean;
   feature_google_chat: boolean;
+  feature_impersonate: boolean;
+  impersonation_environment: string;
+  impersonation_polling_interval_ms: number;
   allowed_email_domain: string;
   firebase_web_config: FirebaseWebConfig;
   firestore: {
@@ -40,6 +43,7 @@ export type SessionUser = {
   is_active?: number;
   coex_authorized?: number;
   coex_phone?: string;
+  impersonation?: { by: number; sid: string; expires_at: string; auth_uid: string; environment: string };
 };
 
 // RBAC dinamico (M-B2). Catalogo FIXO da plataforma — manter em sincronia
@@ -73,6 +77,7 @@ export type PermissionKey =
   | "ver_monitor_atendimento"
   | "buscar_protocolo"
   | "gerenciar_usuarios"
+  | "ver_como_usuario"
   | "desativar_usuarios"
   | "gerenciar_perfis_acesso"
   | "gerenciar_departamentos"
@@ -143,6 +148,7 @@ export type Operator = {
   firebase_uid?: string;
   coex_authorized?: number;
   coex_phone?: string;
+  is_active?: number;
 };
 
 export type Contact = {

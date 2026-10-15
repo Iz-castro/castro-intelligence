@@ -28,6 +28,7 @@ from config import (
     FIREBASE_WEB_MESSAGING_SENDER_ID, FIRESTORE_PROJECT_ID, IS_CLOUD_RUN,
 )
 from firebase_admin_client import verify_firebase_id_token
+from impersonation_identity import is_impersonation_token
 from super_admin import (
     get_super_admin, is_active_super_admin, log_system_audit,
     set_super_admin_mfa_enrolled,
@@ -107,6 +108,8 @@ def _authorize(request: Request, require_mfa: bool) -> dict:
     uid = decoded.get("uid") or decoded.get("sub")
     if not uid:
         raise HTTPException(status_code=401, detail="Token sem uid")
+    if is_impersonation_token(decoded):
+        raise HTTPException(status_code=403, detail="Identidade de visualizacao nao acessa a plataforma")
     if decoded.get("super_admin") is not True:
         raise HTTPException(status_code=403, detail="Acesso restrito (super-admin)")
     doc = get_super_admin(uid)
