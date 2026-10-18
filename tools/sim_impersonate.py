@@ -71,6 +71,14 @@ TARGET = {
     "email": "target@example.invalid", "tenant_id": TENANT,
     "perfil_acesso_id": "perfil_sim_custom", "last_login": None,
 }
+# Nao-admin com o toggle ligado no perfil (revisao do merge, 2026-10-18).
+LIDER_OP = {
+    "id": 3, "username": "lider_sim", "display_name": "Lider Sim",
+    "role": "operador", "firebase_uid": "uid-lider-sim", "is_active": 1,
+    "email": "lider@example.invalid", "tenant_id": TENANT,
+    "perfil_acesso_id": "perfil_lider",
+}
+LIDER_SUP = dict(LIDER_OP, id=4, username="lider_sup", role="supervisor", firebase_uid="uid-lider-sup")
 REASON = "Verificar visibilidade da conversa"
 CUSTOM_TOKEN = "custom-token-somente-simulado"
 STORE = {}
@@ -320,6 +328,7 @@ def reset():
     QUERIES.clear()
     auth.invalidate_auth_cache()
     rbac.invalidate_perfil_cache()
+    impersonation._requester_cache.clear()
     fsc.set_tenant_context(TENANT)
     bucket("users")[str(ADMIN["id"])] = deepcopy(ADMIN)
     bucket("users")[str(TARGET["id"])] = deepcopy(TARGET)
@@ -433,11 +442,20 @@ def scenario_start():
     check(SIGNED[0][1]["perfil_acesso_id"] == "perfil_supervisor", "perfil ausente usa seed da role")
 
 
+def perfil_lider():
+    bucket("perfis_acesso")["perfil_lider"] = {
+        "id": "perfil_lider", "role_equivalente": "operador",
+        "toggles": {"ver_como_usuario": True, "ver_todos_leads": False},
+    }
+
+
 def scenario_denials():
     title("CENARIO 2 - Negacoes e falhas sem vazamento")
     cases = [
         ("flag desligada", 404, lambda: setattr(main, "FEATURE_IMPERSONATE", False), {}),
         ("sem toggle", 403, lambda: None, {"user": TARGET}),
+        ("operador com toggle no perfil (nao admin)", 403, lambda: perfil_lider(), {"user": LIDER_OP}),
+        ("supervisor com toggle no perfil (nao admin)", 403, lambda: perfil_lider(), {"user": LIDER_SUP}),
         ("alvo inexistente", 404, lambda: bucket("users").pop("2"), {}),
         ("alvo inativo", 404, lambda: bucket("users")["2"].update(is_active=0), {}),
         ("alvo sem uid", 409, lambda: bucket("users")["2"].update(firebase_uid=""), {}),
@@ -743,6 +761,56 @@ def scenario_middleware():
         check(response.status_code in (401, 403) and not executed,
               "middleware nega principal legado/incompleto/ambiente sem executar endpoint")
     check(fsc.get_tenant_context() == TENANT, "middleware restaura contexto depois do endpoint")
+
+
+def scenario_revocation():
+    title("CENARIO 14 - Revogacao do solicitante, kill-switch e trava fechada")
+    reset()
+    check(impersonation.validate_session(decoded_imp()) is not None, "baseline: sessao ativa valida")
+    mutations = (
+        ("admin desativado", lambda: bucket("users")["1"].update(is_active=0)),
+        ("admin rebaixado", lambda: bucket("users")["1"].update(role="supervisor")),
+        ("admin sem o toggle",
+         lambda: bucket("perfis_acesso").__setitem__("perfil_admin", {"toggles": {"ver_como_usuario": False}})),
+        ("admin removido", lambda: bucket("users").pop("1")),
+    )
+    for label, mutate in mutations:
+        reset()
+        mutate()
+        rbac.invalidate_perfil_cache()
+        check(impersonation.validate_session(decoded_imp()) is None, f"{label}: sessao cai na proxima request")
+        response, executed = run_middleware("GET", "/api/session", decoded_imp())
+        check(response.status_code == 401 and not executed, f"{label}: middleware nega antes do endpoint")
+    reset()
+    impersonation.validate_session(decoded_imp())
+    bucket("users")["1"].update(is_active=0)
+    check(impersonation.validate_session(decoded_imp()) is not None,
+          "cache de 30 s evita reler o admin a cada request do polling")
+    impersonation._requester_cache.clear()
+    check(impersonation.validate_session(decoded_imp()) is None, "vencido o cache, a revogacao vale")
+
+    reset()
+    main.FEATURE_IMPERSONATE = False
+    for method in ("GET", "POST"):
+        response, executed = run_middleware(method, "/api/session", decoded_imp())
+        check(response.status_code == 403 and not executed
+              and json.loads(response.body)["detail"] == "Visualizacao desativada",
+              f"kill-switch {method}: sessao ja emitida negada antes do endpoint")
+    response, executed = run_middleware("GET", "/api/session", decoded_normal())
+    check(response.status_code == 200 and executed == [TENANT], "kill-switch nao afeta token normal")
+
+    reset()
+    TOKENS["imp-dep"] = decoded_imp()
+    req = request(method="POST", path="/api/wa/send", token="imp-dep")
+    expect_http(lambda: main.get_current_user(req), 503,
+                "trava falha fechada: token imp que nao passou pela trava do middleware")
+    req_ok = request(method="GET", path="/api/session", token="imp-dep")
+    req_ok.state.impersonation_session = impersonation.validate_session(decoded_imp())
+    user = main.get_current_user(req_ok)
+    check(user.get("impersonation", {}).get("sid") == SID, "com a trava aplicada, a dependency segue normal")
+    TOKENS["normal-dep"] = decoded_normal()
+    user_normal = main.get_current_user(request(method="POST", path="/api/wa/send", token="normal-dep"))
+    check("impersonation" not in user_normal, "token normal nao e afetado pela trava fechada")
 
 
 def scenario_rbac():
@@ -1266,7 +1334,8 @@ def main_sim():
             stack.enter_context(patch.object(impersonation, "list_tenants", list_tenants))
         for scenario in (scenario_start, scenario_denials, scenario_auth, scenario_expiry, scenario_contract,
                          scenario_middleware, scenario_rbac, scenario_rules_static, scenario_cleanup,
-                         scenario_end, scenario_namespace, scenario_http, scenario_legacy_scopes):
+                         scenario_end, scenario_namespace, scenario_http, scenario_legacy_scopes,
+                         scenario_revocation):
             try:
                 scenario()
             except Exception:

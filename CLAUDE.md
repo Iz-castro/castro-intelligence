@@ -108,6 +108,10 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   Exigir gates do transporte HTTP atual; nao presumir prontidao pelos testes antigos.
   Polling repete leituras e target backup original nao tem cap; avaliar custo antes de
   ativar, sem reduzir janelas silenciosamente. Feature desligada por default.
+  **Revisao do merge (2026-10-18):** so role admin inicia (o toggle sozinho nao basta);
+  FEATURE_IMPERSONATE=false derruba sessoes ja emitidas no middleware; o solicitante e
+  revalidado (ativo, admin, com o toggle; cache de 30 s); get_current_user falha FECHADO
+  (503) se um token imp chegar sem a trava do middleware. `sim_impersonate.py` = 306.
 - **`_GLOBAL_COLLECTIONS` (`firestore_common.py`)** = `channels, pending_webhook_events,
   super_admins, audit_logs_system, phone_routing, _meta, tenants`. Ficam **flat/globais** mesmo
   com tenant context ativo. Toda coleção que o webhook precisa ler **antes** de saber o tenant

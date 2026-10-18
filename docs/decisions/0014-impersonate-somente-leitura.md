@@ -305,3 +305,27 @@ Os criterios antigos de listener apos TTL e backup falharam no emulador; a revis
 foi aprovada depois desse diagnostico. Gates novos constam na entrega. Nenhum deles
 substitui o aceite de staging ou verifica producao. Na validacao manual, testar tambem
 URL de midia conhecida sem Authorization e registrar seu limite anonimo preexistente.
+
+## Emenda: revisao do merge (2026-10-18)
+
+Revisao com verificacao adversarial antes do merge no develop. Quatro ajustes entraram no
+proprio PR, sem mudar o contrato:
+
+1. **So admin inicia.** O toggle `ver_como_usuario` pode ser ligado em qualquer perfil
+   pelo editor. Sem checar a role, um operador com o toggle veria como uma supervisora e
+   leria o tenant inteiro (fura `can_see_all_tenant`). `POST /api/admin/impersonate` exige
+   `role == admin`; o botao tambem.
+2. **Kill-switch real.** Com `FEATURE_IMPERSONATE=false`, o middleware nega qualquer token
+   `imp` (403), inclusive de sessoes ja emitidas.
+3. **Revogacao do solicitante.** `validate_session` confere se o admin segue ativo, com
+   role admin e com o toggle (cache de 30 s por sessao). Desativar ou rebaixar o admin
+   derruba a sessao.
+4. **Trava falha fechada.** Se a verificacao do token falhar no middleware e passar no
+   `get_current_user`, a trava de metodo/rota nao rodou: a dependency devolve 503.
+
+Tambem: `Dockerfile.superadmin` passou a copiar `impersonation_identity.py` (e `lgpd_bot.py`,
+lacuna anterior) com `RUN python -c "import superadmin_main, tenant_bootstrap"` como trava;
+o editor de perfis esconde a permissao com a flag desligada; o harness
+`frontend/tools/check_message_correction.mjs` ganhou stub de `./firebase`. Pendentes para
+antes de ligar a flag: custo do polling (backup sem limite, aba oculta), claims com nomes
+proprios (`imp_tenant_id`...) ou a ordem rules/indice/cron antes da flag.

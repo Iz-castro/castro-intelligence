@@ -315,6 +315,9 @@ async def tenant_context_middleware(request: Request, call_next):
             # tenant pra setar context cedo.
             pass
     if decoded and is_impersonation_token(decoded):
+        # Kill-switch: desligar a flag derruba tambem as sessoes ja emitidas.
+        if not FEATURE_IMPERSONATE:
+            return _impersonation_denied(403, "Visualizacao desativada")
         # Checado antes de qualquer endpoint/dependency, inclusive os GETs.
         if not valid_impersonation_subject(decoded):
             return _impersonation_denied(401, "Sessao de visualizacao invalida")
@@ -438,6 +441,12 @@ def get_current_user(request: Request):
     )
     if not result["success"]:
         raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
+    # Falha FECHADA: token de visualizacao so chega ao endpoint depois de o
+    # middleware aplicar a trava de metodo/rota. Se a verificacao do token
+    # falhou la (ex.: chaves publicas indisponiveis) e passou aqui, a trava
+    # nao rodou -- nunca executar o endpoint como o alvo nesse caso.
+    if result["user"].get("impersonation") and getattr(request.state, "impersonation_session", None) is None:
+        raise HTTPException(status_code=503, detail="Nao foi possivel validar a visualizacao")
     return result["user"]
 
 # Convencao RBAC (M-B2): endpoints chamam ensure_permission(current_user,
@@ -821,6 +830,11 @@ async def admin_impersonate(
     if is_impersonation_token(decoded) or current_user.get("impersonation"):
         raise HTTPException(status_code=403, detail="Visualizacao nao permite iniciar outra sessao")
     ensure_permission(current_user, "ver_como_usuario")
+    # So admin inicia (spec D7). O toggle pode ser ligado em qualquer perfil
+    # pelo editor; sem esta trava, um operador com o toggle veria como uma
+    # supervisora e leria o tenant inteiro (fura can_see_all_tenant).
+    if str(current_user.get("role") or "") != "admin":
+        raise HTTPException(status_code=403, detail="Ver como restrito a administradores")
     reason = body.reason.strip()
     if len(reason) < 10:
         raise HTTPException(status_code=400, detail="Informe um motivo com pelo menos 10 caracteres")

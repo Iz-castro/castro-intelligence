@@ -55,7 +55,7 @@ A leitura recomendada agora e:
 ### Planos e refactors
 - [Ver como: identidade separada](REVISAO_IMPERSONATE_IDENTIDADE_SEPARADA.md) — contrato aprovado e implementado com transporte HTTP; gates locais aprovados, feature desligada e staging posterior
 - [Ver como: TTL por backend](REVISAO_IMPERSONATE_TTL_BACKEND.md) — revisao APROVADA e validada localmente: HTTP/polling de 15 s, janelas e revalidacao final
-- [Ver como: diagnostico local](../tools/impersonate_emulators/DIAGNOSTICO.md) — gate reprovado; 149 verificacoes positivas e 24 observacoes indevidas de backup, sem verificacao de producao
+- [Ver como: diagnostico local](../tools/impersonate_emulators/DIAGNOSTICO.md) — contrato atual: gate local aprovado (779 verificacoes); historico do contrato anterior reprovado (149 positivas, 24 entregas indevidas de backup); sem verificacao de producao
 - [Plano Reabertura em lote — Recepção e Bot (v2)](PLANO_REABERTURA_LOTE_BOT_RECEPCAO.md) — 2026-09-23: decisões fechadas do PO, públicos por estado, 24 casos de aceitação; ADR 0013
 - [Retomada em lote pela Val — pedido ao dev de IA](CX_RETOMADA_LOTE_DEV_IA.md) — 2026-10-05: params `origem`, `midia_tipo`, `desfecho_bot`, roteiro de teste e nome de exibição da Hubloc
 - [Pendencias e Roadmap](PENDENCIAS_E_ROADMAP.md) — estado por frente (revisado em 2026-08-21)

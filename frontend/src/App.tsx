@@ -2105,7 +2105,7 @@ function DetailPanel() {
 
         {can("buscar_protocolo") ? <ProtocolSearchCard /> : null}
 
-        {can("gerenciar_usuarios") || (config?.feature_impersonate && can("ver_como_usuario")) ? (
+        {can("gerenciar_usuarios") || (config?.feature_impersonate && can("ver_como_usuario") && sessionUser?.role === "admin") ? (
           <CollapsibleCard title={can("gerenciar_perfis_acesso") ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
             <div className="admin-user-list">{operators.map((op) => (
               <div key={op.id} className="admin-user-row">
@@ -2136,7 +2136,7 @@ function DetailPanel() {
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: "0.25rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <span className="chip" style={{ fontSize: "0.68rem" }}>{op.role}</span>
-                    {config?.feature_impersonate && can("ver_como_usuario") && !readOnly && op.id !== sessionUser?.id && op.role !== "admin" && op.firebase_uid && op.is_active !== 0 ? <button type="button" className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => setImpersonateTarget(op)}>Ver como</button> : null}
+                    {config?.feature_impersonate && can("ver_como_usuario") && sessionUser?.role === "admin" && !readOnly && op.id !== sessionUser?.id && op.role !== "admin" && op.firebase_uid && op.is_active !== 0 ? <button type="button" className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => setImpersonateTarget(op)}>Ver como</button> : null}
                     {op.coex_authorized ? <span className="chip" style={{ fontSize: "0.62rem" }} title={op.coex_phone ? `Coex liberado: ${op.coex_phone}` : "Coex liberado"}>📱 Coex</span> : null}
                     {can("gerenciar_perfis_acesso") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Editar</button>}
                     {can("autorizar_coex_para_operador") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditCoex(op)} title={readOnly ? READ_ONLY_TOOLTIP : ("Autorizar WhatsApp coexistence do operador")} disabled={readOnly}>Coex</button>}
@@ -2854,7 +2854,7 @@ function ReopenBatchModal() {
 // ---------------------------------------------------------------------------
 
 function PerfisAcessoModal() {
-  const { readOnly } = useCrm();
+  const { readOnly, config } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
@@ -2892,7 +2892,10 @@ function PerfisAcessoModal() {
     setCreating(false);
   }, [selectedId, perfis, catalogo]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const grupos = catalogo.reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
+  // Permissao de recurso desligado nao aparece (o rascunho mantem o valor
+  // salvo, entao salvar o perfil nao a altera).
+  const ocultas = new Set<string>(config?.feature_impersonate ? [] : ["ver_como_usuario"]);
+  const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
     (acc[item.grupo] = acc[item.grupo] || []).push(item);
     return acc;
   }, {});

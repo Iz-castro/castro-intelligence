@@ -2,6 +2,7 @@
 """Registro e ciclo de vida do Ver como; nunca altera contas dos alvos."""
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -12,6 +13,10 @@ from impersonation_identity import build_auth_uid, is_impersonation_uid, valid_i
 logger = logging.getLogger("castro_crm.impersonation")
 COLLECTION = "impersonation_sessions"
 CLEANUP_DELAY = timedelta(hours=2)
+# Revalidacao do SOLICITANTE (admin): desativado, rebaixado ou sem o toggle
+# derruba a sessao em no maximo este intervalo.
+REQUESTER_RECHECK_SECONDS = 30
+_requester_cache = {}
 
 
 def _timestamp(value):
@@ -101,7 +106,34 @@ def validate_session(decoded):
             or auth_time > now.timestamp() + 60
             or now.timestamp() - auth_time > session["ttl_seconds"] + 60):
         return None
+    if not requester_still_allowed(session):
+        return None
     return session
+
+
+def requester_still_allowed(session):
+    """True se o admin que iniciou continua ativo, admin e com o toggle.
+
+    Le o doc do usuario e o perfil (sem o snapshot do Ver como: o dict do
+    admin nao tem 'impersonation'). Falha de leitura propaga (vira 503 no
+    middleware), nunca amplia acesso. Cache por sessao de 30 s."""
+    key = (session["tenant_id"], session["sid"])
+    now = time.monotonic()
+    cached = _requester_cache.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+    from database import get_user_raw_by_id
+    from rbac import has_permission
+    with tenant_context(session["tenant_id"]):
+        admin = get_user_raw_by_id(session["admin_user_id"])
+        ok = bool(
+            admin and admin.get("is_active", 1)
+            and admin.get("firebase_uid") == session["admin_uid"]
+            and str(admin.get("role") or "") == "admin"
+            and has_permission(dict(admin, tenant_id=session["tenant_id"]), "ver_como_usuario")
+        )
+    _requester_cache[key] = (now + REQUESTER_RECHECK_SECONDS, ok)
+    return ok
 
 
 def close_session(session):
