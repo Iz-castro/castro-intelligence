@@ -28,6 +28,7 @@ from database_firestore import (
     upsert_firebase_user,
 )
 from firestore_common import get_tenant_context, tenant_context
+from impersonation_identity import ReservedImpersonationIdentityError
 from pii_redaction import redact_name
 from rbac import seed_perfis_acesso
 from tenant_service import (
@@ -79,6 +80,8 @@ def provision_operator(email, display_name="", role="operador", department_id=No
     try:
         from firebase_admin_client import get_firebase_uid_by_email
         firebase_uid = get_firebase_uid_by_email(email)
+    except ReservedImpersonationIdentityError:
+        raise
     except Exception as exc:
         logger.warning(
             "provision_operator: lookup da conta Firebase falhou (%s) — segue so com doc local",
@@ -206,6 +209,8 @@ def ensure_tenant_admin(admin_email, admin_display_name="", department_name=None
     try:
         from firebase_admin_client import get_or_create_firebase_user
         firebase_uid, uid_created = get_or_create_firebase_user(admin_email, admin_display_name)
+    except ReservedImpersonationIdentityError:
+        raise
     except Exception as exc:
         logger.warning(
             "ensure_tenant_admin: sem conta Firebase (%s) — segue so com doc local",

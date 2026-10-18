@@ -12,6 +12,7 @@
 // periodo e no "Atualizar" (cache de 10 min no backend).
 
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { READ_ONLY_TOOLTIP } from "../Impersonation";
 import type { Chart, ChartConfiguration } from "chart.js";
 import { useCrm } from "../../context/CrmContext";
 import { getJson } from "../../api";
@@ -543,7 +544,7 @@ function Comercial({ m, paleta }: { m: Metricas; paleta: Paleta }) {
 // ---------------------------------------------------------------------------
 
 function Auditoria({ operators }: { operators: { id: number; display_name?: string }[] }) {
-  const { bundle } = useCrm();
+  const { bundle, readOnly } = useCrm();
   const lista = useMemo(
     () => [...operators].sort((a, b) => String(a.display_name || "").localeCompare(String(b.display_name || ""))),
     [operators],
@@ -556,7 +557,7 @@ function Auditoria({ operators }: { operators: { id: number; display_name?: stri
 
   const baixar = async (ev: FormEvent) => {
     ev.preventDefault();
-    if (!bundle || op === "") return;
+    if (readOnly || !bundle || op === "") return;
     setBaixando(true);
     setEstado("Gerando…");
     try {
@@ -597,7 +598,7 @@ function Auditoria({ operators }: { operators: { id: number; display_name?: stri
         </label>
         <label>De <input type="date" value={inicio} max={fim} required onChange={(e) => setInicio(e.target.value)} /></label>
         <label>Até <input type="date" value={fim} min={inicio} required onChange={(e) => setFim(e.target.value)} /></label>
-        <button type="submit" className="primary" disabled={baixando || op === ""}>Baixar arquivo</button>
+        <button type="submit" className="primary" disabled={readOnly || baixando || op === ""} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Baixar arquivo</button>
       </form>
       {estado ? <p className="monitor-nota">{estado}</p> : null}
     </section>

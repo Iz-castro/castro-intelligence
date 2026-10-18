@@ -11,8 +11,22 @@ service cloud.firestore {
     // Oregon) e o bloco de staging; nao gateia mais nada tenant-scoped.
     // (allowed_email_domains do tenant e guarda-corpo SOFT no provisionamento/
     // roteamento — decisao 2026-07-03 — e nao entra nas rules.)
+    function isImpersonation() {
+      // Ver como consulta exclusivamente o backend. Marcador malformado tambem
+      // nao pode entrar nos grants normais por SDK/REST direto.
+      return request.auth != null && request.auth.token.get('imp', false) != false;
+    }
+
+    function reservedUid(uid) {
+      return uid is string && uid.matches('imp_ro_.*');
+    }
+
+    function normalPrincipal() {
+      return request.auth != null && !reservedUid(request.auth.uid) && !isImpersonation();
+    }
+
     function signedIn() {
-      return request.auth != null && request.auth.token.email != null;
+      return normalPrincipal() && request.auth.token.email != null;
     }
 
     function emailAllowed() {
@@ -50,7 +64,7 @@ service cloud.firestore {
     // cegas a este claim (defense-in-depth §4.1: comprometer o claim nao da
     // acesso cross-tenant via A). Usado SO nas colecoes root de plataforma.
     function isSuperAdmin() {
-      return request.auth != null && request.auth.token.super_admin == true;
+      return normalPrincipal() && request.auth.token.super_admin == true;
     }
 
     // ====================================================================
@@ -193,7 +207,7 @@ service cloud.firestore {
     // inexistentes ate o --seed; deny-by-default cobre o intervalo.
     // ====================================================================
     match /castro_crm_super_admins/{uid} {
-      allow read: if isSuperAdmin() || (request.auth != null && request.auth.uid == uid);
+      allow read: if isSuperAdmin() || (normalPrincipal() && request.auth.uid == uid);
       allow write: if false;
     }
 
@@ -331,112 +345,141 @@ service cloud.firestore {
           allow write: if false;
         }
       }
+      match /impersonation_sessions/{sid} {
+        allow read, write: if false;
+      }
     }
 
     // ====================================================================
     // STAGING (FIRESTORE_COLLECTION_PREFIX=castro_crm_staging)
-    // Rules permissivas: qualquer email autorizado pode ler/escrever.
+    // Rules permissivas para sessoes normais. Ver como nunca le nem escreve
+    // por SDK/REST direto: toda leitura temporaria passa pelo backend.
     // Sera substituido por regras tenant-based na Fase 2 (subcolecao
     // tenants/{tenant_id}/* com claim no JWT).
     // ====================================================================
 
     match /castro_crm_staging_operator_profiles/{uid} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_users/{userId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_departments/{deptId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_channels/{channelId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_wa_contacts/{contactId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_wa_conversations/{convId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_wa_messages/{messageId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_wa_message_status/{docId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_wa_transfer_log/{transferId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_bot_states/{convId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_system_settings/{docId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_user_settings/{userId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_audit_log/{docId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_audit_metrics/{docId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_operator_assume_counters/{userId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_media_assets/{assetId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
       match /chunks/{chunkId} {
-        allow read, write: if emailAllowed();
+        allow read: if emailAllowed();
+        allow write: if emailAllowed() && !isImpersonation();
       }
     }
 
     match /castro_crm_staging_gc_conversations/{convId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_gc_messages/{msgId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_messages/{messageId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging_internal_unread/{docId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     match /castro_crm_staging__meta/{docId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
     }
 
     // Doc do tenant em si (lista de tenants ainda flat, indice global).
     match /castro_crm_staging_tenants/{tenantId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed();
+      allow write: if emailAllowed() && !isImpersonation();
 
-      // Subcolecoes de cada tenant — em staging libera tudo para
-      // qualquer email autorizado (modelo simplificado de teste).
-      // Sera substituido por rules tenant-based estritas com claim no
-      // JWT quando o frontend renovar tokens (sub-fase futura).
-      match /{subcol=**} {
-        allow read, write: if emailAllowed();
+      // Mantem o grant legado NORMAL, mas o registro de suporte e sempre
+      // server-only. Um wildcard permissivo anularia um deny especifico.
+      match /{subcol}/{rest=**} {
+        allow read, write: if emailAllowed() && subcol != 'impersonation_sessions';
+      }
+
+      match /impersonation_sessions/{sid} {
+        allow read, write: if false;
       }
     }
   }

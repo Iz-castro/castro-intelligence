@@ -22,6 +22,7 @@ from firestore_common import (
 )
 from lgpd_bot import aceite_cobre_data, hoje_br, validar_config_lgpd
 from rbac import default_perfil_for_role
+from impersonation_identity import require_real_uid
 
 logger = logging.getLogger("castro_crm.database")
 
@@ -466,6 +467,7 @@ def _sync_operator_profile_from_user(user):
     firebase_uid = (user or {}).get("firebase_uid")
     if not firebase_uid:
         return
+    require_real_uid(firebase_uid)
     _operator_profile_ref(firebase_uid).set({
         "uid": firebase_uid,
         "user_id": user["id"],
@@ -802,6 +804,7 @@ def update_last_login(user_id):
 
 
 def sync_user_identity(user_id, email=None, firebase_uid=None, auth_provider="firebase", display_name=None):
+    require_real_uid(firebase_uid)
     fields = {
         "auth_provider": auth_provider or "firebase",
     }
@@ -819,6 +822,7 @@ def sync_user_identity(user_id, email=None, firebase_uid=None, auth_provider="fi
 
 
 def upsert_firebase_user(firebase_uid, email, display_name="", role=None, department_id=None):
+    require_real_uid(firebase_uid)
     email = (email or "").strip().lower()
     existing = get_user_by_firebase_uid(firebase_uid) or get_user_by_email(email)
     if existing:
@@ -3843,14 +3847,14 @@ def get_all_ratings(date_from=None, date_to=None):
     return rows
 
 
-def log_audit(user_id, action, detail="", ip_address=""):
+def log_audit(user_id, action, detail="", ip_address="", *, strict=False):
     # ID auto-gerado pelo Firestore (nao sequencial). O contador via
     # next_sequence() era um documento unico e virava hotspot de escrita:
     # sob rajada de requests a transacao abortava por contencao (409) e
     # estourava 500. O id do audit nunca e lido como sequencial em lugar
     # algum, entao doc-id automatico remove o hotspot.
-    # Best-effort: uma falha de auditoria nunca deve derrubar o request que
-    # a originou — loga warning e segue.
+    # Best-effort por default; inicio de Ver como exige strict=True para
+    # nunca entregar acesso sem auditoria persistida.
     try:
         ref = collection("audit_log").document()
         ref.set({
@@ -3862,6 +3866,10 @@ def log_audit(user_id, action, detail="", ip_address=""):
             "created_at": utcnow(),
         })
     except Exception:
+        if strict:
+            # O caller informa apenas ids/sid, sem traceback que possa
+            # conter dados do documento ou credenciais de transporte.
+            raise
         logger.warning(
             "log_audit falhou (nao-fatal): action=%s user_id=%s",
             action, user_id, exc_info=True,

@@ -17,7 +17,10 @@ RUN pip install --no-cache-dir -r requirements-superadmin.txt
 # Fecho de imports do servico B (computado; ver docs/PLANO_OPERACAO_CLOUDRUN_B).
 COPY config.py firebase_admin_client.py firestore_common.py super_admin.py \
      tenant_service.py tenant_bootstrap.py database_firestore.py rbac.py \
-     bootstrap_data.py pii_redaction.py superadmin_main.py ./
+     bootstrap_data.py pii_redaction.py superadmin_main.py \
+     impersonation_identity.py lgpd_bot.py ./
+# Trava de regressao: modulo fora do COPY derrubava o boot so no Cloud Run.
+RUN python -c "import superadmin_main, tenant_bootstrap"
 COPY superadmin_web/ ./superadmin_web/
 
 EXPOSE 8080

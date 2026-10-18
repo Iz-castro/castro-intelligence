@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field as PydanticField, field_validator
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
-    FEATURE_ASSUME_COUNTER,
+    FEATURE_ASSUME_COUNTER, FEATURE_IMPERSONATE, IMPERSONATE_POLLING_INTERVAL_MS,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
@@ -46,6 +46,7 @@ from config import (
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
     CHAT_DELIVERY_MODE, POLLING_INTERVAL_MS, AUTH_MODE,
     FIRESTORE_PROJECT_ID, FIREBASE_STORAGE_BUCKET,
+    FIRESTORE_COLLECTION_PREFIX,
     FIREBASE_WEB_API_KEY, FIREBASE_WEB_AUTH_DOMAIN, FIREBASE_WEB_APP_ID,
     FIREBASE_WEB_MESSAGING_SENDER_ID, FIREBASE_WEB_MEASUREMENT_ID,
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
@@ -55,6 +56,7 @@ from config import (
 )
 from database import (
     init_database, get_user_by_id, get_user_raw_by_id, get_all_users,
+    get_operator_profile_by_uid,
     get_all_wa_contacts, get_wa_conversation,
     mark_wa_conversation_read, mark_wa_conversation_read_by_id, recompute_wa_contact_unread,
     save_wa_message, get_wa_contact,
@@ -95,7 +97,12 @@ from channel_service import (
     get_channel_by_id_from_db, get_channel_by_phone_id_from_db, rebind_channel,
     CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
-from auth import authenticate_firebase_token, invalidate_auth_cache
+from auth import authenticate_firebase_token, invalidate_auth_cache, validate_impersonation_claims
+from impersonation_identity import (
+    ReservedImpersonationIdentityError, is_impersonation_uid,
+    is_impersonation_token, valid_impersonation_subject,
+)
+from impersonation import create_session, validate_session, close_session, cleanup_expired_sessions
 from firestore_common import (
     collection_name, collection as fs_coll, document as fs_document, utcnow as fs_utcnow,
 )
@@ -103,6 +110,7 @@ from rbac import (
     PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
     can_see_all_tenant, default_perfil_for_role, effective_toggles,
     ensure_permission, get_perfil, has_permission, toggles_beyond_user,
+    read_impersonation_toggles, set_impersonation_perfil, reset_impersonation_perfil,
 )
 from pii_redaction import redact_phone, redact_name
 from webhook import process_webhook_payload, validate_signature, process_claimed_bot_buffer
@@ -148,6 +156,117 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+# Excecoes de leitura revisadas no inventario do ADR 0014. Busca/tag ficam
+# no body por LGPD; nenhum destes POSTs grava dados ou envia mensagens.
+_IMPERSONATE_READ_POSTS = frozenset({
+    "/api/wa/contacts/picker/search",
+    "/api/wa/contacts/picker/by-tag",
+    "/api/admin/reopen-batch/preview",
+})
+_IMPERSONATE_UNSAFE_GETS = frozenset({"/api/admin/monitor/auditoria"})
+# Lista positiva: os transportes Firestore antigos nao sao alternativas ao
+# transporte de suporte. Adicionar uma rota exige revisar seus efeitos/escopo.
+_IMPERSONATE_READ_GETS = frozenset({
+    "/", "/chat", "/app", "/media/{subdir}/{filename}",
+    "/api/session", "/api/client-config", "/api/admin/roles",
+    "/api/admin/perfis-acesso", "/api/settings/system", "/api/settings/user",
+    "/api/wa/contacts/all", "/api/wa/contacts/picker", "/api/wa/qualifications",
+    "/api/departments", "/api/operators", "/api/wa/contact/{contact_id}",
+    "/api/wa/transfer-history/{contact_id}", "/api/wa/templates",
+    "/api/wa/channel/{channel_id}/billing-status", "/api/admin/channels",
+    "/api/admin/conflicts", "/api/admin/protocol/{protocol_id}",
+    "/api/admin/pending-webhook-events", "/api/admin/export",
+    "/api/admin/embedded-signup/config", "/api/admin/reopen-batch/{batch_id}",
+    "/api/gc/spaces", "/api/admin/dashboard/summary", "/api/admin/dashboard/ratings",
+    "/api/admin/monitor/fila", "/api/admin/monitor/metricas",
+    "/api/wa/usage/current-month", "/api/wa/usage/history", "/api/wa/usage/{year_month}",
+    "/api/impersonation/view/snapshot", "/api/impersonation/view/page",
+    "/api/impersonation/view/messages", "/api/impersonation/view/thread",
+    "/api/impersonation/view/internal-chat",
+})
+_IMPERSONATE_READ_PARAMS = {
+    "/api/impersonation/view/page": {"scope", "view", "limit"},
+    "/api/impersonation/view/messages": {"contact_id", "channel_id", "limit"},
+    "/api/impersonation/view/thread": {"contact_id", "channel_id"},
+    "/api/impersonation/view/internal-chat": {"kind", "conversation_id"},
+    "/api/wa/contacts/all": {"limit", "count_only"},
+    "/api/wa/contacts/picker": {"page_size", "cursor", "owner_id", "qualification"},
+    "/api/wa/templates": {"channel_id"},
+    "/api/admin/pending-webhook-events": {"status", "limit"},
+    "/api/admin/dashboard/summary": {"date_from", "date_to"},
+    "/api/admin/dashboard/ratings": {"date_from", "date_to"},
+    "/api/admin/monitor/metricas": {"dias", "refresh"},
+    "/api/wa/usage/history": {"months"},
+    "/api/admin/export": {"date_from", "date_to", "format"},
+    "/api/admin/embedded-signup/config": {"type"},
+}
+
+
+def _impersonation_read_route(request):
+    from starlette.routing import Match
+    scope = dict(request.scope)
+    scope["path"] = scope["path"].rstrip("/") or "/"
+    if scope["method"] in ("HEAD", "OPTIONS"):
+        scope["method"] = "GET"
+    for route in app.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            return route
+    return None
+
+
+def _impersonation_denied(status_code, detail):
+    # O middleware de tenant e externo ao middleware normal de headers.
+    return JSONResponse(status_code=status_code, content={"detail": detail},
+                        headers={"Cache-Control": "private, no-store"})
+
+
+async def _impersonation_finish_response(request, response):
+    """Nao entrega um corpo preparado sob uma autorizacao que ja venceu."""
+    decoded = getattr(request.state, "firebase_decoded", {})
+    if not is_impersonation_token(decoded):
+        return response
+    response.headers["Cache-Control"] = "private, no-store"
+    if response.status_code >= 400 or request.url.path == "/api/impersonation/end":
+        return response
+    # call_next devolve um stream ASGI mesmo para JSON/CSV comuns. Consumir
+    # antes da revalidacao impede entregar parte do corpo apos falha de TTL.
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    try:
+        result = await run_in_threadpool(
+            authenticate_firebase_token, "", decoded_token=decoded,
+        )
+        # O lookup final do usuario tambem pode demorar. Conferir registro
+        # DEPOIS desse I/O e o relogio depois de todo await fecha essa janela.
+        if result["success"]:
+            toggles = await run_in_threadpool(read_impersonation_toggles, decoded["tenant_id"], decoded["perfil_acesso_id"])
+            if toggles != getattr(request.state, "impersonation_toggles", None):
+                result = {"success": False, "status_code": 409,
+                          "error": "Permissoes atualizadas; consulte novamente a visualizacao"}
+            active = await run_in_threadpool(validate_session, decoded)
+            if not active or not validate_impersonation_claims(decoded):
+                result = {"success": False, "status_code": 401,
+                          "error": "Sessao de visualizacao expirada ou encerrada"}
+    except Exception:
+        logger.warning("impersonate validacao final indisponivel | sid=%s", decoded.get("imp_sid"))
+        return JSONResponse(status_code=503, content={"detail": "Nao foi possivel validar a visualizacao"},
+                            headers={"Cache-Control": "private, no-store"})
+    if not result["success"]:
+        return JSONResponse(status_code=result.get("status_code", 401), content={"detail": result["error"]},
+                            headers={"Cache-Control": "private, no-store"})
+    return Response(content=body, status_code=response.status_code, headers=dict(response.headers),
+                    background=response.background)
+
+
+def _request_route_label(request):
+    # So o template da rota: segmentos recebidos podem conter PII/segredos.
+    from starlette.routing import Match
+    for route in app.routes:
+        match, _ = route.matches(request.scope)
+        if match != Match.NONE:
+            return getattr(route, "path", "<rota>")
+    return "<rota-desconhecida>"
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -165,7 +284,9 @@ async def add_security_headers(request: Request, call_next):
     # cache de disco de maquina compartilhada. Carimbado AQUI porque o
     # header setado dentro da rota nao sobrevive a HTTPException/422 — os
     # caminhos de ERRO saiam sem no-store.
-    if request.url.path.startswith("/api/wa/contacts/picker"):
+    if (request.url.path.startswith("/api/wa/contacts/picker")
+            or request.url.path.rstrip("/") in ("/api/admin/impersonate", "/api/impersonation/end")
+            or is_impersonation_token(getattr(request.state, "firebase_decoded", {}))):
         response.headers["Cache-Control"] = "private, no-store"
     return response
 
@@ -181,6 +302,7 @@ async def tenant_context_middleware(request: Request, call_next):
 
     auth_header = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
     tid = None
+    decoded = None
     if auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
         try:
@@ -192,17 +314,70 @@ async def tenant_context_middleware(request: Request, call_next):
             # Auth real acontece em get_current_user; aqui so detecta
             # tenant pra setar context cedo.
             pass
+    if decoded and is_impersonation_token(decoded):
+        # Kill-switch: desligar a flag derruba tambem as sessoes ja emitidas.
+        if not FEATURE_IMPERSONATE:
+            return _impersonation_denied(403, "Visualizacao desativada")
+        # Checado antes de qualquer endpoint/dependency, inclusive os GETs.
+        if not valid_impersonation_subject(decoded):
+            return _impersonation_denied(401, "Sessao de visualizacao invalida")
+        if not validate_impersonation_claims(decoded):
+            return _impersonation_denied(401, "Sessao de visualizacao expirada")
+        try:
+            imp_session = await run_in_threadpool(validate_session, decoded)
+        except Exception:
+            logger.warning("impersonate registro indisponivel | sid=%s", decoded["imp_sid"])
+            return _impersonation_denied(503, "Nao foi possivel validar a visualizacao")
+        if not imp_session:
+            return _impersonation_denied(401, "Sessao de visualizacao invalida")
+        request.state.impersonation_session = imp_session
+        # O router aceita barra final; normalizar evita contornar o GET
+        # inseguro por redirect e nao amplia a allowlist de POSTs.
+        path = request.url.path.rstrip("/") or "/"
+        route = _impersonation_read_route(request)
+        read_method = (request.method in ("GET", "HEAD", "OPTIONS") and route is not None
+                       and getattr(route, "path", "") in _IMPERSONATE_READ_GETS)
+        allowed_post = request.method == "POST" and request.url.path in _IMPERSONATE_READ_POSTS
+        own_end = request.method == "POST" and request.url.path == "/api/impersonation/end"
+        if (not read_method and not allowed_post and not own_end) or (
+            request.method in ("GET", "HEAD") and path in _IMPERSONATE_UNSAFE_GETS
+        ):
+            logger.warning(
+                "impersonate bloqueado | sid=%s method=%s path=%s",
+                decoded.get("imp_sid"), request.method, _request_route_label(request),
+            )
+            return _impersonation_denied(403, "Modo visualizacao: somente leitura")
+        # Busca/tag so no body dos POSTs aprovados. A allowlist de params nao
+        # cresce implicitamente quando outra feature muda a assinatura da rota.
+        accepted = _IMPERSONATE_READ_PARAMS.get(getattr(route, "path", ""), set()) if read_method else set()
+        if set(request.query_params) - accepted:
+            return JSONResponse(status_code=400, content={"detail": "Parametros de visualizacao invalidos"},
+                                headers={"Cache-Control": "private, no-store"})
     # Fallback: usuarios pre-Fase 2 sem custom_claim ainda — assume tenant default.
     if not tid and auth_header:
         tid = "hubloc"
 
     if tid:
         ctx_token = set_tenant_context(tid)
+        perfil_token = None
         try:
-            return await call_next(request)
+            if decoded and is_impersonation_token(decoded):
+                try:
+                    toggles = await run_in_threadpool(read_impersonation_toggles, tid, decoded["perfil_acesso_id"])
+                except Exception:
+                    logger.warning("impersonate perfil indisponivel | sid=%s", decoded.get("imp_sid"))
+                    return JSONResponse(status_code=503, content={"detail": "Nao foi possivel validar o perfil"},
+                                        headers={"Cache-Control": "private, no-store"})
+                request.state.impersonation_toggles = toggles
+                perfil_token = set_impersonation_perfil(tid, decoded["perfil_acesso_id"], toggles)
+            response = await call_next(request)
+            return await _impersonation_finish_response(request, response)
         finally:
+            if perfil_token is not None:
+                reset_impersonation_perfil(perfil_token)
             reset_tenant_context(ctx_token)
-    return await call_next(request)
+    response = await call_next(request)
+    return await _impersonation_finish_response(request, response)
 
 
 if os.path.isdir(FRONTEND_ASSETS_DIR):
@@ -260,9 +435,18 @@ def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token ausente")
     token = auth_header.split(" ", 1)[1]
     ip = request.client.host if request.client else "unknown"
-    result = authenticate_firebase_token(token, ip)
+    result = authenticate_firebase_token(
+        token, ip, decoded_token=getattr(request.state, "firebase_decoded", None),
+        impersonation_session=getattr(request.state, "impersonation_session", None),
+    )
     if not result["success"]:
         raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
+    # Falha FECHADA: token de visualizacao so chega ao endpoint depois de o
+    # middleware aplicar a trava de metodo/rota. Se a verificacao do token
+    # falhou la (ex.: chaves publicas indisponiveis) e passou aqui, a trava
+    # nao rodou -- nunca executar o endpoint como o alvo nesse caso.
+    if result["user"].get("impersonation") and getattr(request.state, "impersonation_session", None) is None:
+        raise HTTPException(status_code=503, detail="Nao foi possivel validar a visualizacao")
     return result["user"]
 
 # Convencao RBAC (M-B2): endpoints chamam ensure_permission(current_user,
@@ -607,6 +791,9 @@ async def client_config():
             "measurementId": FIREBASE_WEB_MEASUREMENT_ID,
         },
         "feature_message_status": FEATURE_MESSAGE_STATUS,
+        "feature_impersonate": FEATURE_IMPERSONATE,
+        "impersonation_environment": FIRESTORE_COLLECTION_PREFIX,
+        "impersonation_polling_interval_ms": IMPERSONATE_POLLING_INTERVAL_MS,
         "feature_google_chat": FEATURE_GOOGLE_CHAT,
         "firestore": {
             "collections": {
@@ -621,6 +808,214 @@ async def client_config():
             "snapshot_enabled": True,
         },
     }
+
+
+# -- API: Ver como --
+
+class ImpersonateRequest(BaseModel):
+    user_id: int
+    reason: str
+
+
+@app.post("/api/admin/impersonate")
+async def admin_impersonate(
+    body: ImpersonateRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Emite login separado para leitura do escopo do alvo, sem autentica-lo."""
+    if not FEATURE_IMPERSONATE:
+        raise HTTPException(status_code=404, detail="Recurso indisponivel")
+    decoded = getattr(request.state, "firebase_decoded", {})
+    if is_impersonation_token(decoded) or current_user.get("impersonation"):
+        raise HTTPException(status_code=403, detail="Visualizacao nao permite iniciar outra sessao")
+    ensure_permission(current_user, "ver_como_usuario")
+    # So admin inicia (spec D7). O toggle pode ser ligado em qualquer perfil
+    # pelo editor; sem esta trava, um operador com o toggle veria como uma
+    # supervisora e leria o tenant inteiro (fura can_see_all_tenant).
+    if str(current_user.get("role") or "") != "admin":
+        raise HTTPException(status_code=403, detail="Ver como restrito a administradores")
+    reason = body.reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(status_code=400, detail="Informe um motivo com pelo menos 10 caracteres")
+
+    from firestore_common import get_tenant_context
+    tenant_id = str(current_user.get("tenant_id") or "")
+    # Sem fallback para tenant default: o lookup deve ocorrer no tenant
+    # autenticado e no mesmo contexto que o middleware estabeleceu.
+    if not tenant_id or get_tenant_context() != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant da sessao invalido")
+    target = get_user_by_id(body.user_id)
+    if not target or not target.get("is_active", 1):
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+    target_uid = target.get("firebase_uid")
+    if not target_uid:
+        raise HTTPException(status_code=409, detail="Usuario ainda nao possui identidade Firebase")
+    if (target.get("role") == "admin" or target["id"] == current_user["id"]
+            or target_uid == current_user.get("firebase_uid") or is_impersonation_uid(target_uid)
+            or not current_user.get("firebase_uid") or is_impersonation_uid(current_user.get("firebase_uid"))):
+        raise HTTPException(status_code=403, detail="Usuario nao elegivel para visualizacao")
+
+    from firebase_admin import auth as firebase_auth
+    from firebase_admin_client import get_firebase_app, get_user_claims_strict
+    try:
+        target_claims = get_user_claims_strict(target_uid)
+    except Exception:
+        logger.warning("impersonate claims indisponiveis | admin_id=%s target_id=%s",
+                       current_user["id"], target["id"])
+        raise HTTPException(status_code=503, detail="Nao foi possivel consultar a identidade do usuario")
+    claim_tenant = str(target_claims.get("tenant_id") or target.get("tenant_id") or tenant_id)
+    role = target_claims.get("role") or target.get("role") or "operador"
+    if claim_tenant != tenant_id or role == "admin":
+        raise HTTPException(status_code=403, detail="Usuario nao elegivel neste tenant")
+    perfil_id = (target_claims.get("perfil_acesso_id") or target.get("perfil_acesso_id")
+                 or default_perfil_for_role(role))
+    if (role != target.get("role") or perfil_id != (
+            target.get("perfil_acesso_id") or default_perfil_for_role(target.get("role")))):
+        raise HTTPException(status_code=409, detail="Identidade e perfil desatualizados; atualize os claims do usuario")
+    profile = get_operator_profile_by_uid(target_uid)
+    if (not profile or profile.get("uid") != target_uid or profile.get("user_id") != target["id"]
+            or profile.get("role") != role or (
+                profile.get("perfil_acesso_id") or default_perfil_for_role(profile.get("role"))) != perfil_id):
+        raise HTTPException(status_code=409, detail="Perfil do operador indisponivel ou desatualizado para visualizacao")
+    try:
+        imp_session = await run_in_threadpool(create_session, current_user, target, tenant_id, role, perfil_id)
+    except Exception:
+        logger.warning("impersonate criacao de registro indisponivel | admin_id=%s target_id=%s",
+                       current_user["id"], target["id"])
+        raise HTTPException(status_code=503, detail="Nao foi possivel registrar a sessao de visualizacao")
+    sid = imp_session["sid"]
+    expires = imp_session["expires_at"]
+    developer_claims = {
+        "imp": True, "imp_by": current_user["id"],
+        "imp_by_uid": current_user.get("firebase_uid"), "imp_sid": sid,
+        "imp_exp": int(expires.timestamp()), "tenant_id": tenant_id,
+        "role": role, "perfil_acesso_id": perfil_id,
+        "imp_target_uid": target_uid, "imp_env": FIRESTORE_COLLECTION_PREFIX,
+    }
+    try:
+        token = await run_in_threadpool(firebase_auth.create_custom_token, imp_session["auth_uid"],
+                                       developer_claims, app=get_firebase_app())
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+    except Exception:
+        _abandon_impersonation(imp_session)
+        logger.warning("impersonate assinatura indisponivel | admin_id=%s target_id=%s sid=%s",
+                       current_user["id"], target["id"], sid)
+        raise HTTPException(status_code=503, detail="Nao foi possivel assinar o token de visualizacao; verifique a permissao IAM de assinatura")
+    try:
+        await run_in_threadpool(log_audit, current_user["id"], "IMPERSONATE_START",
+                                f"target={target['id']} sid={sid} exp={expires.isoformat()} motivo={reason[:200]}",
+                                strict=True)
+    except Exception:
+        _abandon_impersonation(imp_session)
+        logger.warning("impersonate auditoria indisponivel | admin_id=%s target_id=%s sid=%s",
+                       current_user["id"], target["id"], sid)
+        raise HTTPException(status_code=503, detail="Nao foi possivel registrar a auditoria da visualizacao")
+    logger.info("impersonate iniciado | admin_id=%s target_id=%s sid=%s",
+                current_user["id"], target["id"], sid)
+    return {
+        "custom_token": token, "session_id": sid, "expires_at": expires.isoformat(),
+        "target": {"id": target["id"], "display_name": target.get("display_name", ""), "role": role},
+    }
+
+
+def _abandon_impersonation(session):
+    # Compensacao best-effort: sem token entregue; cleanup tentara de novo.
+    try:
+        close_session(session)
+    except Exception:
+        logger.warning("impersonate compensacao indisponivel | sid=%s", session["sid"])
+
+
+@app.post("/api/impersonation/end")
+async def impersonation_end(request: Request, current_user: dict = Depends(get_current_user)):
+    decoded = getattr(request.state, "firebase_decoded", {})
+    session = getattr(request.state, "impersonation_session", None)
+    if not current_user.get("impersonation") or not valid_impersonation_subject(decoded):
+        raise HTTPException(status_code=403, detail="Apenas a propria sessao de visualizacao pode encerrar")
+    try:
+        session = session or await run_in_threadpool(validate_session, decoded)
+        if not session:
+            raise HTTPException(status_code=401, detail="Sessao de visualizacao invalida")
+        # Ator e sempre o solicitante original, nunca o operador visualizado.
+        await run_in_threadpool(log_audit, session["admin_user_id"], "IMPERSONATE_END",
+                               f"sid={session['sid']}", strict=True)
+        await run_in_threadpool(close_session, session)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("impersonate encerramento indisponivel | sid=%s", decoded["imp_sid"])
+        raise HTTPException(status_code=503, detail="Nao foi possivel encerrar a visualizacao no servidor")
+    return {"status": "ok"}
+
+
+def get_impersonation_view_user(current_user: dict = Depends(get_current_user)):
+    if not current_user.get("impersonation"):
+        raise HTTPException(status_code=403, detail="Apenas sessoes de visualizacao usam este transporte")
+    return current_user
+
+
+@app.get("/api/impersonation/view/snapshot")
+async def impersonation_view_snapshot(current_user: dict = Depends(get_impersonation_view_user)):
+    from impersonation_views import read_snapshot
+    return await run_in_threadpool(read_snapshot, current_user)
+
+
+@app.get("/api/impersonation/view/page")
+async def impersonation_view_page(
+    scope: str = "mine", view: str = "meus", limit: int = Query(50, ge=1),
+    current_user: dict = Depends(get_impersonation_view_user),
+):
+    from impersonation_views import read_page
+    return await run_in_threadpool(read_page, current_user, scope, view, limit)
+
+
+@app.get("/api/impersonation/view/messages")
+async def impersonation_view_messages(
+    contact_id: int = Query(..., ge=1), channel_id: int | None = Query(None, ge=1),
+    limit: int = Query(10, ge=1), current_user: dict = Depends(get_impersonation_view_user),
+):
+    from impersonation_views import read_messages
+    return await run_in_threadpool(read_messages, current_user, contact_id, channel_id, limit)
+
+
+@app.get("/api/impersonation/view/thread")
+async def impersonation_view_thread(
+    contact_id: int = Query(..., ge=1), channel_id: int | None = Query(None, ge=1),
+    current_user: dict = Depends(get_impersonation_view_user),
+):
+    from impersonation_views import read_thread
+    return await run_in_threadpool(read_thread, current_user, contact_id, channel_id)
+
+
+@app.get("/api/impersonation/view/internal-chat")
+async def impersonation_view_internal_chat(
+    kind: str = "conversations", conversation_id: int | None = Query(None, ge=1),
+    current_user: dict = Depends(get_impersonation_view_user),
+):
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    from impersonation_views import read_internal_chat
+    return await run_in_threadpool(read_internal_chat, current_user, kind, conversation_id)
+
+
+def _impersonation_channels(current_user):
+    """Mesmo conjunto exibido ao alvo; o cache global de canais nao autoriza."""
+    rows = (get_all_active_channels() if has_permission(current_user, "gerenciar_canais")
+            else get_channels_for_user(current_user["id"]))
+    tid = str(current_user.get("tenant_id") or "")
+    return [row for row in rows if str(row.get("tenant_id") or "hubloc") == tid]
+
+
+def _require_impersonation_channel_scope(channel, current_user):
+    if not current_user.get("impersonation"):
+        return
+    tid = str(current_user.get("tenant_id") or "")
+    allowed_ids = {str(row.get("id")) for row in _impersonation_channels(current_user)}
+    if (not channel or str(channel.get("tenant_id") or "hubloc") != tid
+            or str(channel.get("id")) not in allowed_ids):
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
 
 
 # -- API: Avatar do operador --
@@ -717,6 +1112,8 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
             role=role,
             department_id=department_id,
         )
+    except ReservedImpersonationIdentityError:
+        raise HTTPException(status_code=409, detail="Email vinculado a identidade temporaria; use uma conta de operador")
     except TenantConflictError:
         raise HTTPException(status_code=409, detail="Email ja vinculado a outro tenant")
     except DeactivatedUserError:
@@ -1813,6 +2210,8 @@ def _require_contact_access(contact: dict, current_user: dict):
     Levanta 403 caso contrario. contact pode ser {} (trata como sem acesso)."""
     if can_see_all_tenant(current_user):
         return
+    if current_user.get("impersonation") and contact and contact.get("is_backup"):
+        raise HTTPException(status_code=403, detail="Acesso negado: contato de backup")
     if contact and contact.get("assigned_to") == current_user.get("id"):
         return
     if contact and not contact.get("assigned_to_uid"):  # pool: '' ou None
@@ -1826,9 +2225,11 @@ def _require_contact_access(contact: dict, current_user: dict):
             if _uid:
                 _q = (_fs_coll("wa_conversations")
                       .where("contact_id", "==", contact.get("id"))
-                      .where("assigned_to_uid", "==", _uid)
-                      .limit(1))
-                if any(True for _ in _q.stream()):
+                      .where("assigned_to_uid", "==", _uid))
+                if current_user.get("impersonation"):
+                    if any(not (snap.to_dict() or {}).get("is_backup") for snap in _q.stream()):
+                        return
+                elif any(True for _ in _q.limit(1).stream()):
                     return
         except Exception as exc:
             logger.warning("_require_contact_access thread-check falhou: %s", exc)
@@ -3452,6 +3853,7 @@ async def wa_list_templates(
     from channel_service import get_channel, get_default_channel
 
     channel = get_channel(channel_id) if channel_id is not None else get_default_channel()
+    _require_impersonation_channel_scope(channel, current_user)
     if channel is None:
         raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
 
@@ -4044,9 +4446,12 @@ async def admin_conflicts(current_user: dict = Depends(get_current_user)):
                 return None
         return None
 
+    hide_backup = bool(current_user.get("impersonation")) and not can_see_all_tenant(current_user)
     by_contact: dict = {}
     for snap in fs_coll("wa_conversations").stream():
         c = snap.to_dict() or {}
+        if hide_backup and c.get("is_backup"):
+            continue
         if c.get("assigned_to") is None or c.get("channel_active") is False:
             continue
         lm = _to_dt(c.get("last_message_at"))
@@ -4065,6 +4470,8 @@ async def admin_conflicts(current_user: dict = Depends(get_current_user)):
         if len({c.get("assigned_to") for c, _ in items}) < 2:
             continue
         contact = contacts_by_id.get(cid) or {}
+        if hide_backup and contact.get("is_backup"):
+            continue
         items_sorted = sorted(items, key=lambda t: t[1], reverse=True)
         conflicts.append({
             "contact_id": cid,
@@ -4100,6 +4507,9 @@ async def admin_get_protocol(protocol_id: str, current_user: dict = Depends(get_
         raise HTTPException(status_code=404, detail="Protocolo nao encontrado")
     messages = get_messages_by_protocol(protocol_id)
     contact = get_wa_contact(atendimento.get("contact_id"))
+    if current_user.get("impersonation"):
+        from impersonation_views import filter_message_rows
+        messages = filter_message_rows(current_user, contact, messages)
     contact_brief = None
     if contact:
         contact_brief = {
@@ -4239,8 +4649,12 @@ async def list_pending_webhook_events(
     excecao no processamento). Garantia de zero perda — operador retenta
     apos o canal estar disponivel."""
     ensure_permission(current_user, "gerenciar_canais")
-    from pending_events import list_pending_events
-    events = list_pending_events(status=status, limit=limit)
+    from pending_events import list_pending_events, list_pending_events_for_channels
+    if current_user.get("impersonation"):
+        phone_ids = [channel.get("phone_number_id") for channel in _impersonation_channels(current_user)]
+        events = list_pending_events_for_channels(phone_ids, status=status, limit=limit)
+    else:
+        events = list_pending_events(status=status, limit=limit)
     return {"events": events, "count": len(events)}
 
 
@@ -4383,6 +4797,7 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
     from channel_service import get_channel
 
     channel = get_channel(channel_id)
+    _require_impersonation_channel_scope(channel, current_user)
     if not channel:
         raise HTTPException(status_code=404, detail="Canal nao encontrado")
     waba_id = str(channel.get("waba_id") or "").strip()
@@ -4596,6 +5011,13 @@ def _verify_cron_auth(request: Request) -> None:
         status_code=401,
         detail="auth ausente: envie Authorization: Bearer <oidc> ou X-Cron-Secret",
     )
+
+
+@app.post("/api/internal/cron/cleanup-impersonation")
+async def cron_cleanup_impersonation(request: Request):
+    """Limpa somente contas temporarias registradas; funciona com flag off."""
+    _verify_cron_auth(request)
+    return await run_in_threadpool(cleanup_expired_sessions)
 
 
 @app.post("/api/internal/cron/health-check")
@@ -5887,6 +6309,17 @@ async def gc_list_spaces(current_user: dict = Depends(get_current_user)):
     """Lista spaces disponiveis no Google Chat."""
     if not FEATURE_GOOGLE_CHAT:
         raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    if current_user.get("impersonation"):
+        # A lista do app Google Chat e global. Somente salas com vinculo
+        # comprovado na colecao deste tenant podem aparecer na visualizacao.
+        spaces = {}
+        for snap in fs_coll("gc_conversations").where("space_id", "!=", "").stream():
+            row = snap.to_dict() or {}
+            space_id = row.get("space_id")
+            if space_id:
+                spaces[space_id] = {"space_id": space_id, "display_name": row.get("space_name") or space_id,
+                                    "type": "", "single_user_bot_dm": False}
+        return {"spaces": list(spaces.values())}
     from google_chat import list_spaces
     spaces = list_spaces()
     return {"spaces": spaces}
@@ -5986,6 +6419,8 @@ async def dashboard_ratings(
 ):
     ensure_permission(current_user, "ver_dashboard_uso")
     ratings = get_all_ratings(date_from or None, date_to or None)
+    if current_user.get("impersonation") and not can_see_all_tenant(current_user):
+        ratings = [row for row in ratings if not row.get("is_backup")]
     return {"ratings": ratings}
 
 
@@ -6142,7 +6577,10 @@ async def export_data(
     """Exporta conversas e contatos em JSON ou CSV."""
     ensure_permission(current_user, "exportar_contatos")
 
-    contacts = get_all_wa_contacts(include_archived=True)
+    if current_user.get("impersonation") and not can_see_all_tenant(current_user):
+        contacts = get_wa_contacts_scoped_for_user(current_user.get("id"))
+    else:
+        contacts = get_all_wa_contacts(include_archived=True)
     # Filtrar por data se especificado
     if date_from:
         contacts = [c for c in contacts if str(c.get("first_seen_at", ""))[:10] >= date_from]

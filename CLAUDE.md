@@ -35,6 +35,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (69).
   History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
+  Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
+  `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
+  `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`.
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -88,6 +91,27 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 
 ## Invariantes que NÃO podem quebrar (landmines reais)
 
+- **Ver como (ADR 0014):** UID Firebase temporario `imp_ro_*`, nunca o do alvo/admin;
+  `sessionUser.firebase_uid` e queries/toggles continuam do alvo. Registro tenant-scoped
+  prende UID/SID/ambiente/prazo; contrato exige registro/TTL no backend e nega mutacoes CRM,
+  inclusive sem claim `imp` no UID reservado. Sem escrita automatica no alvo. Fim so da
+  propria sessao; cleanup apos 2h exclui apenas UID registrado, nunca contas reais.
+  Auth temporario em memoria, sem cliente Firestore temporario, e marcador de aba sem
+  segredo evitam restaurar admin no reload.
+  **Transporte revisado aprovado:** temporario usa somente HTTP/polling fixo15s; rules
+  negam toda leitura/escrita direta, inclusive UID reservado sem claim e imp legado.
+  Backend preserva janelas por target, filtra backup/ownership antes de entregar e
+  reautentica apos bufferizar cada corpo, sem memo final. UI descarta resposta tardia;
+  nenhuma queda para Firestore. Sessoes normais mantem listeners atuais. A revisao veio
+  apos listener +1,259s e backup indevido no emulador (prod nao verificado); pendencia de
+  backup normal e URL de midia anonima conhecida continuam fora desta mudanca.
+  Exigir gates do transporte HTTP atual; nao presumir prontidao pelos testes antigos.
+  Polling repete leituras e target backup original nao tem cap; avaliar custo antes de
+  ativar, sem reduzir janelas silenciosamente. Feature desligada por default.
+  **Revisao do merge (2026-10-18):** so role admin inicia (o toggle sozinho nao basta);
+  FEATURE_IMPERSONATE=false derruba sessoes ja emitidas no middleware; o solicitante e
+  revalidado (ativo, admin, com o toggle; cache de 30 s); get_current_user falha FECHADO
+  (503) se um token imp chegar sem a trava do middleware. `sim_impersonate.py` = 306.
 - **`_GLOBAL_COLLECTIONS` (`firestore_common.py`)** = `channels, pending_webhook_events,
   super_admins, audit_logs_system, phone_routing, _meta, tenants`. Ficam **flat/globais** mesmo
   com tenant context ativo. Toda coleção que o webhook precisa ler **antes** de saber o tenant
@@ -165,6 +189,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | Registry de canais WhatsApp (flat) | `channel_service.py` |
 | Tenants, `phone_routing` global, resolução de login por domínio | `tenant_service.py` |
 | Auth (Firebase ID token, resolução de tenant) | `auth.py` |
+| Ver como (identidade, registro, HTTP/polling e cleanup) | `impersonation_identity.py`, `impersonation.py`, `impersonation_views.py` — ADR 0014 |
 | RBAC dinâmico por tenant | `rbac.py` |
 | Gate LGPD | `lgpd_bot.py` |
 | Bot builtin + dispatcher builtin/CX | `bot_service.py` |

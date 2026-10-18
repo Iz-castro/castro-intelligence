@@ -139,6 +139,11 @@ FEATURE_ASSUME_COUNTER = _bool_env("FEATURE_ASSUME_COUNTER", "false")
 # origem e auditoria por atendente para admins dos tenants em MONITOR_TENANTS.
 # Kill-switch sem deploy: FEATURE_MONITOR=false volta o menu ao Dashboard.
 FEATURE_MONITOR = _bool_env("FEATURE_MONITOR", "true")
+# Ver como: login temporario separado, sessao curta e somente leitura.
+FEATURE_IMPERSONATE = os.environ.get("FEATURE_IMPERSONATE", "false").lower() == "true"
+IMPERSONATE_TTL_MINUTES = max(5, min(60, int(os.environ.get("IMPERSONATE_TTL_MINUTES", "30"))))
+# Intervalo aprovado para suporte; independente do transporte da sessao normal.
+IMPERSONATE_POLLING_INTERVAL_MS = 15000
 
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
 # CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em

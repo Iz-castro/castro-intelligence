@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { CrmProvider, useCrm } from "./context/CrmContext";
 import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, VideoIcon, FileIcon, MapPinIcon, MicIcon, SendIcon, SearchIcon, DotsIcon, CloseIcon } from "./components/icons";
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
@@ -10,10 +10,12 @@ import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
-import { ApiError, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
+import { ApiError, getDownload, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
 import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
+import { ImpersonateModal, ImpersonationLayout, READ_ONLY_TOOLTIP } from "./components/Impersonation";
+import { impersonationTab, isFirebaseSessionActive } from "./firebase";
 
 const TEAM_OPERATOR_COLORS = ["#0f766e", "#1d4ed8", "#c2410c", "#7c3aed", "#be123c", "#0f766e", "#0369a1", "#15803d", "#b45309", "#4338ca"];
 
@@ -209,6 +211,7 @@ function NavBar() {
 type ContactPickerMode = "list" | "create";
 
 function NewContactModal({ onClose }: { onClose: () => void }) {
+  const { readOnly } = useCrm();
   const { createManualContact, busyCreateContact, channels, loadAllContacts, pickerPage, pickerSearch, pickerByTag, countAllContacts, openConversationForContact, operators, sessionUser, canSeeAll, can, systemSettings, userSettings, settingsLoaded } = useCrm();
   const [mode, setMode] = useState<ContactPickerMode>("list");
   const [name, setName] = useState("");
@@ -450,10 +453,10 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
           <p className="eyebrow">Novo contato</p>
           <h2 style={{ margin: "0 0 1rem" }}>Criar contato manual</h2>
           <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required />
-            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required />
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nome do contato" autoFocus required title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Telefone (ex: 31999990000)" required title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             {availableChannels.length > 1 && (
-              <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")}>
+              <select value={channelId} onChange={(e) => setChannelId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                 <option value="">Selecionar canal</option>
                 {availableChannels.map(ch => <option key={ch.id} value={ch.id}>{ch.label || ch.display_phone_number}</option>)}
               </select>
@@ -462,7 +465,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
               <button type="button" className="ghost" onClick={() => setMode("list")}>Voltar</button>
               <div style={{ display: "flex", gap: "0.5rem" }}>
                 <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
-                <button type="submit" className="primary" disabled={busyCreateContact || !name.trim() || !phone.trim()}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
+                <button type="submit" className="primary" disabled={readOnly || busyCreateContact || !name.trim() || !phone.trim()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyCreateContact ? "Criando..." : "Criar contato"}</button>
               </div>
             </div>
           </form>
@@ -540,6 +543,8 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
           type="button"
           className="primary"
           onClick={() => setMode("create")}
+          disabled={readOnly}
+          title={readOnly ? READ_ONLY_TOOLTIP : undefined}
           style={{ width: "100%", marginBottom: "0.75rem" }}
         >
           + Novo contato
@@ -719,6 +724,7 @@ function ProtocolSearchCard() {
 }
 
 function ReassignLeadCard() {
+  const { readOnly } = useCrm();
   // Fase 3B: reatribui SO o Dono do Lead; os atendimentos mantem seus donos.
   const { operators, sessionUser, reassignLead, busyTransfer } = useCrm();
   const [uid, setUid] = useState<number | "">("");
@@ -726,9 +732,9 @@ function ReassignLeadCard() {
   return (
     <CollapsibleCard title="Reatribuir Lead (dono)" defaultOpen={false}>
       <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Muda so o dono do Lead — os atendimentos abertos mantem seus donos.</span>
-      <select value={uid} onChange={(e) => setUid(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione o operador</option>{operators.filter((o) => o.id !== sessionUser?.id).map((o) => <option key={o.id} value={o.id}>{o.display_name}</option>)}</select>
-      <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo (opcional)" />
-      <button className="primary" onClick={() => { if (uid) { void reassignLead(Number(uid), null, reason, ""); setReason(""); setUid(""); } }} disabled={!uid || busyTransfer}>{busyTransfer ? "..." : "Reatribuir Lead"}</button>
+      <select value={uid} onChange={(e) => setUid(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Selecione o operador</option>{operators.filter((o) => o.id !== sessionUser?.id).map((o) => <option key={o.id} value={o.id}>{o.display_name}</option>)}</select>
+      <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+      <button className="primary" onClick={() => { if (uid) { void reassignLead(Number(uid), null, reason, ""); setReason(""); setUid(""); } }} disabled={readOnly || (!uid || busyTransfer)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTransfer ? "..." : "Reatribuir Lead"}</button>
     </CollapsibleCard>
   );
 }
@@ -1063,6 +1069,7 @@ function ContactList() {
 }
 
 function MessageMedia({ message }: { message: ChatMessage }) {
+  const { readOnly } = useCrm();
   const { transcribingMessageId, transcribeMessage, openLightbox } = useCrm();
   const media = resolveMessageMedia(message);
   if (!media || !message.media_path) return null;
@@ -1081,7 +1088,7 @@ function MessageMedia({ message }: { message: ChatMessage }) {
     <div className="audio-container">
       <audio controls src={message.media_path} />
       {message.transcription ? <p className="transcription-text">{message.transcription}</p> : (
-        <button type="button" className="transcribe-btn" onClick={() => void transcribeMessage(message.id)} disabled={transcribingMessageId === message.id}>{transcribingMessageId === message.id ? "Transcrevendo..." : "🔤 Transcrever"}</button>
+        <button type="button" className="transcribe-btn" onClick={() => void transcribeMessage(message.id)} disabled={readOnly || (transcribingMessageId === message.id)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{transcribingMessageId === message.id ? "Transcrevendo..." : "🔤 Transcrever"}</button>
       )}
     </div>
   );
@@ -1099,6 +1106,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 }
 
 function ChatPanel() {
+  const { readOnly } = useCrm();
   const ctx = useCrm();
   const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, quickSelectedIndex, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
@@ -1320,22 +1328,22 @@ function ChatPanel() {
               ))}
             </div>
             <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.4rem", justifyContent: "flex-end" }}>
-              {ctx.can("assumir_atendimento") && (!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id) ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={busyAssume}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}
+              {ctx.can("assumir_atendimento") && (!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id) ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={readOnly || (busyAssume)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}
               <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleChatSearch} aria-label="Buscar na conversa" title="Buscar na conversa">{showChatSearch ? <CloseIcon /> : <SearchIcon />}</button>
               <div ref={dotsMenuRef} style={{ position: "relative" }}>
                 <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleDotsMenu} aria-label="Mais opcoes" title="Mais opcoes"><DotsIcon /></button>
                 {showDotsMenu ? (
                   <div className="attach-menu" style={{ right: 0, left: "auto", bottom: "auto", top: "calc(100% + 0.5rem)", minWidth: 220 }}>
-                    <button type="button" className="attach-option" onClick={() => { setShowTemplatePicker(true); closeDotsMenu(); }}><span>📋</span><span>Enviar template</span></button>
+                    <button type="button" className="attach-option" onClick={() => { setShowTemplatePicker(true); closeDotsMenu(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>📋</span><span>Enviar template</span></button>
                     <div style={{ height: 1, background: "var(--border)", margin: "0.3rem 0.5rem" }} />
-                    <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }}><span>✏️</span><span>Editar apelido</span></button>
+                    <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>✏️</span><span>Editar apelido</span></button>
                     {selectedThreadId ? <button type="button" className="attach-option" onClick={() => {
                       if (attendanceClosed) { void setAttendance(selectedThreadId, "aberto"); }
                       else if (["novo", "em_atendimento"].includes(selectedContact.qualification || "novo")) { setShowCloseModal(true); }
                       else { void setAttendance(selectedThreadId, "fechado_manual"); }
                       closeDotsMenu();
-                    }}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
-                    {ctx.systemSettings.pool_mode === "reception" && selectedContact.assigned_to != null ? <button type="button" className="attach-option" onClick={() => { void ctx.returnContactToPool(selectedContact.id); closeDotsMenu(); }}><span>↩️</span><span>Devolver à recepção</span></button> : null}
+                    }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
+                    {ctx.systemSettings.pool_mode === "reception" && selectedContact.assigned_to != null ? <button type="button" className="attach-option" onClick={() => { void ctx.returnContactToPool(selectedContact.id); closeDotsMenu(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>↩️</span><span>Devolver à recepção</span></button> : null}
                     {selectedContact.attendance_protocol ? <button type="button" className="attach-option" onClick={() => { navigator.clipboard.writeText(selectedContact.attendance_protocol!).catch(() => {}); closeDotsMenu(); ctx.setNotice(`Protocolo copiado: ${selectedContact.attendance_protocol}`); }}><span>📋</span><span>Copiar protocolo</span></button> : null}
                   </div>
                 ) : null}
@@ -1358,7 +1366,7 @@ function ChatPanel() {
         {iAmIntervening ? (
           <div className="sub" style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem 0.8rem", alignItems: "center", padding: "0.3rem 1rem", fontSize: "0.72rem", background: "rgba(250,204,21,0.12)", borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
             <span>👁️ Intervindo como supervisão — suas mensagens vão assinadas <strong>[Supervisão - {(sessionUser?.display_name || "").split(" ")[0]}]</strong>.</span>
-            <button type="button" className="ghost" style={{ padding: "0.2rem 0.5rem", fontSize: "0.7rem", whiteSpace: "nowrap" }} disabled={busySend} onClick={() => { if (selectedThreadId) void supervisorTakeover(selectedThreadId); }}>Assumir como supervisor</button>
+            <button type="button" className="ghost" style={{ padding: "0.2rem 0.5rem", fontSize: "0.7rem", whiteSpace: "nowrap" }} disabled={readOnly || (busySend)} onClick={() => { if (selectedThreadId) void supervisorTakeover(selectedThreadId); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Assumir como supervisor</button>
           </div>
         ) : null}
 
@@ -1369,14 +1377,14 @@ function ChatPanel() {
                 ? <>Este contato pertence a <strong>{leadOwnerName}</strong>. Assuma para responder sem transferir o lead.</>
                 : <>Voce assumiu este atendimento temporariamente — lead de <strong>{leadOwnerName}</strong>.</>}
             </span>
-            {isTakeoverActive ? <button type="button" className="ghost" style={{ whiteSpace: "nowrap" }} disabled={busyTakeover} onClick={() => void doReturn()}>{busyTakeover ? "..." : "Encerrar e devolver"}</button> : null}
+            {isTakeoverActive ? <button type="button" className="ghost" style={{ whiteSpace: "nowrap" }} disabled={readOnly || (busyTakeover)} onClick={() => void doReturn()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTakeover ? "..." : "Encerrar e devolver"}</button> : null}
           </div>
         ) : null}
 
         {editingNickname ? (
           <form className="toolbar" onSubmit={(e) => { e.preventDefault(); void updateDeclaredName(selectedContact.id, nicknameInput.trim()); setEditingNickname(false); }} style={{ gap: "0.4rem" }}>
-            <input value={nicknameInput} onChange={(e) => setNicknameInput(e.target.value)} placeholder="Apelido do contato (vazio para remover)" autoFocus style={{ flex: 1 }} />
-            <button type="submit" className="ghost" style={{ padding: "0.6rem 0.8rem", fontSize: "0.82rem" }}>Salvar</button>
+            <input value={nicknameInput} onChange={(e) => setNicknameInput(e.target.value)} placeholder="Apelido do contato (vazio para remover)" autoFocus style={{ flex: 1 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <button type="submit" className="ghost" style={{ padding: "0.6rem 0.8rem", fontSize: "0.82rem" }} disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Salvar</button>
             <button type="button" className="ghost" style={{ padding: "0.6rem 0.8rem", fontSize: "0.82rem", opacity: 0.6 }} onClick={() => setEditingNickname(false)}>x</button>
           </form>
         ) : null}
@@ -1403,10 +1411,10 @@ function ChatPanel() {
                     <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Acoes da mensagem" aria-expanded={isMenuOpen}>v</button>
                     {isMenuOpen ? (
                       <div className={`bubble-menu attach-menu ${openMessageMenuDirection === "up" ? "open-upward" : ""}`}>
-                        <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }}><span>Responder</span></button>
+                        <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>Responder</span></button>
                         <button type="button" className="attach-option" onClick={() => { void copyMessageText(message); setOpenMessageMenuId(null); }}><span>Copiar</span></button>
                         {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && ((message.sender_user_id ?? message.operator_id) === sessionUser?.id || isManager) ? (
-                          <button type="button" className="attach-option" disabled={busySend || busyAudio || busyUpload || recording} onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }}><span>Corrigir</span></button>
+                          <button type="button" className="attach-option" disabled={readOnly || (busySend || busyAudio || busyUpload || recording)} onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}><span>Corrigir</span></button>
                         ) : null}
                       </div>
                     ) : null}
@@ -1425,7 +1433,7 @@ function ChatPanel() {
 
         {quickSuggestions.length > 0 && (
           <div className="quick-suggestions" role="listbox" aria-label="Mensagens rapidas" ref={quickListRef}>{quickSuggestions.map((qm, idx) => (
-            <button key={idx} type="button" role="option" aria-selected={idx === quickSelectedIndex} className={idx === quickSelectedIndex ? "quick-suggestion-item is-selected" : "quick-suggestion-item"} onClick={() => applyQuickMessage(qm)}>
+            <button key={idx} type="button" role="option" aria-selected={idx === quickSelectedIndex} className={idx === quickSelectedIndex ? "quick-suggestion-item is-selected" : "quick-suggestion-item"} onClick={() => applyQuickMessage(qm)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
               <strong>{qm.shortcut.startsWith("/") ? qm.shortcut : `/${qm.shortcut}`}</strong>
               {qm.title ? <span className="qs-title">{qm.title}</span> : null}
               <span className="sub">{qm.message.length > 80 ? qm.message.slice(0, 80) + "..." : qm.message}</span>
@@ -1444,17 +1452,17 @@ function ChatPanel() {
             {showTakeoverPrompt ? (
               <>
                 <span className="sub" style={{ width: "100%" }}>Mensagem ao cliente (opcional, editavel):</span>
-                <textarea value={greetDraft} onChange={(e) => setGreetDraft(e.target.value)} rows={3} style={{ width: "100%", resize: "vertical" }} />
+                <textarea value={greetDraft} onChange={(e) => setGreetDraft(e.target.value)} rows={3} style={{ width: "100%", resize: "vertical" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 <div style={{ display: "flex", gap: "0.5rem", width: "100%", flexWrap: "wrap" }}>
-                  <button type="button" className="primary" style={{ flex: 1 }} disabled={busyTakeover} onClick={() => void confirmTakeover(true)}>{busyTakeover ? "..." : "Assumir e enviar"}</button>
-                  <button type="button" className="ghost" disabled={busyTakeover} onClick={() => void confirmTakeover(false)}>Assumir sem mensagem</button>
+                  <button type="button" className="primary" style={{ flex: 1 }} disabled={readOnly || (busyTakeover)} onClick={() => void confirmTakeover(true)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTakeover ? "..." : "Assumir e enviar"}</button>
+                  <button type="button" className="ghost" disabled={readOnly || (busyTakeover)} onClick={() => void confirmTakeover(false)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Assumir sem mensagem</button>
                   <button type="button" className="ghost" disabled={busyTakeover} onClick={() => setShowTakeoverPrompt(false)}>Cancelar</button>
                 </div>
               </>
             ) : (
               <>
                 <div className="sub" style={{ textAlign: "center", width: "100%" }}>Contato de {leadOwnerName}. Assuma para responder sem transferir o lead.</div>
-                <button type="button" className="assume-btn" style={{ background: "var(--danger)", borderColor: "var(--danger)" }} disabled={busyTakeover} onClick={openTakeoverPrompt}>Assumir atendimento temporariamente</button>
+                <button type="button" className="assume-btn" style={{ background: "var(--danger)", borderColor: "var(--danger)" }} disabled={readOnly || (busyTakeover)} onClick={openTakeoverPrompt} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Assumir atendimento temporariamente</button>
               </>
             )}
           </div>
@@ -1481,26 +1489,26 @@ function ChatPanel() {
           ) : null}
           <div className={`composer-shell ${recording ? "is-recording" : ""}`}>
             <div className="composer-menu" ref={attachMenuRef}>
-              <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={!selectedContact || busySend || busyUpload || busyAudio || Boolean(correctionTarget)} aria-label="Abrir menu de anexos"><PlusIcon /></button>
+              <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={readOnly || (!selectedContact || busySend || busyUpload || busyAudio || Boolean(correctionTarget))} aria-label="Abrir menu de anexos" title={readOnly ? READ_ONLY_TOOLTIP : undefined}><PlusIcon /></button>
               {ctx.can("enviar_nota_interna") ? (
-                <button type="button" className="composer-icon" disabled={busySend || Boolean(correctionTarget)} onClick={() => setInternalMode(!internalMode)} title={internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)"} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
+                <button type="button" className="composer-icon" disabled={readOnly || (busySend || Boolean(correctionTarget))} onClick={() => setInternalMode(!internalMode)} title={readOnly ? READ_ONLY_TOOLTIP : (internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)")} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
               ) : null}
               {showAttachMenu ? (
                 <div className="attach-menu">
-                  <button type="button" className="attach-option" onClick={openImagePicker}><PhotoIcon /><span>Foto</span></button>
-                  <button type="button" className="attach-option" onClick={openVideoPicker}><VideoIcon /><span>Vídeo</span></button>
-                  <button type="button" className="attach-option" onClick={openDocPicker}><FileIcon /><span>Documento</span></button>
-                  <button type="button" className="attach-option" onClick={() => void sendLocation()}><MapPinIcon /><span>Localização</span></button>
+                  <button type="button" className="attach-option" onClick={openImagePicker} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><PhotoIcon /><span>Foto</span></button>
+                  <button type="button" className="attach-option" onClick={openVideoPicker} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><VideoIcon /><span>Vídeo</span></button>
+                  <button type="button" className="attach-option" onClick={openDocPicker} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><FileIcon /><span>Documento</span></button>
+                  <button type="button" className="attach-option" onClick={() => void sendLocation()} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><MapPinIcon /><span>Localização</span></button>
                 </div>
               ) : null}
-              <input ref={imageInputRef} type="file" accept="image/*" onChange={handleImageSelected} hidden />
-              <input ref={videoInputRef} type="file" accept="video/*" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Vídeo"); }} hidden />
-              <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden />
+              <input ref={imageInputRef} type="file" accept="image/*" onChange={handleImageSelected} hidden title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+              <input ref={videoInputRef} type="file" accept="video/*" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Vídeo"); }} hidden title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+              <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             </div>
             <div className="composer-field">
-              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={correctionTarget ? "Digite o texto corrigido" : internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title="Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia" disabled={busySend || busyAudio} style={internalMode ? { background: "#fef9c3" } : undefined} />}
+              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={correctionTarget ? "Digite o texto corrigido" : internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title={readOnly ? READ_ONLY_TOOLTIP : ("Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia")} disabled={readOnly || (busySend || busyAudio)} style={internalMode ? { background: "#fef9c3" } : undefined} />}
             </div>
-            <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={!selectedContact || busyUpload || busyComposerAction || (Boolean(correctionTarget) && !hasDraft)} aria-label={correctionTarget ? "Enviar correção" : recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"}>
+            <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={readOnly || (!selectedContact || busyUpload || busyComposerAction || (Boolean(correctionTarget) && !hasDraft))} aria-label={correctionTarget ? "Enviar correção" : recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
               {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : correctionTarget || recording || hasDraft ? <SendIcon /> : <MicIcon />}
             </button>
           </div>
@@ -1532,6 +1540,7 @@ function ChatPanel() {
 // novo/em_atendimento sao estados de passagem e ficam fora do select.
 // A trava real e o 400 do backend (set-attendance); aqui e UX.
 function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact; threadId: string; onClose: () => void }) {
+  const { readOnly } = useCrm();
   // `error` renderizado DENTRO do modal: o alert global fica atras do
   // overlay do lightbox — um 400/403 do encerramento ficava invisivel.
   const { setAttendance, busyTransfer, error, systemSettings, userSettings } = useCrm();
@@ -1553,7 +1562,7 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
         {error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{error}</span></div> : null}
         <p className="sub" style={{ marginBottom: "0.8rem" }}>Este lead ainda esta como <strong>{currentLabel}</strong>. Qualifique o desfecho antes de encerrar.</p>
         <label className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Desfecho *</label>
-        <select value={outcome} onChange={(e) => setOutcome(e.target.value)} style={{ width: "100%" }} autoFocus>
+        <select value={outcome} onChange={(e) => setOutcome(e.target.value)} style={{ width: "100%" }} autoFocus title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
           <option value="">Selecione...</option>
           <option value="convertido">Convertido</option>
           <option value="nao_convertido">Nao convertido</option>
@@ -1563,14 +1572,14 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Tags</label>
         <TagDraftEditor draft={tags} onChange={setTags} meta={tagMeta} listId="tag-suggestions-close" onNewLabel={(slug, label) => setTagLabels((prev) => ({ ...prev, [slug]: label }))} />
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Notas de atendimento</label>
-        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={4} style={{ width: "100%" }} />
+        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={4} style={{ width: "100%" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end", marginTop: "1rem" }}>
           <button type="button" className="ghost" onClick={onClose} disabled={busyTransfer}>Cancelar</button>
           <button
             type="button"
             className="primary"
-            disabled={!outcome || busyTransfer}
-            onClick={() => { void (async () => { const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels }); if (ok) onClose(); })(); }}
+            disabled={readOnly || (!outcome || busyTransfer)}
+            onClick={() => { void (async () => { const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels }); if (ok) onClose(); })(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
           >
             {busyTransfer ? "Encerrando..." : "Salvar e encerrar"}
           </button>
@@ -1677,11 +1686,12 @@ function buildTagOptions(globalTags?: TagDef[], personalTags?: TagDef[]): TagDef
 }
 
 function TagChip({ slug, meta, onRemove }: { slug: string; meta: Map<string, TagDef>; onRemove?: () => void }) {
+  const { readOnly } = useCrm();
   const t = meta.get(slug);
   return (
     <span className="chip" style={t?.color ? { background: t.color, color: tagTextColor(t.color) } : undefined}>
       {t?.label || slug}
-      {onRemove ? <button type="button" onClick={onRemove} style={{ marginLeft: 4, background: "none", border: "none", color: "inherit", cursor: "pointer", padding: 0 }} aria-label={`Remover tag ${t?.label || slug}`}>×</button> : null}
+      {onRemove ? <button type="button" onClick={onRemove} style={{ marginLeft: 4, background: "none", border: "none", color: "inherit", cursor: "pointer", padding: 0 }} aria-label={`Remover tag ${t?.label || slug}`} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>×</button> : null}
     </span>
   );
 }
@@ -1690,6 +1700,7 @@ function TagChip({ slug, meta, onRemove }: { slug: string; meta: Map<string, Tag
 // contato e no modal de encerramento. `draft` guarda o que o usuario digitou
 // (rotulo ou slug) — o backend normaliza pro slug canonico no save.
 function TagDraftEditor({ draft, onChange, meta, listId, onNewLabel }: { draft: string[]; onChange: (next: string[]) => void; meta: Map<string, TagDef>; listId: string; onNewLabel?: (slug: string, label: string) => void }) {
+  const { readOnly } = useCrm();
   const [input, setInput] = useState("");
   const atLimit = draft.length >= 12;
   const add = (raw: string) => {
@@ -1718,8 +1729,8 @@ function TagDraftEditor({ draft, onChange, meta, listId, onNewLabel }: { draft: 
         {draft.length === 0 ? <span className="sub" style={{ fontSize: "0.8rem" }}>Sem tags.</span> : null}
       </div>
       <div style={{ display: "flex", gap: "0.4rem" }}>
-        <input list={listId} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(input); } }} placeholder={atLimit ? "Limite de 12 tags por lead" : "Adicionar tag (Enter)"} disabled={atLimit} style={{ flex: 1 }} />
-        <button className="ghost" type="button" onClick={() => add(input)} disabled={atLimit} aria-label="Adicionar tag">+</button>
+        <input list={listId} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(input); } }} placeholder={atLimit ? "Limite de 12 tags por lead" : "Adicionar tag (Enter)"} disabled={readOnly || (atLimit)} style={{ flex: 1 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
+        <button className="ghost" type="button" onClick={() => add(input)} disabled={readOnly || (atLimit)} aria-label="Adicionar tag" title={readOnly ? READ_ONLY_TOOLTIP : undefined}>+</button>
       </div>
       <datalist id={listId}>{Array.from(meta.values()).map((t) => <option key={t.slug} value={t.label} />)}</datalist>
     </>
@@ -1727,6 +1738,7 @@ function TagDraftEditor({ draft, onChange, meta, listId, onNewLabel }: { draft: 
 }
 
 function ContactTagsCard({ contact }: { contact: Contact }) {
+  const { readOnly } = useCrm();
   const { saveContactTags, systemSettings, userSettings, busySave } = useCrm();
   const [draft, setDraft] = useState<string[]>(contact.tags || []);
   const [newLabels, setNewLabels] = useState<Record<string, string>>({});
@@ -1749,12 +1761,13 @@ function ContactTagsCard({ contact }: { contact: Contact }) {
   return (
     <CollapsibleCard title="Tags">
       <TagDraftEditor draft={draft} onChange={setDraft} meta={meta} listId="tag-suggestions-panel" onNewLabel={(slug, label) => setNewLabels((prev) => ({ ...prev, [slug]: label }))} />
-      <button className="primary" style={{ marginTop: "0.6rem" }} onClick={() => { void (async () => { const ok = await saveContactTags(contact.id, draft, newLabels); if (ok) { tagSeedRef.current = { id: contact.id, tags: draft.join("|") }; setNewLabels({}); } })(); }} disabled={busySave}>{busySave ? "Salvando..." : "Salvar tags"}</button>
+      <button className="primary" style={{ marginTop: "0.6rem" }} onClick={() => { void (async () => { const ok = await saveContactTags(contact.id, draft, newLabels); if (ok) { tagSeedRef.current = { id: contact.id, tags: draft.join("|") }; setNewLabels({}); } })(); }} disabled={readOnly || (busySave)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySave ? "Salvando..." : "Salvar tags"}</button>
     </CollapsibleCard>
   );
 }
 
 function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
+  const { readOnly } = useCrm();
   const { fetchTemplates, sendTemplate, reopenConversation, busyTemplate } = useCrm();
   const [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
@@ -1922,7 +1935,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
                           <input
                             style={{ width: "100%", padding: "0.4rem 0.6rem" }}
                             value={vars[`header_${n}`] || ""}
-                            onChange={(e) => setVars((v) => ({ ...v, [`header_${n}`]: e.target.value }))}
+                            onChange={(e) => setVars((v) => ({ ...v, [`header_${n}`]: e.target.value }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}
                           />
                         </div>
                       ))}
@@ -1932,7 +1945,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
                           <input
                             style={{ width: "100%", padding: "0.4rem 0.6rem" }}
                             value={vars[`body_${n}`] || ""}
-                            onChange={(e) => setVars((v) => ({ ...v, [`body_${n}`]: e.target.value }))}
+                            onChange={(e) => setVars((v) => ({ ...v, [`body_${n}`]: e.target.value }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}
                           />
                         </div>
                       ))}
@@ -1941,7 +1954,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
 
                   <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
                     <button type="button" className="ghost" onClick={onClose}>Cancelar</button>
-                    <button type="button" className="primary" onClick={() => void submit()} disabled={!canSubmit}>
+                    <button type="button" className="primary" onClick={() => void submit()} disabled={readOnly || (!canSubmit)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
                       {busyTemplate ? "Enviando..." : isReopen ? "Enviar reabertura" : "Enviar template"}
                     </button>
                   </div>
@@ -1971,6 +1984,8 @@ function CollapsibleCard({ title, defaultOpen = true, children }: { title: strin
 }
 
 function DetailPanel() {
+  const { config, readOnly } = useCrm();
+  const [impersonateTarget, setImpersonateTarget] = useState<Operator | null>(null);
   const { bundle, selectedContact, selectedThreadId, selectedConversation, sessionUser, can, canSeeAll, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
   const [bulkFromUser, setBulkFromUser] = useState<number | "">("");
@@ -2063,21 +2078,21 @@ function DetailPanel() {
           ) : null}
 
           <CollapsibleCard title="Qualificacao">
-            <select value={qualification} onChange={(e) => setQualification(e.target.value)}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></select>
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" />
-            <button className="primary" onClick={() => void saveQualification()} disabled={busySave}>{busySave ? "Salvando..." : "Salvar"}</button>
+            <select value={qualification} onChange={(e) => setQualification(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></select>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <button className="primary" onClick={() => void saveQualification()} disabled={readOnly || (busySave)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySave ? "Salvando..." : "Salvar"}</button>
             {can("editar_dono_lead") && selectedContact.assigned_to ? (
-              <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={busyReturnBot} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
+              <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={readOnly || (busyReturnBot)} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
             ) : null}
           </CollapsibleCard>
           <ContactTagsCard contact={selectedContact} />
           {can("transferir_atendimento") ? <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move so este atendimento (thread). O Dono do Lead nao muda.</span>
-            <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
-            <select value={toDepartmentId} onChange={(e) => setToDepartmentId(e.target.value ? Number(e.target.value) : "")}><option value="">Manter departamento atual</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-            <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferencia" />
-            <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatorio" />
-            <button className="primary" onClick={() => void transferContact()} disabled={!toUserId || !transferSummary.trim() || busyTransfer}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
+            <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
+            <select value={toDepartmentId} onChange={(e) => setToDepartmentId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Manter departamento atual</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+            <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferencia" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatorio" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <button className="primary" onClick={() => void transferContact()} disabled={readOnly || (!toUserId || !transferSummary.trim() || busyTransfer)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
           </CollapsibleCard> : null}
           {can("editar_dono_lead") ? <ReassignLeadCard /> : null}
         </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
@@ -2090,41 +2105,42 @@ function DetailPanel() {
 
         {can("buscar_protocolo") ? <ProtocolSearchCard /> : null}
 
-        {can("gerenciar_usuarios") ? (
+        {can("gerenciar_usuarios") || (config?.feature_impersonate && can("ver_como_usuario") && sessionUser?.role === "admin") ? (
           <CollapsibleCard title={can("gerenciar_perfis_acesso") ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
             <div className="admin-user-list">{operators.map((op) => (
               <div key={op.id} className="admin-user-row">
                 <div className="admin-user-info"><strong>{op.display_name}</strong><span className="sub">{op.email || ""}</span></div>
                 {can("gerenciar_perfis_acesso") && editingUserId === op.id ? (
                   <div className="admin-user-edit">
-                    <select value={editRole} onChange={(e) => { setEditRole(e.target.value); setEditPerfilId(""); }}><option value="admin">admin</option><option value="supervisor">supervisor</option><option value="operador">operador</option></select>
-                    <select value={editPerfilId} onChange={(e) => setEditPerfilId(e.target.value)} title="Perfil de acesso (RBAC)">
+                    <select value={editRole} onChange={(e) => { setEditRole(e.target.value); setEditPerfilId(""); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="admin">admin</option><option value="supervisor">supervisor</option><option value="operador">operador</option></select>
+                    <select value={editPerfilId} onChange={(e) => setEditPerfilId(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : ("Perfil de acesso (RBAC)")} disabled={readOnly}>
                       <option value="">Perfil padrao do cargo</option>
                       {(perfilOptions || []).map((p) => <option key={p.id} value={p.id}>{p.nome}</option>)}
                     </select>
-                    <select value={editDeptId} onChange={(e) => setEditDeptId(e.target.value ? Number(e.target.value) : "")}><option value="">Sem setor</option>{departments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>
+                    <select value={editDeptId} onChange={(e) => setEditDeptId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Sem setor</option>{departments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>
                     <div style={{ display: "flex", gap: "0.4rem" }}>
-                      <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveUserRole(op.id)} disabled={busyRoleUpdate}>{busyRoleUpdate ? "..." : "Salvar"}</button>
+                      <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveUserRole(op.id)} disabled={readOnly || (busyRoleUpdate)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyRoleUpdate ? "..." : "Salvar"}</button>
                       <button className="ghost" style={{ padding: "0.5rem 0.7rem" }} onClick={() => setEditingUserId(null)}>✕</button>
                     </div>
                   </div>
                 ) : coexEditingUserId === op.id ? (
                   <div className="admin-user-edit">
-                    <input type="tel" value={coexPhoneInput} onChange={(e) => setCoexPhoneInput(e.target.value)} placeholder="Numero coex (ex: 5531999990000)" />
+                    <input type="tel" value={coexPhoneInput} onChange={(e) => setCoexPhoneInput(e.target.value)} placeholder="Numero coex (ex: 5531999990000)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                     <span className="sub" style={{ fontSize: "0.66rem", lineHeight: 1.3 }}>Numero corporativo que o operador vai conectar. Libera o Embedded Signup pra ele.</span>
                     <div style={{ display: "flex", gap: "0.4rem" }}>
-                      <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveCoex(op.id)} disabled={busyCoexUpdate}>{busyCoexUpdate ? "..." : "Salvar"}</button>
-                      {op.coex_authorized ? <button className="ghost" style={{ padding: "0.5rem 0.7rem", color: "var(--danger)" }} onClick={() => void revokeCoex(op.id)} disabled={busyCoexUpdate} title="Revogar autorizacao">⊘</button> : null}
+                      <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveCoex(op.id)} disabled={readOnly || (busyCoexUpdate)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyCoexUpdate ? "..." : "Salvar"}</button>
+                      {op.coex_authorized ? <button className="ghost" style={{ padding: "0.5rem 0.7rem", color: "var(--danger)" }} onClick={() => void revokeCoex(op.id)} disabled={readOnly || (busyCoexUpdate)} title={readOnly ? READ_ONLY_TOOLTIP : ("Revogar autorizacao")}>⊘</button> : null}
                       <button className="ghost" style={{ padding: "0.5rem 0.7rem" }} onClick={() => cancelEditCoex()}>✕</button>
                     </div>
                   </div>
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: "0.25rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <span className="chip" style={{ fontSize: "0.68rem" }}>{op.role}</span>
+                    {config?.feature_impersonate && can("ver_como_usuario") && sessionUser?.role === "admin" && !readOnly && op.id !== sessionUser?.id && op.role !== "admin" && op.firebase_uid && op.is_active !== 0 ? <button type="button" className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => setImpersonateTarget(op)}>Ver como</button> : null}
                     {op.coex_authorized ? <span className="chip" style={{ fontSize: "0.62rem" }} title={op.coex_phone ? `Coex liberado: ${op.coex_phone}` : "Coex liberado"}>📱 Coex</span> : null}
-                    {can("gerenciar_perfis_acesso") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)}>Editar</button>}
-                    {can("autorizar_coex_para_operador") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditCoex(op)} title="Autorizar WhatsApp coexistence do operador">Coex</button>}
-                    <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} disabled={busyResetCounter === op.id} onClick={() => void resetAssumeCounter(op.id, op.display_name)} title="Resetar contador">{busyResetCounter === op.id ? "..." : "Reset"}</button>
+                    {can("gerenciar_perfis_acesso") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditUser(op)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Editar</button>}
+                    {can("autorizar_coex_para_operador") && <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} onClick={() => startEditCoex(op)} title={readOnly ? READ_ONLY_TOOLTIP : ("Autorizar WhatsApp coexistence do operador")} disabled={readOnly}>Coex</button>}
+                    <button className="ghost" style={{ padding: "0.2rem 0.4rem", fontSize: "0.72rem" }} disabled={readOnly || (busyResetCounter === op.id)} onClick={() => void resetAssumeCounter(op.id, op.display_name)} title={readOnly ? READ_ONLY_TOOLTIP : ("Resetar contador")}>{busyResetCounter === op.id ? "..." : "Reset"}</button>
                   </div>
                 )}
               </div>
@@ -2135,24 +2151,25 @@ function DetailPanel() {
         {can("editar_dono_lead") ? (
           <CollapsibleCard title="Reatribuicao em lote" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Reatribuir todos os contatos de um operador:</span>
-            <select value={bulkFromUser} onChange={(e) => setBulkFromUser(e.target.value ? Number(e.target.value) : "")}>
+            <select value={bulkFromUser} onChange={(e) => setBulkFromUser(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
               <option value="">Selecione operador de origem</option>
               {operators.map((op) => <option key={op.id} value={op.id}>{op.display_name}</option>)}
             </select>
-            <select value={bulkAction} onChange={(e) => setBulkAction(e.target.value as "return_to_bot" | "transfer")}>
+            <select value={bulkAction} onChange={(e) => setBulkAction(e.target.value as "return_to_bot" | "transfer")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
               <option value="return_to_bot">Devolver ao bot</option>
               <option value="transfer">Transferir para operador</option>
             </select>
             {bulkAction === "transfer" ? (
-              <select value={bulkToUser} onChange={(e) => setBulkToUser(e.target.value ? Number(e.target.value) : "")}>
+              <select value={bulkToUser} onChange={(e) => setBulkToUser(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                 <option value="">Selecione operador destino</option>
                 {operators.filter((op) => op.id !== bulkFromUser).map((op) => <option key={op.id} value={op.id}>{op.display_name}</option>)}
               </select>
             ) : null}
-            <button className="primary" style={{ marginTop: "0.4rem" }} disabled={!bulkFromUser || (bulkAction === "transfer" && !bulkToUser) || busyBulk} onClick={() => { if (confirm("Reatribuir TODOS os contatos deste operador?")) void executeBulkReassign(); }}>{busyBulk ? "Processando..." : "Executar reatribuicao"}</button>
+            <button className="primary" style={{ marginTop: "0.4rem" }} disabled={readOnly || (!bulkFromUser || (bulkAction === "transfer" && !bulkToUser) || busyBulk)} onClick={() => { if (confirm("Reatribuir TODOS os contatos deste operador?")) void executeBulkReassign(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyBulk ? "Processando..." : "Executar reatribuicao"}</button>
           </CollapsibleCard>
         ) : null}
       </div>
+      {impersonateTarget ? <ImpersonateModal target={impersonateTarget} onClose={() => setImpersonateTarget(null)} /> : null}
     </aside>
   );
 }
@@ -2185,6 +2202,7 @@ type SignupDiag = {
 };
 
 function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "coexistence" | "standard" }) {
+  const { readOnly } = useCrm();
   const { bundle, setShowSettings, operators, sessionUser, can } = useCrm();
   const isStandard = channelType === "standard";
   // Admin/supervisor conecta o coex NO CELULAR de outro operador (sem a senha
@@ -2410,7 +2428,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             {canPickOwner && (
               <div style={{ marginBottom: "1rem" }}>
                 <label htmlFor="coex-owner" style={{ display: "block", fontWeight: 600, marginBottom: "0.35rem" }}>De quem e o numero que sera conectado?</label>
-                <select id="coex-owner" value={ownerChoice} onChange={(e) => setOwnerChoice(e.target.value)} style={{ width: "100%" }}>
+                <select id="coex-owner" value={ownerChoice} onChange={(e) => setOwnerChoice(e.target.value)} style={{ width: "100%" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                   <option value="">Selecione o operador dono do numero...</option>
                   {coexOwnerOptions.map((op) => (
                     <option key={op.id} value={String(op.id)} disabled={!op.firebase_uid}>
@@ -2426,7 +2444,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
                 </p>
               </div>
             )}
-            <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup} disabled={canPickOwner && !ownerChoice}>
+            <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup} disabled={readOnly || (canPickOwner && !ownerChoice)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
               {isStandard ? "Conectar numero (Cloud API)" : "Iniciar Embedded Signup"}
             </button>
           </div>
@@ -2493,6 +2511,7 @@ WHATSAPP_WABA_ID=${result.waba_id || "???"}`}
 }
 
 function SettingsModals() {
+  const { readOnly } = useCrm();
   const { showSettings, setShowSettings, sessionUser, systemSettings, setSystemSettings, userSettings, setUserSettings, busySettings, saveUserSettingsAction, saveSystemSettingsAction, can, monitorEnabled } = useCrm();
   if (!sessionUser) return null;
   return (
@@ -2506,11 +2525,11 @@ function SettingsModals() {
               <h3>Prefixo de mensagem</h3>
               {systemSettings.chat_prefix_roles.includes(sessionUser.role) ? (
                 <div className="settings-block">
-                  <label className="settings-toggle"><input type="checkbox" checked={userSettings.chat_prefix_enabled} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} /><span>Usar prefixo (ex: <strong>Rafael:</strong> Bom dia...)</span></label>
-                  {userSettings.chat_prefix_enabled && <input value={userSettings.chat_prefix_name} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_name: e.target.value }))} placeholder="Nome que aparecera como prefixo" style={{ marginTop: "0.5rem" }} />}
+                  <label className="settings-toggle"><input type="checkbox" checked={userSettings.chat_prefix_enabled} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>Usar prefixo (ex: <strong>Rafael:</strong> Bom dia...)</span></label>
+                  {userSettings.chat_prefix_enabled && <input value={userSettings.chat_prefix_name} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_name: e.target.value }))} placeholder="Nome que aparecera como prefixo" style={{ marginTop: "0.5rem" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />}
                 </div>
               ) : <div className="empty" style={{ fontSize: "0.88rem" }}>Prefixo de mensagem nao habilitado para seu cargo.</div>}
-              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar"}</button>
+              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar"}</button>
             </div>
           </div>
         </div>
@@ -2531,7 +2550,7 @@ function SettingsModals() {
                   max={systemSettings.quick_message_max}
                 />
               </div>
-              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar"}</button>
+              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar"}</button>
             </div>
           </div>
         </div>
@@ -2561,21 +2580,23 @@ function SettingsModals() {
 // ---------------------------------------------------------------------------
 
 function TagEditorRows({ tags, onChange }: { tags: TagDef[]; onChange: (next: TagDef[]) => void }) {
+  const { readOnly } = useCrm();
   return (
     <div className="settings-block">
       {tags.map((t, idx) => (
         <div key={idx} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.4rem", alignItems: "center" }}>
-          <input value={t.label} onChange={(e) => { const u = [...tags]; u[idx] = { ...u[idx], label: e.target.value }; onChange(u); }} placeholder="Nome da tag (ex: varizes)" style={{ flex: 1 }} />
-          <input type="color" value={t.color || "#334155"} onChange={(e) => { const u = [...tags]; u[idx] = { ...u[idx], color: e.target.value }; onChange(u); }} title="Cor da tag" style={{ width: 44, padding: 2, height: 34 }} />
-          <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => onChange(tags.filter((_, i) => i !== idx))}>X</button>
+          <input value={t.label} onChange={(e) => { const u = [...tags]; u[idx] = { ...u[idx], label: e.target.value }; onChange(u); }} placeholder="Nome da tag (ex: varizes)" style={{ flex: 1 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+          <input type="color" value={t.color || "#334155"} onChange={(e) => { const u = [...tags]; u[idx] = { ...u[idx], color: e.target.value }; onChange(u); }} title={readOnly ? READ_ONLY_TOOLTIP : ("Cor da tag")} style={{ width: 44, padding: 2, height: 34 }} disabled={readOnly} />
+          <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => onChange(tags.filter((_, i) => i !== idx))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>X</button>
         </div>
       ))}
-      <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => onChange([...tags, { slug: "", label: "" }])}>+ Adicionar tag</button>
+      <button className="ghost" style={{ fontSize: "0.85rem", padding: "0.5rem 0.8rem" }} onClick={() => onChange([...tags, { slug: "", label: "" }])} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>+ Adicionar tag</button>
     </div>
   );
 }
 
 function TagsSettingsModal() {
+  const { readOnly } = useCrm();
   const { setShowSettings, systemSettings, userSettings, saveGlobalTags, saveUserTags, busySettings, can, error, notice } = useCrm();
   // Rascunhos LOCAIS (revisao B): editar userSettings direto sujava o estado
   // global ao fechar sem salvar, e o re-seed incondicional perdia a digitacao
@@ -2599,14 +2620,14 @@ function TagsSettingsModal() {
             <h3>Tags globais do tenant</h3>
             <p className="sub" style={{ marginBottom: "0.6rem" }}>Aparecem no autocomplete de toda a equipe. Mantenha o vocabulario oficial aqui (ex.: varizes, hemorroidas, convenio, retorno).</p>
             <TagEditorRows tags={globalDraft} onChange={(next) => { globalDirty.current = true; setGlobalDraft(next); }} />
-            <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveGlobalTags(globalDraft)) globalDirty.current = false; })(); }} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar tags globais"}</button>
+            <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveGlobalTags(globalDraft)) globalDirty.current = false; })(); }} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar tags globais"}</button>
           </div>
         ) : null}
         <div className="settings-section" style={{ marginTop: can("gerenciar_tags_globais") ? "1.2rem" : 0 }}>
           <h3>Minhas tags</h3>
           <p className="sub" style={{ marginBottom: "0.6rem" }}>Criadas automaticamente quando voce aplica uma tag nova num lead. So aparecem no seu autocomplete.</p>
           <TagEditorRows tags={personalDraft} onChange={(next) => { personalDirty.current = true; setPersonalDraft(next); }} />
-          <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveUserTags(personalDraft)) personalDirty.current = false; })(); }} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar minhas tags"}</button>
+          <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveUserTags(personalDraft)) personalDirty.current = false; })(); }} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar minhas tags"}</button>
         </div>
       </div>
     </div>
@@ -2668,6 +2689,7 @@ const REOPEN_SKIP_LABELS: Record<string, string> = {
 };
 
 function ReopenBatchModal() {
+  const { readOnly } = useCrm();
   const { bundle, setShowSettings, can } = useCrm();
   const [preview, setPreview] = useState<ReopenPreview | null>(null);
   const [busyPreview, setBusyPreview] = useState(false);
@@ -2801,7 +2823,7 @@ function ReopenBatchModal() {
                 <h3>Disparo</h3>
                 <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", marginBottom: "0.6rem" }}>
                   <label style={{ fontSize: "0.88rem" }}>Limite de envios:</label>
-                  <input type="number" min={1} max={250} value={maxSends} onChange={(e) => setMaxSends(e.target.value)} style={{ width: 90 }} />
+                  <input type="number" min={1} max={250} value={maxSends} onChange={(e) => setMaxSends(e.target.value)} style={{ width: 90 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 </div>
                 {confirming ? (
                   <div className="settings-block" style={{ fontSize: "0.9rem" }}>
@@ -2811,12 +2833,12 @@ function ReopenBatchModal() {
                       Templates fora da janela sao <strong>conversas pagas</strong> na Meta.
                     </p>
                     <div style={{ display: "flex", gap: "0.6rem" }}>
-                      <button className="primary" onClick={() => void executeBatch()} disabled={busyExec}>{busyExec ? "Disparando..." : "Confirmar disparo"}</button>
+                      <button className="primary" onClick={() => void executeBatch()} disabled={readOnly || (busyExec)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyExec ? "Disparando..." : "Confirmar disparo"}</button>
                       <button className="ghost" onClick={() => setConfirming(false)} disabled={busyExec}>Cancelar</button>
                     </div>
                   </div>
                 ) : (
-                  <button className="primary" onClick={() => setConfirming(true)} disabled={busyPreview || busyExec}>Disparar lote</button>
+                  <button className="primary" onClick={() => setConfirming(true)} disabled={readOnly || (busyPreview || busyExec)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Disparar lote</button>
                 )}
               </div>
             ) : null}
@@ -2832,6 +2854,7 @@ function ReopenBatchModal() {
 // ---------------------------------------------------------------------------
 
 function PerfisAcessoModal() {
+  const { readOnly, config } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
@@ -2869,7 +2892,10 @@ function PerfisAcessoModal() {
     setCreating(false);
   }, [selectedId, perfis, catalogo]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const grupos = catalogo.reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
+  // Permissao de recurso desligado nao aparece (o rascunho mantem o valor
+  // salvo, entao salvar o perfil nao a altera).
+  const ocultas = new Set<string>(config?.feature_impersonate ? [] : ["ver_como_usuario"]);
+  const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
     (acc[item.grupo] = acc[item.grupo] || []).push(item);
     return acc;
   }, {});
@@ -2933,19 +2959,19 @@ function PerfisAcessoModal() {
             ))}
             {creating ? (
               <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", border: "1px solid var(--border, #444)", borderRadius: 8, padding: "0.55rem" }}>
-                <input value={newNome} onChange={(e) => setNewNome(e.target.value)} placeholder="Nome do perfil" />
-                <select value={newBase} onChange={(e) => setNewBase(e.target.value)}>
+                <input value={newNome} onChange={(e) => setNewNome(e.target.value)} placeholder="Nome do perfil" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+                <select value={newBase} onChange={(e) => setNewBase(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                   <option value="perfil_operador">Base: Operador</option>
                   <option value="perfil_supervisor">Base: Supervisor</option>
                   <option value="perfil_admin">Base: Administrador</option>
                 </select>
                 <div style={{ display: "flex", gap: "0.35rem" }}>
-                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={busy || !newNome.trim()} onClick={() => void createPerfil()}>{busy ? "..." : "Criar"}</button>
+                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={readOnly || (busy || !newNome.trim())} onClick={() => void createPerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "..." : "Criar"}</button>
                   <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setCreating(false)}>✕</button>
                 </div>
               </div>
             ) : (
-              <button type="button" className="ghost" style={{ padding: "0.5rem" }} onClick={() => setCreating(true)}>+ Novo perfil</button>
+              <button type="button" className="ghost" style={{ padding: "0.5rem" }} onClick={() => setCreating(true)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>+ Novo perfil</button>
             )}
           </div>
 
@@ -2953,8 +2979,8 @@ function PerfisAcessoModal() {
           {selected ? (
             <div style={{ flex: "1 1 380px", minWidth: 300 }}>
               <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem", flexWrap: "wrap" }}>
-                <input value={draftNome} onChange={(e) => setDraftNome(e.target.value)} disabled={selected.is_system_locked} style={{ flex: "1 1 180px" }} />
-                <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} />
+                <input value={draftNome} onChange={(e) => setDraftNome(e.target.value)} disabled={readOnly || (selected.is_system_locked)} style={{ flex: "1 1 180px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
+                <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               </div>
               {selected.is_system_locked ? (
                 <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: todas as permissoes ficam sempre ligadas (e o teto do tenant — protecao contra auto-bloqueio). Para um perfil administrativo limitado, crie um perfil customizado com base Administrador.</p>
@@ -2970,8 +2996,8 @@ function PerfisAcessoModal() {
                           <input
                             type="checkbox"
                             checked={draftToggles[item.chave] === true}
-                            disabled={locked || busy}
-                            onChange={(e) => setDraftToggles((prev) => ({ ...prev, [item.chave]: e.target.checked }))}
+                            disabled={readOnly || (locked || busy)}
+                            onChange={(e) => setDraftToggles((prev) => ({ ...prev, [item.chave]: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
                           />
                           <span>{item.rotulo}{locked ? " 🔒" : ""}</span>
                         </label>
@@ -2981,9 +3007,9 @@ function PerfisAcessoModal() {
                 </div>
               ))}
               <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.8rem" }}>
-                <button className="primary" disabled={busy || !draftNome.trim()} onClick={() => void savePerfil()}>{busy ? "Salvando..." : "Salvar perfil"}</button>
+                <button className="primary" disabled={readOnly || (busy || !draftNome.trim())} onClick={() => void savePerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "Salvando..." : "Salvar perfil"}</button>
                 {!selected.is_seed && !selected.is_system_locked ? (
-                  <button className="ghost" style={{ color: "var(--danger)" }} disabled={busy} onClick={() => void removePerfil()}>Excluir</button>
+                  <button className="ghost" style={{ color: "var(--danger)" }} disabled={readOnly || (busy)} onClick={() => void removePerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>Excluir</button>
                 ) : null}
               </div>
             </div>
@@ -3032,6 +3058,7 @@ function DashboardBody() {
         getJson<Record<string, unknown>>(bundle.auth, `/api/admin/dashboard/summary?date_from=${dateFrom}&date_to=${dateTo}`),
         getJson<{ ratings: Record<string, unknown>[] }>(bundle.auth, `/api/admin/dashboard/ratings?date_from=${dateFrom}&date_to=${dateTo}`),
       ]);
+      if (!isFirebaseSessionActive(bundle.auth)) return;
       setSummary(sumRes);
       setRatings(ratRes.ratings || []);
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
@@ -3046,13 +3073,10 @@ function DashboardBody() {
   };
 
   const exportCsv = useCallback(async () => {
-    if (!bundle) return;
+    if (!bundle || !isFirebaseSessionActive(bundle.auth)) return;
     try {
-      const token = await bundle.auth.currentUser?.getIdToken();
-      const resp = await fetch(`/api/admin/export?date_from=${dateFrom}&date_to=${dateTo}&format=csv`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const blob = await resp.blob();
+      const blob = await getDownload(bundle.auth, `/api/admin/export?date_from=${dateFrom}&date_to=${dateTo}&format=csv`);
+      if (!isFirebaseSessionActive(bundle.auth)) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a"); a.href = url; a.download = `export_${dateFrom}_${dateTo}.csv`; a.click();
       URL.revokeObjectURL(url);
@@ -3176,6 +3200,7 @@ function DashboardBody() {
 // ---------------------------------------------------------------------------
 
 function AdminSettingsModal() {
+  const { readOnly } = useCrm();
   const {
     bundle, setShowSettings, departments, channels, operators,
     systemSettings, setSystemSettings, savedSystemSettings, busySettings, saveSystemSettingsAction,
@@ -3294,11 +3319,11 @@ function AdminSettingsModal() {
           <>
             <div className="settings-section">
               <h3>Prefixo de mensagem</h3>
-              <div className="settings-block"><label className="settings-toggle"><input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} /><span>Habilitar prefixo de mensagem (padrao do sistema)</span></label></div>
+              <div className="settings-block"><label className="settings-toggle"><input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>Habilitar prefixo de mensagem (padrao do sistema)</span></label></div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Cargos que podem usar prefixo:</span>
                 {["admin", "supervisor", "operador"].map((role) => (
-                  <label key={role} className="settings-toggle" style={{ marginBottom: "0.25rem" }}><input type="checkbox" checked={systemSettings.chat_prefix_roles.includes(role)} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_roles: e.target.checked ? [...prev.chat_prefix_roles, role] : prev.chat_prefix_roles.filter((r) => r !== role) }))} /><span>{role}</span></label>
+                  <label key={role} className="settings-toggle" style={{ marginBottom: "0.25rem" }}><input type="checkbox" checked={systemSettings.chat_prefix_roles.includes(role)} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_roles: e.target.checked ? [...prev.chat_prefix_roles, role] : prev.chat_prefix_roles.filter((r) => r !== role) }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>{role}</span></label>
                 ))}
               </div>
             </div>
@@ -3306,7 +3331,7 @@ function AdminSettingsModal() {
               <h3>Mensagens rapidas</h3>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Limite por usuario:</span>
-                <input type="number" min={1} max={100} value={systemSettings.quick_message_max} onChange={(e) => setSystemSettings((prev) => ({ ...prev, quick_message_max: Math.max(1, Number(e.target.value) || 1) }))} style={{ width: 100 }} />
+                <input type="number" min={1} max={100} value={systemSettings.quick_message_max} onChange={(e) => setSystemSettings((prev) => ({ ...prev, quick_message_max: Math.max(1, Number(e.target.value) || 1) }))} style={{ width: 100 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               </div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens globais (padrao para todos):</span>
@@ -3318,7 +3343,7 @@ function AdminSettingsModal() {
               <h3>Bot de atendimento</h3>
               <div className="settings-block">
                 <label className="settings-toggle">
-                  <input type="checkbox" checked={systemSettings.bot_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, bot_enabled: e.target.checked }))} />
+                  <input type="checkbox" checked={systemSettings.bot_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, bot_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                   <span>Habilitar bot (coleta nome, equipamento e setor antes de encaminhar)</span>
                 </label>
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Quando desabilitado, mensagens novas caem direto para "Novos".</p>
@@ -3331,7 +3356,7 @@ function AdminSettingsModal() {
                 <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
                   <span>Data da política de privacidade em vigor</span>
                   <input type="date" value={lgpdDateDraft} max={lgpdTodayBr} style={{ width: 180 }}
-                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_policy_date: e.target.value }))} />
+                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_policy_date: e.target.value }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 </label>
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Use a data de publicação da política que está no ar, não a data de hoje. Quem aceitou antes dessa data verá o aviso de novo na próxima mensagem.</p>
                 {lgpdDateDraft !== lgpdDateSaved ? (
@@ -3346,14 +3371,14 @@ function AdminSettingsModal() {
                 <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
                   <span>Link da política</span>
                   <input type="url" value={systemSettings.lgpd_privacy_url || ""} placeholder="https://... (vazio = usa o link atual)"
-                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_privacy_url: e.target.value }))} />
+                    onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_privacy_url: e.target.value }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 </label>
               </div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Texto do aviso:</span>
                 <textarea value={systemSettings.lgpd_notice || ""} maxLength={900} rows={5} style={{ width: "100%", resize: "vertical" }}
                   placeholder="Vazio = usa o texto atual do aviso."
-                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_notice: e.target.value }))} />
+                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, lgpd_notice: e.target.value }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.75rem" }}>O sistema acrescenta ao final o link da política e a pergunta "Podemos continuar?". {(systemSettings.lgpd_notice || "").length}/900</p>
               </div>
             </div>
@@ -3362,7 +3387,7 @@ function AdminSettingsModal() {
               <div className="settings-block">
                 <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem", fontSize: "0.85rem" }}>
                   <span>Modo da fila</span>
-                  <select value={systemSettings.pool_mode} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_mode: e.target.value === "reception" ? "reception" : "legacy" }))}>
+                  <select value={systemSettings.pool_mode} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_mode: e.target.value === "reception" ? "reception" : "legacy" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                     <option value="legacy">Exclusivo — assumir para falar (padrão)</option>
                     <option value="reception">Recepção — pool compartilhada</option>
                   </select>
@@ -3375,19 +3400,19 @@ function AdminSettingsModal() {
               <p className="sub" style={{ marginBottom: "0.6rem", fontSize: "0.8rem" }}>Quando o lead aceita a LGPD e entra na fila, se nenhum operador assumir ou responder dentro do tempo abaixo, o sistema envia esta mensagem uma única vez. A checagem roda a cada 5 minutos, só dentro do horário de atendimento e da janela de 24h do WhatsApp. Lead que chega fora do expediente começa a contar na abertura.</p>
               <div className="settings-block">
                 <label className="settings-toggle">
-                  <input type="checkbox" checked={systemSettings.pool_wait_notice_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_enabled: e.target.checked }))} />
+                  <input type="checkbox" checked={systemSettings.pool_wait_notice_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                   <span>Enviar aviso quando o lead esperar demais na fila</span>
                 </label>
               </div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Minutos de espera antes do aviso (5 a 240):</span>
-                <input type="number" min={5} max={240} value={systemSettings.pool_wait_notice_minutes} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_minutes: Number(e.target.value) || 0 }))} style={{ width: 100 }} />
+                <input type="number" min={5} max={240} value={systemSettings.pool_wait_notice_minutes} onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_minutes: Number(e.target.value) || 0 }))} style={{ width: 100 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               </div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagem enviada ao cliente:</span>
                 <textarea value={systemSettings.pool_wait_notice_text} maxLength={1000} rows={4} style={{ width: "100%", resize: "vertical" }}
                   placeholder="Ex.: Oi! Estamos com um volume de mensagens acima do normal e ainda não conseguimos te atender por aqui. Para agilizar, você pode ligar para +55 XX XXXX-XXXX..."
-                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_text: e.target.value }))} />
+                  onChange={(e) => setSystemSettings((prev) => ({ ...prev, pool_wait_notice_text: e.target.value }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.75rem" }}>Escreva o telefone com +55 e DDD para o WhatsApp deixá-lo clicável. {(systemSettings.pool_wait_notice_text || "").length}/1000</p>
               </div>
             </div>
@@ -3395,7 +3420,7 @@ function AdminSettingsModal() {
               <h3>Agenda de contatos (picker novo)</h3>
               <div className="settings-block">
                 <label className="settings-toggle">
-                  <input type="checkbox" checked={systemSettings.picker_v2_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, picker_v2_enabled: e.target.checked }))} />
+                  <input type="checkbox" checked={systemSettings.picker_v2_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, picker_v2_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                   <span>Ativar a agenda nova (ordem alfabética + busca profunda) para TODOS</span>
                 </label>
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Abre em páginas de 50 (sem carregar a agenda inteira) e busca em toda a base por começo de nome ou telefone. Desmarcar desliga para todos, EXCETO quem estiver no canário abaixo — pra reverter tudo, desmarque E limpe o canário.</p>
@@ -3407,16 +3432,16 @@ function AdminSettingsModal() {
                     const ids = systemSettings.picker_v2_user_ids || [];
                     const on = ids.includes(o.id);
                     return (
-                      <button key={o.id} type="button" className={on ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} title={o.display_name}
-                        onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: on ? (prev.picker_v2_user_ids || []).filter((i) => i !== o.id) : [...(prev.picker_v2_user_ids || []), o.id] }))}>
+                      <button key={o.id} type="button" className={on ? "primary" : "ghost"} style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }} title={readOnly ? READ_ONLY_TOOLTIP : (o.display_name)}
+                        onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: on ? (prev.picker_v2_user_ids || []).filter((i) => i !== o.id) : [...(prev.picker_v2_user_ids || []), o.id] }))} disabled={readOnly}>
                         {o.display_name.split(" ")[0]}
                       </button>
                     );
                   })}
                   {(systemSettings.picker_v2_user_ids || []).length > 0 ? (
                     <button type="button" className="ghost" style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }}
-                      title="Zera a lista inteira — inclusive ids de usuarios desativados que nao aparecem como chip"
-                      onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: [] }))}>
+                      title={readOnly ? READ_ONLY_TOOLTIP : ("Zera a lista inteira — inclusive ids de usuarios desativados que nao aparecem como chip")}
+                      onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: [] }))} disabled={readOnly}>
                       Limpar canário ({(systemSettings.picker_v2_user_ids || []).length})
                     </button>
                   ) : null}
@@ -3424,7 +3449,7 @@ function AdminSettingsModal() {
               </div>
               <div className="settings-block">
                 <label className="settings-toggle">
-                  <input type="checkbox" checked={systemSettings.picker_tag_filter_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, picker_tag_filter_enabled: e.target.checked }))} />
+                  <input type="checkbox" checked={systemSettings.picker_tag_filter_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, picker_tag_filter_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                   <span>Filtro por 🏷 tag na agenda nova</span>
                 </label>
                 <p className="sub" style={{ marginTop: "0.3rem", fontSize: "0.8rem" }}>Mostra o seletor de tag no picker — só para perfis com a permissão "Filtrar a agenda por tag" (Perfis de acesso; padrão: supervisão). Tags podem revelar dado sensível: ligue por decisão consciente do tenant.</p>
@@ -3433,7 +3458,7 @@ function AdminSettingsModal() {
             {/* Erro do save (ex.: 400 da politica LGPD) visivel DENTRO do modal — o alerta global fica atras do lightbox. */}
             {error ? <div className="alert danger" role="alert" style={{ marginTop: "1rem" }}><span>{error}</span><button type="button" className="alert-close" onClick={() => setError("")} aria-label="Fechar">&#10005;</button></div> : null}
             {notice ? <div className="alert success" style={{ marginTop: "1rem" }}><span>{notice}</span><button type="button" className="alert-close" onClick={() => setNotice("")} aria-label="Fechar">&#10005;</button></div> : null}
-            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
+            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
           </>
         )}
 
@@ -3446,10 +3471,10 @@ function AdminSettingsModal() {
                 <div key={dept.id} className="admin-user-row" style={{ padding: "0.5rem 0.6rem" }}>
                   {editingDeptId === dept.id ? (
                     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", flex: 1 }}>
-                      <input value={editDeptName} onChange={(e) => setEditDeptName(e.target.value)} placeholder="Nome" />
-                      <input value={editDeptDesc} onChange={(e) => setEditDeptDesc(e.target.value)} placeholder="Descricao (opcional)" />
+                      <input value={editDeptName} onChange={(e) => setEditDeptName(e.target.value)} placeholder="Nome" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+                      <input value={editDeptDesc} onChange={(e) => setEditDeptDesc(e.target.value)} placeholder="Descricao (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                       <label className="sub" style={{ fontSize: "0.75rem" }}>Setor do bot (roteamento automatico):</label>
-                      <select value={editDeptBotKey} onChange={(e) => setEditDeptBotKey(e.target.value)}>
+                      <select value={editDeptBotKey} onChange={(e) => setEditDeptBotKey(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                         <option value="">Nenhum (nao recebe do bot)</option>
                         <option value="comercial">Comercial</option>
                         <option value="financeiro">Financeiro</option>
@@ -3457,7 +3482,7 @@ function AdminSettingsModal() {
                         <option value="sac">SAC</option>
                       </select>
                       <div style={{ display: "flex", gap: "0.4rem" }}>
-                        <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={busyDept} onClick={() => void saveDeptEdit(dept.id)}>{busyDept ? "..." : "Salvar"}</button>
+                        <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={readOnly || (busyDept)} onClick={() => void saveDeptEdit(dept.id)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyDept ? "..." : "Salvar"}</button>
                         <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setEditingDeptId(null)}>Cancelar</button>
                       </div>
                     </div>
@@ -3469,8 +3494,8 @@ function AdminSettingsModal() {
                         {dept.description ? <span className="sub">{dept.description}</span> : null}
                       </div>
                       <div style={{ display: "flex", gap: "0.3rem" }}>
-                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} onClick={() => { setEditingDeptId(dept.id); setEditDeptName(dept.name); setEditDeptDesc(dept.description || ""); setEditDeptBotKey(dept.bot_key || ""); }}>Editar</button>
-                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Remover departamento "${dept.name}"?`)) void deleteDept(dept.id); }}>Remover</button>
+                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem" }} onClick={() => { setEditingDeptId(dept.id); setEditDeptName(dept.name); setEditDeptDesc(dept.description || ""); setEditDeptBotKey(dept.bot_key || ""); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Editar</button>
+                        <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Remover departamento "${dept.name}"?`)) void deleteDept(dept.id); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Remover</button>
                       </div>
                     </>
                   )}
@@ -3479,16 +3504,16 @@ function AdminSettingsModal() {
             </div>
             <div style={{ marginTop: "1rem", display: "flex", flexDirection: "column", gap: "0.4rem", borderTop: "1px solid var(--border)", paddingTop: "0.8rem" }}>
               <span className="sub">Novo departamento:</span>
-              <input value={newDeptName} onChange={(e) => setNewDeptName(e.target.value)} placeholder="Nome do departamento" />
-              <input value={newDeptDesc} onChange={(e) => setNewDeptDesc(e.target.value)} placeholder="Descricao (opcional)" />
-              <select value={newDeptBotKey} onChange={(e) => setNewDeptBotKey(e.target.value)}>
+              <input value={newDeptName} onChange={(e) => setNewDeptName(e.target.value)} placeholder="Nome do departamento" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+              <input value={newDeptDesc} onChange={(e) => setNewDeptDesc(e.target.value)} placeholder="Descricao (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+              <select value={newDeptBotKey} onChange={(e) => setNewDeptBotKey(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                 <option value="">Setor do bot: Nenhum</option>
                 <option value="comercial">Setor do bot: Comercial</option>
                 <option value="financeiro">Setor do bot: Financeiro</option>
                 <option value="administrativo">Setor do bot: Administrativo</option>
                 <option value="sac">Setor do bot: SAC</option>
               </select>
-              <button className="primary" style={{ padding: "0.5rem" }} disabled={!newDeptName.trim() || busyDept} onClick={() => void createDept()}>{busyDept ? "Criando..." : "Criar departamento"}</button>
+              <button className="primary" style={{ padding: "0.5rem" }} disabled={readOnly || (!newDeptName.trim() || busyDept)} onClick={() => void createDept()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyDept ? "Criando..." : "Criar departamento"}</button>
             </div>
           </div>
         )}
@@ -3520,7 +3545,7 @@ function AdminSettingsModal() {
                           {ch.is_active ? "Ativo" : "Inativo"}
                         </span>
                         {ch.channel_type !== "standard" && (
-                          <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Desativar canal "${ch.label}"?`)) void deactivateChannel(ch.id); }}>Desativar</button>
+                          <button className="ghost" style={{ padding: "0.3rem 0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => { if (confirm(`Desativar canal "${ch.label}"?`)) void deactivateChannel(ch.id); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Desativar</button>
                         )}
                       </div>
                     </div>
@@ -3544,6 +3569,7 @@ function AdminSettingsModal() {
 }
 
 function NotificationsTab() {
+  const { readOnly } = useCrm();
   const { bundle, departments, systemSettings, setSystemSettings, busySettings, saveSystemSettingsAction, setError, setNotice, error, notice } = useCrm();
   const [uploadingNotif, setUploadingNotif] = useState(false);
   const [uploadingAlarm, setUploadingAlarm] = useState(false);
@@ -3585,20 +3611,20 @@ function NotificationsTab() {
         <p className="sub" style={{ marginBottom: "0.6rem" }}>Todos os usuarios ouvem um beep quando chega mensagem nova numa conversa das caixas Novos/Recepcao ou Meus. Equipe, Bot, Backup e Nao qualificados nao fazem som.</p>
         <div className="settings-block">
           <label className="settings-toggle">
-            <input type="checkbox" checked={systemSettings.notification_sound_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, notification_sound_enabled: e.target.checked }))} />
+            <input type="checkbox" checked={systemSettings.notification_sound_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, notification_sound_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <span>Habilitar som de notificacao</span>
           </label>
         </div>
         <div className="settings-block" style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.4rem" }}>
-          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => notifFileRef.current?.click()} disabled={uploadingNotif}>
+          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => notifFileRef.current?.click()} disabled={readOnly || (uploadingNotif)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
             {uploadingNotif ? "Enviando..." : systemSettings.notification_sound_path ? "Trocar som" : "Upload som personalizado"}
           </button>
           {systemSettings.notification_sound_path && <span className="sub" style={{ fontSize: "0.75rem" }}>Personalizado ativo</span>}
           <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => testSound(systemSettings.notification_sound_path, 880)} title="Testar som">Testar</button>
           {systemSettings.notification_sound_path && (
-            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, notification_sound_path: "" }))}>Usar padrao</button>
+            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, notification_sound_path: "" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Usar padrao</button>
           )}
-          <input ref={notifFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "notification"); }} />
+          <input ref={notifFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "notification"); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         </div>
       </div>
 
@@ -3607,13 +3633,13 @@ function NotificationsTab() {
         <p className="sub" style={{ marginBottom: "0.6rem" }}>Alarme sonoro para usuarios dos departamentos selecionados: toca ao entrar e depois a cada 30 s enquanto houver conversa nas caixas Novos/Recepcao ou Meus com mensagem nao lida cuja ultima mensagem do cliente tem mais tempo que o limite abaixo. Para quando a conversa e aberta (exceto com "So espiar" ligado, modo de admin/supervisor que nao marca como lida).</p>
         <div className="settings-block">
           <label className="settings-toggle">
-            <input type="checkbox" checked={systemSettings.alarm_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_enabled: e.target.checked }))} />
+            <input type="checkbox" checked={systemSettings.alarm_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <span>Habilitar alarme</span>
           </label>
         </div>
         <div className="settings-block" style={{ marginTop: "0.6rem" }}>
           <span className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Tempo sem resposta (minutos):</span>
-          <input type="number" min={1} max={60} value={systemSettings.alarm_threshold_minutes} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_threshold_minutes: Math.max(1, Number(e.target.value) || 5) }))} style={{ width: 100 }} />
+          <input type="number" min={1} max={60} value={systemSettings.alarm_threshold_minutes} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_threshold_minutes: Math.max(1, Number(e.target.value) || 5) }))} style={{ width: 100 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         </div>
         <div className="settings-block" style={{ marginTop: "0.6rem" }}>
           <span className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Departamentos que recebem alarme:</span>
@@ -3624,22 +3650,22 @@ function NotificationsTab() {
                 alarm_department_ids: e.target.checked
                   ? [...(prev.alarm_department_ids || []), dept.id]
                   : (prev.alarm_department_ids || []).filter((id) => id !== dept.id),
-              }))} />
+              }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               <span>{dept.name}</span>
             </label>
           ))}
           {departments.length === 0 && <span className="sub">Nenhum departamento cadastrado.</span>}
         </div>
         <div className="settings-block" style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.6rem" }}>
-          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => alarmFileRef.current?.click()} disabled={uploadingAlarm}>
+          <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => alarmFileRef.current?.click()} disabled={readOnly || (uploadingAlarm)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
             {uploadingAlarm ? "Enviando..." : systemSettings.alarm_sound_path ? "Trocar alarme" : "Upload alarme personalizado"}
           </button>
           {systemSettings.alarm_sound_path && <span className="sub" style={{ fontSize: "0.75rem" }}>Personalizado ativo</span>}
           <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => testSound(systemSettings.alarm_sound_path, 660)} title="Testar alarme">Testar</button>
           {systemSettings.alarm_sound_path && (
-            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, alarm_sound_path: "" }))}>Usar padrao</button>
+            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, alarm_sound_path: "" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Usar padrao</button>
           )}
-          <input ref={alarmFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "alarm"); }} />
+          <input ref={alarmFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "alarm"); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         </div>
       </div>
 
@@ -3648,7 +3674,7 @@ function NotificationsTab() {
         <p className="sub" style={{ marginBottom: "0.6rem" }}>Ligada, o encerramento manual envia junto do protocolo a pergunta "como voce avalia o atendimento?" com botoes Ruim / Bom / Excelente. Dentro da janela de 24h a mensagem e gratuita; fora dela vai por template aprovado (conversa paga iniciada pela empresa). A nota do cliente fica visivel apenas para administradores e supervisores.</p>
         <div className="settings-block">
           <label className="settings-toggle">
-            <input type="checkbox" checked={systemSettings.rating_request_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, rating_request_enabled: e.target.checked }))} />
+            <input type="checkbox" checked={systemSettings.rating_request_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, rating_request_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <span>Perguntar avaliacao ao encerrar atendimento</span>
           </label>
         </div>
@@ -3659,7 +3685,7 @@ function NotificationsTab() {
         <p className="sub" style={{ marginBottom: "0.6rem" }}>Com esta opcao ligada, o sistema fecha sozinho (a cada 30 min) atendimentos parados ha mais de 24h sem mensagem. Desligada, nenhuma conversa atendida fecha sozinha — o encerramento passa a ser sempre manual.{systemSettings.pool_mode === "reception" ? " Em qualquer caso, leads entregues pela recepcao que nunca receberam resposta humana voltam ao assistente virtual apos 7 dias (valvula de seguranca)." : ""}</p>
         <div className="settings-block">
           <label className="settings-toggle">
-            <input type="checkbox" checked={systemSettings.auto_close_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, auto_close_enabled: e.target.checked }))} />
+            <input type="checkbox" checked={systemSettings.auto_close_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, auto_close_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <span>Fechar atendimentos automaticamente por inatividade</span>
           </label>
         </div>
@@ -3668,7 +3694,7 @@ function NotificationsTab() {
       {/* Mesmo save da aba Sistema (objeto inteiro): o 400 aparece aqui tambem. */}
       {error ? <div className="alert danger" role="alert" style={{ marginTop: "1rem" }}><span>{error}</span><button type="button" className="alert-close" onClick={() => setError("")} aria-label="Fechar">&#10005;</button></div> : null}
       {notice ? <div className="alert success" style={{ marginTop: "1rem" }}><span>{notice}</span><button type="button" className="alert-close" onClick={() => setNotice("")} aria-label="Fechar">&#10005;</button></div> : null}
-      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={busySettings}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
+      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
     </>
   );
 }
@@ -3766,14 +3792,16 @@ function BillingHealthBanner() {
 
 
 function CrmApp() {
-  const { booting, config, firebaseUser, sessionUser, error } = useCrm();
+  const { booting, config, firebaseUser, sessionUser, error, impersonationEndMessage, readOnly, impersonationScopeGeneration } = useCrm();
 
   if (booting) return <BootScreen />;
   if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Configuracao invalida</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "O backend deve operar em modo Firebase."}</p></div></div>;
-  if (!firebaseUser || !sessionUser) return <LoginScreen />;
+  if (!firebaseUser || !sessionUser) return impersonationTab
+    ? <div className="screen"><div className="hero-card"><h1>Modo de visualização</h1><p>{impersonationEndMessage || error || (firebaseUser ? "Carregando o acesso..." : "A sessão foi encerrada ou expirou. Gere um novo acesso na aba do administrador.")}</p></div></div>
+    : <LoginScreen />;
 
   return (
-    <>
+    <Fragment key={readOnly ? impersonationScopeGeneration : "normal"}>
       <div className="crm-layout">
         <TopBar />
         <BillingHealthBanner />
@@ -3786,7 +3814,7 @@ function CrmApp() {
       </div>
       <SettingsModals />
       <Lightbox />
-    </>
+    </Fragment>
   );
 }
 
@@ -3797,7 +3825,7 @@ function CrmApp() {
 export default function App() {
   return (
     <CrmProvider>
-      <CrmApp />
+      <ImpersonationLayout><CrmApp /></ImpersonationLayout>
     </CrmProvider>
   );
 }
