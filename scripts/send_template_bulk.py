@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
-r"""Disparo de template APROVADO em lote (campanha), por um canal do CRM.
+r"""Conferencia legada de campanha de template, SEM execucao de envios.
 
-Le uma lista de numeros de um CSV, normaliza/deduplica e manda UM template
-para cada destinatario. Default e DRY-RUN: so envia com --yes.
+Le uma lista de numeros de um CSV e normaliza/deduplica para DRY-RUN.
+ENVIO DESABILITADO: este produtor nao compartilha as reservas/orcamento do CRM.
+--yes falha antes do preflight; o transporte tambem nega chamadas diretas e
+retries. Use a reabertura central apos validar suas politicas. Nao existe
+excecao por --test, nome do tenant ou classificacao informal como servico:
+confirmacoes/lembretes proativos tambem precisam dos limites compartilhados.
 
-PRINCIPIO: o script NAO escreve NADA no Firestore. Ele so LE o doc do canal
-(pra pegar token/phone_id/waba). Quem responder ao template entra pelo webhook
-normal e vira lead pelo funil de sempre (gate LGPD -> bot -> pool). Pre-criar
-contato/conversation aqui seria pior em todos os eixos:
-  - thread vazia sem `bot_completed` nunca fecha no modo recepcao;
-  - thread com `bot_completed=True` MATA o bot (a Val nunca atende);
-  - milhares de threads com last_message_at=agora estouram o listener
-    orderBy(desc).limit(50) e escondem as conversas reais da recepcao;
-  - vira lead ate pra numero que nem tem WhatsApp.
-Deixando o inbound criar, so quem realmente respondeu vira lead.
+O script NAO escreve NADA no Firestore. A conferencia le canal e contatos
+ja existentes do tenant, excluindo identidade ambigua/ausente, falta de aceite
+LGPD, revogacao, opt-out e preferencia comercial. Nao cria contatos ou threads.
+O plano informativo nao equivale a autorizacao para enviar.
 
 O relatorio de saida tem telefone em claro (necessario pra retomada) e por isso
 vive em scripts/_exports/ (ja no .gitignore). O console so mostra mascarado.
@@ -32,17 +30,11 @@ Uso (PowerShell, a partir da raiz do repo):
       --csv scripts\_exports\campanhas\varizemed_todas_20260807_1316.csv `
       --column user_id
 
-  # 2) teste com os 2 numeros combinados (ignora o CSV)
-  .\.venv\Scripts\python.exe -m scripts.send_template_bulk --test --yes
+  # --yes, inclusive com --test, e rejeitado; use o fluxo central de reabertura.
 
-  # 3) campanha real, fatiada (rode 1x por dia respeitando o tier da Meta)
-  .\.venv\Scripts\python.exe -m scripts.send_template_bulk `
-      --csv scripts\_exports\campanhas\varizemed_todas_20260807_1316.csv `
-      --column user_id --max-sends 250 --yes
-
-Retomada: antes de enviar, o script le os relatorios ja existentes da campanha
+Conferencia de retomada: o script le os relatorios ja existentes da campanha
 (o proprio --out e os irmaos <template>_*.csv na mesma pasta) e pula quem tem
-desfecho terminal. Rodar o mesmo comando amanha continua de onde parou.
+desfecho terminal. Isso somente filtra o plano informativo, sem executar envio.
 O nome default do relatorio NAO leva data de proposito — se levasse, a virada
 do dia geraria um arquivo novo, a retomada nao acharia nada e o fatiamento
 reenviaria os MESMOS primeiros N todo dia.
@@ -161,27 +153,71 @@ def fase_da_falha(exc):
     return "incerta"
 
 
-def graph_post(caminho, token, payload, timeout=30):
-    """(http_status, corpo). Status sinteticos: 0 = falha ANTES de enviar
-    (retentar e seguro), -1 = falha DEPOIS de enviar (nao retentar)."""
-    url = "{}/{}".format(GRAPH_BASE, caminho)
-    dados = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=dados, method="POST")
-    req.add_header("Authorization", "Bearer " + token)
-    req.add_header("Content-Type", "application/json")
+def _legacy_bulk_disabled():
+    raise Fatal(
+        "Envio legado por CSV desabilitado: falta integrar o orcamento comum, "
+        "os limites e as preferencias do CRM. Use o fluxo central de reabertura; "
+        "DRY-RUN nao autoriza envio, inclusive para servico ou numeros de teste.")
+
+
+def _commercial_recipient_reason(tenant_id, wa_id):
+    """Conferencia fail-closed por identidade do contato, sem criar registros."""
+    if (not isinstance(tenant_id, str) or not tenant_id.strip()
+            or "/" in tenant_id or "\\" in tenant_id):
+        return "tenant_invalido"
+    from commercial_contact_policy import is_commercial_contact_blocked
+    from database_firestore import wa_id_variants
+    from firestore_common import tenant_collection
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        corpo = exc.read().decode("utf-8", errors="replace")
-        try:
-            return exc.code, json.loads(corpo)
-        except ValueError:
-            return exc.code, {"error": {"message": corpo[:300]}}
-    except Exception as exc:  # noqa: BLE001
-        fase = fase_da_falha(exc)
-        return (0 if fase == "pre" else -1), {
-            "error": {"message": "falha de rede ({}): {}".format(fase, exc)}}
+        matches = {}
+        for variant in wa_id_variants(wa_id):
+            query = (tenant_collection(tenant_id, "wa_contacts")
+                     .where("wa_id", "==", variant).limit(2))
+            for snap in query.stream():
+                matches[snap.id] = snap.to_dict() or {}
+            if len(matches) > 1:
+                return "contato_ambiguo"
+        if not matches:
+            return "contato_ausente"
+        contact = next(iter(matches.values()))
+        if contact.get("tenant_id") not in (None, "", tenant_id):
+            return "tenant_divergente"
+        if int(contact.get("is_archived") or 0) or contact.get("is_backup"):
+            return "contato_indisponivel"
+        if contact.get("lgpd_revoked"):
+            return "lgpd_revogado"
+        if contact.get("lgpd_consent") is not True:
+            return "consentimento_ausente"
+        if contact.get("reopen_opt_out"):
+            return "opt_out_retomada"
+        if is_commercial_contact_blocked(contact):
+            return "commercial_contact_blocked"
+        return ""
+    except Exception:
+        return "verificacao_indisponivel"
+
+
+def filtrar_destinatarios_comerciais(tenant_id, alvos):
+    """Plano informativo; nao concede permissao de envio ao produtor legado."""
+    aceitos, pulados = [], {}
+    for alvo in alvos:
+        reason = _commercial_recipient_reason(tenant_id, alvo.get("wa_id"))
+        if reason:
+            pulados[reason] = pulados.get(reason, 0) + 1
+        else:
+            aceitos.append(alvo)
+    return aceitos, pulados
+
+
+def graph_post(caminho, token, payload, timeout=30, *, tenant_id=None):
+    """Transporte legado desabilitado; nenhum POST pode contornar a politica."""
+    # Toda chamada/retry revalida o destinatario antes do bloqueio do produtor.
+    # Mesmo um contato elegivel nao pode contornar o orcamento compartilhado.
+    reason = _commercial_recipient_reason(tenant_id, (payload or {}).get("to"))
+    if reason:
+        raise Fatal("Destinatario impedido: {}.".format(reason))
+    _legacy_bulk_disabled()
 
 
 # ---------------------------------------------------------------------------
@@ -441,13 +477,15 @@ def classificar(http_status, corpo):
     return "pula", code, subcode, title, msg
 
 
-def enviar_um(phone_id, token, wa_id, template, idioma, tentativas_backoff, pausa_backoff):
+def enviar_um(phone_id, token, wa_id, template, idioma, tentativas_backoff, pausa_backoff,
+              *, tenant_id=None):
     """Envia com retry em erro global. Retorna dict do resultado."""
     payload = montar_payload(wa_id, template, idioma)
     tentativa = 0
     while True:
         tentativa += 1
-        http_status, corpo = graph_post("{}/messages".format(phone_id), token, payload)
+        http_status, corpo = graph_post("{}/messages".format(phone_id), token, payload,
+                                       tenant_id=tenant_id)
         classe, code, subcode, title, msg = classificar(http_status, corpo)
 
         if classe == "ok":
@@ -594,7 +632,7 @@ def filtrar_por_data(alvos, meta, coluna_data, dias):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Dispara um template aprovado para uma lista de numeros.")
+        description="Confere campanha de template; envio legado desabilitado.")
     p.add_argument("--csv", help="CSV com os numeros (obrigatorio sem --test)")
     p.add_argument("--column", default="",
                    help="nome da coluna de telefone (ex.: user_id). Sem isso, "
@@ -610,7 +648,7 @@ def main():
     p.add_argument("--out", default="",
                    help="CSV de relatorio (default: scripts/_exports/campanhas/<template>_<data>.csv)")
     p.add_argument("--max-sends", type=int, default=250,
-                   help="teto de envios NESTA execucao (tier da Meta e por 24h)")
+                   help="limite do plano informativo; nao autoriza envio")
     p.add_argument("--sleep", type=float, default=1.5, help="pausa entre envios (s)")
     p.add_argument("--batch-size", type=int, default=50, help="envios por lote")
     p.add_argument("--batch-pause", type=float, default=60.0, help="pausa entre lotes (s)")
@@ -642,9 +680,11 @@ def main():
                    help="aborta apos N falhas seguidas")
     p.add_argument("--backoff-tentativas", type=int, default=4)
     p.add_argument("--backoff-pausa", type=float, default=15.0)
-    p.add_argument("--yes", action="store_true", help="ENVIA (default: dry-run)")
+    p.add_argument("--yes", action="store_true", help="indisponivel: envio deve usar o fluxo central")
     args = p.parse_args()
 
+    if args.yes:
+        _legacy_bulk_disabled()
     if not args.test and not args.csv:
         p.error("--csv e obrigatorio (ou use --test)")
     if args.since_days and not args.date_column:
@@ -672,6 +712,7 @@ def main():
                                 "{}_{}.csv".format(args.template, sufixo))
 
     print("=" * 72)
+    print("SOMENTE DRY-RUN: o produtor legado nao executa envios.")
     print("CAMPANHA {} | tenant={} canal={} | {}".format(
         args.template, args.tenant, args.channel_id,
         "MODO TESTE" if args.test else "lista do CSV"))
@@ -720,6 +761,9 @@ def main():
 
     if args.sort_recent:
         alvos = ordenar_por_recencia(alvos, meta, args.date_column)
+
+    alvos, recusados_politica = filtrar_destinatarios_comerciais(args.tenant, alvos)
+    print("  exclusoes CRM (identidade/LGPD/opt-out/preferencia): {}".format(recusados_politica or {}))
 
     if not args.include_landline:
         fixos = [a for a in alvos if a["kind"] == "landline"]
@@ -778,7 +822,7 @@ def main():
 
     if not args.yes:
         print()
-        print("DRY-RUN — nada foi enviado. Adicione --yes para disparar.")
+        print("DRY-RUN — nada foi enviado. --yes esta desabilitado; use o fluxo central de reabertura.")
         return 0
 
     # --- envio --------------------------------------------------------------
@@ -795,7 +839,7 @@ def main():
         for i, alvo in enumerate(alvos, start=1):
             wa_id = alvo["wa_id"]
             res = enviar_um(phone_id, token, wa_id, args.template, args.language,
-                            args.backoff_tentativas, args.backoff_pausa)
+                            args.backoff_tentativas, args.backoff_pausa, tenant_id=args.tenant)
 
             if res["classe"] == "ok":
                 enviados += 1

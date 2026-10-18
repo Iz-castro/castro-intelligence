@@ -96,7 +96,7 @@ async function initialData() {
         assigned_to_uid: owner, is_backup: backup, is_archived: 0, last_message_at: name,
       });
     }
-    for (const kind of ["departments", "perfis_acesso", "system_settings", "health_status", "gc_conversations", "gc_messages", "messages", "media_assets", "wa_transfer_log", "audit_log", "audit_metrics", "users", "user_settings", "bot_states", "unknown_collection", "wa_message_status", "internal_unread", "operator_assume_counters", "_meta"])
+    for (const kind of ["departments", "perfis_acesso", "system_settings", "health_status", "gc_conversations", "gc_messages", "messages", "media_assets", "wa_transfer_log", "audit_log", "audit_metrics", "users", "user_settings", "bot_states", "unknown_collection", "wa_message_status", "internal_unread", "operator_assume_counters", "_meta", "crm_tasks", "crm_activities", "webhook_raw_debug", "bot_buffers", "wa_contact_index", "wa_message_index", "attendances_daily", "reopen_batches"])
       await seed(`${root}/${kind}/sample`, { value: "sim" });
     await seed(`${root}/media_assets/sample/chunks/part`, { value: "sim" });
     await seed(`${root}/wa_messages/regular`, { is_backup: false, content: "sim" });
@@ -118,7 +118,7 @@ async function rulesMatrix() {
       const db = dbFor(s);
       const paths = [root, `${root}/operator_profiles/${s.target}`, `${root}/operator_profiles/${ACTOR}`,
         ...["wa_contacts", "wa_conversations"].flatMap((kind) => ["mine", "pool", "null", "other", "backup", "backup-pool", "backup-null"].map((id) => `${root}/${kind}/${id}`)),
-        ...["departments", "perfis_acesso", "system_settings", "health_status", "gc_conversations", "gc_messages", "messages", "media_assets", "wa_transfer_log", "audit_log", "audit_metrics", "users", "user_settings", "bot_states", "unknown_collection", "wa_message_status", "internal_unread", "operator_assume_counters", "_meta"].map((kind) => `${root}/${kind}/sample`),
+        ...["departments", "perfis_acesso", "system_settings", "health_status", "gc_conversations", "gc_messages", "messages", "media_assets", "wa_transfer_log", "audit_log", "audit_metrics", "users", "user_settings", "bot_states", "unknown_collection", "wa_message_status", "internal_unread", "operator_assume_counters", "_meta", "crm_tasks", "crm_activities", "webhook_raw_debug", "bot_buffers", "wa_contact_index", "wa_message_index", "attendances_daily", "reopen_batches"].map((kind) => `${root}/${kind}/sample`),
         `${root}/media_assets/sample/chunks/part`, `${root}/wa_messages/regular`, `${root}/wa_messages/backup`,
         `${root}/impersonation_sessions/${s.sid}`, `${root}/impersonation_sessions/${s.sid}/nested/sample`,
         `${base(prefix, "other-tenant")}/departments/sample`,
@@ -145,12 +145,13 @@ async function rulesMatrix() {
     await deny(`${prefix}: normal nao escreve registry`, setDoc(doc(normal, `${root}/impersonation_sessions/${session.sid}`), session.record));
     await deny(`${prefix}: normal nao le descendente registry`, getDoc(doc(normal, `${root}/impersonation_sessions/${session.sid}/nested/sample`)));
     await deny(`${prefix}: normal nao escreve descendente registry`, setDoc(doc(normal, `${root}/impersonation_sessions/${session.sid}/nested/sample`), { value: "nao" }));
-    if (prefix === "castro_crm_staging") await allow("staging: escrita normal antiga preservada", setDoc(doc(normal, `${root}/wa_contacts/normal-write`), { assigned_to_uid: TARGET }));
-    else {
-      await deny("prod: escrita normal continua negada", setDoc(doc(normal, `${root}/wa_contacts/normal-write`), { assigned_to_uid: TARGET }));
-      await deny("prod: get normal de colega continua negado", getDoc(doc(normal, `${root}/wa_contacts/other`)));
-      await deny("prod: get normal de backup continua negado", getDoc(doc(normal, `${root}/wa_contacts/backup`)));
-    }
+    // Merge do follow-up (2026-10-18): staging fechou a escrita de cliente e
+    // ganhou o mesmo escopo de contato da prod.
+    await deny(`${prefix}: escrita normal negada`, setDoc(doc(normal, `${root}/wa_contacts/normal-write`), { assigned_to_uid: TARGET }));
+    await deny(`${prefix}: get normal de colega negado`, getDoc(doc(normal, `${root}/wa_contacts/other`)));
+    await deny(`${prefix}: get normal de backup negado`, getDoc(doc(normal, `${root}/wa_contacts/backup`)));
+    for (const kind of ["crm_tasks", "crm_activities", "webhook_raw_debug", "bot_buffers", "wa_contact_index", "wa_message_index", "attendances_daily", "reopen_batches"])
+      await deny(`${prefix}: normal nao le ${kind} (so backend)`, getDoc(doc(normal, `${root}/${kind}/sample`)));
     for (const [label, uid, claims] of [["reservado sem imp", session.uid, normalClaims()], ["UID real com imp antigo", TARGET, { ...normalClaims(), ...session.claims }], ["imp malformado", TARGET, { ...normalClaims(), imp: "true" }]]) {
       const blocked = env.authenticatedContext(uid, claims).firestore();
       await deny(`${prefix}: ${label} nao le`, getDoc(doc(blocked, `${root}/departments/sample`)));

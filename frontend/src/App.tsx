@@ -10,6 +10,7 @@ import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
+import { CommercialContactBanner, FollowupEntry } from "./components/followup/FollowupEntry";
 import { ApiError, getDownload, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
 import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
@@ -132,6 +133,7 @@ function TopBar() {
         <span className="sub">{sessionUser.email || sessionUser.username} · <span className="chip">{sessionUser.role}</span>{sessionUser.department_name ? <> · <span className="chip">{sessionUser.department_name}</span></> : null}</span>
       </div>
       <div className="topbar-actions">
+        <FollowupEntry />
         <button className="composer-icon" onClick={toggleTheme} title={theme === "dark" ? "Tema claro" : "Tema escuro"} aria-label="Alternar tema">
           {theme === "dark" ? <SunIcon /> : <MoonIcon />}
         </button>
@@ -1390,6 +1392,7 @@ function ChatPanel() {
         ) : null}
         {showChatSearch ? <div className="toolbar"><input value={chatSearch} onChange={(e) => setChatSearch(e.target.value)} placeholder="Buscar na conversa..." autoFocus />{chatSearch ? <span className="sub">{(visibleMessagesFiltered ?? []).length} resultado(s)</span> : null}</div> : null}
 
+        <CommercialContactBanner contact={selectedContact} />
         <div className="messages" ref={messagesRef}>
           {chatIsEmpty && isManualContact ? (
             <div className="empty" style={{ alignSelf: "center", textAlign: "center", marginTop: "2rem" }}>
@@ -1767,7 +1770,7 @@ function ContactTagsCard({ contact }: { contact: Contact }) {
 }
 
 function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
-  const { readOnly } = useCrm();
+  const { readOnly, config } = useCrm();
   const { fetchTemplates, sendTemplate, reopenConversation, busyTemplate } = useCrm();
   const [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
@@ -1775,6 +1778,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
   const [vars, setVars] = useState<Record<string, string>>({});
   const [loadError, setLoadError] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<"ALL" | "MARKETING" | "UTILITY" | "AUTHENTICATION">("ALL");
+  const [contactPurpose, setContactPurpose] = useState<"commercial" | "service">("commercial");
 
   useEffect(() => {
     let cancelled = false;
@@ -1806,6 +1810,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
 
   function pickTemplate(idx: number) {
     setSelectedIdx(idx);
+    setContactPurpose("commercial");
     const t = templates[idx];
     if (isReopenTemplate(t)) {
       // Reabertura: vars sao so para o preview; o backend recalcula e e a
@@ -1845,11 +1850,13 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
       templateName: selected.name,
       language: selected.language,
       components: components.length ? components : undefined,
+      contactPurpose,
     });
     if (ok) onClose();
   }
 
-  const canSubmit = selected && !busyTemplate && (
+  const blockedCommercial = Boolean(contact?.commercial_contact_block?.active && (isReopen || contactPurpose === "commercial"));
+  const canSubmit = selected && !busyTemplate && !blockedCommercial && (
     isReopen
       ? !!conversationId
       : Array.from({ length: bodyPlaceholders }, (_, i) => `body_${i + 1}`).every((k) => (vars[k] || "").trim())
@@ -1907,6 +1914,16 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
             <div>
               {selected ? (
                 <>
+                  {/* Finalidade so existe com o follow-up ligado; desligado, o envio segue comercial como antes. */}
+                  {config?.feature_followup ? <label htmlFor="template-contact-purpose" style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginBottom: "1rem", fontSize: "0.85rem" }}>
+                    <span>Finalidade deste contato</span>
+                    <select id="template-contact-purpose" value={isReopen ? "commercial" : contactPurpose} disabled={isReopen || busyTemplate} onChange={(event) => setContactPurpose(event.target.value as "commercial" | "service")}>
+                      <option value="commercial">Retomada comercial</option>
+                      <option value="service">Serviço / consulta já marcada</option>
+                    </select>
+                    <span className="sub" style={{ fontSize: "0.75rem" }}>Confirmação, lembrete ou comunicação de serviço pertinente. A categoria Utility da Meta não define a finalidade; reabertura permanece comercial.</span>
+                  </label> : null}
+                  {blockedCommercial && <div className="alert danger" role="alert">O paciente pediu que parem os contatos comerciais. Este envio está impedido; consultas e comunicações de serviço pertinentes seguem suas próprias regras.</div>}
                   <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "0.8rem", background: "#f9fafb", color: "#111", marginBottom: "1rem" }}>
                     <div style={{ fontSize: "0.7rem", marginBottom: "0.3rem", color: "#374151", fontWeight: 600 }}>Preview</div>
                     {preview?.header ? <div style={{ fontWeight: 600, marginBottom: "0.3rem", color: "#111" }}>{preview.header}</div> : null}
@@ -2056,6 +2073,8 @@ function DetailPanel() {
       <div className="panel-head"><div><p className="eyebrow">Contato</p><h2>Operacao</h2></div><span className="sub">{operators.length} operadores - {departments.length} setores</span></div>
       <div className="detail-scroll">
         {selectedContact ? <>
+          <CommercialContactBanner contact={selectedContact} />
+          <FollowupEntry contactId={selectedContact.id} variant="contact" />
           {/* Info do canal */}
           {contactChannel ? (
             <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", opacity: 0.7, display: "flex", gap: "0.3rem", alignItems: "center" }}>
@@ -2666,6 +2685,7 @@ const REOPEN_SKIP_LABELS: Record<string, string> = {
   opt_out: "Cliente pediu para nao ser reaberto",
   ja_resolvido: "Ja encerrado por lote anterior (sem resposta)",
   lgpd_revogado: "Consentimento LGPD revogado",
+  commercial_contact_blocked: "Pediu para nao receber contatos comerciais",
   arquivado: "Lead arquivado",
   backup: "Lead da Caixa Backup",
   canal_invalido: "Canal inativo ou coexistence",
@@ -2894,7 +2914,11 @@ function PerfisAcessoModal() {
 
   // Permissao de recurso desligado nao aparece (o rascunho mantem o valor
   // salvo, entao salvar o perfil nao a altera).
-  const ocultas = new Set<string>(config?.feature_impersonate ? [] : ["ver_como_usuario"]);
+  const ocultas = new Set<string>([
+    ...(config?.feature_impersonate ? [] : ["ver_como_usuario"]),
+    ...(config?.feature_followup ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
+      "registrar_recusa_comercial", "reativar_contato_comercial"]),
+  ]);
   const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
     (acc[item.grupo] = acc[item.grupo] || []).push(item);
     return acc;

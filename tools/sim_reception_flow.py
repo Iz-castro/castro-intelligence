@@ -2093,6 +2093,11 @@ def _seed_publicos(now):
     contato(149, ("janela_aberta",) * 2, last_inbound_at=iso(hours=2))
     contato(150, ("janela_desconhecida",) * 2, last_inbound_at=None)
     contato(151, ("cooldown",) * 2, last_reopen_template_at=iso(hours=3))
+    # Recusa comercial do follow-up (merge 2026-10-18): fora das duas visoes.
+    contato(152, ("commercial_contact_blocked",) * 2,
+            commercial_contact_block={"active": True, "version": 1})
+    # Registro invalido segue bloqueando (falha fechada).
+    contato(153, ("commercial_contact_blocked",) * 2, commercial_contact_block={"active": "sim"})
 
     STORE["wa_contacts"] = contacts
     STORE["wa_conversations"] = threads
@@ -2558,6 +2563,139 @@ def cenario_worker_publico_bot():
         restore_dbf()
 
 
+def cenario_recusa_desfeita_por_mensagem():
+    titulo("CENARIO 27 — Recusa comercial se desfaz quando o PACIENTE escreve (PO 18/10)")
+    patch_store()
+    now = datetime.now(timezone.utc)
+    audits = []
+    real_audit = dbf.log_audit
+    dbf.log_audit = lambda *a, **k: audits.append(a)
+
+    def _reset(updated_at, field=None):
+        bloco = field if field is not None else {
+            "active": True, "version": 1, "updated_at": updated_at,
+            "updated_by_user_id": 7, "updated_by_uid": "uid-7", "reason": "patient_request",
+            "source": "operator_recorded"}
+        STORE["wa_contacts"] = {"80": {"id": 80, "wa_id": "5531980000080", "qualification": "em_atendimento",
+                                       "source_channel_type": "standard", "commercial_contact_block": bloco}}
+        STORE["wa_conversations"] = {}
+        audits.clear()
+
+    def _msg(direction="inbound", ts=None, **kw):
+        contato = dict(STORE["wa_contacts"]["80"])
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=80, direction=direction, msg_type=kw.pop("msg_type", "text"),
+            content="oi", status=kw.pop("status", "received"),
+            timestamp_wa=(ts or now).isoformat(), channel_id=6,
+            conversation_id="6__5531980000080", contact=contato, **kw)
+        return STORE["wa_contacts"]["80"]["commercial_contact_block"]
+
+    try:
+        _reset(now - timedelta(hours=1))
+        b = _msg()
+        check(b.get("active") is False and b.get("version") == 2 and b.get("reason") == "patient_wrote"
+              and b.get("source") == "patient_message",
+              "mensagem nova do paciente DEPOIS da recusa desfaz (versao 2, reason patient_wrote)")
+        check(b.get("updated_by_user_id") is None and b.get("updated_by_uid") is None,
+              "liberacao nao herda o operador que registrou a recusa")
+        check(len(audits) == 1 and audits[0][1] == "COMMERCIAL_CONTACT_UNBLOCK"
+              and "origem=mensagem_do_paciente" in audits[0][2], "liberacao registrada no audit_log")
+        import commercial_contact_policy as _ccp
+        check(_ccp.is_commercial_contact_blocked(STORE["wa_contacts"]["80"]) is False,
+              "contato volta a poder receber retomada comercial")
+        b = _msg()
+        check(b.get("version") == 2 and len(audits) == 1, "nova mensagem com recusa ja desfeita nao regrava")
+
+        _reset(now - timedelta(hours=1))
+        b = _msg(ts=now - timedelta(hours=3))
+        check(b.get("active") is True and not audits,
+              "mensagem ANTERIOR ao registro (historico/reentrega) nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(control_message=True).get("active") is True, "clique de controle (botao) nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(msg_type="reaction").get("active") is True, "reacao nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(status="read").get("active") is True, "historico importado (status != received) nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(direction="outbound", sender_user_id=7).get("active") is True,
+              "mensagem do operador nao desfaz")
+        _reset(None, field={"active": "sim"})
+        check(_msg().get("active") == "sim", "registro invalido segue bloqueando (revisao humana)")
+        _reset((now - timedelta(hours=1)).isoformat())
+        check(_msg().get("active") is False, "updated_at em texto ISO tambem e comparado")
+    finally:
+        dbf.log_audit = real_audit
+        restore_dbf()
+
+
+def cenario_worker_recusa_comercial():
+    titulo("CENARIO 28 — Worker: recusa registrada depois da previa e pulada e contada")
+    import types as _types
+    patch_store()
+    now = datetime.now(timezone.utc)
+    STORE["wa_contacts"] = {
+        "90": {"id": 90, "wa_id": "5531990000090", "channel_id": 6, "qualification": "em_atendimento",
+               "last_inbound_at": (now - timedelta(hours=30)).isoformat(), "unread_count": 0},
+        "91": {"id": 91, "wa_id": "5531990000091", "channel_id": 6, "qualification": "em_atendimento",
+               "last_inbound_at": (now - timedelta(hours=30)).isoformat(), "unread_count": 0},
+    }
+    plano = [dict(STORE["wa_contacts"]["90"]), dict(STORE["wa_contacts"]["91"])]
+    # Recusa registrada DEPOIS da previa (o item do plano nao tem o campo).
+    STORE["wa_contacts"]["90"]["commercial_contact_block"] = {"active": True, "version": 1}
+    posts = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"messages": [{"id": "wamid.REC1"}]}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            posts.append(json["to"])
+            return _Resp()
+
+    async def _sleep(_s):
+        return None
+
+    audits = []
+    real = (main.fs_coll, main.fs_document, main.httpx, main.asyncio,
+            main._resolve_channel_creds_by_id, main.log_audit)
+    main.fs_coll = lambda name: _CollRef(name)
+    main.fs_document = dbf.document
+    main.httpx = _types.SimpleNamespace(AsyncClient=_Client)
+    main.asyncio = _types.SimpleNamespace(sleep=_sleep)
+    main._resolve_channel_creds_by_id = lambda chid: ("tok", "pnid", "https://graph.example")
+    main.log_audit = lambda *a, **k: audits.append(a)
+    try:
+        asyncio.run(main._run_reopen_batch(
+            "t3", 9201, plano, [], {6: dict(_CANAIS3[0])}, {6: _TPL_RETOMADA}, 7, "reception"))
+        lote = STORE["reopen_batches"]["9201"]
+        check(posts == ["5531990000091"], "so o contato sem recusa recebe o template")
+        check(lote.get("pulados_recusa_comercial") == 1 and lote.get("enviados") == 1
+              and lote.get("status") == "concluido",
+              "lote conta o pulo por recusa (enviados < planejados com motivo)")
+        c90 = STORE["wa_contacts"]["90"]
+        check(not c90.get("reopen_attempts") and not c90.get("last_reopen_template_at"),
+              "pulo por recusa nao carimba tentativa nem cooldown")
+        check(any(a[1] == "REOPEN_BATCH_END" and "pulados_recusa=1" in a[2] for a in audits),
+              "auditoria do fim do lote traz o pulo por recusa")
+    finally:
+        (main.fs_coll, main.fs_document, main.httpx, main.asyncio,
+         main._resolve_channel_creds_by_id, main.log_audit) = real
+        main._reopen_preview_cache.clear()
+        restore_dbf()
+
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -2588,6 +2726,8 @@ def run():
     cenario_previa_publicos_api()
     cenario_disparo_publicos()
     cenario_worker_publico_bot()
+    cenario_recusa_desfeita_por_mensagem()
+    cenario_worker_recusa_comercial()
     cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()

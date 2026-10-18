@@ -65,6 +65,11 @@ PERMISSION_CATALOG = [
     ("Lead", "gerenciar_tags_globais", "Gerenciar tags globais do tenant"),
     ("Lead", "filtrar_leads_por_tag", "Filtrar a agenda por tag (picker)"),
     ("Lead", "reabrir_em_lote", "Disparar reabertura em lote"),
+    ("Follow-up", "gerenciar_followup", "Consultar e trabalhar tarefas de follow-up do proprio escopo"),
+    ("Follow-up", "redistribuir_followup", "Redistribuir tarefas de follow-up da equipe"),
+    ("Follow-up", "gerenciar_horarios_followup", "Configurar filas e horarios de follow-up"),
+    ("Follow-up", "registrar_recusa_comercial", "Registrar pedido para parar contatos comerciais"),
+    ("Follow-up", "reativar_contato_comercial", "Reativar contato comercial a pedido do paciente"),
     ("Lead", "editar_declared_name", "Editar nome declarado"),
     ("Lead", "arquivar_lead", "Arquivar lead"),
     ("Lead", "adicionar_contato_manual", "Adicionar contato manual"),
@@ -147,6 +152,8 @@ SEED_PERFIS = {
             "editar_dono_lead", "qualificar_lead", "editar_declared_name",
             "arquivar_lead", "adicionar_contato_manual", "exportar_contatos",
             "gerenciar_tags_globais", "reabrir_em_lote",
+            "gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
+            "registrar_recusa_comercial", "reativar_contato_comercial",
             # F5: filtrar a agenda por tag agrega dado potencialmente
             # sensivel (art. 11) — seed ON so supervisao; operador comum
             # ganha por decisao explicita do admin no perfil.
@@ -172,6 +179,7 @@ SEED_PERFIS = {
             "reabrir_atendimento_manual", "enviar_template",
             "qualificar_lead", "editar_declared_name", "arquivar_lead",
             "adicionar_contato_manual",
+            "gerenciar_followup", "registrar_recusa_comercial",
         }),
     },
 }

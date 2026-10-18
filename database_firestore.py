@@ -3454,8 +3454,27 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                 _rha_advances = True
             if _rha_advances:
                 updates["reopen_human_active_at"] = _eff_msg_at
+        # Recusa comercial (follow-up; decisao do PO 2026-10-18): mensagem nova
+        # do PACIENTE, posterior ao registro da recusa, desfaz a recusa -- a
+        # mesma regra do Encerrar da reabertura (D4). Clique de controle,
+        # reacao e historico importado (status diferente de received) nao
+        # contam. Vai no MESMO write do contato.
+        _commercial_released = None
+        if (direction == "inbound" and status == "received" and not control_message
+                and msg_type != "reaction"):
+            from commercial_contact_policy import FIELD as _CC_FIELD, released_by_patient_message
+            _commercial_released = released_by_patient_message(contact, _eff_msg_at)
+            if _commercial_released:
+                updates[_CC_FIELD] = _commercial_released
         if updates:
             document("wa_contacts", contact_id).set(updates, merge=True)
+        if _commercial_released:
+            try:
+                log_audit(None, "COMMERCIAL_CONTACT_UNBLOCK",
+                          "contact_id=%s origem=mensagem_do_paciente version=%s"
+                          % (contact_id, _commercial_released["version"]))
+            except Exception:
+                logger.warning("audit da recusa desfeita falhou | contato=%s", contact_id)
 
         # Atualiza conversation correspondente (Fase 2 — sub-threads).
         # Se ainda nao existe (mensagem de contato legado pre-Fase 2),
@@ -4328,6 +4347,8 @@ def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
     evidencia de janela fechada); cooldown por lead; attempts >= max vira
     AUTO-RESOLVE (fecha sem enviar — "muito importante", PO); exclui opt-out
     (ADR 0009 D2), lgpd_revoked, arquivado e backup."""
+    from commercial_contact_policy import is_commercial_contact_blocked
+
     now = utcnow()
     janela_cutoff = now - timedelta(hours=window_hours)
     cooldown_cutoff = now - timedelta(hours=cooldown_hours)
@@ -4356,6 +4377,9 @@ def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
             continue
         if c.get("is_backup"):
             _skip("backup")
+            continue
+        if is_commercial_contact_blocked(c):
+            _skip("commercial_contact_blocked")
             continue
         if c.get("reopen_opt_out"):
             _skip("opt_out")
@@ -4587,6 +4611,7 @@ def scan_reopen_audiences(channels_ok, cx_available, policy_date=None, *,
 
     # 1) Filtros de contato (sem leitura extra).
     survivors = []
+    from commercial_contact_policy import is_commercial_contact_blocked as _is_commercial_contact_blocked
     total = 0
     for snap in collection("wa_contacts").where(
             "qualification", "in", list(_REOPEN_SCAN_QUALIFICATIONS)).stream():
@@ -4607,6 +4632,12 @@ def scan_reopen_audiences(channels_ok, cx_available, policy_date=None, *,
             continue
         if c.get("lgpd_revoked"):
             _skip(c, "lgpd_revogado")
+            continue
+        # Recusa comercial do follow-up: fora do lote e do auto-resolve (como
+        # no v1, que segue de referencia da conciliacao). O worker ainda rele
+        # o contato antes do POST para a recusa registrada depois da previa.
+        if _is_commercial_contact_blocked(c):
+            _skip(c, "commercial_contact_blocked")
             continue
         li = _reopen_sent_at_utc(c.get("last_inbound_at"))
         if li is None:

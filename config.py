@@ -144,6 +144,10 @@ FEATURE_IMPERSONATE = os.environ.get("FEATURE_IMPERSONATE", "false").lower() == 
 IMPERSONATE_TTL_MINUTES = max(5, min(60, int(os.environ.get("IMPERSONATE_TTL_MINUTES", "30"))))
 # Intervalo aprovado para suporte; independente do transporte da sessao normal.
 IMPERSONATE_POLLING_INTERVAL_MS = 15000
+# Follow-up humano (tarefas, filas, preferencia comercial). Desligado: rotas
+# /api/followup respondem 404 e a UI do follow-up some (inclusive o campo de
+# finalidade do template e as permissoes no editor de perfis).
+FEATURE_FOLLOWUP = _bool_env("FEATURE_FOLLOWUP", "false")
 
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
 # CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em

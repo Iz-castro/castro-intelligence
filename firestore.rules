@@ -240,6 +240,15 @@ service cloud.firestore {
         allow read, write: if false;
       }
 
+      // Follow-up e historico passam exclusivamente pelo backend, que
+      // revalida acesso atual ao contato E a thread em cada operacao.
+      match /crm_tasks/{taskId} {
+        allow read, write: if false;
+      }
+      match /crm_activities/{activityId} {
+        allow read, write: if false;
+      }
+
       match /departments/{deptId} {
         allow read: if ownsTenant(tenantId);
         allow write: if false;
@@ -374,8 +383,10 @@ service cloud.firestore {
     }
 
     match /castro_crm_staging_channels/{channelId} {
-      allow read: if emailAllowed();
-      allow write: if emailAllowed() && !isImpersonation();
+      // Metadados de canal participam da autorizacao da pool no follow-up.
+      // emailAllowed() ja exclui o Ver como (signedIn -> normalPrincipal).
+      allow read: if emailAllowed() && ownsTenant(resource.data.tenant_id);
+      allow write: if false;
     }
 
     match /castro_crm_staging_wa_contacts/{contactId} {
@@ -469,15 +480,42 @@ service cloud.firestore {
 
     // Doc do tenant em si (lista de tenants ainda flat, indice global).
     match /castro_crm_staging_tenants/{tenantId} {
-      allow read: if emailAllowed();
-      allow write: if emailAllowed() && !isImpersonation();
+      allow read: if emailAllowed() && ownsTenant(tenantId);
+      allow write: if false;
 
-      // Mantem o grant legado NORMAL, mas o registro de suporte e sempre
-      // server-only. Um wildcard permissivo anularia um deny especifico.
-      match /{subcol}/{rest=**} {
-        allow read, write: if emailAllowed() && subcol != 'impersonation_sessions';
+      // Nao usar wildcard permissivo: um deny especifico nao revoga outro
+      // allow (regras somam com OU). Escritas via Admin SDK; tarefas e
+      // historico do follow-up so pelo backend. O registro do Ver como
+      // (impersonation_sessions) e server-only e PRECISA estar na lista: o
+      // match especifico mais abaixo nao revoga o wildcard. Colecoes so de
+      // backend com dados pessoais tambem ficam fora. O frontend le pelo SDK
+      // so wa_contacts, wa_conversations, wa_messages, gc_*, perfis_acesso e
+      // departments. emailAllowed() ja exclui o Ver como (normalPrincipal).
+      match /{subcol}/{document=**} {
+        allow read: if emailAllowed() && ownsTenant(tenantId)
+          && !(subcol in ['crm_tasks', 'crm_activities', 'users', 'audit_log',
+                         'bot_states', 'wa_message_status', 'internal_unread',
+                         'operator_assume_counters', '_meta', 'wa_contacts',
+                         'wa_conversations', 'wa_messages', 'impersonation_sessions',
+                         'user_settings', 'webhook_raw_debug', 'bot_buffers',
+                         'wa_contact_index', 'wa_message_index', 'attendances_daily',
+                         'reopen_batches']);
+        allow write: if false;
       }
-
+      match /wa_contacts/{contactId} {
+        allow read: if emailAllowed() && canSeeContactScoped(tenantId);
+        allow write: if false;
+      }
+      match /wa_conversations/{conversationId} {
+        allow read: if emailAllowed() && canSeeContactScoped(tenantId);
+        allow write: if false;
+      }
+      match /wa_messages/{messageId} {
+        allow read: if emailAllowed() && ownsTenant(tenantId)
+          && (isPrivilegedInTenant(tenantId) || resource.data.get('is_backup', false) != true)
+          && (isPrivilegedInTenant(tenantId) || resource.data.get('visibility', 'all') != 'admin_only');
+        allow write: if false;
+      }
       match /impersonation_sessions/{sid} {
         allow read, write: if false;
       }

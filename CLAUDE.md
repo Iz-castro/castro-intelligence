@@ -30,14 +30,18 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 71 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (222).
-  Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (285).
+  Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (59).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (69).
   History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
   `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
-  `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`.
+  `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
+  (rules combinadas com o follow-up: 861 verificacoes em 2026-10-18).
+  Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (79),
+  `tools\sim_followup_api.py` (53), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
+  na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -170,6 +174,14 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
   transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
   mesmo áudio por dias (incidente 2026-08-14/18).
+- **Follow-up (PR #2, 2026-10-18):** `FEATURE_FOLLOWUP` (default false) e GLOBAL — antes de ligar,
+  criar gate por tenant (ou desligar as 5 chaves de Follow-up nos perfis dos outros tenants). A recusa
+  comercial (`wa_contacts.commercial_contact_block`) barra template comercial, reabertura pontual, o scan
+  v2 do lote (`scan_reopen_audiences`), o worker (pulo contado em `pulados_recusa_comercial`) e o script
+  one-off; **se desfaz quando o paciente manda mensagem nova** (decisao do PO, mesmo D4 do Encerrar),
+  no `save_wa_message`, so para inbound recebido posterior ao registro (clique, reacao e historico nao
+  contam). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
+  250/dia). Tarefas e historico (`crm_tasks`, `crm_activities`) sao so do backend nas rules.
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar
@@ -195,6 +207,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | Bot builtin + dispatcher builtin/CX | `bot_service.py` |
 | Envio de resposta automática WhatsApp | `bot_sender.py` |
 | Horário comercial por tenant (aviso builtin + params CX) | `business_hours.py` |
+| Follow-up (tarefas, filas, calendario, preferencia comercial) | `followup_service.py`, `followup_routes.py`, `followup_access.py`, `followup_repository.py`, `commercial_contact_policy.py`, `frontend/src/features/followup/` — ver `docs/followup_crm_varizemed.md` (secao 16) |
 | Monitor de atendimento (porte do painel do Izael; so-leitura, so admin por default) | `monitor_service.py`, `frontend/src/components/monitor/MonitorModal.tsx` — ver `docs/MONITOR_ATENDIMENTO.md` |
 | Redação de PII em logs | `pii_redaction.py` |
 | Frontend (estado central + listeners) | `frontend/src/context/CrmContext.tsx`, `App.tsx` |

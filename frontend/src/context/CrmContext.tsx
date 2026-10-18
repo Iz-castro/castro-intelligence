@@ -251,6 +251,7 @@ type CrmContextValue = {
     templateName: string;
     language: string;
     components?: TemplateSendComponent[];
+    contactPurpose?: "commercial" | "service";
   }) => Promise<boolean>;
   // Reabertura: envia o template de inatividade com {{1}} (nome) e {{2}}
   // (data da ultima conversa) preenchidos no backend. Sem caixa manual.
@@ -3066,6 +3067,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     templateName: string;
     language: string;
     components?: TemplateSendComponent[];
+    contactPurpose?: "commercial" | "service";
   }): Promise<boolean> {
     if (readOnly) return false;
     if (!bundle) return false;
@@ -3079,6 +3081,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         template_name: params.templateName,
         language: params.language,
         components: params.components || [],
+        contact_purpose: params.contactPurpose || "commercial",
       });
       setNotice("Template enviado.");
       if (!snapshotMode) await refreshPollingViews();
