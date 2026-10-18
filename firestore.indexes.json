@@ -1,6 +1,14 @@
 {
   "indexes": [
     {
+      "collectionGroup": "impersonation_sessions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "cleanup_after", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "wa_conversations",
       "queryScope": "COLLECTION_GROUP",
       "fields": [

@@ -9,4 +9,5 @@
 .git
 .gitignore
 docs/
+tools/impersonate_emulators/
 #!include:.gitignore

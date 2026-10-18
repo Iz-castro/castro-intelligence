@@ -61,7 +61,7 @@ export function setCommercialPreference(auth: Auth, contactId: number, body: Rec
   });
 }
 
-export type CommercialPreference = { active: boolean; version: number; updated_at?: string; actor_name?: string };
+export type CommercialPreference = { active: boolean; version: number; updated_at?: string; actor_name?: string; reason?: string; source?: string };
 
 export async function loadCommercialPreference(auth: Auth, contactId: number): Promise<CommercialPreference> {
   const response = await getJson<{ commercial_contact_block: CommercialPreference }>(auth, `${BASE}/contacts/${contactId}/commercial-preference`);

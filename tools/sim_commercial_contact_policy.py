@@ -285,7 +285,24 @@ def run():
             skip_conversation_upsert=True,
         )
         check(contact()["last_inbound_at"] == NOW and policy.is_commercial_contact_blocked(contact()),
-              "caminho real de inbound preserva recusa comercial geral")
+              "upsert do contato no inbound nao mexe na recusa (quem desfaz e o save da mensagem)")
+        # Decisao do PO (2026-10-18): mensagem nova do paciente desfaz a recusa.
+        ativo = {policy.FIELD: {"active": True, "version": 3, "updated_at": NOW}}
+        depois = policy.released_by_patient_message(ativo, NOW + timedelta(minutes=1))
+        check(depois and depois["active"] is False and depois["version"] == 4
+              and depois["reason"] == "patient_wrote" and depois["source"] == "patient_message",
+              "mensagem posterior ao registro desfaz (versao+1, motivo patient_wrote)")
+        check(policy.released_by_patient_message(ativo, NOW - timedelta(minutes=1)) is None
+              and policy.released_by_patient_message(ativo, NOW) is None,
+              "mensagem anterior ou no mesmo instante do registro nao desfaz")
+        check(policy.released_by_patient_message({policy.FIELD: {"active": False, "version": 2,
+                                                                  "updated_at": NOW}}, NOW + timedelta(hours=1)) is None
+              and policy.released_by_patient_message({policy.FIELD: {"active": "sim"}}, NOW + timedelta(hours=1)) is None
+              and policy.released_by_patient_message({}, NOW) is None,
+              "sem recusa ativa e valida nao ha o que desfazer (invalida segue bloqueando)")
+        view = policy._view({policy.FIELD: depois})
+        check(view["reason"] == "patient_wrote" and view["source"] == "patient_message",
+              "leitura da preferencia mostra que o paciente desfez")
 
         class Query:
             def where(self, field, operator, value):

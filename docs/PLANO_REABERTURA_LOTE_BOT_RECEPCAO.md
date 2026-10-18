@@ -87,7 +87,8 @@ do marco de ciclo (2.2.4).
 - Frio: `last_inbound_at` do **contato** ≥ 24h (desconhecido = não envia). Cooldown de 24h por `last_reopen_template_at`.
 - **Teto por contato (D8 + P1):** `reopen_batch_sent_at` = lista de `{at, audience}`; no máximo `REOPEN_MAX_PER_CONTACT` (2) entradas
   em `REOPEN_WINDOW_DAYS` (90). Inbound **não** zera. Motivo `teto_contato`. Compatibilidade: `reopen_bot_sent_at` (lista ISO do script
-  de 23/09) é lida como `{at, audience: "bot"}`; nunca é escrita.
+  de 23/09) é lida como `{at, audience: "bot"}`. O script one-off ainda grava as duas listas; o código do CRM só grava
+  `reopen_batch_sent_at`. Leitura unificada: `reopen_batch_sends` (database_firestore).
 - Envio só por canal standard ativo com template compatível; coexistence fora. Um envio por contato por lote; o plano interno
   guarda `contact_id`, `conversation_id` e `channel_id`.
 
@@ -239,7 +240,8 @@ POST /api/admin/reopen-batch/{id}/cancel
 - Falhas: erro permanente → `reopen_failures`, 2 falhas → `envio_falhou`; timeout/5xx/sem `messages[]` → cooldown sem tentativa +
   lista de reconciliação. Sem retry cego.
 - Carimbo de sucesso (lote e pontual): `reopen_attempts +1`, `last_reopen_template_at`, `last_reopen_at`, `last_reopen_audience`,
-  `last_reopen_conversation_id/channel_id`, `reopen_batch_sent_at += {at, audience}`. Antes do save da mensagem.
+  `last_reopen_conversation_id/channel_id`. Só o **lote** acrescenta `reopen_batch_sent_at += {at, audience}`; a pontual grava
+  `last_reopen_audience = "manual"` e não entra no teto por contato, que vale só para envio em massa. Antes do save da mensagem.
 - **Auto-resolve:** filtrado pelo público selecionado; estilo segue a audiência da **tentativa** (`last_reopen_audience`). Fallbacks
   para tentativas antigas: sem `last_reopen_conversation_id` → `{channel_id}__{wa_id}`; sem `last_reopen_audience` → reclassificar
   pelo estado (2.2); sem `last_reopen_at` → `last_reopen_template_at`; ausência dos dois = sem supressão por `reopen_human_active_at`.
@@ -251,7 +253,7 @@ POST /api/admin/reopen-batch/{id}/cancel
 
 | Onde | Chave | Default | Papel |
 |---|---|---|---|
-| `system_settings` (tenant) | `reopen_batch_enabled` | `true` | kill-switch do **lote inteiro** (prévia e disparo). **Pré-requisito de deploy (etapa 3):** `PUT reopen_batch_enabled=false` na Hubloc **antes** de promover a revisão; sem isso a Hubloc ganharia o público novo pelo canal 4 em LIMITED entre o deploy e a liberação (P3). |
+| `system_settings` (tenant, **só Castro**: `scripts/set_reopen_flags.py`; o PUT da UI descarta as três flags) | `reopen_batch_enabled` | `true` | kill-switch do **lote inteiro** (prévia e disparo). **Pré-requisito de deploy (etapa 3):** `PUT reopen_batch_enabled=false` na Hubloc **antes** de promover a revisão; sem isso a Hubloc ganharia o público novo pelo canal 4 em LIMITED entre o deploy e a liberação (P3). |
 | `system_settings` (tenant) | `reopen_bot_audience_enabled` | `false` | kill-switch do público Bot. **Desligada, a classificação não muda:** leads em fase de bot continuam fora da Recepção (`fase_bot` na prévia). Rollback do Bot = desligar. |
 | `system_settings` (tenant) | `bot_media_turn_enabled` | `false` | turno do bot para mídia (D10) e `was_dup` condicional; canário próprio |
 | `system_settings` (tenant) | `lgpd_policy_date`, `lgpd_privacy_url`, `lgpd_notice` | vazio → fallback `settings.ai` | P2b (frente própria): conteúdo LGPD editado pelo admin da clínica na aba Sistema |

@@ -1,5 +1,7 @@
 import type { QuickMessage } from "../../types";
 import { duplicateQuickShortcuts, isQuickMessageComplete, normalizeShortcut } from "../../utils/quickMessages";
+import { useCrm } from "../../context/CrmContext";
+import { READ_ONLY_TOOLTIP } from "../Impersonation";
 
 type Props = {
   items: QuickMessage[];
@@ -16,11 +18,13 @@ type Props = {
 // salvar valida de novo (quickMessagesProblem) e o backend rejeita
 // atalho/mensagem vazios e atalho repetido.
 export function QuickMessagesEditor({ items, onChange, addLabel, max }: Props) {
+  const { readOnly } = useCrm();
   const duplicates = new Set(duplicateQuickShortcuts(items));
   const hasProblem = items.some((qm) => !isQuickMessageComplete(qm) || duplicates.has(normalizeShortcut(qm.shortcut)));
   const atLimit = max != null && items.length >= max;
 
   function update(idx: number, patch: Partial<QuickMessage>) {
+    if (readOnly) return;
     onChange(items.map((qm, i) => (i === idx ? { ...qm, ...patch } : qm)));
   }
 
@@ -35,11 +39,11 @@ export function QuickMessagesEditor({ items, onChange, addLabel, max }: Props) {
           <div key={idx} className={cardClass}>
             <div className="qm-card-head">
               <span className="qm-index">{idx + 1}</span>
-              <input className="qm-title" value={qm.title ?? ""} onChange={(e) => update(idx, { title: e.target.value })} placeholder="Titulo (ex.: Saudacao Tanusa)" aria-label="Titulo" />
-              <input className="qm-shortcut" value={qm.shortcut} onChange={(e) => update(idx, { shortcut: e.target.value })} placeholder="/atalho" aria-label="Atalho" />
-              <button type="button" className="ghost qm-remove" onClick={() => onChange(items.filter((_, i) => i !== idx))} aria-label="Remover mensagem" title="Remover">X</button>
+              <input className="qm-title" value={qm.title ?? ""} onChange={(e) => update(idx, { title: e.target.value })} placeholder="Titulo (ex.: Saudacao Tanusa)" aria-label="Titulo" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
+              <input className="qm-shortcut" value={qm.shortcut} onChange={(e) => update(idx, { shortcut: e.target.value })} placeholder="/atalho" aria-label="Atalho" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
+              <button type="button" className="ghost qm-remove" onClick={() => onChange(items.filter((_, i) => i !== idx))} aria-label="Remover mensagem" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : "Remover"}>X</button>
             </div>
-            <textarea className="qm-text" value={qm.message} onChange={(e) => update(idx, { message: e.target.value })} placeholder="Mensagem completa (como vai pro cliente)" rows={2} aria-label="Mensagem" />
+            <textarea className="qm-text" value={qm.message} onChange={(e) => update(idx, { message: e.target.value })} placeholder="Mensagem completa (como vai pro cliente)" rows={2} aria-label="Mensagem" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
             {complete ? null : <div className="qm-warn">Preencha titulo, atalho e mensagem — ou remova este item.</div>}
             {duplicate ? <div className="qm-warn">Atalho repetido: outra mensagem desta lista usa {normalizeShortcut(qm.shortcut)}.</div> : null}
           </div>
@@ -51,8 +55,8 @@ export function QuickMessagesEditor({ items, onChange, addLabel, max }: Props) {
         <button
           type="button"
           className="ghost qm-add"
-          disabled={hasProblem}
-          title={hasProblem ? "Corrija a mensagem marcada antes de adicionar outra" : undefined}
+          disabled={readOnly || hasProblem}
+          title={readOnly ? READ_ONLY_TOOLTIP : hasProblem ? "Corrija a mensagem marcada antes de adicionar outra" : undefined}
           onClick={() => onChange([...items, { title: "", shortcut: "", message: "" }])}
         >{addLabel}</button>
       )}

@@ -1,5 +1,10 @@
 # Product Docs
 
+## Manual da interface
+
+- [Manual completo da interface do usuário](MANUAL_COMPLETO_INTERFACE_USUARIO.md) — inventário funcional em português, revisado em 02/10/2026: telas, fluxos, permissões, configurações, portal superadmin e limitações observadas no código.
+- [Versão para leitura no navegador](MANUAL_COMPLETO_INTERFACE_USUARIO.html) · [Versão PDF](MANUAL_COMPLETO_INTERFACE_USUARIO.pdf).
+
 > **Status em 2026-08-21:** este doc ainda descreve o CRM de um tenant so. Hoje ele e
 > **multi-tenant** (3 tenants ativos em prod) e o atendimento tem **dois modos por
 > tenant**: "assumir pra falar" (`pool_mode=legacy`, Hubloc —

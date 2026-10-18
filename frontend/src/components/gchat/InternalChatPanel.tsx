@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { collection, limit as firestoreLimit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, limit as firestoreLimit, orderBy, query } from "firebase/firestore";
 import { useCrm } from "../../context/CrmContext";
+import { watchSessionQuery } from "../../firebase";
 import { getJson, sendJson } from "../../api";
 import type { GcConversation, GcMessage } from "../../types";
 import { CloseIcon, SendIcon } from "../icons";
+import { useImpersonationPolling, type PollCycle } from "../../hooks/useImpersonationPolling";
+import { assertImpersonationRead, type ImpersonationRead, type RawDocument } from "../../utils/impersonation";
 
 // ---------------------------------------------------------------------------
 // InternalChatPanel - Slide-in panel for Google Chat integration
@@ -12,7 +15,7 @@ import { CloseIcon, SendIcon } from "../icons";
 type PanelView = "conversations" | "chat";
 
 export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { bundle, sessionUser, config } = useCrm();
+  const { bundle, sessionUser, config, readOnly, impersonationPollIntervalMs, impersonationRefreshNonce, reportImpersonationRead } = useCrm();
   const panelRef = useRef<HTMLDivElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -29,20 +32,61 @@ export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: (
 
   // Fetch conversations on open
   useEffect(() => {
-    if (!open || !bundle?.auth) return;
+    if (readOnly || !open || !bundle?.auth) return;
     setLoading(true);
     getJson<{ conversations: GcConversation[] }>(bundle.auth, "/api/gc/conversations")
       .then((r) => setConversations(r.conversations))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [open, bundle?.auth]);
+  }, [open, bundle?.auth, readOnly]);
+
+  const pollConversations = useCallback(async ({ signal, current }: PollCycle) => {
+    if (!bundle) return;
+    setLoading(true);
+    try {
+      const result = await getJson<ImpersonationRead & { items: RawDocument[] }>(bundle.auth, "/api/impersonation/view/internal-chat?kind=conversations", { signal });
+      assertImpersonationRead(bundle, result);
+      if (!current()) return;
+      setConversations(result.items.map((d) => ({
+        id: Number(d.id), space_id: String(d.space_id || ""), space_name: String(d.space_name || ""),
+        participants: Array.isArray(d.participants) ? d.participants.map(String) : [],
+        last_message: String(d.last_message || ""), last_message_at: String(d.last_message_at || ""),
+        unread_count: (d.unread_count || {}) as Record<string, number>, created_at: String(d.created_at || ""),
+      })));
+      reportImpersonationRead("internal-conversations", false);
+    } catch { if (current()) reportImpersonationRead("internal-conversations", true); }
+    finally { if (current()) setLoading(false); }
+  }, [bundle, reportImpersonationRead]);
+  useImpersonationPolling(bundle?.auth || null, readOnly && open, impersonationPollIntervalMs, pollConversations, impersonationRefreshNonce);
+
+  const selectedId = selectedConv?.id;
+  const pollMessages = useCallback(async ({ signal, current }: PollCycle) => {
+    if (!bundle || !selectedId) return;
+    try {
+      const result = await getJson<ImpersonationRead & { items: RawDocument[] }>(bundle.auth, `/api/impersonation/view/internal-chat?kind=messages&conversation_id=${selectedId}`, { signal });
+      assertImpersonationRead(bundle, result);
+      if (!current()) return;
+      setMessages(result.items.map((d) => ({
+        id: Number(d.id), conversation_id: Number(d.conversation_id), gchat_message_id: String(d.gchat_message_id || ""),
+        sender_email: String(d.sender_email || ""), sender_name: String(d.sender_name || ""), msg_type: String(d.msg_type || "text"),
+        content: String(d.content || ""), media_path: String(d.media_path || ""), media_mime: String(d.media_mime || ""),
+        source: String(d.source || "google_chat"), create_time: String(d.create_time || ""), created_at: String(d.created_at || ""),
+      })).filter((m) => m.conversation_id === selectedId).sort((a, b) => a.created_at.localeCompare(b.created_at)));
+      reportImpersonationRead("internal-messages", false);
+    } catch { if (current()) reportImpersonationRead("internal-messages", true); }
+  }, [bundle, selectedId, reportImpersonationRead]);
+  useImpersonationPolling(bundle?.auth || null, readOnly && open && !!selectedId, impersonationPollIntervalMs, pollMessages, impersonationRefreshNonce);
+  useEffect(() => {
+    if (!open) reportImpersonationRead("internal-conversations", false);
+    if (!open || !selectedId) reportImpersonationRead("internal-messages", false);
+  }, [open, selectedId, reportImpersonationRead]);
 
   // Firestore real-time for conversations list
   useEffect(() => {
     if (!open || !bundle?.db || !config?.firestore?.collections?.gc_conversations) return;
     const colName = config.firestore.collections.gc_conversations;
     const q = query(collection(bundle.db, colName), orderBy("last_message_at", "desc"), firestoreLimit(50));
-    const unsub = onSnapshot(q, (snap) => {
+    const unsub = watchSessionQuery(bundle.auth, q, (snap) => {
       const items: GcConversation[] = snap.docs.map((doc) => {
         const d = doc.data();
         return {
@@ -70,7 +114,7 @@ export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: (
       orderBy("created_at", "desc"),
       firestoreLimit(100),
     );
-    const unsub = onSnapshot(q, (snap) => {
+    const unsub = watchSessionQuery(bundle.auth, q, (snap) => {
       const items: GcMessage[] = snap.docs
         .map((doc) => {
           const d = doc.data();
@@ -103,9 +147,9 @@ export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: (
 
   // Mark as read when opening a conversation
   useEffect(() => {
-    if (!selectedConv || !bundle?.auth) return;
+    if (!selectedConv || !bundle?.auth || readOnly) return;
     sendJson(bundle.auth, `/api/gc/mark-read/${selectedConv.id}`, {}).catch(() => {});
-  }, [selectedConv, bundle?.auth]);
+  }, [selectedConv, bundle?.auth, readOnly]);
 
   const openConversation = useCallback((conv: GcConversation) => {
     setSelectedConv(conv);
@@ -122,7 +166,7 @@ export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: (
 
   const handleSend = useCallback(async (e?: FormEvent) => {
     e?.preventDefault();
-    if (!draft.trim() || !selectedConv || busy || !bundle?.auth) return;
+    if (readOnly || !draft.trim() || !selectedConv || busy || !bundle?.auth) return;
     setBusy(true);
     try {
       await sendJson(bundle.auth, "/api/gc/send", {
@@ -136,7 +180,7 @@ export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: (
     } finally {
       setBusy(false);
     }
-  }, [draft, selectedConv, busy, bundle?.auth]);
+  }, [draft, selectedConv, busy, bundle?.auth, readOnly]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -261,9 +305,10 @@ export function InternalChatPanel({ open, onClose }: { open: boolean; onClose: (
               onKeyDown={handleKeyDown}
               placeholder="Digite uma mensagem..."
               rows={1}
-              disabled={busy}
+              disabled={readOnly || busy}
+              title={readOnly ? "Somente leitura (modo Ver como)" : undefined}
             />
-            <button type="submit" className="gc-panel__send" disabled={busy || !draft.trim()} title="Enviar">
+            <button type="submit" className="gc-panel__send" disabled={readOnly || busy || !draft.trim()} title={readOnly ? "Somente leitura (modo Ver como)" : "Enviar"}>
               <SendIcon />
             </button>
           </form>

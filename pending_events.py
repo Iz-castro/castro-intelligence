@@ -107,6 +107,49 @@ def list_pending_events(status: str | None = None, limit: int = 100) -> list[dic
     return [normalize_record(r) for r in rows]
 
 
+def list_pending_events_for_channels(phone_number_ids, status=None, limit=100):
+    """Consulta somente canais autorizados e nunca entrega um batch cross-tenant."""
+    allowed = {str(value).strip() for value in phone_number_ids if value}
+    rows = {}
+    for phone_id in sorted(allowed):
+        query = global_collection(PENDING_COLLECTION).where("phone_number_id", "==", phone_id)
+        if status:
+            query = query.where("status", "==", status)
+        for snap in query.stream():
+            source = snap.to_dict() or {}
+            payload = source.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            # O documento original guarda o webhook INTEIRO. O phone_id do
+            # envelope nao prova que todos os changes pertencem ao mesmo tenant.
+            entries = []
+            for entry in payload.get("entry") or []:
+                if not isinstance(entry, dict):
+                    continue
+                changes = []
+                for change in entry.get("changes") or []:
+                    if not isinstance(change, dict):
+                        continue
+                    value = change.get("value")
+                    metadata = value.get("metadata") if isinstance(value, dict) else None
+                    if isinstance(metadata, dict) and str(metadata.get("phone_number_id") or "") in allowed:
+                        changes.append(change)
+                if changes:
+                    entries.append({"changes": changes})
+            if not entries:
+                continue
+            row = {key: source.get(key) for key in (
+                "received_at", "change_field", "phone_number_id", "status", "attempts", "last_attempt_at")}
+            row["id"] = source.get("id", snap.id)
+            # Erros de batch podem conter detalhes de outro change; so codigo.
+            row["reason"] = str(source.get("reason") or "").split(":", 1)[0]
+            row["last_error"] = ""
+            row["payload"] = {"entry": entries}
+            rows[snap.id] = row
+    result = sorted(rows.values(), key=lambda row: str(normalize_record(row).get("received_at") or ""), reverse=True)
+    return [normalize_record(row) for row in result[:limit]]
+
+
 def get_pending_event(event_id: str) -> dict | None:
     snap = global_document(PENDING_COLLECTION, event_id).get()
     if not snap.exists:

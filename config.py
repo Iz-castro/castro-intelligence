@@ -135,6 +135,18 @@ FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
 # Contador de "assumidas sem resposta" (bloqueia assume com 2+ pendentes).
 # Desligado a pedido do cliente; religar via env sem mudar codigo.
 FEATURE_ASSUME_COUNTER = _bool_env("FEATURE_ASSUME_COUNTER", "false")
+# Monitor de atendimento (monitor_service.py): fila de espera, metricas,
+# origem e auditoria por atendente para admins dos tenants em MONITOR_TENANTS.
+# Kill-switch sem deploy: FEATURE_MONITOR=false volta o menu ao Dashboard.
+FEATURE_MONITOR = _bool_env("FEATURE_MONITOR", "true")
+# Ver como: login temporario separado, sessao curta e somente leitura.
+FEATURE_IMPERSONATE = os.environ.get("FEATURE_IMPERSONATE", "false").lower() == "true"
+IMPERSONATE_TTL_MINUTES = max(5, min(60, int(os.environ.get("IMPERSONATE_TTL_MINUTES", "30"))))
+# Intervalo aprovado para suporte; independente do transporte da sessao normal.
+IMPERSONATE_POLLING_INTERVAL_MS = 15000
+# Follow-up humano (tarefas, filas, preferencia comercial). Desligado: rotas
+# /api/followup respondem 404 e a UI do follow-up some (inclusive o campo de
+# finalidade do template e as permissoes no editor de perfis).
 FEATURE_FOLLOWUP = _bool_env("FEATURE_FOLLOWUP", "false")
 
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
@@ -265,6 +277,25 @@ REOPEN_COOLDOWN_HOURS = int(os.environ.get("REOPEN_COOLDOWN_HOURS", "24"))
 # Teto de envios POR EXECUCAO do lote (o tier da Meta e por portfolio, em
 # destinatarios unicos/24h, SEM codigo de erro ao estourar — contamos nos).
 REOPEN_BATCH_MAX_SENDS = int(os.environ.get("REOPEN_BATCH_MAX_SENDS", "100"))
+# Reabertura por publico (plano v2.2, secao 7; docs/PLANO_REABERTURA_LOTE_BOT_
+# RECEPCAO.md). Lidos uma vez no import; mudar = env + nova revisao.
+# Teto diario POR PORTFOLIO (D7): soma dos lotes das ultimas 24h de TODOS os
+# tenants ativos (Hubloc, Varizemed e teste dividem o TIER_2K da Meta).
+REOPEN_DAILY_CAP = max(0, _as_int(os.environ.get("REOPEN_DAILY_CAP"), 250))
+# Teto por contato (D8 + P1): no maximo N envios EM MASSA em M dias, nos dois
+# publicos (lista unica reopen_batch_sent_at; inbound nao zera).
+REOPEN_MAX_PER_CONTACT = max(1, _as_int(os.environ.get("REOPEN_MAX_PER_CONTACT"), 2))
+REOPEN_WINDOW_DAYS = max(1, _as_int(os.environ.get("REOPEN_WINDOW_DAYS"), 90))
+# P4: idade maxima (dias desde o ultimo inbound) do lead "novo" pos-handoff
+# no publico Recepcao. O publico Bot nao tem teto de idade.
+REOPEN_MAX_IDLE_DAYS = max(1, _as_int(os.environ.get("REOPEN_MAX_IDLE_DAYS"), 30))
+# Candidatos que pagam leitura de threads/bot_states por previa (corte DEPOIS
+# da ordenacao em_atendimento -> novo, ultimo inbound mais recente primeiro).
+REOPEN_SCAN_MAX = max(1, _as_int(os.environ.get("REOPEN_SCAN_MAX"), 2000))
+# P5 (heuristica provisoria ate o agente expor desfecho_bot): trecho do link
+# de agendamento da Val; quem o recebeu da Val no ciclo fica fora do publico
+# Bot. Vazio desliga a heuristica.
+REOPEN_DESFECHO_LINK = os.environ.get("REOPEN_DESFECHO_LINK", "marcaconsultas").strip().lower()
 # Janela (horas) em que o clique de avaliacao ainda vale apos o pedido —
 # clique fora dela e ignorado (nunca vira nota nem chega ao bot).
 RATING_CAPTURE_HOURS = int(os.environ.get("RATING_CAPTURE_HOURS", "48"))

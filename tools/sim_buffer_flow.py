@@ -48,6 +48,10 @@ AI_CFG = {
     "lgpd_policy_version": "test-v1",
 }
 
+# system_settings do tenant em memoria (P2b: lgpd_consent_resolved le a data
+# da politica LGPD daqui) — o sim nunca toca Firestore real.
+SYS_SETTINGS = {"bot_enabled": True}
+
 BLOCK_FIRST_CX = False
 FIRST_CX_STARTED = None
 RELEASE_FIRST_CX = None
@@ -139,6 +143,8 @@ def _reset(consented=True, assigned=False, completed=False):
         "buffer_seconds": 0.04,
         "lgpd_policy_version": "test-v1",
     })
+    SYS_SETTINGS.clear()
+    SYS_SETTINGS["bot_enabled"] = True
     cid = _ensure_contact("5531999999999")
     CONTACTS[str(cid)].update({
         "assigned_to": 9 if assigned else None,
@@ -368,6 +374,7 @@ def _install_patches():
     # lgpd_consent_resolved REAL (importado no webhook); so a config de IA do
     # tenant e substituida para nao tocar Firestore/tenant context.
     bot_service._get_tenant_ai_config = lambda: dict(AI_CFG)
+    bot_service.get_system_settings = lambda: dict(SYS_SETTINGS)
 
     stt = types.ModuleType("transcription_service")
     stt.get_speech_client = lambda: object()
@@ -727,6 +734,47 @@ async def scenario_new_cycle_hydration():
     check(CX_CALLS == [] and not BUFFERS, "recusa no estado: sem buffer, sem turno CX")
 
 
+async def scenario_policy_date():
+    title("20. P2b: aceite anterior a data da politica LGPD nao arma o debounce (estado True)")
+    hoje_br = datetime.now(timezone(timedelta(hours=-3))).date()
+    antigo = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    recente = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+    # Aceite ANTERIOR a politica, estado "aceito": lgpd_consent_resolved real
+    # devolve False -> turno direto por mensagem (o turno real reapresenta o aviso).
+    cid = _reset()
+    SYS_SETTINGS["lgpd_policy_date"] = (hoje_br - timedelta(days=5)).isoformat()
+    CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_consent_at": antigo})
+    await asyncio.gather(
+        _deliver([_text("pd1", "um")]),
+        _deliver([_text("pd2", "dois")]),
+    )
+    check(sorted(CX_CALLS) == ["dois", "um"] and not BUFFERS,
+          "aceite desatualizado: sem debounce (1 turno direto por mensagem)")
+
+    # Aceite POSTERIOR a politica: debounce normal (1 turno com a rajada).
+    cid = _reset()
+    SYS_SETTINGS["lgpd_policy_date"] = (hoje_br - timedelta(days=5)).isoformat()
+    CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_consent_at": recente})
+    await asyncio.gather(
+        _deliver([_text("pd3", "tres")]),
+        _deliver([_text("pd4", "quatro")]),
+    )
+    check(CX_CALLS == ["tres\nquatro"] and not BUFFERS,
+          "aceite em dia com a politica: debounce intacto")
+
+    # Aceite legado sem lgpd_consent_at continua valido.
+    cid = _reset()
+    SYS_SETTINGS["lgpd_policy_date"] = (hoje_br - timedelta(days=5)).isoformat()
+    CONTACTS[str(cid)].update({"lgpd_consent": True})
+    await asyncio.gather(
+        _deliver([_text("pd5", "cinco")]),
+        _deliver([_text("pd6", "seis")]),
+    )
+    check(CX_CALLS == ["cinco\nseis"] and not BUFFERS,
+          "aceite legado sem carimbo: debounce intacto")
+
+
 def scenario_transaction_contracts():
     title("14. Contratos transacionais da persistencia real")
 
@@ -830,6 +878,7 @@ async def main():
     await scenario_interactive_busy_after_wait()
     await scenario_kill_switch_key_absent()
     await scenario_new_cycle_hydration()
+    await scenario_policy_date()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

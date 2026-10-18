@@ -29,11 +29,22 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 56 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (173).
-  Modo Recepção (pool compartilhada): `tools\sim_reception_flow.py` (173).
-  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (56).
+  API, exercita o código real, 71 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (222).
+  Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
+  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (59).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
+  Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (69).
+  History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
+  Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
+  `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
+  `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
+  (rules combinadas com o follow-up: 861 verificacoes em 2026-10-18).
+  Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (79),
+  `tools\sim_followup_api.py` (53), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
+  na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
+  ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
+  escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
   `frontend/` (~32 asserts, exit 0/1; compila com o esbuild do Vite).
@@ -84,6 +95,27 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 
 ## Invariantes que NÃO podem quebrar (landmines reais)
 
+- **Ver como (ADR 0014):** UID Firebase temporario `imp_ro_*`, nunca o do alvo/admin;
+  `sessionUser.firebase_uid` e queries/toggles continuam do alvo. Registro tenant-scoped
+  prende UID/SID/ambiente/prazo; contrato exige registro/TTL no backend e nega mutacoes CRM,
+  inclusive sem claim `imp` no UID reservado. Sem escrita automatica no alvo. Fim so da
+  propria sessao; cleanup apos 2h exclui apenas UID registrado, nunca contas reais.
+  Auth temporario em memoria, sem cliente Firestore temporario, e marcador de aba sem
+  segredo evitam restaurar admin no reload.
+  **Transporte revisado aprovado:** temporario usa somente HTTP/polling fixo15s; rules
+  negam toda leitura/escrita direta, inclusive UID reservado sem claim e imp legado.
+  Backend preserva janelas por target, filtra backup/ownership antes de entregar e
+  reautentica apos bufferizar cada corpo, sem memo final. UI descarta resposta tardia;
+  nenhuma queda para Firestore. Sessoes normais mantem listeners atuais. A revisao veio
+  apos listener +1,259s e backup indevido no emulador (prod nao verificado); pendencia de
+  backup normal e URL de midia anonima conhecida continuam fora desta mudanca.
+  Exigir gates do transporte HTTP atual; nao presumir prontidao pelos testes antigos.
+  Polling repete leituras e target backup original nao tem cap; avaliar custo antes de
+  ativar, sem reduzir janelas silenciosamente. Feature desligada por default.
+  **Revisao do merge (2026-10-18):** so role admin inicia (o toggle sozinho nao basta);
+  FEATURE_IMPERSONATE=false derruba sessoes ja emitidas no middleware; o solicitante e
+  revalidado (ativo, admin, com o toggle; cache de 30 s); get_current_user falha FECHADO
+  (503) se um token imp chegar sem a trava do middleware. `sim_impersonate.py` = 306.
 - **`_GLOBAL_COLLECTIONS` (`firestore_common.py`)** = `channels, pending_webhook_events,
   super_admins, audit_logs_system, phone_routing, _meta, tenants`. Ficam **flat/globais** mesmo
   com tenant context ativo. Toda coleção que o webhook precisa ler **antes** de saber o tenant
@@ -131,12 +163,25 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   lead em fase de bot invisível ao operador). Não reintroduza zeramento só da thread.
 - **Resolução de canal no webhook:** `phone_number_id` sem canal **ativo** vai pra pending —
   nunca cai no canal default (número coex desconectado vazaria pro standard).
+- **History sync do coex NÃO é mensagem ao vivo:** `_process_history` usa a data REAL de cada mensagem
+  (contato com `from_message_event=False`; thread criada pelo pré-passe com o **dono do número**;
+  mensagem antiga não reabre atendimento) e o eco (`smb_message_echoes`) não mexe em `last_inbound_at`
+  (janela de 24h é só mensagem DO CLIENTE). Carimbar "agora" encheu o top-50 do Meus de conversas
+  antigas (incidente Roberta, 2026-10-14). Reparo de dados: `scripts/repair_recency_channels.py` (dry-run default).
 - **Reentrega da Meta:** `POST /webhook` só responde 200 **depois** do turno do bot (CX tem
   orçamento de `CX_DETECT_TIMEOUT_SECONDS`, 60s, por TURNO; read-timeout da chamada principal
   reenvia 1x com o teto inteiro — `CX_READ_TIMEOUT_RETRY`, default true, pior caso ~2min) e a Meta
   **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
   transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
   mesmo áudio por dias (incidente 2026-08-14/18).
+- **Follow-up (PR #2, 2026-10-18):** `FEATURE_FOLLOWUP` (default false) e GLOBAL — antes de ligar,
+  criar gate por tenant (ou desligar as 5 chaves de Follow-up nos perfis dos outros tenants). A recusa
+  comercial (`wa_contacts.commercial_contact_block`) barra template comercial, reabertura pontual, o scan
+  v2 do lote (`scan_reopen_audiences`), o worker (pulo contado em `pulados_recusa_comercial`) e o script
+  one-off; **se desfaz quando o paciente manda mensagem nova** (decisao do PO, mesmo D4 do Encerrar),
+  no `save_wa_message`, so para inbound recebido posterior ao registro (clique, reacao e historico nao
+  contam). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
+  250/dia). Tarefas e historico (`crm_tasks`, `crm_activities`) sao so do backend nas rules.
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar
@@ -156,11 +201,14 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | Registry de canais WhatsApp (flat) | `channel_service.py` |
 | Tenants, `phone_routing` global, resolução de login por domínio | `tenant_service.py` |
 | Auth (Firebase ID token, resolução de tenant) | `auth.py` |
+| Ver como (identidade, registro, HTTP/polling e cleanup) | `impersonation_identity.py`, `impersonation.py`, `impersonation_views.py` — ADR 0014 |
 | RBAC dinâmico por tenant | `rbac.py` |
 | Gate LGPD | `lgpd_bot.py` |
 | Bot builtin + dispatcher builtin/CX | `bot_service.py` |
 | Envio de resposta automática WhatsApp | `bot_sender.py` |
 | Horário comercial por tenant (aviso builtin + params CX) | `business_hours.py` |
+| Follow-up (tarefas, filas, calendario, preferencia comercial) | `followup_service.py`, `followup_routes.py`, `followup_access.py`, `followup_repository.py`, `commercial_contact_policy.py`, `frontend/src/features/followup/` — ver `docs/followup_crm_varizemed.md` (secao 16) |
+| Monitor de atendimento (porte do painel do Izael; so-leitura, so admin por default) | `monitor_service.py`, `frontend/src/components/monitor/MonitorModal.tsx` — ver `docs/MONITOR_ATENDIMENTO.md` |
 | Redação de PII em logs | `pii_redaction.py` |
 | Frontend (estado central + listeners) | `frontend/src/context/CrmContext.tsx`, `App.tsx` |
 

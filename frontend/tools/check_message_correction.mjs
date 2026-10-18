@@ -48,12 +48,25 @@ const extracted = ts.transpileModule([
 // with fornece apenas o ambiente do provider; nenhum corpo de funcao e reescrito.
 const instantiate = new Function("scope", `with (scope) { ${extracted}\nreturn { ${names.join(", ")}, runSelectionEffect }; }`);
 
+// api.ts importa ./firebase (SDK do navegador); no Node basta o contrato que
+// o api.ts usa, fora do modo Ver como.
+const stubFirebase = {
+  name: "stub-firebase",
+  setup(b) {
+    b.onResolve({ filter: /^\.\/firebase$/ }, (args) => (args.importer.endsWith("api.ts") ? { path: "firebase", namespace: "stub" } : undefined));
+    b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({
+      loader: "js",
+      contents: "export const impersonationTab = false; export function assertFirebaseSessionActive() {} export function stopImpersonationReading() {} export function trackImpersonationTask() { return () => {}; }",
+    }));
+  },
+};
 const helpers = await build({
   stdin: {
     contents: 'export { buildMessageReplyReference } from "./src/utils/formatting"; export { errorText } from "./src/utils/errors";',
     resolveDir: frontend, loader: "ts",
   },
   bundle: true, write: false, format: "esm", platform: "node", logLevel: "silent",
+  plugins: [stubFirebase],
 });
 const realHelpers = await import(`data:text/javascript;base64,${Buffer.from(helpers.outputFiles[0].text).toString("base64")}`);
 const original = {
@@ -65,7 +78,7 @@ function harness(overrides = {}) {
   const state = {
     bundle: { auth: {} }, selectedContact: { id: 7 }, selectedContactId: 7,
     selectedThreadId: original.conversation_id, draft: "", correctionTarget: null,
-    replyTarget: null, internalMode: false, showAttachMenu: false,
+    replyTarget: null, internalMode: false, showAttachMenu: false, readOnly: false,
     quickSuggestions: [], quickSelectedIndex: -1,
     busySend: false, busyAudio: false, busyUpload: false, recording: false, recordingSeconds: 0,
     snapshotMode: true, error: "", notice: "", messages: [{ ...original }],

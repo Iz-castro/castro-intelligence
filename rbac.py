@@ -25,6 +25,8 @@ rules. Os seeds nao cruzam esse teto.
 import logging
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from fastapi import HTTPException
 
@@ -77,8 +79,13 @@ PERMISSION_CATALOG = [
     ("Canais", "autorizar_coex_para_operador", "Autorizar coexistence para operador"),
     ("Auditoria", "ver_painel_conflitos", "Ver painel de conflitos"),
     ("Auditoria", "ver_dashboard_uso", "Ver dashboard e uso (billing)"),
+    # Monitor de atendimento (monitor_service.py): seed SO no perfil_admin
+    # (PO 2026-10-13). Exporta conversas de atendentes — liberar para outro
+    # perfil e decisao explicita do admin na tela de perfis.
+    ("Auditoria", "ver_monitor_atendimento", "Ver monitor de atendimento (fila, metricas e auditoria de conversas)"),
     ("Auditoria", "buscar_protocolo", "Buscar protocolo de atendimento"),
     ("Gestao", "gerenciar_usuarios", "Criar e editar usuarios"),
+    ("Gestao", "ver_como_usuario", "Ver como outro usuario (somente leitura, suporte)"),
     ("Gestao", "desativar_usuarios", "Desativar usuarios"),
     ("Gestao", "gerenciar_perfis_acesso", "Gerenciar perfis de acesso"),
     ("Gestao", "gerenciar_departamentos", "Criar e editar setores"),
@@ -192,6 +199,8 @@ def default_perfil_for_role(role):
 
 _PERFIL_CACHE_TTL = float(os.getenv("RBAC_PERFIL_CACHE_TTL_SECONDS", "60") or 60)
 _perfil_cache: dict = {}
+# Snapshot limitado a UMA request temporaria; nao compartilha o cache normal.
+_impersonation_perfil = ContextVar("impersonation_perfil", default=None)
 
 # Sentinela para cachear tambem a AUSENCIA do doc (evita re-read por request
 # em tenant pre-seed) sem confundir com falha de leitura.
@@ -225,6 +234,37 @@ def _read_perfil_doc(tenant_id, perfil_id):
     if not snap.exists:
         return None
     return snap.to_dict() or {}
+
+
+def read_impersonation_toggles(tenant_id, perfil_id):
+    """Leitura estrita sem cache: indisponibilidade nao amplia permissao."""
+    doc = _read_perfil_doc(str(tenant_id), str(perfil_id))
+    toggles = (doc or {}).get("toggles")
+    return dict(toggles) if isinstance(toggles, dict) else None
+
+
+def set_impersonation_perfil(tenant_id, perfil_id, toggles):
+    return _impersonation_perfil.set((str(tenant_id), str(perfil_id), toggles))
+
+
+def reset_impersonation_perfil(token):
+    _impersonation_perfil.reset(token)
+
+
+@contextmanager
+def impersonation_perfil_context(user):
+    """Reusa snapshot HTTP ou le uma vez para um servico chamado diretamente."""
+    tenant_id = str(user.get("tenant_id") or "")
+    perfil_id = user.get("perfil_acesso_id") or default_perfil_for_role(user.get("role"))
+    scoped = _impersonation_perfil.get()
+    if scoped and scoped[:2] == (tenant_id, perfil_id):
+        yield
+        return
+    token = set_impersonation_perfil(tenant_id, perfil_id, read_impersonation_toggles(tenant_id, perfil_id))
+    try:
+        yield
+    finally:
+        reset_impersonation_perfil(token)
 
 
 def get_perfil(tenant_id, perfil_id):
@@ -297,7 +337,13 @@ def has_permission(current_user, perm):
         return False
     role = current_user.get("role")
     perfil_id = str(current_user.get("perfil_acesso_id") or "") or default_perfil_for_role(role)
-    toggles = get_perfil_toggles(_resolve_tenant(current_user), perfil_id) if perfil_id else None
+    tenant_id = _resolve_tenant(current_user)
+    if current_user.get("impersonation"):
+        scoped = _impersonation_perfil.get()
+        toggles = (scoped[2] if scoped and scoped[:2] == (tenant_id, perfil_id)
+                   else read_impersonation_toggles(tenant_id, perfil_id))
+    else:
+        toggles = get_perfil_toggles(tenant_id, perfil_id) if perfil_id else None
     if toggles is not None and perm in toggles:
         return bool(toggles[perm])
     return _fallback_role_toggle(role, perm)

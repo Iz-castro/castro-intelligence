@@ -10,7 +10,7 @@ import { requestError } from "../../features/followup/useOperation";
 
 export function CommercialContactBanner({ contact }: { contact: Contact }) {
   if (!contact.commercial_contact_block?.active) return null;
-  return <div className="followup-commercial-banner" role="status"><strong>Não realizar novas retomadas comerciais.</strong><span>Pedido do paciente registrado. Consultas marcadas e tarefas independentes permanecem. Uma mensagem nova não remove esta preferência.</span></div>;
+  return <div className="followup-commercial-banner" role="status"><strong>Não realizar novas retomadas comerciais.</strong><span>Pedido do paciente registrado. Consultas marcadas e tarefas independentes permanecem. Se o paciente mandar uma nova mensagem, a recusa se desfaz sozinha.</span></div>;
 }
 
 export function FollowupEntry({ contactId, variant = "topbar" }: { contactId?: number; variant?: "topbar" | "contact" }) {

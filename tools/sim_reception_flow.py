@@ -37,6 +37,7 @@ import database  # noqa: E402  (reexporta database_firestore)
 import database_firestore as dbf  # noqa: E402
 import channel_service  # noqa: E402
 import firestore_common  # noqa: E402
+import tenant_service  # noqa: E402
 
 # Guarda originais pra restaurar entre cenarios.
 _REAL_IS_RECEPTION = dbf.is_reception_mode
@@ -107,6 +108,9 @@ def titulo(txt):
 # =========================================================================
 
 STORE = {}
+# Log de writes (coll, doc_id, campos) — prova "no MESMO write" nos cenarios
+# da reabertura. Zerado pelo cenario que o le.
+WRITES = []
 
 
 class _Snap:
@@ -135,10 +139,24 @@ class _DocRef:
 
     def set(self, data, merge=False):
         coll = STORE.setdefault(self.coll, {})
+        cur = coll.get(self.doc_id) if merge else None
+        resolved = {}
+        for k, v in data.items():
+            # Sentinela firestore.ArrayUnion (teto por contato da reabertura):
+            # resolve como o servidor — acrescenta so o que ainda nao existe.
+            if type(v).__name__ == "ArrayUnion":
+                base = list((cur or {}).get(k) or [])
+                for item in v.values:
+                    if item not in base:
+                        base.append(item)
+                resolved[k] = base
+            else:
+                resolved[k] = v
+        WRITES.append((self.coll, self.doc_id, dict(resolved)))
         if merge and self.doc_id in coll:
-            coll[self.doc_id].update(data)
+            coll[self.doc_id].update(resolved)
         else:
-            coll[self.doc_id] = dict(data)
+            coll[self.doc_id] = dict(resolved)
 
     def create(self, data):
         # Claim atomico (wa_message_index / wa_contact_index): falha se existe.
@@ -166,14 +184,57 @@ class _QSnap:
         return dict(self._data) if self._data else None
 
 
+def _sort_value(v):
+    # Ordenacao do mock: datetime e ISO viram o mesmo eixo (instante UTC).
+    if isinstance(v, datetime):
+        return (0, (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).timestamp())
+    if isinstance(v, str):
+        try:
+            d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return (0, (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp())
+        except ValueError:
+            return (1, v)
+    if v is None:
+        return (-1, 0)
+    return (0, v)
+
+
+def _match(data, field, op, value):
+    got = data.get(field)
+    if op == "==":
+        return got == value
+    if op == "in":
+        return got in value
+    if got is None:
+        return False
+    try:
+        if op == ">=":
+            return got >= value
+        if op == ">":
+            return got > value
+        if op == "<=":
+            return got <= value
+        if op == "<":
+            return got < value
+    except TypeError:
+        return False
+    raise AssertionError(f"operador nao suportado no mock: {op}")
+
+
 class _CollRef:
     def __init__(self, coll):
         self.coll = coll
         self._filters = []
         self._limit = None
+        self._order = None
 
     def where(self, field, op, value):
         self._filters.append((field, op, value))
+        return self
+
+    def order_by(self, field, direction="ASCENDING"):
+        # Reabertura (heuristica do P5): ultimas N mensagens da thread.
+        self._order = (field, str(direction).upper().startswith("DESC"))
         return self
 
     def limit(self, n):
@@ -189,13 +250,17 @@ class _CollRef:
         return _DocRef(self.coll, doc_id)
 
     def stream(self):
+        rows = [(doc_id, data) for doc_id, data in list(STORE.get(self.coll, {}).items())
+                if all(_match(data, f, op, v) for (f, op, v) in self._filters)]
+        if self._order:
+            field, desc = self._order
+            rows.sort(key=lambda r: _sort_value(r[1].get(field)), reverse=desc)
         emitted = 0
-        for doc_id, data in list(STORE.get(self.coll, {}).items()):
-            if all(op == "==" and data.get(f) == v for (f, op, v) in self._filters):
-                yield _QSnap(self.coll, doc_id, data)
-                emitted += 1
-                if self._limit is not None and emitted >= self._limit:
-                    break
+        for doc_id, data in rows:
+            yield _QSnap(self.coll, doc_id, data)
+            emitted += 1
+            if self._limit is not None and emitted >= self._limit:
+                break
 
 
 _SEQ = {"n": 1000}
@@ -672,14 +737,18 @@ def cenario_auto_close_toggle():
 def cenario_release_to_bot():
     titulo("CENARIO 11 — release_lead_to_bot: fechamento devolve ao agente (PO 2026-08-05)")
     patch_store()
+    _antes = datetime.now(timezone.utc)
     STORE["wa_contacts"] = {
         "20": {"id": 20, "assigned_to": 3, "assigned_to_uid": "uid3",
                "bot_completed": True, "department_id": 5, "qualification": "novo",
                "attendance_protocol": "20260805-20-REC", "sale_owner_user_id": 3,
-               "lead_temperature": "morno"},
+               "lead_temperature": "morno",
+               "bot_outcome": "agendado", "bot_outcome_at": _antes - timedelta(days=3)},
         "21": {"id": 21, "assigned_to": 3, "lgpd_revoked": True},
-        "22": {"id": 22, "assigned_to": 3, "bot_completed": True},
+        "22": {"id": 22, "assigned_to": 3, "bot_completed": True,
+               "bot_outcome": "link_enviado", "bot_outcome_at": _antes - timedelta(days=1)},
     }
+    WRITES.clear()
     STORE["wa_conversations"] = {
         "T1": {"id": "T1", "contact_id": 20, "assigned_to": 3, "assigned_to_uid": "uid3"},
         "T2": {"id": "T2", "contact_id": 20, "assigned_to": None,
@@ -713,11 +782,36 @@ def cenario_release_to_bot():
           "bot_states: ciclo CX zerado, prova LGPD preservada")
     check("20" not in STORE.get("bot_buffers", {}),
           "release_lead_to_bot limpa o buffer do ciclo fechado")
-    check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None,
-          "guard J-3: lgpd_revoked NAO volta pro funil (release=None)")
+    # Plano de reabertura (etapa 2): marco de ciclo + desfecho zerado.
+    _rel = c.get("bot_released_at")
+    check(isinstance(_rel, datetime) and _rel.tzinfo is not None and _rel >= _antes,
+          "release grava bot_released_at datetime UTC (marco de ciclo, mesmo tipo de handoff_at)")
+    check(c.get("bot_outcome") is None and c.get("bot_outcome_at") is None
+          and "bot_outcome" in c and "bot_outcome_at" in c,
+          "release zera bot_outcome e bot_outcome_at")
+    _w20 = [w for w in WRITES if w[0] == "wa_contacts" and w[1] == "20"]
+    check(len(_w20) == 1 and _w20[0][2].get("bot_completed") is False
+          and "bot_released_at" in _w20[0][2] and "bot_outcome" in _w20[0][2],
+          "release: marco e desfecho vao no MESMO write do commit-point (1 write no contato)")
+    _hand = dbf._coerce_timestamp(_ts(1))
+    try:
+        _cmp_ok = isinstance(_rel > _hand, bool)
+    except TypeError:
+        _cmp_ok = False
+    check(_cmp_ok, "bot_released_at compara com handoff_at coagido (_coerce_timestamp) sem TypeError")
+    check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None
+          and "bot_released_at" not in STORE["wa_contacts"]["21"],
+          "guard J-3: lgpd_revoked NAO volta pro funil (release=None, sem marco)")
+    WRITES.clear()
     check(dbf.return_contact_to_bot(22, 7) is True
           and "22" not in STORE.get("bot_buffers", {}),
           "return_contact_to_bot tambem limpa o buffer anterior")
+    c22 = STORE["wa_contacts"]["22"]
+    _w22 = [w for w in WRITES if w[0] == "wa_contacts" and w[1] == "22"]
+    check(isinstance(c22.get("bot_released_at"), datetime)
+          and c22.get("bot_outcome") is None and c22.get("bot_outcome_at") is None
+          and len(_w22) == 1 and "bot_released_at" in _w22[0][2],
+          "return_contact_to_bot: marco datetime + desfecho zerado no mesmo write do contato")
     restore_dbf()
 
 
@@ -1181,9 +1275,25 @@ def cenario_worker_lote():
         c31 = STORE["wa_contacts"]["31"]
         check(int(c31.get("reopen_attempts") or 0) == 1 and c31.get("last_reopen_template_at"),
               "envio 200: attempts+cooldown carimbados no contato")
+        # Plano de reabertura (etapa 2): campos por tentativa + teto por contato.
+        check(c31.get("last_reopen_at") == c31.get("last_reopen_template_at")
+              and isinstance(c31.get("last_reopen_at"), str),
+              "lote: last_reopen_at (ISO) = mesmo instante do last_reopen_template_at")
+        check(c31.get("last_reopen_audience") == "reception"
+              and c31.get("last_reopen_conversation_id") == "6__5531911112222"
+              and c31.get("last_reopen_channel_id") == 6,
+              "lote: audiencia reception + thread {channel_id}__{wa_id} + canal do envio")
+        check(c31.get("reopen_batch_sent_at") == [{"at": c31.get("last_reopen_at"),
+                                                   "audience": "reception"}],
+              "lote: reopen_batch_sent_at recebe {at, audience: reception} (ArrayUnion)")
         th31 = STORE["wa_conversations"].get("6__5531911112222") or {}
         check(not th31.get("last_human_outbound_at"),
               "template de lote NAO carimba last_human_outbound_at (valvula reception)")
+        check(th31.get("id") == c31.get("last_reopen_conversation_id"),
+              "thread carimbada no contato e a mesma que o save da mensagem usou")
+        check("reopen_human_active_at" not in c31 and "bot_released_at" not in c31
+              and c31.get("bot_completed") is None and c31.get("assigned_to") is None,
+              "template do lote nao muda o balde (sem reopen_human_active_at, marco, dono ou bot_completed)")
         check(STORE["wa_conversations"]["6__5531933334444"].get("attendance_status") == "fechado_inatividade",
               "auto-resolve: thread aberta do lead ja-tentado fecha (fs_coll vivo)")
         c32 = STORE["wa_contacts"]["32"]
@@ -1220,6 +1330,244 @@ def cenario_worker_lote():
         main._resolve_channel_creds_by_id = real_creds
         main._close_daily_and_send_protocol = real_close_daily
         restore_dbf()
+
+
+def cenario_reabertura_pontual_carimbo():
+    titulo("CENARIO 22b — Reabertura pontual: campos por tentativa (audiencia manual, sem teto)")
+    patch_store()
+    _legado = [{"at": "2026-09-23T12:00:00+00:00", "audience": "bot"}]
+    STORE["wa_contacts"] = {"34": {"id": 34, "wa_id": "5531977771111", "channel_id": 6,
+                                   "reopen_attempts": 0, "reopen_batch_sent_at": list(_legado)}}
+    # Kill-switch do LOTE desligado: a pontual nao pode ser afetada.
+    STORE["system_settings"] = {"chat": {"reopen_batch_enabled": False}}
+    enviados = []
+
+    async def _fake_send(body=None, current_user=None):
+        enviados.append(body)
+        return {"status": "sent"}
+
+    async def _fake_tpls(channel):
+        return {"templates": []}
+
+    real = (main._resolve_send_target, main._check_conv_send_permission,
+            main.wa_send_template, main._load_approved_templates_for_channel, main.log_audit)
+    main._resolve_send_target = lambda cid, ch: (
+        {"id": cid, "contact_id": 34, "channel_id": 6},
+        dict(STORE["wa_contacts"]["34"]),
+        {"id": 6, "channel_type": "standard"},
+    )
+    main._check_conv_send_permission = lambda *a, **k: None
+    main.wa_send_template = _fake_send
+    main._load_approved_templates_for_channel = _fake_tpls
+    main.log_audit = lambda *a, **k: None
+    try:
+        res = asyncio.run(main.wa_reopen_conversation("6__5531977771111", body=None,
+                                                      current_user=dict(SUPERVISOR)))
+        c34 = STORE["wa_contacts"]["34"]
+        check(res.get("status") == "sent" and len(enviados) == 1,
+              "pontual segue enviando com reopen_batch_enabled=False (kill-switch e so do lote)")
+        check(c34.get("reopen_attempts") == 1
+              and c34.get("last_reopen_at") == c34.get("last_reopen_template_at")
+              and isinstance(c34.get("last_reopen_at"), str),
+              "pontual: attempts+1, last_reopen_at = last_reopen_template_at (ISO)")
+        check(c34.get("last_reopen_audience") == "manual"
+              and c34.get("last_reopen_conversation_id") == "6__5531977771111"
+              and c34.get("last_reopen_channel_id") == 6,
+              "pontual: audiencia manual + conversa da rota + canal da thread")
+        check(c34.get("reopen_batch_sent_at") == _legado,
+              "pontual NAO acrescenta item em reopen_batch_sent_at (teto so p/ envio em massa)")
+    finally:
+        (main._resolve_send_target, main._check_conv_send_permission,
+         main.wa_send_template, main._load_approved_templates_for_channel, main.log_audit) = real
+        restore_dbf()
+
+
+def cenario_reopen_human_active():
+    titulo("CENARIO 22c — reopen_human_active_at: outbound HUMANO apos template de retomada")
+    patch_store()
+    _now = datetime.now(timezone.utc)
+    STORE["wa_contacts"] = {
+        "60": {"id": 60, "wa_id": "5531960000001", "qualification": "em_atendimento",
+               "last_reopen_template_at": (_now - timedelta(hours=2)).isoformat(),
+               "reopen_attempts": 1, "source_channel_type": "standard"},
+        "61": {"id": 61, "wa_id": "5531960000002", "qualification": "em_atendimento",
+               "source_channel_type": "standard"},
+    }
+
+    def _msg(cid, ts=None, **kw):
+        contato = dict(STORE["wa_contacts"][str(cid)])
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=cid, direction="outbound", msg_type="text",
+            content="x", status="sent", timestamp_wa=(ts or _now).isoformat(),
+            channel_id=6, conversation_id=f"6__{contato['wa_id']}", contact=contato, **kw,
+        )
+        return STORE["wa_contacts"][str(cid)]
+
+    c = _msg(60, ts=_now - timedelta(minutes=100))  # bot: sem sender_user_id
+    check("reopen_human_active_at" not in c, "resposta do BOT apos o template nao grava")
+    c = _msg(60, ts=_now - timedelta(minutes=90), sender_user_id=7, human_outbound=False)
+    check("reopen_human_active_at" not in c,
+          "outbound com human_outbound=False (template de lote) nao grava")
+    WRITES.clear()
+    _t_h = _now - timedelta(hours=1)
+    c = _msg(60, ts=_t_h, sender_user_id=7)
+    check(c.get("reopen_human_active_at") == _t_h,
+          "outbound HUMANO apos o template grava reopen_human_active_at = data real da mensagem")
+    _w60 = [w for w in WRITES if w[0] == "wa_contacts" and w[1] == "60"]
+    check(len(_w60) == 1 and "reopen_human_active_at" in _w60[0][2]
+          and "last_message_at" in _w60[0][2],
+          "carimbo vai no MESMO write do contato que o save ja fazia (sem write novo)")
+    check(c.get("reopen_attempts") == 1, "outbound humano NAO zera reopen_attempts")
+    c = _msg(60, ts=_now - timedelta(hours=5), sender_user_id=7)
+    check(c.get("reopen_human_active_at") == _t_h, "replay mais antigo nao recua o carimbo")
+    c61 = _msg(61, sender_user_id=7)
+    check("reopen_human_active_at" not in c61,
+          "contato sem template de retomada: outbound humano NAO grava")
+    restore_dbf()
+
+
+def cenario_kill_switch_lote():
+    titulo("CENARIO 22d — reopen_batch_enabled=False: previa e disparo do lote -> 409")
+    from fastapi import BackgroundTasks
+    patch_store()
+    reset_rbac()
+    main._reopen_preview_cache.clear()
+    varreduras = []
+
+    def _view_vazia():
+        return {"enviaveis": [], "auto_resolve": [], "pulados": {}, "por_setor": {}}
+
+    async def _fake_plan(sys_settings=None):
+        varreduras.append(1)
+        return {"scan": {"criteria_version": "v2.2", "total": 0, "excedente": 0,
+                         "audiences": {"reception": _view_vazia(), "bot": _view_vazia()}},
+                "canais": {}, "tpls": {},
+                "availability": {"cx_ok": False, "disponivel": False, "motivo": "x"}}
+
+    real_plan = main._plan_reopen_batch
+    real_list_tenants = tenant_service.list_tenants
+    main._plan_reopen_batch = _fake_plan
+    # Teto diario do disparo: sem tenants ativos no sim (nada de Firestore real).
+    tenant_service.list_tenants = lambda active_only=True: []
+    try:
+        res = asyncio.run(main.reopen_batch_preview(current_user=dict(SUPERVISOR)))
+        check(res.get("enviaveis") == 0 and varreduras == [1],
+              "default (doc ausente): lote ligado, previa roda normal")
+        STORE["system_settings"] = {"chat": {"reopen_batch_enabled": False}}
+        varreduras.clear()
+        exc = expect_http(lambda: asyncio.run(main.reopen_batch_preview(current_user=dict(SUPERVISOR))),
+                          409, "flag desligada: previa -> 409")
+        check(exc is not None and exc.detail == "Reabertura em lote desligada para esta empresa.",
+              "detalhe do 409 legivel para o admin")
+        bt = BackgroundTasks()
+        expect_http(lambda: asyncio.run(main.reopen_batch_execute(
+            _FakeRequest({"max_sends": 10}), bt, current_user=dict(SUPERVISOR))),
+            409, "flag desligada: disparo -> 409")
+        check(varreduras == [] and not STORE.get("reopen_batches") and not bt.tasks,
+              "409 antes de qualquer varredura: sem scan, sem doc de lote, sem worker")
+        expect_http(lambda: asyncio.run(main.reopen_batch_preview(current_user=dict(OPERADOR))),
+                    403, "permissao segue antes da flag (operador sem reabrir_em_lote -> 403)")
+        STORE["system_settings"]["chat"]["reopen_batch_enabled"] = True
+        expect_http(lambda: asyncio.run(main.reopen_batch_execute(
+            _FakeRequest({}), BackgroundTasks(), current_user=dict(SUPERVISOR))),
+            400, "flag religada: disparo volta ao fluxo normal (400 sem elegiveis)")
+        check(varreduras == [1], "flag religada: o scan voltou a rodar")
+    finally:
+        main._plan_reopen_batch = real_plan
+        tenant_service.list_tenants = real_list_tenants
+        main._reopen_preview_cache.clear()
+        restore_dbf()
+
+
+def cenario_flags_reabertura_settings():
+    titulo("CENARIO 22e — flags da reabertura em system_settings (defaults + coercao no PUT)")
+    patch_store()
+    reset_rbac()
+    real_audit = main.log_audit
+    main.log_audit = lambda *a, **k: None
+    try:
+        s = dbf.get_system_settings()
+        check(s.get("reopen_batch_enabled") is True
+              and s.get("reopen_bot_audience_enabled") is False
+              and s.get("bot_media_turn_enabled") is False,
+              "defaults no READ: lote ligado, publico Bot e midia desligados")
+        # Gravacao pela camada de dados (caminho do script da Castro): coage para bool.
+        dbf.save_system_settings({
+            "reopen_batch_enabled": "false", "reopen_bot_audience_enabled": "1",
+            "bot_media_turn_enabled": 0,
+        })
+        doc = STORE.get("system_settings", {}).get("chat", {})
+        check(doc.get("reopen_batch_enabled") is False
+              and doc.get("reopen_bot_audience_enabled") is True
+              and doc.get("bot_media_turn_enabled") is False,
+              "save_system_settings coage as 3 chaves para bool ('false'->False, '1'->True, 0->False)")
+        dbf.save_system_settings({
+            "reopen_batch_enabled": True, "reopen_bot_audience_enabled": "off",
+            "bot_media_turn_enabled": "TRUE",
+        })
+        doc = STORE["system_settings"]["chat"]
+        check(doc.get("reopen_batch_enabled") is True
+              and doc.get("reopen_bot_audience_enabled") is False
+              and doc.get("bot_media_turn_enabled") is True,
+              "segunda gravacao: True/'off'/'TRUE' -> True/False/True")
+        # PUT da UI (objeto inteiro, aba stale) NAO consegue mexer nas flags da Castro.
+        dbf.save_system_settings({"reopen_batch_enabled": False})
+        res = asyncio.run(main.update_settings_system(_FakeRequest({
+            "reopen_batch_enabled": True, "reopen_bot_audience_enabled": True,
+            "bot_media_turn_enabled": True, "alarm_threshold_minutes": 7,
+        }), current_user=dict(ADMIN)))
+        doc = STORE["system_settings"]["chat"]
+        check(doc.get("reopen_batch_enabled") is False
+              and doc.get("reopen_bot_audience_enabled") is False
+              and doc.get("bot_media_turn_enabled") is True,
+              "PUT da UI descarta as flags da Castro (aba stale nao religa o lote)")
+        check(res.get("alarm_threshold_minutes") == 7,
+              "o resto do PUT da UI continua sendo gravado")
+    finally:
+        main.log_audit = real_audit
+        restore_dbf()
+
+
+def cenario_teto_contato_helper():
+    titulo("CENARIO 22f — teto por contato: leitura unificada (reopen_batch_sent_at + legado)")
+    _now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+    _A = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    _B = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+    _C = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    _D = datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)
+    contato = {
+        "reopen_batch_sent_at": [
+            {"at": _A.isoformat(), "audience": "bot"},          # script grava nas 2 listas
+            {"at": _B.isoformat(), "audience": "reception"},
+            {"at": _C.isoformat(), "audience": "reception"},    # fora da janela de 90d
+            {"at": "lixo", "audience": "bot"},
+            {"audience": "reception"},                          # sem at
+        ],
+        "reopen_bot_sent_at": [
+            _A.isoformat(),                                     # duplicata exata
+            "2026-09-23T12:00:00Z",                             # mesmo instante, outro formato
+            "2026-09-23T09:00:00-03:00",                        # mesmo instante, offset BR
+            "2026-09-30T08:00:00",                              # naive = UTC, so no legado
+            _B.isoformat(),                                     # dup de item com audiencia explicita
+            None,
+        ],
+    }
+    r = dbf.reopen_batch_sends(contato, window_days=90, now=_now)
+    check([(s["at"], s["audience"]) for s in r] == [(_A, "bot"), (_D, "bot"), (_B, "reception")],
+          "janela 90d: 3 envios unicos em ordem; dedup pelo instante; legado lido como bot")
+    check(len(dbf.reopen_batch_sends(contato, now=_now)) == 4,
+          "sem janela: inclui o envio antigo (4 unicos), ignora lixo/None/sem at")
+    _borda = {"reopen_bot_sent_at": [(_now - timedelta(days=90)).isoformat(),
+                                     (_now - timedelta(days=90, seconds=1)).isoformat()]}
+    check(len(dbf.reopen_batch_sends(_borda, window_days=90, now=_now)) == 1,
+          "borda da janela: at == now-90d entra, 1s antes fica fora")
+    check(dbf.reopen_batch_sends({}, window_days=90) == [] and dbf.reopen_batch_sends(None) == [],
+          "contato sem listas (ou None) -> lista vazia")
+    import importlib
+    _script = importlib.import_module("scripts.reopen_bot_audience_once")
+    check(_script.reopen_batch_sends is dbf.reopen_batch_sends
+          and not hasattr(_script, "_sent_timestamps"),
+          "script one-off usa o helper unificado do CRM no teto por contato")
 
 
 def cenario_recibo_nao_reabre():
@@ -1472,6 +1820,882 @@ def cenario_unread_sync():
           "valor igual -> nenhuma escrita (idempotente)")
     restore_dbf()
 
+# =========================================================================
+# Cenario — P2b: conteudo LGPD na aba Sistema (save real + PUT + audit)
+# =========================================================================
+
+ADMIN = {"id": 9, "role": "admin", "tenant_id": "hubloc",
+         "display_name": "Admin", "firebase_uid": "uid9"}
+
+
+def cenario_lgpd_politica_sistema():
+    titulo("CENARIO — P2b: politica LGPD na aba Sistema (validacao no save + PUT + audit)")
+    import lgpd_bot
+    patch_store()
+    reset_rbac()
+    audits = []
+    real_audit = main.log_audit
+    main.log_audit = lambda uid, action, detail="", *a, **k: audits.append((uid, action, detail))
+    hoje = lgpd_bot.hoje_br(datetime.now(timezone.utc))
+    amanha = (hoje + timedelta(days=1)).isoformat()
+    data_pol = (hoje - timedelta(days=90)).isoformat()
+    data_pol2 = (hoje - timedelta(days=30)).isoformat()
+    aviso = "Aviso da clinica: seus dados de saude sao tratados conforme a LGPD."
+    try:
+        s = dbf.get_system_settings()
+        check(s.get("lgpd_policy_date") == "" and s.get("lgpd_privacy_url") == ""
+              and s.get("lgpd_notice") == "",
+              "defaults vazios no READ (bot cai no fallback: nada muda no deploy)")
+        for campos, rotulo in (
+            ({"lgpd_policy_date": amanha}, "data futura"),
+            ({"lgpd_privacy_url": "http://clinica.example/politica"}, "link sem https"),
+            ({"lgpd_notice": "x" * 901}, "aviso com 901 caracteres"),
+        ):
+            try:
+                dbf.save_system_settings(campos)
+                levantou = False
+            except ValueError:
+                levantou = True
+            doc = STORE.get("system_settings", {}).get("chat", {})
+            check(levantou and not any(k in doc for k in campos),
+                  f"save real rejeita {rotulo} (ValueError) e nao grava nada")
+
+        exc = expect_http(lambda: asyncio.run(main.update_settings_system(
+            _FakeRequest({"lgpd_policy_date": amanha}), current_user=dict(ADMIN))),
+            400, "PUT com data futura")
+        check(exc is not None and "futura" in str(exc.detail),
+              "detalhe do 400 legivel (explica que a data nao pode ser futura)")
+        expect_http(lambda: asyncio.run(main.update_settings_system(
+            _FakeRequest({"lgpd_policy_date": data_pol}), current_user=dict(SUPERVISOR))),
+            403, "supervisor sem gerenciar_config_sistema nao edita a politica")
+
+        # Objeto INTEIRO, como o frontend manda.
+        body = dict(dbf.get_system_settings())
+        body.update(lgpd_policy_date=data_pol, lgpd_privacy_url=" https://clinica.example/politica ",
+                    lgpd_notice=aviso)
+        res = asyncio.run(main.update_settings_system(_FakeRequest(body), current_user=dict(ADMIN)))
+        check(res.get("lgpd_policy_date") == data_pol
+              and res.get("lgpd_privacy_url") == "https://clinica.example/politica"
+              and res.get("lgpd_notice") == aviso,
+              "PUT valido persiste os 3 campos (link normalizado)")
+        lg = [a for a in audits if a[1] == "LGPD_POLICY_UPDATE"]
+        check(len(lg) == 1 and lg[0][0] == ADMIN["id"]
+              and lg[0][2] == f"data (vazia) -> {data_pol} | link alterado | aviso alterado",
+              "LGPD_POLICY_UPDATE: data antiga -> nova + link/aviso alterados")
+        check(all(aviso not in a[2] for a in audits),
+              "texto do aviso nao vai inteiro para nenhum audit")
+
+        body2 = dict(res)
+        body2["alarm_enabled"] = False
+        asyncio.run(main.update_settings_system(_FakeRequest(body2), current_user=dict(ADMIN)))
+        check(len([a for a in audits if a[1] == "LGPD_POLICY_UPDATE"]) == 1,
+              "save de outro campo (objeto inteiro) nao registra troca de politica")
+
+        body3 = dict(res)
+        body3["lgpd_policy_date"] = data_pol2
+        asyncio.run(main.update_settings_system(_FakeRequest(body3), current_user=dict(ADMIN)))
+        lg = [a for a in audits if a[1] == "LGPD_POLICY_UPDATE"]
+        check(len(lg) == 2 and lg[-1][2] == f"data {data_pol} -> {data_pol2} | link mantido | aviso mantido",
+              "troca so da data: audit com data antiga -> nova, link/aviso mantidos")
+    finally:
+        main.log_audit = real_audit
+        restore_dbf()
+
+
+# =========================================================================
+# Reabertura por publico (plano v2.2, etapa 3): scan unico com dois baldes
+# =========================================================================
+
+_NOW3 = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+_TPL_RETOMADA = {
+    "name": "varizemed_retomada_generica_utility_v1", "language": "pt_BR", "category": "UTILITY",
+    "components": [
+        {"type": "BODY", "text": "Ola {{1}}, sua ultima conversa foi em {{2}}.",
+         "example": {"body_text": [["Rafael", "01/01/2026"]]}},
+        {"type": "BUTTONS", "buttons": [
+            {"type": "QUICK_REPLY", "text": "Continuar"},
+            {"type": "QUICK_REPLY", "text": "Encerrar atendimento"}]},
+    ],
+}
+# Canais do tenant no sim: 6 e 8 standard COM template, 7 standard SEM
+# template, 9 coexistence (fora do lote por inteiro).
+_CANAIS3 = [
+    {"id": 6, "channel_type": "standard", "is_active": True, "owner_user_id": None},
+    {"id": 7, "channel_type": "standard", "is_active": True, "owner_user_id": None},
+    {"id": 8, "channel_type": "standard", "is_active": True, "owner_user_id": None},
+    {"id": 9, "channel_type": "coexistence", "is_active": True, "owner_user_id": 7},
+]
+_CHANNELS_OK3 = {6: True, 7: False, 8: True}
+
+
+def _seed_publicos(now):
+    """Um contato por caso da secao 10 que depende da selecao. Devolve
+    {contact_id: (estado na visao Recepcao, estado na visao Bot)} esperado —
+    estado = "enviavel" | "auto_resolve" | motivo do pulo."""
+    def ago(**kw):
+        return now - timedelta(**kw)
+
+    def iso(**kw):
+        return ago(**kw).isoformat()
+
+    contacts, threads, msgs, states = {}, {}, {}, {}
+    expected = {}
+
+    def contato(cid, exp, **kw):
+        base = {"id": cid, "wa_id": f"5531900{cid:06d}", "qualification": "novo",
+                "lgpd_consent": True, "last_inbound_at": iso(hours=30),
+                "assigned_to": None, "bot_completed": False, "channel_id": 6,
+                "display_name": f"Lead {cid}"}
+        base.update(kw)
+        contacts[str(cid)] = base
+        if exp is not None:
+            expected[cid] = exp
+        return base
+
+    def thread(cid, ch, **kw):
+        tid = f"{ch}__{contacts[str(cid)]['wa_id']}"
+        base = {"id": tid, "contact_id": cid, "channel_id": ch,
+                "attendance_status": "aberto", "last_message_at": iso(hours=30)}
+        base.update(kw)
+        threads[tid] = base
+        return tid
+
+    def msg(cid, conv, content, ts, **kw):
+        base = {"contact_id": cid, "conversation_id": conv, "direction": "outbound",
+                "sender_user_id": None, "msg_type": "text", "content": content,
+                "timestamp_wa": ts}
+        base.update(kw)
+        msgs[f"m{len(msgs) + 1}"] = base
+
+    RH, BOT = ("enviavel", "atendimento_humano"), ("fase_bot", "enviavel")
+    link = "Agende aqui: https://marcaconsultas.com.br/varizemed"
+
+    # Caso 1: aviso LGPD sem resposta. Caso 7: recusou.
+    contato(101, ("consentimento_ausente",) * 2, lgpd_consent=None); thread(101, 6)
+    contato(107, ("consentimento_ausente",) * 2, lgpd_consent=False); thread(107, 6)
+    # Caso 2: aceitou, Val respondeu, sumiu > 24h -> Bot.
+    contato(102, BOT); c102 = thread(102, 6); msg(102, c102, "Posso ajudar?", ago(hours=31))
+    # Caso 3: handoff sem atendimento (novo + bot_completed) <= 30d -> Recepcao;
+    # P4: 31 dias fora (so Recepcao); borda exata de 30 dias entra.
+    contato(103, RH, bot_completed=True, last_inbound_at=iso(days=5), department_id=2); thread(103, 6)
+    contato(1031, ("mais_antigo_que_limite", "atendimento_humano"), bot_completed=True,
+            last_inbound_at=iso(days=31)); thread(1031, 6)
+    contato(1032, RH, bot_completed=True, last_inbound_at=iso(days=30)); thread(1032, 6)
+    # Caso 4: handoff e conversaram (em_atendimento).
+    contato(104, RH, qualification="em_atendimento", bot_completed=True, department_id=2)
+    thread(104, 6, last_human_outbound_at=ago(days=2))
+    # Casos 5 e 21: desfecho terminal nem entra na varredura.
+    contato(105, None, qualification="convertido"); thread(105, 6)
+    contato(121, None, qualification="nao_convertido", last_inbound_at=iso(days=9)); thread(121, 6)
+    # Caso 6 COM marco: atendido ANTES do release -> Bot (D2).
+    contato(106, BOT, qualification="em_atendimento", bot_released_at=ago(days=3))
+    c106 = thread(106, 6, last_human_outbound_at=ago(days=4))
+    # Casos 6/27 SEM marco (legado): criterio 4 ignorado, criterio 2 decide.
+    contato(1061, BOT, qualification="em_atendimento")
+    thread(1061, 6, last_human_outbound_at=ago(days=10))
+    # Caso 10: supervisor respondeu na aba Bot DEPOIS do marco -> Recepcao.
+    contato(110, RH, qualification="em_atendimento", bot_released_at=ago(days=5))
+    thread(110, 6, last_human_outbound_at=ago(days=2))
+    # Caso 11 (CX): devolvido pelo menu (return_contact_to_bot) -> caso 6.
+    contato(111, BOT, bot_released_at=ago(days=2)); thread(111, 6, last_human_outbound_at=ago(days=6))
+    # Caso 12: lead com dono, frio -> Recepcao.
+    contato(112, RH, qualification="em_atendimento", assigned_to=7, bot_completed=True,
+            department_id=3); thread(112, 6)
+    # Caso 14: ignorou o template da Recepcao -> auto-resolve Recepcao.
+    contato(114, ("auto_resolve", "tentativa_outro_publico"), qualification="em_atendimento",
+            bot_completed=True, reopen_attempts=1, last_reopen_audience="reception",
+            last_reopen_at=iso(hours=30), last_reopen_template_at=iso(hours=30),
+            last_inbound_at=iso(days=3))
+    thread(114, 6)
+    # Caso 15: 2 retomadas em 90 dias (qualquer publico) -> teto_contato;
+    # com 1 dentro da janela (a outra ha 100 dias) ainda entra.
+    contato(115, ("teto_contato",) * 2, qualification="em_atendimento", assigned_to=7,
+            bot_completed=True, last_reopen_template_at=iso(days=10),
+            reopen_batch_sent_at=[{"at": iso(days=40), "audience": "bot"},
+                                  {"at": iso(days=10), "audience": "reception"}]); thread(115, 6)
+    contato(1151, RH, qualification="em_atendimento", assigned_to=7, bot_completed=True,
+            reopen_batch_sent_at=[{"at": iso(days=100), "audience": "bot"},
+                                  {"at": iso(days=10), "audience": "reception"}]); thread(1151, 6)
+    # Caso 18: duas threads. Coexistence com resposta humana apos o marco
+    # decide no CONTATO (Recepcao); envio pela standard mais recente (canal 8).
+    contato(118, RH, bot_released_at=ago(days=5))
+    thread(118, 9, last_human_outbound_at=ago(days=1))
+    thread(118, 6, last_message_at=iso(days=3))
+    thread(118, 8, last_message_at=iso(days=2))
+    # Empate de last_message_at entre standards: menor channel_id (6).
+    contato(1181, RH, qualification="em_atendimento", assigned_to=7, bot_completed=True)
+    thread(1181, 8, last_message_at=iso(days=2)); thread(1181, 6, last_message_at=iso(days=2))
+    # Caso 23: canal sem template compativel. Sem thread standard (coex,
+    # nenhuma thread, so backup).
+    contato(123, ("sem_template",) * 2, qualification="em_atendimento", assigned_to=7,
+            bot_completed=True); thread(123, 7)
+    contato(1231, ("sem_thread_standard",) * 2); thread(1231, 9)
+    contato(1232, ("sem_thread_standard",) * 2)
+    contato(1233, ("sem_thread_standard",) * 2, assigned_to=7, bot_completed=True)
+    thread(1233, 6, is_backup=True)
+    # Caso 26: template como Recepcao, devolvido ao bot antes do lote seguinte
+    # -> auto-resolve pela audiencia da TENTATIVA (Recepcao).
+    contato(126, ("auto_resolve", "tentativa_outro_publico"), qualification="em_atendimento",
+            reopen_attempts=1, last_reopen_audience="reception", last_reopen_at=iso(days=2),
+            last_reopen_template_at=iso(days=2), bot_released_at=ago(days=1),
+            last_inbound_at=iso(days=4)); thread(126, 6)
+    # Caso 29 (P5): bot_outcome preenchido -> fora do Bot (desfecho_bot).
+    contato(129, ("fase_bot", "desfecho_bot"), bot_outcome="agendado"); thread(129, 6)
+    # P5 heuristica: link da Val no ciclo -> desfecho_bot; antes do marco,
+    # de humano, no template do lote ou alem das 40 ultimas -> nao conta.
+    contato(1291, ("fase_bot", "desfecho_bot")); c = thread(1291, 6)
+    msg(1291, c, link, ago(days=2))
+    contato(1292, BOT, bot_released_at=ago(days=2)); c = thread(1292, 6)
+    msg(1292, c, link, ago(days=5))
+    contato(1293, BOT); c = thread(1293, 6)
+    msg(1293, c, link, ago(days=3), sender_user_id=7)
+    msg(1293, c, "[Reabertura em lote: marcaconsultas]", ago(days=2), msg_type="template")
+    contato(1294, BOT); c = thread(1294, 6)
+    msg(1294, c, link, ago(days=10))
+    for i in range(40):
+        msg(1294, c, f"resposta {i}", ago(days=9, minutes=-i))
+    # Caso 31 (P2b): aceite anterior a data da politica -> fora.
+    contato(131, ("politica_desatualizada",) * 2, qualification="em_atendimento", assigned_to=7,
+            bot_completed=True, lgpd_consent_at=iso(days=60)); thread(131, 6)
+    contato(1311, RH, qualification="em_atendimento", assigned_to=7, bot_completed=True,
+            lgpd_consent_at=iso(days=10)); thread(1311, 6)
+    # Auto-resolve: supressao por outbound humano apos a tentativa (ancora
+    # last_reopen_at; fallback last_reopen_template_at); humano ANTES nao suprime.
+    contato(140, ("atendimento_pos_retomada",) * 2, qualification="em_atendimento",
+            reopen_attempts=1, last_reopen_audience="reception", last_reopen_at=iso(days=3),
+            last_reopen_template_at=iso(days=3), reopen_human_active_at=ago(days=2))
+    contato(1401, ("atendimento_pos_retomada",) * 2, qualification="em_atendimento",
+            reopen_attempts=1, last_reopen_template_at=iso(days=3),
+            reopen_human_active_at=ago(days=2))
+    contato(1402, ("auto_resolve", "tentativa_outro_publico"), qualification="em_atendimento",
+            assigned_to=7, reopen_attempts=1, last_reopen_audience="reception",
+            last_reopen_at=iso(days=2), last_reopen_template_at=iso(days=2),
+            reopen_human_active_at=ago(days=3))
+    # Tentativa sem audiencia (pre-deploy) ou "manual" -> reclassifica pelo estado.
+    contato(141, ("tentativa_outro_publico", "auto_resolve"), reopen_attempts=1,
+            last_reopen_template_at=iso(days=2)); thread(141, 6)
+    contato(1411, ("auto_resolve", "tentativa_outro_publico"), qualification="em_atendimento",
+            assigned_to=7, reopen_attempts=1, last_reopen_audience="manual",
+            last_reopen_template_at=iso(days=2))
+    # Caso 30: carimbado pelo script de 23/09 (audiencia bot) e ignorou.
+    contato(142, ("tentativa_outro_publico", "auto_resolve"), reopen_attempts=1,
+            last_reopen_audience="bot", last_reopen_template_at=iso(days=14),
+            reopen_bot_sent_at=[iso(days=14)])
+    contato(143, ("ja_resolvido",) * 2, reopen_attempts=1, reopen_resolved_at=iso(days=1),
+            last_reopen_template_at=iso(days=2))
+    # bot_states.human_active (criterio 2.2.3) -> Recepcao.
+    contato(144, RH); thread(144, 6); states["144"] = {"human_active": True}
+    # Filtros de contato herdados da C2.
+    contato(145, ("opt_out",) * 2, reopen_opt_out=True)
+    contato(146, ("arquivado",) * 2, is_archived=1)
+    contato(147, ("backup",) * 2, is_backup=True)
+    contato(148, ("lgpd_revogado",) * 2, lgpd_revoked=True)
+    contato(149, ("janela_aberta",) * 2, last_inbound_at=iso(hours=2))
+    contato(150, ("janela_desconhecida",) * 2, last_inbound_at=None)
+    contato(151, ("cooldown",) * 2, last_reopen_template_at=iso(hours=3))
+    # Recusa comercial do follow-up (merge 2026-10-18): fora das duas visoes.
+    contato(152, ("commercial_contact_blocked",) * 2,
+            commercial_contact_block={"active": True, "version": 1})
+    # Registro invalido segue bloqueando (falha fechada).
+    contato(153, ("commercial_contact_blocked",) * 2, commercial_contact_block={"active": "sim"})
+
+    STORE["wa_contacts"] = contacts
+    STORE["wa_conversations"] = threads
+    STORE["wa_messages"] = msgs
+    STORE["bot_states"] = states
+    return expected
+
+
+def _ids(rows):
+    return [c["id"] for c in rows]
+
+
+def _view_sum(view):
+    return len(view["enviaveis"]) + len(view["auto_resolve"]) + sum(view["pulados"].values())
+
+
+def cenario_publicos_particao():
+    titulo("CENARIO 23 — Reabertura por publico: particao Recepcao x Bot (secao 10)")
+    from datetime import date as _date
+    patch_store()
+    expected = _seed_publicos(_NOW3)
+    pol = (_NOW3 - timedelta(days=30)).date()
+
+    def _scan(**kw):
+        args = dict(max_attempts=1, cooldown_hours=24, window_hours=24, max_per_contact=2,
+                    window_days=90, max_idle_days=30, scan_max=2000,
+                    desfecho_link="marcaconsultas", now=_NOW3, with_detail=True)
+        args.update(kw)
+        return dbf.scan_reopen_audiences(_CHANNELS_OK3, args.pop("cx", True), pol, **args)
+
+    try:
+        r = _scan()
+        det = r["detalhe"]
+        rec, bot = r["audiences"]["reception"], r["audiences"]["bot"]
+        errados = {cid: ((det.get(cid) or {}).get("reception"), (det.get(cid) or {}).get("bot"), exp)
+                   for cid, exp in expected.items()
+                   if ((det.get(cid) or {}).get("reception"), (det.get(cid) or {}).get("bot")) != exp}
+        check(not errados, f"cada caso no destino esperado nas duas visoes ({len(expected)} contatos; divergentes={errados})")
+        check(105 not in det and 121 not in det and r["total"] == len(expected),
+              "casos 5/21: desfecho terminal nem entra na varredura (query por qualification)")
+        baldes = [_ids(rec["enviaveis"]), _ids(rec["auto_resolve"]),
+                  _ids(bot["enviaveis"]), _ids(bot["auto_resolve"])]
+        todos = [i for b in baldes for i in b]
+        check(len(todos) == len(set(todos)), "nenhum contato cai em dois baldes")
+        check(_view_sum(rec) == r["total"] and _view_sum(bot) == r["total"],
+              "cada visao soma o total varrido (enviaveis + auto_resolve + pulados)")
+        check(sorted(_ids(bot["enviaveis"])) == [102, 106, 111, 1061, 1292, 1293, 1294],
+              f"Bot = casos 2, 6 (com/sem marco), 11 CX e P5 fora do ciclo ({sorted(_ids(bot['enviaveis']))})")
+        check(sorted(_ids(rec["auto_resolve"])) == [114, 126, 1402, 1411]
+              and sorted(_ids(bot["auto_resolve"])) == [141, 142],
+              "auto-resolve pelo publico da TENTATIVA (14, 26, manual/ausente reclassificado, 30)")
+        chave = [(0 if c["qualification"] == "em_atendimento" else 1,
+                  -datetime.fromisoformat(c["last_inbound_at"]).timestamp())
+                 for c in rec["enviaveis"]]
+        check(chave == sorted(chave) and rec["enviaveis"][-1]["id"] == 1032,
+              "ordem 2.3: em_atendimento antes de novo; ultimo inbound mais recente primeiro")
+        alvo = {c["id"]: c["_reopen_target"] for c in rec["enviaveis"] + bot["enviaveis"]}
+        check(alvo[118]["channel_id"] == 8 and alvo[118]["conversation_id"] == "8__5531900000118",
+              "caso 18: criterios no contato (coex atendida -> Recepcao), envio pela standard mais recente")
+        check(alvo[1181]["channel_id"] == 6, "thread candidata: empate de last_message_at -> menor channel_id")
+        check(all(t["channel_id"] in (6, 8) for t in alvo.values()),
+              "envio so por canal standard ativo com template (nunca 7 sem template nem 9 coex)")
+        check(rec["por_setor"].get(2) == 2 and rec["por_setor"].get(3) == 1,
+              f"por_setor por publico (Recepcao: {rec['por_setor']})")
+        check(rec["pulados"].get("fase_bot") == 9 and bot["pulados"].get("desfecho_bot") == 2
+              and bot["pulados"].get("atendimento_humano") == 11,
+              f"motivos do outro balde: fase_bot={rec['pulados'].get('fase_bot')} "
+              f"desfecho_bot={bot['pulados'].get('desfecho_bot')} "
+              f"atendimento_humano={bot['pulados'].get('atendimento_humano')}")
+        lt = r["leituras"]
+        check(lt["threads"] == 24 and lt["bot_states"] == 13 and lt["mensagens"] == 8,
+              f"custo: threads/bot_states/mensagens so p/ sobreviventes ({lt})")
+
+        # Sem heuristica (REOPEN_DESFECHO_LINK vazio): o link nao tira do Bot.
+        r2 = _scan(desfecho_link="")
+        check(1291 in _ids(r2["audiences"]["bot"]["enviaveis"]) and r2["leituras"]["mensagens"] == 0,
+              "REOPEN_DESFECHO_LINK vazio desliga a heuristica (sem query de mensagens)")
+        # Sem data de politica: o aceite antigo (caso 31) volta a valer.
+        r3 = dbf.scan_reopen_audiences(_CHANNELS_OK3, True, None, now=_NOW3, with_detail=True,
+                                       desfecho_link="marcaconsultas")
+        check(r3["detalhe"][131]["reception"] == "enviavel",
+              "sem lgpd_policy_date: politica_desatualizada nao se aplica")
+
+        # Tenant SEM motor CX (builtin, Hubloc): nao ha fase de bot.
+        rb = _scan(cx=False)
+        db_ = rb["detalhe"]
+        check(rb["audiences"]["bot"]["enviaveis"] == [] and rb["leituras"]["bot_states"] == 0,
+              "builtin: publico Bot vazio e nenhuma leitura de bot_states")
+        check(all(db_[i]["reception"] == "aguardando_bot" for i in (102, 106, 111, 118, 144, 1061)),
+              "casos 11 builtin/19: sem dono + bot_completed falso -> aguardando_bot (fora da Recepcao)")
+        check(db_[141]["reception"] == "auto_resolve" and db_[142]["bot"] == "auto_resolve",
+              "builtin: tentativa sem audiencia reclassifica p/ Recepcao; a do script segue no Bot")
+        check(db_[1031]["reception"] == "mais_antigo_que_limite" and db_[103]["reception"] == "enviavel",
+              "caso 19: Recepcao muda pelo P4 tambem no builtin")
+        check(_view_sum(rb["audiences"]["reception"]) == rb["total"], "builtin: visao Recepcao soma o total")
+
+        # Corte REOPEN_SCAN_MAX depois da ordenacao: excedente nao paga leitura.
+        rc = _scan(scan_max=3)
+        rcr = rc["audiences"]["reception"]
+        colocados = [c for v in rc["audiences"].values() for c in v["enviaveis"] + v["auto_resolve"]]
+        check(rc["excedente"] > 0 and rcr["pulados"].get("limite_varredura") == rc["excedente"]
+              and rc["audiences"]["bot"]["pulados"].get("limite_varredura") == rc["excedente"]
+              and _view_sum(rcr) == rc["total"],
+              f"corte: {rc['excedente']} candidatos alem do limite -> limite_varredura nas duas visoes")
+        check(rc["leituras"]["threads"] <= 3 and len(colocados) <= 3
+              and all(c["qualification"] == "em_atendimento" for c in colocados),
+              "corte: so os 3 primeiros da ordem (em_atendimento) pagam leitura")
+
+        # Conciliacao 11.1 (tools/reopen_conciliation.py) sobre o mesmo store:
+        # nivel de scan, todo canal standard conta como tendo template.
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location(
+            "reopen_conciliation", os.path.join(ROOT, "tools", "reopen_conciliation.py"))
+        conc_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(conc_mod)
+        v1, v2 = conc_mod.classificar({6: True, 7: True, 8: True}, True, pol, now=_NOW3)
+        cc = conc_mod.conciliar(v1, v2)
+        check(cc["recepcao_v1"] == 11 and cc["recepcao_v2"] == 11
+              and {k: v for k, v in cc["parcelas"].items() if v} == {
+                  "fase_bot": [106, 1061], "teto_contato": [115], "politica_desatualizada": [131]}
+              and cc["novo_pos_handoff_elegivel"] == [103, 1032],
+              f"conciliacao: v1 11 - (fase_bot 2 + teto 1 + politica 1) + novo pos-handoff 2 ({cc['parcelas']})")
+        check(cc["esperado"] == 9 and cc["residuo"] == 2 and cc["residuo_inexplicado"] == 0
+              and cc["novo_em_atendimento_humano"] == {"humano_pos_marco": [118], "human_active": [144]},
+              "conciliacao: residuo 2 = novo em atendimento humano (caso 18 e human_active), 0 inexplicado")
+        _v1b = {"enviaveis": [{"id": 1}, {"id": 2}], "auto_resolve": [], "pulados": {}}
+        _v2b = {"detalhe": {1: {"reception": "cooldown"},
+                            2: {"reception": "enviavel", "qualification": "em_atendimento"},
+                            3: {"reception": "enviavel", "qualification": "em_atendimento", "via": "dono"}}}
+        cb = conc_mod.conciliar(_v1b, _v2b)
+        check(cb["residuo_inexplicado"] == 2 and cb["saida_inexplicada"] == {"cooldown": [1]}
+              and cb["entrada_inexplicada"] == {"em_atendimento/dono": [3]},
+              "conciliacao: saida/entrada fora das parcelas viram residuo inexplicado (bug)")
+        from google.cloud.firestore_v1 import (
+            batch as _fb, collection as _fc, document as _fdoc, transaction as _ft)
+        _alvos = [(_fdoc.DocumentReference, n) for n in ("set", "update", "delete", "create")] + [
+            (_fc.CollectionReference, "add"), (_fb.WriteBatch, "commit"), (_ft.Transaction, "commit")]
+        _originais = [(cls, n, cls.__dict__.get(n)) for cls, n in _alvos]
+        try:
+            conc_mod.trava_escrita()
+            try:
+                _fdoc.DocumentReference("c", "d", client=None).set({"x": 1})
+                bloqueou = False
+            except RuntimeError:
+                bloqueou = True
+            check(bloqueou, "conciliacao: trava de escrita do cliente Firestore (so leitura)")
+        finally:
+            for cls, n, orig in _originais:
+                if orig is None:
+                    delattr(cls, n)  # metodo herdado: volta a resolver na base
+                else:
+                    setattr(cls, n, orig)
+    finally:
+        restore_dbf()
+
+
+def _reopen_api_env(ai_cfg, tenants=("varizemed", "hubloc"), request_tenant="varizemed"):
+    """Stubs do caminho HTTP da reabertura (sem Firestore/Meta reais).
+    reopen_batches fica POR TENANT no store (chave "{tid}/reopen_batches")
+    para o teto diario somar tenants de verdade. Devolve (restore, contadores)."""
+    def _tcoll(coll):
+        tid = firestore_common.get_tenant_context()
+        return f"{tid}/{coll}" if (tid and coll == "reopen_batches") else coll
+
+    contadores = {"scan": 0, "tpl": 0, "channels_creds": []}
+    real = {
+        "dbf.collection": dbf.collection, "dbf.document": dbf.document,
+        "main.fs_coll": main.fs_coll, "main.fs_document": main.fs_document,
+        "get_all_active_channels": channel_service.get_all_active_channels,
+        "tpl": main._resolve_reopen_template, "get_tenant": tenant_service.get_tenant,
+        "list_tenants": tenant_service.list_tenants, "next_seq": database.next_sequence,
+        "log_audit": main.log_audit, "scan": database.scan_reopen_audiences,
+    }
+    dbf.collection = lambda coll: _CollRef(_tcoll(coll))
+    dbf.document = lambda coll, doc_id: _DocRef(_tcoll(coll), doc_id)
+    main.fs_coll = lambda coll: _CollRef(_tcoll(coll))
+    main.fs_document = lambda coll, doc_id: _DocRef(_tcoll(coll), doc_id)
+    channel_service.get_all_active_channels = lambda: [dict(c) for c in _CANAIS3]
+
+    async def _fake_tpl(ch):
+        contadores["tpl"] += 1
+        return dict(_TPL_RETOMADA) if ch.get("id") in (6, 8) else None
+
+    main._resolve_reopen_template = _fake_tpl
+    tenant_service.get_tenant = lambda tid: {"id": tid, "settings": {"ai": dict(ai_cfg)}}
+    tenant_service.list_tenants = lambda active_only=True: [{"id": t} for t in tenants]
+    database.next_sequence = dbf.next_sequence
+    main.log_audit = lambda *a, **k: None
+
+    def _scan_contado(*a, **k):
+        contadores["scan"] += 1
+        return real["scan"](*a, **k)
+
+    database.scan_reopen_audiences = _scan_contado
+    main._reopen_preview_cache.clear()
+    token = firestore_common.set_tenant_context(request_tenant)
+
+    def restore():
+        firestore_common.reset_tenant_context(token)
+        dbf.collection, dbf.document = real["dbf.collection"], real["dbf.document"]
+        main.fs_coll, main.fs_document = real["main.fs_coll"], real["main.fs_document"]
+        channel_service.get_all_active_channels = real["get_all_active_channels"]
+        main._resolve_reopen_template = real["tpl"]
+        tenant_service.get_tenant = real["get_tenant"]
+        tenant_service.list_tenants = real["list_tenants"]
+        database.next_sequence = real["next_seq"]
+        main.log_audit = real["log_audit"]
+        database.scan_reopen_audiences = real["scan"]
+        main._reopen_preview_cache.clear()
+
+    return restore, contadores
+
+
+_AI_CX = {"bot_engine": "dialogflow_cx", "status": "active"}
+_OLD_PREVIEW_KEYS = ("enviaveis", "auto_resolve", "pulados", "por_setor", "amostra", "max_sends_default")
+
+
+def _seed_batches(now, usados_varizemed=140, abortado=5, hubloc_reserva=100):
+    """Lotes das ultimas 24h nos dois tenants (teto do portfolio)."""
+    STORE["varizemed/reopen_batches"] = {
+        "1": {"id": 1, "status": "concluido", "enviados": usados_varizemed, "planejados": 150,
+              "started_at": (now - timedelta(hours=2)).isoformat()},
+        "2": {"id": 2, "status": "abortado", "enviados": abortado, "planejados": 100,
+              "started_at": (now - timedelta(hours=3)).isoformat()},
+        "3": {"id": 3, "status": "concluido", "enviados": 90,
+              "started_at": (now - timedelta(hours=30)).isoformat()},   # fora das 24h
+    }
+    STORE["hubloc/reopen_batches"] = {
+        # Executando de outra instancia: conta a RESERVA (max(enviados, planejados)).
+        "7": {"id": 7, "status": "executando", "enviados": 10, "planejados": hubloc_reserva,
+              "started_at": (now - timedelta(hours=1)).isoformat(),
+              "last_progress_at": (now - timedelta(hours=1)).isoformat()},
+    }
+
+
+def cenario_previa_publicos_api():
+    titulo("CENARIO 24 — Previa por publico: compatibilidade, flags, teto diario e cache")
+    patch_store()
+    reset_rbac()
+    # O endpoint le o relogio real DEPOIS do seed: semear 5 min a frente mantem
+    # a borda exata do P4 (30 dias) dentro da janela.
+    now = datetime.now(timezone.utc) + timedelta(minutes=5)
+    _seed_publicos(now)
+    STORE["system_settings"] = {"chat": {"bot_enabled": True,
+                                         "lgpd_policy_date": (now - timedelta(days=30)).date().isoformat()}}
+    _seed_batches(now)
+    restore, cont = _reopen_api_env(_AI_CX)
+    prev = lambda body=None: asyncio.run(main.reopen_batch_preview(  # noqa: E731
+        request=_FakeRequest(body) if body is not None else None, current_user=dict(SUPERVISOR)))
+    try:
+        res = prev()
+        rec = res["audiences"]["reception"]
+        check(all(k in res for k in _OLD_PREVIEW_KEYS)
+              and all(res[k] == rec[k] for k in _OLD_PREVIEW_KEYS),
+              "campos antigos da previa presentes e iguais ao balde Recepcao (tela atual intacta)")
+        check(set(res["audiences"]) == {"reception", "bot"}
+              and all(set(v) == set(_OLD_PREVIEW_KEYS) for v in res["audiences"].values()),
+              "audiences.reception e audiences.bot com as mesmas chaves da previa antiga")
+        check(res["enviaveis"] == 10 and res["audiences"]["bot"]["enviaveis"] == 7
+              and res["audiences"]["bot"]["auto_resolve"] == 2,
+              f"contagens dos dois baldes (Recepcao {res['enviaveis']}, Bot {res['audiences']['bot']['enviaveis']})")
+        check(res["bot_disponivel"] is False
+              and res["bot_indisponivel_motivo"] == "publico Bot ainda nao liberado para esta empresa",
+              "flag do Bot desligada: indisponivel com motivo, contagens ainda visiveis")
+        check(res["daily_cap"] == {"cap": 250, "usados_24h": 245, "disponiveis": 5},
+              f"teto diario soma os dois tenants (reserva do executando, abortado, fora das 24h) ({res['daily_cap']})")
+        a0 = res["amostra"][0]
+        check(set(a0) >= {"contact_id", "nome", "department_id", "conversation_id", "channel_id"}
+              and a0["conversation_id"].startswith(f"{a0['channel_id']}__"),
+              "amostra traz conversation_id/channel_id da thread candidata")
+        check(res["pulados"].get("fase_bot") == 9 and "canal_invalido" not in res["pulados"],
+              "visao Recepcao mostra o lead do Bot como fase_bot (flag desligada nao muda a classificacao)")
+        check(res["cache_hit"] is False and cont["scan"] == 1, "1a previa: varre (sem cache)")
+
+        res2 = prev()
+        check(res2["cache_hit"] is True and cont["scan"] == 1
+              and res2["audiences"] == res["audiences"],
+              "2a previa em < 90s (troca de publico): cache, sem nova varredura")
+        res3 = prev({"refresh": True})
+        check(res3["cache_hit"] is False and cont["scan"] == 2, "refresh=true ignora o cache")
+
+        main._reopen_preview_cache.clear()
+
+        async def _duas():
+            return await asyncio.gather(
+                main.reopen_batch_preview(request=None, current_user=dict(SUPERVISOR)),
+                main.reopen_batch_preview(request=None, current_user=dict(SUPERVISOR)))
+        a, b = asyncio.run(_duas())
+        check(cont["scan"] == 3 and sorted([a["cache_hit"], b["cache_hit"]]) == [False, True],
+              "uma previa por vez por tenant: a concorrente espera e sai do cache")
+
+        STORE["system_settings"]["chat"]["reopen_bot_audience_enabled"] = True
+        res4 = prev()
+        check(res4["bot_disponivel"] is True and res4["bot_indisponivel_motivo"] == "",
+              "flag ligada + CX ativo + bot_enabled: Bot disponivel")
+        STORE["system_settings"]["chat"]["bot_enabled"] = False
+        res5 = prev()
+        check(res5["bot_disponivel"] is False
+              and res5["bot_indisponivel_motivo"] == "bot desligado nas configuracoes da empresa",
+              "bot_enabled desligado: Bot indisponivel com motivo")
+    finally:
+        restore()
+        restore_dbf()
+
+    # Caso 19 (Hubloc): builtin -> Bot indisponivel; lote inteiro desligado -> 409.
+    patch_store()
+    reset_rbac()
+    _seed_publicos(now)
+    STORE["system_settings"] = {"chat": {"bot_enabled": True}}
+    restore, cont = _reopen_api_env({}, tenants=("hubloc",), request_tenant="hubloc")
+    try:
+        res = asyncio.run(main.reopen_batch_preview(request=None, current_user=dict(SUPERVISOR)))
+        check(res["bot_disponivel"] is False and "motor CX" in res["bot_indisponivel_motivo"]
+              and res["audiences"]["bot"]["enviaveis"] == 0
+              and res["pulados"].get("aguardando_bot", 0) > 0,
+              "caso 19: builtin -> Bot indisponivel (motor), aguardando_bot na Recepcao")
+        STORE["system_settings"]["chat"]["reopen_batch_enabled"] = False
+        expect_http(lambda: asyncio.run(main.reopen_batch_preview(request=None, current_user=dict(SUPERVISOR))),
+                    409, "caso 19: reopen_batch_enabled=false -> previa 409")
+    finally:
+        restore()
+        restore_dbf()
+
+
+def cenario_disparo_publicos():
+    titulo("CENARIO 25 — Disparo por publico: audience, 409/422, teto diario e reserva")
+    from fastapi import BackgroundTasks
+    patch_store()
+    reset_rbac()
+    now = datetime.now(timezone.utc) + timedelta(minutes=5)  # mesma razao do cenario 24
+    _seed_publicos(now)
+    STORE["system_settings"] = {"chat": {"bot_enabled": True,
+                                         "lgpd_policy_date": (now - timedelta(days=30)).date().isoformat()}}
+    _seed_batches(now)
+    restore, cont = _reopen_api_env(_AI_CX)
+    exe = lambda body, bt=None: asyncio.run(main.reopen_batch_execute(  # noqa: E731
+        _FakeRequest(body), bt or BackgroundTasks(), current_user=dict(SUPERVISOR)))
+    lotes = lambda: STORE.get("varizemed/reopen_batches", {})  # noqa: E731
+    try:
+        n0 = len(lotes())
+        expect_http(lambda: exe({"audience": "robo"}), 422, "audience invalido -> 422")
+        expect_http(lambda: exe({"audience": 123}), 422, "audience nao-string -> 422")
+        exc = expect_http(lambda: exe({"audience": "bot"}), 409, "Bot com a flag desligada -> 409")
+        check(exc is not None and "ainda nao liberado" in str(exc.detail) and len(lotes()) == n0
+              and cont["scan"] == 0,
+              "409 do Bot traz o motivo e sai antes de varrer/criar lote")
+
+        # Recepcao (audience ausente = reception). Teto: 245 usados -> 5 disponiveis.
+        main._reopen_preview_cache["varizemed"] = (main._monotonic(), {"x": 1})
+        bt = BackgroundTasks()
+        res = exe({"max_sends": 100}, bt)
+        doc = lotes()[str(res["batch_id"])]
+        check(res["audience"] == "reception" and doc["audience"] == "reception"
+              and doc["criteria_version"] == "v2.2",
+              "audience ausente = reception; doc do lote grava audience e criteria_version")
+        check(res["planejados"] == 5 and doc["planejados"] == 5 and doc["elegiveis"] == 10,
+              "planejados = min(enviaveis 10, max_sends 100, disponiveis 5) — a reserva do teto")
+        args = bt.tasks[0].args
+        check(args[0] == "varizemed" and len(args[2]) == 5 and len(args[3]) == 4
+              and args[7] == "reception" and all("_reopen_target" in c for c in args[2]),
+              "worker recebe 5 envios (com thread candidata), 4 auto-resolve e o publico do lote")
+        check("varizemed" not in main._reopen_preview_cache, "disparo invalida o cache da previa do tenant")
+
+        # O lote recem-criado conta pela reserva: 245 + 5 = 250 -> teto esgotado.
+        lotes()[str(res["batch_id"])].update({"status": "concluido", "enviados": 5})
+        exc = expect_http(lambda: exe({}), 409, "teto diario esgotado (250/250) -> 409")
+        check(exc is not None and "Teto diario de reaberturas atingido (250 de 250" in str(exc.detail),
+              "409 do teto legivel (usados de cap, somando todas as empresas)")
+
+        # Abre espaco (lote de 140 sai das 24h) e libera o publico Bot.
+        lotes()["1"]["started_at"] = (now - timedelta(hours=25)).isoformat()
+        STORE["system_settings"]["chat"]["reopen_bot_audience_enabled"] = True
+        bt = BackgroundTasks()
+        res = exe({"audience": "BOT", "max_sends": 3}, bt)
+        doc = lotes()[str(res["batch_id"])]
+        args = bt.tasks[0].args
+        check(res["audience"] == "bot" and doc["audience"] == "bot" and args[7] == "bot",
+              "audience=bot (case-insensitive) chega ao doc e ao worker")
+        check(res["planejados"] == 3 and [c["id"] for c in args[2]] == [106, 1061, 102],
+              "Bot: planejados = max_sends (3) com teto folgado, na ordem 2.3 (em_atendimento primeiro)")
+        check(all(c["_reopen_target"]["channel_id"] == 6 for c in args[2]),
+              "Bot: cada envio leva a thread candidata (canal 6)")
+        check(args[3] == [] and doc["auto_resolve_planejados"] == 0
+              and doc["auto_resolve_fora_do_disparo"] == 2,
+              "etapa 3: auto-resolve do Bot fica FORA do disparo (so na previa)")
+        uso = dbf.reopen_daily_usage(now=now)
+        check(uso["por_tenant"] == {"varizemed": 5 + 5 + 3, "hubloc": 100} and uso["usados"] == 113,
+              f"reopen_daily_usage por tenant: concluido=enviados, executando=reserva ({uso})")
+    finally:
+        restore()
+        restore_dbf()
+
+
+def cenario_worker_publico_bot():
+    titulo("CENARIO 26 — Worker: publico do lote no carimbo + canal da thread candidata")
+    import types as _types
+    patch_store()
+    now = datetime.now(timezone.utc)
+    STORE["wa_contacts"] = {
+        "70": {"id": 70, "wa_id": "5531970000070", "channel_id": 6, "qualification": "novo",
+               "last_inbound_at": (now - timedelta(hours=30)).isoformat(), "unread_count": 0},
+    }
+    alvo = {"conversation_id": "8__5531970000070", "channel_id": 8,
+            "last_message_at": (now - timedelta(days=2)).isoformat()}
+    item = dict(STORE["wa_contacts"]["70"], _reopen_target=alvo)
+    creds, enviados = [], []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"messages": [{"id": "wamid.BOT1"}]}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            enviados.append((url, json))
+            return _Resp()
+
+    async def _sleep(_s):
+        return None
+
+    real = (main.fs_coll, main.fs_document, main.httpx, main.asyncio,
+            main._resolve_channel_creds_by_id, main.log_audit)
+    main.fs_coll = lambda name: _CollRef(name)
+    main.fs_document = dbf.document
+    main.httpx = _types.SimpleNamespace(AsyncClient=_Client)
+    main.asyncio = _types.SimpleNamespace(sleep=_sleep)
+    main._resolve_channel_creds_by_id = lambda chid: (creds.append(chid) or ("tok", f"pnid{chid}", "https://graph.example"))
+    main.log_audit = lambda *a, **k: None
+    main._reopen_preview_cache["t3"] = (0.0, {})
+    try:
+        canais = {c["id"]: dict(c) for c in _CANAIS3}
+        asyncio.run(main._run_reopen_batch(
+            "t3", 9101, [item], [], canais, {6: _TPL_RETOMADA, 8: _TPL_RETOMADA}, 7, "bot"))
+        c70 = STORE["wa_contacts"]["70"]
+        check(creds == [8] and enviados and enviados[0][0].endswith("/pnid8/messages"),
+              "envio sai pelo canal da THREAD CANDIDATA (8), nao pelo contact.channel_id (6)")
+        check(c70.get("last_reopen_audience") == "bot"
+              and c70.get("last_reopen_conversation_id") == "8__5531970000070"
+              and c70.get("last_reopen_channel_id") == 8
+              and c70.get("reopen_batch_sent_at") == [{"at": c70.get("last_reopen_at"), "audience": "bot"}],
+              "carimbo da tentativa com o publico do LOTE (bot) e a thread candidata")
+        msgs = [m for m in STORE.get("wa_messages", {}).values() if m.get("contact_id") == 70]
+        check(len(msgs) == 1 and msgs[0].get("conversation_id") == "8__5531970000070",
+              "mensagem do template gravada na thread candidata")
+        check(STORE["reopen_batches"]["9101"].get("status") == "concluido"
+              and STORE["reopen_batches"]["9101"].get("resolvidos") == 0,
+              "lote Bot sem auto-resolve no disparo (etapa 3)")
+        check("t3" not in main._reopen_preview_cache, "fim do lote invalida o cache da previa")
+    finally:
+        (main.fs_coll, main.fs_document, main.httpx, main.asyncio,
+         main._resolve_channel_creds_by_id, main.log_audit) = real
+        main._reopen_preview_cache.clear()
+        restore_dbf()
+
+
+def cenario_recusa_desfeita_por_mensagem():
+    titulo("CENARIO 27 — Recusa comercial se desfaz quando o PACIENTE escreve (PO 18/10)")
+    patch_store()
+    now = datetime.now(timezone.utc)
+    audits = []
+    real_audit = dbf.log_audit
+    dbf.log_audit = lambda *a, **k: audits.append(a)
+
+    def _reset(updated_at, field=None):
+        bloco = field if field is not None else {
+            "active": True, "version": 1, "updated_at": updated_at,
+            "updated_by_user_id": 7, "updated_by_uid": "uid-7", "reason": "patient_request",
+            "source": "operator_recorded"}
+        STORE["wa_contacts"] = {"80": {"id": 80, "wa_id": "5531980000080", "qualification": "em_atendimento",
+                                       "source_channel_type": "standard", "commercial_contact_block": bloco}}
+        STORE["wa_conversations"] = {}
+        audits.clear()
+
+    def _msg(direction="inbound", ts=None, **kw):
+        contato = dict(STORE["wa_contacts"]["80"])
+        dbf.save_wa_message(
+            wa_message_id="", contact_id=80, direction=direction, msg_type=kw.pop("msg_type", "text"),
+            content="oi", status=kw.pop("status", "received"),
+            timestamp_wa=(ts or now).isoformat(), channel_id=6,
+            conversation_id="6__5531980000080", contact=contato, **kw)
+        return STORE["wa_contacts"]["80"]["commercial_contact_block"]
+
+    try:
+        _reset(now - timedelta(hours=1))
+        b = _msg()
+        check(b.get("active") is False and b.get("version") == 2 and b.get("reason") == "patient_wrote"
+              and b.get("source") == "patient_message",
+              "mensagem nova do paciente DEPOIS da recusa desfaz (versao 2, reason patient_wrote)")
+        check(b.get("updated_by_user_id") is None and b.get("updated_by_uid") is None,
+              "liberacao nao herda o operador que registrou a recusa")
+        check(len(audits) == 1 and audits[0][1] == "COMMERCIAL_CONTACT_UNBLOCK"
+              and "origem=mensagem_do_paciente" in audits[0][2], "liberacao registrada no audit_log")
+        import commercial_contact_policy as _ccp
+        check(_ccp.is_commercial_contact_blocked(STORE["wa_contacts"]["80"]) is False,
+              "contato volta a poder receber retomada comercial")
+        b = _msg()
+        check(b.get("version") == 2 and len(audits) == 1, "nova mensagem com recusa ja desfeita nao regrava")
+
+        _reset(now - timedelta(hours=1))
+        b = _msg(ts=now - timedelta(hours=3))
+        check(b.get("active") is True and not audits,
+              "mensagem ANTERIOR ao registro (historico/reentrega) nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(control_message=True).get("active") is True, "clique de controle (botao) nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(msg_type="reaction").get("active") is True, "reacao nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(status="read").get("active") is True, "historico importado (status != received) nao desfaz")
+        _reset(now - timedelta(hours=1))
+        check(_msg(direction="outbound", sender_user_id=7).get("active") is True,
+              "mensagem do operador nao desfaz")
+        _reset(None, field={"active": "sim"})
+        check(_msg().get("active") == "sim", "registro invalido segue bloqueando (revisao humana)")
+        _reset((now - timedelta(hours=1)).isoformat())
+        check(_msg().get("active") is False, "updated_at em texto ISO tambem e comparado")
+    finally:
+        dbf.log_audit = real_audit
+        restore_dbf()
+
+
+def cenario_worker_recusa_comercial():
+    titulo("CENARIO 28 — Worker: recusa registrada depois da previa e pulada e contada")
+    import types as _types
+    patch_store()
+    now = datetime.now(timezone.utc)
+    STORE["wa_contacts"] = {
+        "90": {"id": 90, "wa_id": "5531990000090", "channel_id": 6, "qualification": "em_atendimento",
+               "last_inbound_at": (now - timedelta(hours=30)).isoformat(), "unread_count": 0},
+        "91": {"id": 91, "wa_id": "5531990000091", "channel_id": 6, "qualification": "em_atendimento",
+               "last_inbound_at": (now - timedelta(hours=30)).isoformat(), "unread_count": 0},
+    }
+    plano = [dict(STORE["wa_contacts"]["90"]), dict(STORE["wa_contacts"]["91"])]
+    # Recusa registrada DEPOIS da previa (o item do plano nao tem o campo).
+    STORE["wa_contacts"]["90"]["commercial_contact_block"] = {"active": True, "version": 1}
+    posts = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"messages": [{"id": "wamid.REC1"}]}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            posts.append(json["to"])
+            return _Resp()
+
+    async def _sleep(_s):
+        return None
+
+    audits = []
+    real = (main.fs_coll, main.fs_document, main.httpx, main.asyncio,
+            main._resolve_channel_creds_by_id, main.log_audit)
+    main.fs_coll = lambda name: _CollRef(name)
+    main.fs_document = dbf.document
+    main.httpx = _types.SimpleNamespace(AsyncClient=_Client)
+    main.asyncio = _types.SimpleNamespace(sleep=_sleep)
+    main._resolve_channel_creds_by_id = lambda chid: ("tok", "pnid", "https://graph.example")
+    main.log_audit = lambda *a, **k: audits.append(a)
+    try:
+        asyncio.run(main._run_reopen_batch(
+            "t3", 9201, plano, [], {6: dict(_CANAIS3[0])}, {6: _TPL_RETOMADA}, 7, "reception"))
+        lote = STORE["reopen_batches"]["9201"]
+        check(posts == ["5531990000091"], "so o contato sem recusa recebe o template")
+        check(lote.get("pulados_recusa_comercial") == 1 and lote.get("enviados") == 1
+              and lote.get("status") == "concluido",
+              "lote conta o pulo por recusa (enviados < planejados com motivo)")
+        c90 = STORE["wa_contacts"]["90"]
+        check(not c90.get("reopen_attempts") and not c90.get("last_reopen_template_at"),
+              "pulo por recusa nao carimba tentativa nem cooldown")
+        check(any(a[1] == "REOPEN_BATCH_END" and "pulados_recusa=1" in a[2] for a in audits),
+              "auditoria do fim do lote traz o pulo por recusa")
+    finally:
+        (main.fs_coll, main.fs_document, main.httpx, main.asyncio,
+         main._resolve_channel_creds_by_id, main.log_audit) = real
+        main._reopen_preview_cache.clear()
+        restore_dbf()
+
+
 def run():
     print("Simulador do Modo Recepcao (ADR 0010) — codigo real, Firestore mockado")
     cenario_gate_envio()
@@ -1493,6 +2717,17 @@ def run():
     cenario_reabertura_travas()
     cenario_scan_reabertura()
     cenario_worker_lote()
+    cenario_reabertura_pontual_carimbo()
+    cenario_reopen_human_active()
+    cenario_kill_switch_lote()
+    cenario_flags_reabertura_settings()
+    cenario_teto_contato_helper()
+    cenario_publicos_particao()
+    cenario_previa_publicos_api()
+    cenario_disparo_publicos()
+    cenario_worker_publico_bot()
+    cenario_recusa_desfeita_por_mensagem()
+    cenario_worker_recusa_comercial()
     cenario_recibo_nao_reabre()
     cenario_contato_manual()
     cenario_release_to_bot()
@@ -1501,6 +2736,7 @@ def run():
     cenario_assume_carimba_threads_orfas()
     cenario_open_picker_nao_rouba_pool()
     cenario_unread_sync()
+    cenario_lgpd_politica_sistema()
 
     print("\n" + "=" * 70)
     if FAILS:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from config import (
     ALLOWED_FIREBASE_EMAILS,
     AUTO_PROVISION_FIREBASE_USERS,
+    IMPERSONATE_TTL_MINUTES,
 )
 from database import (
     get_user_by_email,
@@ -21,6 +23,8 @@ from database import (
 )
 from firebase_admin_client import set_tenant_claims, verify_firebase_id_token
 from firestore_common import set_tenant_context
+from impersonation_identity import is_impersonation_token, valid_impersonation_subject
+from impersonation import validate_session
 from tenant_service import resolve_tenant_by_email_domain, single_active_tenant
 
 logger = logging.getLogger("castro_crm.auth")
@@ -167,9 +171,30 @@ def _login_gate(claim_tenant, email, domain_authorized):
     return bool(_is_founder(email) or claim_tenant or domain_authorized)
 
 
-def authenticate_firebase_token(id_token, ip_address=""):
+def validate_impersonation_claims(decoded):
+    """TTL absoluto e idade do login; refresh do ID token nao renova a sessao."""
+    now = time.time()
+    exp = decoded.get("imp_exp")
+    auth_time = decoded.get("auth_time")
+    # Claims temporais ausentes/malformados nunca autorizam visualizacao.
+    if type(exp) not in (int, float) or type(auth_time) not in (int, float):
+        return False
     try:
-        decoded = verify_firebase_id_token(id_token)
+        if not math.isfinite(exp) or not math.isfinite(auth_time):
+            return False
+        datetime.fromtimestamp(exp, timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return False
+    return (
+        now < exp
+        and 0 < auth_time <= now + 60
+        and now - auth_time <= IMPERSONATE_TTL_MINUTES * 60 + 60
+    )
+
+
+def authenticate_firebase_token(id_token, ip_address="", *, decoded_token=None, impersonation_session=None):
+    try:
+        decoded = decoded_token if decoded_token is not None else verify_firebase_id_token(id_token)
     except Exception as exc:
         logger.warning("Falha ao validar Firebase ID token: %s", exc)
         return {"success": False, "status_code": 401, "error": "Token Firebase invalido"}
@@ -180,6 +205,42 @@ def authenticate_firebase_token(id_token, ip_address=""):
 
     if not firebase_uid:
         return {"success": False, "status_code": 401, "error": "Token Firebase sem uid"}
+
+    if is_impersonation_token(decoded):
+        # Nao permite tokens antigos do alvo nem UID temporario sem contrato.
+        if not valid_impersonation_subject(decoded):
+            return {"success": False, "status_code": 401, "error": "Sessao de visualizacao invalida"}
+        if not validate_impersonation_claims(decoded):
+            return {"success": False, "status_code": 401, "error": "Sessao de visualizacao expirada"}
+        try:
+            session = impersonation_session or validate_session(decoded)
+        except Exception:
+            logger.warning("impersonate registro indisponivel | sid=%s", decoded["imp_sid"])
+            return {"success": False, "status_code": 503, "error": "Nao foi possivel validar a visualizacao"}
+        if not session:
+            return {"success": False, "status_code": 401, "error": "Sessao de visualizacao invalida"}
+        # Resolve apenas o alvo vinculado no registro; nunca o email Auth.
+        tenant_id = decoded["tenant_id"]
+        set_tenant_context(tenant_id)
+        user = get_user_by_id(session["target_user_id"])
+        from rbac import default_perfil_for_role
+        perfil_id = ((user or {}).get("perfil_acesso_id")
+                     or default_perfil_for_role((user or {}).get("role")))
+        if (not user or not user.get("is_active", 1)
+                or user.get("firebase_uid") != session["target_uid"]
+                or user.get("role") != session["role_at_start"]
+                or perfil_id != session["perfil_acesso_id_at_start"]):
+            return {"success": False, "status_code": 403, "error": "Usuario desativado ou nao provisionado"}
+        user = dict(user)
+        user["tenant_id"] = str(tenant_id)
+        user["impersonation"] = {
+            "by": decoded.get("imp_by"),
+            "sid": decoded["imp_sid"],
+            "expires_at": datetime.fromtimestamp(decoded["imp_exp"], timezone.utc).isoformat(),
+            "auth_uid": firebase_uid,
+            "environment": session["environment"],
+        }
+        return {"success": True, "decoded_token": decoded, "user": user}
 
     # -- Resolucao de tenant (SEM default cego) --
     # claim > dominio do email > rede de transicao (1 tenant ativo).

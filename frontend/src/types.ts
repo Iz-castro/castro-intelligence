@@ -18,6 +18,9 @@ export type ClientConfig = {
   media_storage_backend: string;
   feature_message_status: boolean;
   feature_google_chat: boolean;
+  feature_impersonate: boolean;
+  impersonation_environment: string;
+  impersonation_polling_interval_ms: number;
   feature_followup?: boolean;
   allowed_email_domain: string;
   firebase_web_config: FirebaseWebConfig;
@@ -41,6 +44,7 @@ export type SessionUser = {
   is_active?: number;
   coex_authorized?: number;
   coex_phone?: string;
+  impersonation?: { by: number; sid: string; expires_at: string; auth_uid: string; environment: string };
 };
 
 // RBAC dinamico (M-B2). Catalogo FIXO da plataforma — manter em sincronia
@@ -76,8 +80,10 @@ export type PermissionKey =
   | "autorizar_coex_para_operador"
   | "ver_painel_conflitos"
   | "ver_dashboard_uso"
+  | "ver_monitor_atendimento"
   | "buscar_protocolo"
   | "gerenciar_usuarios"
+  | "ver_como_usuario"
   | "desativar_usuarios"
   | "gerenciar_perfis_acesso"
   | "gerenciar_departamentos"
@@ -148,6 +154,7 @@ export type Operator = {
   firebase_uid?: string;
   coex_authorized?: number;
   coex_phone?: string;
+  is_active?: number;
 };
 
 export type Contact = {
@@ -418,6 +425,13 @@ export type SystemSettings = {
   pool_wait_notice_enabled: boolean;
   pool_wait_notice_minutes: number;
   pool_wait_notice_text: string;
+  // P2b: conteudo LGPD do aviso do bot, editado pela clinica. Vazio = o bot
+  // usa o fallback (settings.ai no CX; texto/link fixos no builtin).
+  // lgpd_policy_date = AAAA-MM-DD da politica vigente: aceite anterior e
+  // reperguntado. Backend rejeita data futura, link sem https:// e aviso > 900.
+  lgpd_policy_date: string;
+  lgpd_privacy_url: string;
+  lgpd_notice: string;
 };
 
 // Linha do picker v2.1 — payload MINIMO do card (backend enrich_picker_rows):
@@ -446,7 +460,7 @@ export type UserSettings = {
 
 export type ActiveView = "novos" | "meus" | "nao_qualificados" | "equipe" | "bot" | "backup";
 
-export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard";
+export type SettingsPage = false | "menu" | "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard" | "monitor";
 
 // Mensagem rapida (global do tenant ou pessoal do operador). `title` e o nome
 // que identifica a mensagem nas configuracoes e na lista do compositor.

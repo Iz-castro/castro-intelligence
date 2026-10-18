@@ -22,6 +22,7 @@ from fastapi import (
     FastAPI, Request, BackgroundTasks,
     HTTPException, Depends, Query, UploadFile, File, Form,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,13 +31,16 @@ from pydantic import BaseModel, Field as PydanticField, field_validator
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
-    FEATURE_ASSUME_COUNTER, FEATURE_FOLLOWUP,
+    FEATURE_ASSUME_COUNTER, FEATURE_IMPERSONATE, IMPERSONATE_POLLING_INTERVAL_MS,
+    FEATURE_FOLLOWUP,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
     QUALIFICATION_OPTIONS, ROLE_OPTIONS, TAKEOVER_TIMEOUT_HOURS, ATTENDANCE_AUTOCLOSE_HOURS,
     RATING_TEMPLATE_NAME, RATING_TEMPLATE_LANG, RATING_REASK_DAYS, CLOSE_TEMPLATE_NAME,
     REOPEN_MAX_ATTEMPTS, REOPEN_COOLDOWN_HOURS, REOPEN_BATCH_MAX_SENDS,
+    REOPEN_DAILY_CAP, REOPEN_MAX_PER_CONTACT, REOPEN_WINDOW_DAYS,
+    REOPEN_MAX_IDLE_DAYS, REOPEN_SCAN_MAX, REOPEN_DESFECHO_LINK,
     RECEPTION_UNATTENDED_RELEASE_DAYS,
     CX_DETECT_TIMEOUT_SECONDS,
     BOOTSTRAP_ADMIN_EMAIL, BOOTSTRAP_ADMIN_DISPLAY_NAME, BOOTSTRAP_ADMIN_DEPARTMENT,
@@ -44,6 +48,7 @@ from config import (
     MEDIA_STORAGE_BACKEND, REQUIRE_WEBHOOK_SIGNATURE, WHATSAPP_APP_SECRET,
     CHAT_DELIVERY_MODE, POLLING_INTERVAL_MS, AUTH_MODE,
     FIRESTORE_PROJECT_ID, FIREBASE_STORAGE_BUCKET,
+    FIRESTORE_COLLECTION_PREFIX,
     FIREBASE_WEB_API_KEY, FIREBASE_WEB_AUTH_DOMAIN, FIREBASE_WEB_APP_ID,
     FIREBASE_WEB_MESSAGING_SENDER_ID, FIREBASE_WEB_MEASUREMENT_ID,
     ALLOWED_FIREBASE_EMAIL_DOMAIN,
@@ -53,6 +58,7 @@ from config import (
 )
 from database import (
     init_database, get_user_by_id, get_user_raw_by_id, get_all_users,
+    get_operator_profile_by_uid,
     get_all_wa_contacts, get_wa_conversation,
     mark_wa_conversation_read, mark_wa_conversation_read_by_id, recompute_wa_contact_unread,
     save_wa_message, get_wa_contact,
@@ -93,7 +99,12 @@ from channel_service import (
     get_channel_by_id_from_db, get_channel_by_phone_id_from_db, rebind_channel,
     CHANNEL_TYPE_STANDARD, CHANNEL_TYPE_COEXISTENCE,
 )
-from auth import authenticate_firebase_token, invalidate_auth_cache
+from auth import authenticate_firebase_token, invalidate_auth_cache, validate_impersonation_claims
+from impersonation_identity import (
+    ReservedImpersonationIdentityError, is_impersonation_uid,
+    is_impersonation_token, valid_impersonation_subject,
+)
+from impersonation import create_session, validate_session, close_session, cleanup_expired_sessions
 from firestore_common import (
     collection_name, collection as fs_coll, document as fs_document, utcnow as fs_utcnow,
 )
@@ -101,6 +112,7 @@ from rbac import (
     PERMISSION_CATALOG, PERMISSION_KEYS, SEED_PERFIL_IDS,
     can_see_all_tenant, default_perfil_for_role, effective_toggles,
     ensure_permission, get_perfil, has_permission, toggles_beyond_user,
+    read_impersonation_toggles, set_impersonation_perfil, reset_impersonation_perfil,
 )
 from pii_redaction import redact_phone, redact_name
 from commercial_contact_policy import is_commercial_contact_blocked
@@ -147,6 +159,117 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+# Excecoes de leitura revisadas no inventario do ADR 0014. Busca/tag ficam
+# no body por LGPD; nenhum destes POSTs grava dados ou envia mensagens.
+_IMPERSONATE_READ_POSTS = frozenset({
+    "/api/wa/contacts/picker/search",
+    "/api/wa/contacts/picker/by-tag",
+    "/api/admin/reopen-batch/preview",
+})
+_IMPERSONATE_UNSAFE_GETS = frozenset({"/api/admin/monitor/auditoria"})
+# Lista positiva: os transportes Firestore antigos nao sao alternativas ao
+# transporte de suporte. Adicionar uma rota exige revisar seus efeitos/escopo.
+_IMPERSONATE_READ_GETS = frozenset({
+    "/", "/chat", "/app", "/media/{subdir}/{filename}",
+    "/api/session", "/api/client-config", "/api/admin/roles",
+    "/api/admin/perfis-acesso", "/api/settings/system", "/api/settings/user",
+    "/api/wa/contacts/all", "/api/wa/contacts/picker", "/api/wa/qualifications",
+    "/api/departments", "/api/operators", "/api/wa/contact/{contact_id}",
+    "/api/wa/transfer-history/{contact_id}", "/api/wa/templates",
+    "/api/wa/channel/{channel_id}/billing-status", "/api/admin/channels",
+    "/api/admin/conflicts", "/api/admin/protocol/{protocol_id}",
+    "/api/admin/pending-webhook-events", "/api/admin/export",
+    "/api/admin/embedded-signup/config", "/api/admin/reopen-batch/{batch_id}",
+    "/api/gc/spaces", "/api/admin/dashboard/summary", "/api/admin/dashboard/ratings",
+    "/api/admin/monitor/fila", "/api/admin/monitor/metricas",
+    "/api/wa/usage/current-month", "/api/wa/usage/history", "/api/wa/usage/{year_month}",
+    "/api/impersonation/view/snapshot", "/api/impersonation/view/page",
+    "/api/impersonation/view/messages", "/api/impersonation/view/thread",
+    "/api/impersonation/view/internal-chat",
+})
+_IMPERSONATE_READ_PARAMS = {
+    "/api/impersonation/view/page": {"scope", "view", "limit"},
+    "/api/impersonation/view/messages": {"contact_id", "channel_id", "limit"},
+    "/api/impersonation/view/thread": {"contact_id", "channel_id"},
+    "/api/impersonation/view/internal-chat": {"kind", "conversation_id"},
+    "/api/wa/contacts/all": {"limit", "count_only"},
+    "/api/wa/contacts/picker": {"page_size", "cursor", "owner_id", "qualification"},
+    "/api/wa/templates": {"channel_id"},
+    "/api/admin/pending-webhook-events": {"status", "limit"},
+    "/api/admin/dashboard/summary": {"date_from", "date_to"},
+    "/api/admin/dashboard/ratings": {"date_from", "date_to"},
+    "/api/admin/monitor/metricas": {"dias", "refresh"},
+    "/api/wa/usage/history": {"months"},
+    "/api/admin/export": {"date_from", "date_to", "format"},
+    "/api/admin/embedded-signup/config": {"type"},
+}
+
+
+def _impersonation_read_route(request):
+    from starlette.routing import Match
+    scope = dict(request.scope)
+    scope["path"] = scope["path"].rstrip("/") or "/"
+    if scope["method"] in ("HEAD", "OPTIONS"):
+        scope["method"] = "GET"
+    for route in app.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            return route
+    return None
+
+
+def _impersonation_denied(status_code, detail):
+    # O middleware de tenant e externo ao middleware normal de headers.
+    return JSONResponse(status_code=status_code, content={"detail": detail},
+                        headers={"Cache-Control": "private, no-store"})
+
+
+async def _impersonation_finish_response(request, response):
+    """Nao entrega um corpo preparado sob uma autorizacao que ja venceu."""
+    decoded = getattr(request.state, "firebase_decoded", {})
+    if not is_impersonation_token(decoded):
+        return response
+    response.headers["Cache-Control"] = "private, no-store"
+    if response.status_code >= 400 or request.url.path == "/api/impersonation/end":
+        return response
+    # call_next devolve um stream ASGI mesmo para JSON/CSV comuns. Consumir
+    # antes da revalidacao impede entregar parte do corpo apos falha de TTL.
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    try:
+        result = await run_in_threadpool(
+            authenticate_firebase_token, "", decoded_token=decoded,
+        )
+        # O lookup final do usuario tambem pode demorar. Conferir registro
+        # DEPOIS desse I/O e o relogio depois de todo await fecha essa janela.
+        if result["success"]:
+            toggles = await run_in_threadpool(read_impersonation_toggles, decoded["tenant_id"], decoded["perfil_acesso_id"])
+            if toggles != getattr(request.state, "impersonation_toggles", None):
+                result = {"success": False, "status_code": 409,
+                          "error": "Permissoes atualizadas; consulte novamente a visualizacao"}
+            active = await run_in_threadpool(validate_session, decoded)
+            if not active or not validate_impersonation_claims(decoded):
+                result = {"success": False, "status_code": 401,
+                          "error": "Sessao de visualizacao expirada ou encerrada"}
+    except Exception:
+        logger.warning("impersonate validacao final indisponivel | sid=%s", decoded.get("imp_sid"))
+        return JSONResponse(status_code=503, content={"detail": "Nao foi possivel validar a visualizacao"},
+                            headers={"Cache-Control": "private, no-store"})
+    if not result["success"]:
+        return JSONResponse(status_code=result.get("status_code", 401), content={"detail": result["error"]},
+                            headers={"Cache-Control": "private, no-store"})
+    return Response(content=body, status_code=response.status_code, headers=dict(response.headers),
+                    background=response.background)
+
+
+def _request_route_label(request):
+    # So o template da rota: segmentos recebidos podem conter PII/segredos.
+    from starlette.routing import Match
+    for route in app.routes:
+        match, _ = route.matches(request.scope)
+        if match != Match.NONE:
+            return getattr(route, "path", "<rota>")
+    return "<rota-desconhecida>"
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -164,7 +287,9 @@ async def add_security_headers(request: Request, call_next):
     # cache de disco de maquina compartilhada. Carimbado AQUI porque o
     # header setado dentro da rota nao sobrevive a HTTPException/422 — os
     # caminhos de ERRO saiam sem no-store.
-    if request.url.path.startswith(("/api/wa/contacts/picker", "/api/followup")):
+    if (request.url.path.startswith(("/api/wa/contacts/picker", "/api/followup"))
+            or request.url.path.rstrip("/") in ("/api/admin/impersonate", "/api/impersonation/end")
+            or is_impersonation_token(getattr(request.state, "firebase_decoded", {}))):
         response.headers["Cache-Control"] = "private, no-store"
     return response
 
@@ -180,6 +305,7 @@ async def tenant_context_middleware(request: Request, call_next):
 
     auth_header = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
     tid = None
+    decoded = None
     if auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
         try:
@@ -191,17 +317,70 @@ async def tenant_context_middleware(request: Request, call_next):
             # Auth real acontece em get_current_user; aqui so detecta
             # tenant pra setar context cedo.
             pass
+    if decoded and is_impersonation_token(decoded):
+        # Kill-switch: desligar a flag derruba tambem as sessoes ja emitidas.
+        if not FEATURE_IMPERSONATE:
+            return _impersonation_denied(403, "Visualizacao desativada")
+        # Checado antes de qualquer endpoint/dependency, inclusive os GETs.
+        if not valid_impersonation_subject(decoded):
+            return _impersonation_denied(401, "Sessao de visualizacao invalida")
+        if not validate_impersonation_claims(decoded):
+            return _impersonation_denied(401, "Sessao de visualizacao expirada")
+        try:
+            imp_session = await run_in_threadpool(validate_session, decoded)
+        except Exception:
+            logger.warning("impersonate registro indisponivel | sid=%s", decoded["imp_sid"])
+            return _impersonation_denied(503, "Nao foi possivel validar a visualizacao")
+        if not imp_session:
+            return _impersonation_denied(401, "Sessao de visualizacao invalida")
+        request.state.impersonation_session = imp_session
+        # O router aceita barra final; normalizar evita contornar o GET
+        # inseguro por redirect e nao amplia a allowlist de POSTs.
+        path = request.url.path.rstrip("/") or "/"
+        route = _impersonation_read_route(request)
+        read_method = (request.method in ("GET", "HEAD", "OPTIONS") and route is not None
+                       and getattr(route, "path", "") in _IMPERSONATE_READ_GETS)
+        allowed_post = request.method == "POST" and request.url.path in _IMPERSONATE_READ_POSTS
+        own_end = request.method == "POST" and request.url.path == "/api/impersonation/end"
+        if (not read_method and not allowed_post and not own_end) or (
+            request.method in ("GET", "HEAD") and path in _IMPERSONATE_UNSAFE_GETS
+        ):
+            logger.warning(
+                "impersonate bloqueado | sid=%s method=%s path=%s",
+                decoded.get("imp_sid"), request.method, _request_route_label(request),
+            )
+            return _impersonation_denied(403, "Modo visualizacao: somente leitura")
+        # Busca/tag so no body dos POSTs aprovados. A allowlist de params nao
+        # cresce implicitamente quando outra feature muda a assinatura da rota.
+        accepted = _IMPERSONATE_READ_PARAMS.get(getattr(route, "path", ""), set()) if read_method else set()
+        if set(request.query_params) - accepted:
+            return JSONResponse(status_code=400, content={"detail": "Parametros de visualizacao invalidos"},
+                                headers={"Cache-Control": "private, no-store"})
     # Fallback: usuarios pre-Fase 2 sem custom_claim ainda — assume tenant default.
     if not tid and auth_header:
         tid = "hubloc"
 
     if tid:
         ctx_token = set_tenant_context(tid)
+        perfil_token = None
         try:
-            return await call_next(request)
+            if decoded and is_impersonation_token(decoded):
+                try:
+                    toggles = await run_in_threadpool(read_impersonation_toggles, tid, decoded["perfil_acesso_id"])
+                except Exception:
+                    logger.warning("impersonate perfil indisponivel | sid=%s", decoded.get("imp_sid"))
+                    return JSONResponse(status_code=503, content={"detail": "Nao foi possivel validar o perfil"},
+                                        headers={"Cache-Control": "private, no-store"})
+                request.state.impersonation_toggles = toggles
+                perfil_token = set_impersonation_perfil(tid, decoded["perfil_acesso_id"], toggles)
+            response = await call_next(request)
+            return await _impersonation_finish_response(request, response)
         finally:
+            if perfil_token is not None:
+                reset_impersonation_perfil(perfil_token)
             reset_tenant_context(ctx_token)
-    return await call_next(request)
+    response = await call_next(request)
+    return await _impersonation_finish_response(request, response)
 
 
 if os.path.isdir(FRONTEND_ASSETS_DIR):
@@ -259,9 +438,18 @@ def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token ausente")
     token = auth_header.split(" ", 1)[1]
     ip = request.client.host if request.client else "unknown"
-    result = authenticate_firebase_token(token, ip)
+    result = authenticate_firebase_token(
+        token, ip, decoded_token=getattr(request.state, "firebase_decoded", None),
+        impersonation_session=getattr(request.state, "impersonation_session", None),
+    )
     if not result["success"]:
         raise HTTPException(status_code=result.get("status_code", 401), detail=result["error"])
+    # Falha FECHADA: token de visualizacao so chega ao endpoint depois de o
+    # middleware aplicar a trava de metodo/rota. Se a verificacao do token
+    # falhou la (ex.: chaves publicas indisponiveis) e passou aqui, a trava
+    # nao rodou -- nunca executar o endpoint como o alvo nesse caso.
+    if result["user"].get("impersonation") and getattr(request.state, "impersonation_session", None) is None:
+        raise HTTPException(status_code=503, detail="Nao foi possivel validar a visualizacao")
     return result["user"]
 
 # Convencao RBAC (M-B2): endpoints chamam ensure_permission(current_user,
@@ -563,7 +751,13 @@ async def session_info(current_user: dict = Depends(get_current_user)):
         logger.warning("session_info: get_tenant(%s) falhou: %s", tenant_id, exc)
         tenant_doc = {}
     tenant_plan = normalize_plan(tenant_doc.get("plan"))
+    # Monitor de atendimento: o tenant TEM monitor? O menu troca "Dashboard"
+    # por "Monitor" quando isto e o toggle ver_monitor_atendimento (can() do
+    # frontend, ao vivo pelo snapshot do perfil) estao ligados — conceder o
+    # toggle a outro perfil vale sem relogin.
+    from monitor_service import monitor_config
     return {
+        "monitor": {"enabled": bool(monitor_config(tenant_id))},
         "user": current_user,
         "auth_mode": AUTH_MODE,
         "tenant_id": tenant_id,
@@ -600,6 +794,9 @@ async def client_config():
             "measurementId": FIREBASE_WEB_MEASUREMENT_ID,
         },
         "feature_message_status": FEATURE_MESSAGE_STATUS,
+        "feature_impersonate": FEATURE_IMPERSONATE,
+        "impersonation_environment": FIRESTORE_COLLECTION_PREFIX,
+        "impersonation_polling_interval_ms": IMPERSONATE_POLLING_INTERVAL_MS,
         "feature_google_chat": FEATURE_GOOGLE_CHAT,
         "feature_followup": FEATURE_FOLLOWUP,
         "firestore": {
@@ -615,6 +812,214 @@ async def client_config():
             "snapshot_enabled": True,
         },
     }
+
+
+# -- API: Ver como --
+
+class ImpersonateRequest(BaseModel):
+    user_id: int
+    reason: str
+
+
+@app.post("/api/admin/impersonate")
+async def admin_impersonate(
+    body: ImpersonateRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """Emite login separado para leitura do escopo do alvo, sem autentica-lo."""
+    if not FEATURE_IMPERSONATE:
+        raise HTTPException(status_code=404, detail="Recurso indisponivel")
+    decoded = getattr(request.state, "firebase_decoded", {})
+    if is_impersonation_token(decoded) or current_user.get("impersonation"):
+        raise HTTPException(status_code=403, detail="Visualizacao nao permite iniciar outra sessao")
+    ensure_permission(current_user, "ver_como_usuario")
+    # So admin inicia (spec D7). O toggle pode ser ligado em qualquer perfil
+    # pelo editor; sem esta trava, um operador com o toggle veria como uma
+    # supervisora e leria o tenant inteiro (fura can_see_all_tenant).
+    if str(current_user.get("role") or "") != "admin":
+        raise HTTPException(status_code=403, detail="Ver como restrito a administradores")
+    reason = body.reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(status_code=400, detail="Informe um motivo com pelo menos 10 caracteres")
+
+    from firestore_common import get_tenant_context
+    tenant_id = str(current_user.get("tenant_id") or "")
+    # Sem fallback para tenant default: o lookup deve ocorrer no tenant
+    # autenticado e no mesmo contexto que o middleware estabeleceu.
+    if not tenant_id or get_tenant_context() != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant da sessao invalido")
+    target = get_user_by_id(body.user_id)
+    if not target or not target.get("is_active", 1):
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+    target_uid = target.get("firebase_uid")
+    if not target_uid:
+        raise HTTPException(status_code=409, detail="Usuario ainda nao possui identidade Firebase")
+    if (target.get("role") == "admin" or target["id"] == current_user["id"]
+            or target_uid == current_user.get("firebase_uid") or is_impersonation_uid(target_uid)
+            or not current_user.get("firebase_uid") or is_impersonation_uid(current_user.get("firebase_uid"))):
+        raise HTTPException(status_code=403, detail="Usuario nao elegivel para visualizacao")
+
+    from firebase_admin import auth as firebase_auth
+    from firebase_admin_client import get_firebase_app, get_user_claims_strict
+    try:
+        target_claims = get_user_claims_strict(target_uid)
+    except Exception:
+        logger.warning("impersonate claims indisponiveis | admin_id=%s target_id=%s",
+                       current_user["id"], target["id"])
+        raise HTTPException(status_code=503, detail="Nao foi possivel consultar a identidade do usuario")
+    claim_tenant = str(target_claims.get("tenant_id") or target.get("tenant_id") or tenant_id)
+    role = target_claims.get("role") or target.get("role") or "operador"
+    if claim_tenant != tenant_id or role == "admin":
+        raise HTTPException(status_code=403, detail="Usuario nao elegivel neste tenant")
+    perfil_id = (target_claims.get("perfil_acesso_id") or target.get("perfil_acesso_id")
+                 or default_perfil_for_role(role))
+    if (role != target.get("role") or perfil_id != (
+            target.get("perfil_acesso_id") or default_perfil_for_role(target.get("role")))):
+        raise HTTPException(status_code=409, detail="Identidade e perfil desatualizados; atualize os claims do usuario")
+    profile = get_operator_profile_by_uid(target_uid)
+    if (not profile or profile.get("uid") != target_uid or profile.get("user_id") != target["id"]
+            or profile.get("role") != role or (
+                profile.get("perfil_acesso_id") or default_perfil_for_role(profile.get("role"))) != perfil_id):
+        raise HTTPException(status_code=409, detail="Perfil do operador indisponivel ou desatualizado para visualizacao")
+    try:
+        imp_session = await run_in_threadpool(create_session, current_user, target, tenant_id, role, perfil_id)
+    except Exception:
+        logger.warning("impersonate criacao de registro indisponivel | admin_id=%s target_id=%s",
+                       current_user["id"], target["id"])
+        raise HTTPException(status_code=503, detail="Nao foi possivel registrar a sessao de visualizacao")
+    sid = imp_session["sid"]
+    expires = imp_session["expires_at"]
+    developer_claims = {
+        "imp": True, "imp_by": current_user["id"],
+        "imp_by_uid": current_user.get("firebase_uid"), "imp_sid": sid,
+        "imp_exp": int(expires.timestamp()), "tenant_id": tenant_id,
+        "role": role, "perfil_acesso_id": perfil_id,
+        "imp_target_uid": target_uid, "imp_env": FIRESTORE_COLLECTION_PREFIX,
+    }
+    try:
+        token = await run_in_threadpool(firebase_auth.create_custom_token, imp_session["auth_uid"],
+                                       developer_claims, app=get_firebase_app())
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+    except Exception:
+        _abandon_impersonation(imp_session)
+        logger.warning("impersonate assinatura indisponivel | admin_id=%s target_id=%s sid=%s",
+                       current_user["id"], target["id"], sid)
+        raise HTTPException(status_code=503, detail="Nao foi possivel assinar o token de visualizacao; verifique a permissao IAM de assinatura")
+    try:
+        await run_in_threadpool(log_audit, current_user["id"], "IMPERSONATE_START",
+                                f"target={target['id']} sid={sid} exp={expires.isoformat()} motivo={reason[:200]}",
+                                strict=True)
+    except Exception:
+        _abandon_impersonation(imp_session)
+        logger.warning("impersonate auditoria indisponivel | admin_id=%s target_id=%s sid=%s",
+                       current_user["id"], target["id"], sid)
+        raise HTTPException(status_code=503, detail="Nao foi possivel registrar a auditoria da visualizacao")
+    logger.info("impersonate iniciado | admin_id=%s target_id=%s sid=%s",
+                current_user["id"], target["id"], sid)
+    return {
+        "custom_token": token, "session_id": sid, "expires_at": expires.isoformat(),
+        "target": {"id": target["id"], "display_name": target.get("display_name", ""), "role": role},
+    }
+
+
+def _abandon_impersonation(session):
+    # Compensacao best-effort: sem token entregue; cleanup tentara de novo.
+    try:
+        close_session(session)
+    except Exception:
+        logger.warning("impersonate compensacao indisponivel | sid=%s", session["sid"])
+
+
+@app.post("/api/impersonation/end")
+async def impersonation_end(request: Request, current_user: dict = Depends(get_current_user)):
+    decoded = getattr(request.state, "firebase_decoded", {})
+    session = getattr(request.state, "impersonation_session", None)
+    if not current_user.get("impersonation") or not valid_impersonation_subject(decoded):
+        raise HTTPException(status_code=403, detail="Apenas a propria sessao de visualizacao pode encerrar")
+    try:
+        session = session or await run_in_threadpool(validate_session, decoded)
+        if not session:
+            raise HTTPException(status_code=401, detail="Sessao de visualizacao invalida")
+        # Ator e sempre o solicitante original, nunca o operador visualizado.
+        await run_in_threadpool(log_audit, session["admin_user_id"], "IMPERSONATE_END",
+                               f"sid={session['sid']}", strict=True)
+        await run_in_threadpool(close_session, session)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("impersonate encerramento indisponivel | sid=%s", decoded["imp_sid"])
+        raise HTTPException(status_code=503, detail="Nao foi possivel encerrar a visualizacao no servidor")
+    return {"status": "ok"}
+
+
+def get_impersonation_view_user(current_user: dict = Depends(get_current_user)):
+    if not current_user.get("impersonation"):
+        raise HTTPException(status_code=403, detail="Apenas sessoes de visualizacao usam este transporte")
+    return current_user
+
+
+@app.get("/api/impersonation/view/snapshot")
+async def impersonation_view_snapshot(current_user: dict = Depends(get_impersonation_view_user)):
+    from impersonation_views import read_snapshot
+    return await run_in_threadpool(read_snapshot, current_user)
+
+
+@app.get("/api/impersonation/view/page")
+async def impersonation_view_page(
+    scope: str = "mine", view: str = "meus", limit: int = Query(50, ge=1),
+    current_user: dict = Depends(get_impersonation_view_user),
+):
+    from impersonation_views import read_page
+    return await run_in_threadpool(read_page, current_user, scope, view, limit)
+
+
+@app.get("/api/impersonation/view/messages")
+async def impersonation_view_messages(
+    contact_id: int = Query(..., ge=1), channel_id: int | None = Query(None, ge=1),
+    limit: int = Query(10, ge=1), current_user: dict = Depends(get_impersonation_view_user),
+):
+    from impersonation_views import read_messages
+    return await run_in_threadpool(read_messages, current_user, contact_id, channel_id, limit)
+
+
+@app.get("/api/impersonation/view/thread")
+async def impersonation_view_thread(
+    contact_id: int = Query(..., ge=1), channel_id: int | None = Query(None, ge=1),
+    current_user: dict = Depends(get_impersonation_view_user),
+):
+    from impersonation_views import read_thread
+    return await run_in_threadpool(read_thread, current_user, contact_id, channel_id)
+
+
+@app.get("/api/impersonation/view/internal-chat")
+async def impersonation_view_internal_chat(
+    kind: str = "conversations", conversation_id: int | None = Query(None, ge=1),
+    current_user: dict = Depends(get_impersonation_view_user),
+):
+    if not FEATURE_GOOGLE_CHAT:
+        raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    from impersonation_views import read_internal_chat
+    return await run_in_threadpool(read_internal_chat, current_user, kind, conversation_id)
+
+
+def _impersonation_channels(current_user):
+    """Mesmo conjunto exibido ao alvo; o cache global de canais nao autoriza."""
+    rows = (get_all_active_channels() if has_permission(current_user, "gerenciar_canais")
+            else get_channels_for_user(current_user["id"]))
+    tid = str(current_user.get("tenant_id") or "")
+    return [row for row in rows if str(row.get("tenant_id") or "hubloc") == tid]
+
+
+def _require_impersonation_channel_scope(channel, current_user):
+    if not current_user.get("impersonation"):
+        return
+    tid = str(current_user.get("tenant_id") or "")
+    allowed_ids = {str(row.get("id")) for row in _impersonation_channels(current_user)}
+    if (not channel or str(channel.get("tenant_id") or "hubloc") != tid
+            or str(channel.get("id")) not in allowed_ids):
+        raise HTTPException(status_code=404, detail="Canal nao encontrado")
 
 
 # -- API: Avatar do operador --
@@ -711,6 +1116,8 @@ async def admin_create_user(request: Request, current_user: dict = Depends(get_c
             role=role,
             department_id=department_id,
         )
+    except ReservedImpersonationIdentityError:
+        raise HTTPException(status_code=409, detail="Email vinculado a identidade temporaria; use uma conta de operador")
     except TenantConflictError:
         raise HTTPException(status_code=409, detail="Email ja vinculado a outro tenant")
     except DeactivatedUserError:
@@ -1047,6 +1454,31 @@ async def delete_perfil_acesso(perfil_id: str, current_user: dict = Depends(get_
 
 # -- API: Configuracoes do sistema --
 
+_LGPD_AUDIT_KEYS = ("lgpd_policy_date", "lgpd_privacy_url", "lgpd_notice")
+
+# Flags da reabertura em lote: so a Castro liga/desliga (script), nunca o PUT da UI.
+_CASTRO_ONLY_SETTINGS = ("reopen_batch_enabled", "reopen_bot_audience_enabled", "bot_media_turn_enabled")
+
+
+def _lgpd_policy_audit_detail(before: dict, after: dict) -> str:
+    """Detalhe do LGPD_POLICY_UPDATE: data antiga -> nova e se link/aviso
+    mudaram, SEM o texto (P2b). Vazio quando nada LGPD mudou — o frontend
+    regrava tudo a cada save de sons/toggles e isso nao e troca de politica."""
+    def _v(src, key):
+        return str((src or {}).get(key) or "").strip()
+
+    old_date, new_date = _v(before, "lgpd_policy_date"), _v(after, "lgpd_policy_date")
+    link_changed = _v(before, "lgpd_privacy_url") != _v(after, "lgpd_privacy_url")
+    notice_changed = _v(before, "lgpd_notice") != _v(after, "lgpd_notice")
+    if old_date == new_date and not link_changed and not notice_changed:
+        return ""
+    return (
+        f"data {old_date or '(vazia)'} -> {new_date or '(vazia)'}"
+        f" | link {'alterado' if link_changed else 'mantido'}"
+        f" | aviso {'alterado' if notice_changed else 'mantido'}"
+    )
+
+
 @app.get("/api/settings/system")
 async def get_settings_system(current_user: dict = Depends(get_current_user)):
     return get_system_settings()
@@ -1062,11 +1494,34 @@ async def update_settings_system(request: Request, current_user: dict = Depends(
     # stale apagava/revertia o registry que um supervisor editou no meio.
     if isinstance(body, dict):
         body.pop("tags_global", None)
+        # Chaves da reabertura (plano v2.2 secao 7) sao da CASTRO, nao do
+        # admin do tenant: so scripts/set_reopen_flags.py grava. Mesmo motivo
+        # do tags_global: o frontend manda o objeto INTEIRO e uma aba Sistema
+        # aberta antes do desligamento religaria o lote (ex.: Hubloc) ao
+        # salvar qualquer outra coisa.
+        for _castro_key in _CASTRO_ONLY_SETTINGS:
+            body.pop(_castro_key, None)
+    # P2b: conteudo LGPD do aviso (data/link/texto) e editado aqui, com a
+    # MESMA permissao da aba Sistema. Estado anterior lido so quando o body
+    # traz alguma chave LGPD (o frontend manda o objeto inteiro: 1 leitura
+    # por save de admin) para auditar a troca de politica.
+    _lgpd_before = (get_system_settings()
+                    if isinstance(body, dict) and any(k in body for k in _LGPD_AUDIT_KEYS)
+                    else None)
     try:
         result = save_system_settings(body)
-    except ValueError as exc:  # mensagem rapida vazia/atalho repetido
+    except ValueError as exc:  # mensagem rapida vazia/atalho repetido/LGPD invalido
         raise HTTPException(status_code=400, detail=str(exc))
-    log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(body))
+    _audit_body = body
+    if isinstance(body, dict) and "lgpd_notice" in body:
+        # Texto do aviso nao vai inteiro pro audit (so o tamanho).
+        _audit_body = dict(body)
+        _audit_body["lgpd_notice"] = f"<{len(str(body.get('lgpd_notice') or ''))} caracteres>"
+    log_audit(current_user["id"], "SYSTEM_SETTINGS_UPDATE", str(_audit_body))
+    if _lgpd_before is not None:
+        _lgpd_detail = _lgpd_policy_audit_detail(_lgpd_before, result)
+        if _lgpd_detail:
+            log_audit(current_user["id"], "LGPD_POLICY_UPDATE", _lgpd_detail)
     return result
 
 
@@ -1759,6 +2214,8 @@ def _require_contact_access(contact: dict, current_user: dict):
     Levanta 403 caso contrario. contact pode ser {} (trata como sem acesso)."""
     if can_see_all_tenant(current_user):
         return
+    if current_user.get("impersonation") and contact and contact.get("is_backup"):
+        raise HTTPException(status_code=403, detail="Acesso negado: contato de backup")
     if contact and contact.get("assigned_to") == current_user.get("id"):
         return
     if contact and not contact.get("assigned_to_uid"):  # pool: '' ou None
@@ -1772,9 +2229,11 @@ def _require_contact_access(contact: dict, current_user: dict):
             if _uid:
                 _q = (_fs_coll("wa_conversations")
                       .where("contact_id", "==", contact.get("id"))
-                      .where("assigned_to_uid", "==", _uid)
-                      .limit(1))
-                if any(True for _ in _q.stream()):
+                      .where("assigned_to_uid", "==", _uid))
+                if current_user.get("impersonation"):
+                    if any(not (snap.to_dict() or {}).get("is_backup") for snap in _q.stream()):
+                        return
+                elif any(True for _ in _q.limit(1).stream()):
                     return
         except Exception as exc:
             logger.warning("_require_contact_access thread-check falhou: %s", exc)
@@ -2857,11 +3316,16 @@ async def wa_reopen_conversation(
     result = await wa_send_template(body=send_body, current_user=current_user)
     # Frente C1: contador do auto-resolve do lote (legado REOPEN_MAX_ATTEMPTS)
     # + cooldown. So no SUCESSO do envio (wa_send_template levanta em falha).
+    # Plano de reabertura (secao 6): mesmos campos por tentativa do lote, com
+    # audiencia "manual" e a conversa da rota; SEM item em reopen_batch_sent_at
+    # (o teto por contato vale so para envio em massa).
     try:
-        fs_document("wa_contacts", contact["id"]).set({
-            "reopen_attempts": int(contact.get("reopen_attempts") or 0) + 1,
-            "last_reopen_template_at": fs_utcnow().isoformat(),
-        }, merge=True)
+        from database import build_reopen_attempt_stamp, REOPEN_AUDIENCE_MANUAL
+        fs_document("wa_contacts", contact["id"]).set(build_reopen_attempt_stamp(
+            contact, REOPEN_AUDIENCE_MANUAL, conversation_id,
+            (conv or {}).get("channel_id"),
+            mass_send=False,
+        ), merge=True)
     except Exception as exc:
         logger.warning("reopen: carimbo de tentativa falhou contato=%s: %s", contact.get("id"), exc)
     log_audit(current_user["id"], "WA_REOPEN_SENT", f"conv={conversation_id} template={template_name} nome={nome} data={data}")
@@ -2870,74 +3334,226 @@ async def wa_reopen_conversation(
 
 
 # -- Frente C2: Reabertura em lote (o "botao" do sistema antigo, com freios) --
+# Plano v2.2 (docs/PLANO_REABERTURA_LOTE_BOT_RECEPCAO.md), etapa 3: um scan
+# unico reparte os candidatos em dois publicos — Recepcao (atendimento
+# humano) e Bot (fase de bot) — e o disparo escolhe qual balde sai.
 
-async def _plan_reopen_batch():
-    """Scan (database.scan_reopen_candidates) + resolucao de canal/template
-    por candidato. Retorna (scan_ajustado, plano, canais, tpl_por_canal)."""
-    from database import scan_reopen_candidates
-    from channel_service import get_channel as _get_ch
-    scan = scan_reopen_candidates(
-        max_attempts=REOPEN_MAX_ATTEMPTS,
-        cooldown_hours=REOPEN_COOLDOWN_HOURS,
-        window_hours=24,
-    )
-    plano, canais, tpl_por_canal = [], {}, {}
+def _ensure_reopen_batch_enabled(sys_settings=None):
+    """Kill-switch do lote INTEIRO por tenant (system_settings.
+    reopen_batch_enabled, plano de reabertura secao 7): desligado -> 409 na
+    previa e no disparo, ANTES de qualquer varredura. A reabertura pontual
+    (/api/wa/conversation/{id}/reopen) nao passa por aqui. Devolve o
+    system_settings lido (o caller reaproveita a leitura)."""
+    settings = sys_settings if isinstance(sys_settings, dict) else get_system_settings()
+    if not settings.get("reopen_batch_enabled", True):
+        raise HTTPException(status_code=409,
+                            detail="Reabertura em lote desligada para esta empresa.")
+    return settings
 
-    def _desclassifica(c, motivo):
-        scan["pulados"][motivo] = scan["pulados"].get(motivo, 0) + 1
-        dep = c.get("department_id") or 0
-        if scan["por_setor"].get(dep):
-            scan["por_setor"][dep] -= 1
 
-    for c in scan["enviaveis"]:
-        ch_id = c.get("channel_id")
-        if ch_id is None:
-            _desclassifica(c, "canal_invalido")
-            continue
-        if ch_id not in canais:
-            canais[ch_id] = _get_ch(ch_id) or {}
-        ch = canais[ch_id]
-        # So canal standard ativo — mesmo guard do send_template_bulk
-        # (campanha NUNCA sai por numero coexistence).
+# Cache da previa por tenant (plano secao 4): a classificacao de uma previa
+# vale 90s e e reaproveitada na troca de publico; uma previa em voo por
+# tenant (a segunda espera a primeira e sai do cache). O DISPARO nunca usa o
+# cache — o re-scan no execute e a verdade — e invalida a entrada do tenant.
+_REOPEN_PREVIEW_TTL_S = 90.0
+_reopen_preview_cache: dict = {}   # tid -> (monotonic, classificacao)
+_reopen_preview_locks: dict = {}   # tid -> (loop, asyncio.Lock)
+
+
+def _reopen_tenant_id(current_user=None) -> str:
+    from firestore_common import get_tenant_context as _get_tid
+    return str(_get_tid() or (current_user or {}).get("tenant_id") or "")
+
+
+def _reopen_preview_invalidate(tenant_id) -> None:
+    _reopen_preview_cache.pop(str(tenant_id or ""), None)
+
+
+def _reopen_bot_availability(sys_settings) -> dict:
+    """Publico Bot disponivel (plano secoes 5 e 7) = criterio 2.2.1 (motor
+    dialogflow_cx ativo + bot_enabled) E flag reopen_bot_audience_enabled.
+    cx_ok alimenta a CLASSIFICACAO (fase de bot existe); disponivel so libera
+    o DISPARO do publico Bot. Indisponivel ainda mostra as contagens."""
+    from bot_service import _get_tenant_ai_config
+    from database import reopen_bot_engine_status
+    cx_ok, motivo = reopen_bot_engine_status(sys_settings, _get_tenant_ai_config())
+    disponivel = bool(cx_ok and (sys_settings or {}).get("reopen_bot_audience_enabled", False))
+    if cx_ok and not disponivel:
+        motivo = "publico Bot ainda nao liberado para esta empresa"
+    return {"cx_ok": bool(cx_ok), "disponivel": disponivel,
+            "motivo": "" if disponivel else motivo}
+
+
+async def _reopen_standard_channels():
+    """Canais STANDARD ATIVOS do tenant e o template de retomada de cada um
+    (plano 2.1: coexistence fica fora; so canal com template compativel).
+    Resolvido ANTES do scan (sincrono, em threadpool): poucos canais por
+    tenant e o loader de templates tem cache proprio (60s)."""
+    from channel_service import get_all_active_channels as _active_channels
+    canais, tpls = {}, {}
+    for ch in _active_channels():
         if not ch or not ch.get("is_active") or ch.get("channel_type") != "standard":
-            _desclassifica(c, "canal_invalido")
             continue
-        if ch_id not in tpl_por_canal:
-            tpl_por_canal[ch_id] = await _resolve_reopen_template(ch)
-        if not tpl_por_canal[ch_id]:
-            _desclassifica(c, "sem_template")
+        ch_id = ch.get("id")
+        if ch_id is None:
             continue
-        plano.append(c)
-    return scan, plano, canais, tpl_por_canal
+        canais[ch_id] = ch
+        tpls[ch_id] = await _resolve_reopen_template(ch)
+    return canais, tpls
 
 
-@app.post("/api/admin/reopen-batch/preview")
-async def reopen_batch_preview(current_user: dict = Depends(get_current_user)):
-    """Dry-run do lote (paridade com o preview do legado + exigencia D3 do
-    ADR 0009: mostrar em qual SETOR as retomadas vao cair ANTES do disparo)."""
-    ensure_permission(current_user, "reabrir_em_lote")
-    scan, plano, _canais, _tpls = await _plan_reopen_batch()
-    from database import get_all_departments as _get_deps
-    dep_nome = {d.get("id"): d.get("name") for d in _get_deps(include_inactive=True)}
+async def _plan_reopen_batch(sys_settings=None):
+    """Classificacao do lote (plano v2.2, 2.1-2.3): canais/templates do
+    tenant + scan unico com dois baldes (database.scan_reopen_audiences)
+    rodando FORA do event loop. Retorna {"scan", "canais", "tpls",
+    "availability"}; cada enviavel leva _reopen_target (thread candidata)."""
+    from database import scan_reopen_audiences
+    from bot_service import _lgpd_policy_date
+    from firestore_common import set_tenant_context, reset_tenant_context
+    sys_settings = sys_settings if isinstance(sys_settings, dict) else get_system_settings()
+    availability = _reopen_bot_availability(sys_settings)
+    canais, tpls = await _reopen_standard_channels()
+    channels_ok = {ch_id: bool(tpls.get(ch_id)) for ch_id in canais}
+    # P2b: mesma regra por data do gate LGPD do bot (data invalida/futura = sem data).
+    policy_date = _lgpd_policy_date(sys_settings)
+    tid = _reopen_tenant_id()
+
+    def _job():
+        # Contexto de tenant setado explicitamente na thread do pool.
+        token = set_tenant_context(tid or None)
+        try:
+            return scan_reopen_audiences(
+                channels_ok, availability["cx_ok"], policy_date,
+                max_attempts=REOPEN_MAX_ATTEMPTS,
+                cooldown_hours=REOPEN_COOLDOWN_HOURS,
+                window_hours=24,
+                max_per_contact=REOPEN_MAX_PER_CONTACT,
+                window_days=REOPEN_WINDOW_DAYS,
+                max_idle_days=REOPEN_MAX_IDLE_DAYS,
+                scan_max=REOPEN_SCAN_MAX,
+                desfecho_link=REOPEN_DESFECHO_LINK,
+            )
+        finally:
+            reset_tenant_context(token)
+
+    scan = await run_in_threadpool(_job)
+    return {"scan": scan, "canais": canais, "tpls": tpls, "availability": availability}
+
+
+def _reopen_daily_cap(tenant_id) -> dict:
+    """Teto diario do portfolio (D7, plano 2.3): {cap, usados_24h,
+    disponiveis}. Soma os lotes das ultimas 24h de todos os tenants ativos
+    (database.reopen_daily_usage). Sincrono: o caller usa threadpool."""
+    from database import reopen_daily_usage
+    uso = reopen_daily_usage(include_tenant_ids=(tenant_id,) if tenant_id else ())
+    usados = int(uso.get("usados") or 0)
+    return {"cap": REOPEN_DAILY_CAP, "usados_24h": usados,
+            "disponiveis": max(0, REOPEN_DAILY_CAP - usados)}
+
+
+def _reopen_audience_payload(view: dict, dep_nome: dict) -> dict:
+    """Uma visao da previa com as MESMAS chaves da previa antiga (a tela atual
+    le o balde Recepcao no topo; o seletor da etapa 6 le audiences)."""
+    plano = view.get("enviaveis") or []
     por_setor = [
         {"department_id": k or None,
          "department_name": dep_nome.get(k) or "Sem setor",
          "count": v}
-        for k, v in sorted(scan["por_setor"].items(), key=lambda kv: -kv[1]) if v > 0
+        for k, v in sorted((view.get("por_setor") or {}).items(), key=lambda kv: -kv[1]) if v > 0
     ]
     amostra = [{
         "contact_id": c.get("id"),
         "nome": c.get("display_name") or c.get("phone_formatted") or "",
         "department_id": c.get("department_id"),
+        "conversation_id": (c.get("_reopen_target") or {}).get("conversation_id"),
+        "channel_id": (c.get("_reopen_target") or {}).get("channel_id"),
     } for c in plano[:20]]
     return {
         "enviaveis": len(plano),
-        "auto_resolve": len(scan["auto_resolve"]),
-        "pulados": scan["pulados"],
+        "auto_resolve": len(view.get("auto_resolve") or []),
+        "pulados": dict(view.get("pulados") or {}),
         "por_setor": por_setor,
         "amostra": amostra,
         "max_sends_default": REOPEN_BATCH_MAX_SENDS,
     }
+
+
+async def _reopen_classify_for_preview(sys_settings) -> dict:
+    """Classificacao resumida (o que a previa mostra) — o que vai pro cache."""
+    from database import REOPEN_AUDIENCES, get_all_departments as _get_deps
+    plan = await _plan_reopen_batch(sys_settings)
+    scan = plan["scan"]
+    dep_nome = {d.get("id"): d.get("name") for d in _get_deps(include_inactive=True)}
+    return {
+        "audiences": {aud: _reopen_audience_payload(scan["audiences"][aud], dep_nome)
+                      for aud in REOPEN_AUDIENCES},
+        "criteria_version": scan.get("criteria_version"),
+        "total": scan.get("total"),
+        "excedente": scan.get("excedente"),
+    }
+
+
+@app.post("/api/admin/reopen-batch/preview")
+async def reopen_batch_preview(request: Request = None,
+                               current_user: dict = Depends(get_current_user)):
+    """Dry-run do lote (paridade com o preview do legado + exigencia D3 do
+    ADR 0009: mostrar em qual SETOR as retomadas vao cair ANTES do disparo).
+
+    Plano v2.2 (secao 5): devolve os DOIS publicos em `audiences`
+    (reception/bot, mesmas chaves da previa antiga), `bot_disponivel` +
+    `bot_indisponivel_motivo` e `daily_cap` {cap, usados_24h, disponiveis}.
+    Os campos antigos do topo continuam = balde Recepcao (tela atual intacta
+    ate a etapa 6). Corpo opcional {"refresh": true} ignora o cache."""
+    ensure_permission(current_user, "reabrir_em_lote")
+    sys_settings = _ensure_reopen_batch_enabled()
+    refresh = False
+    if request is not None:
+        try:
+            _body = await request.json()
+        except Exception:
+            _body = None
+        refresh = bool(_body.get("refresh")) if isinstance(_body, dict) else False
+    tid = _reopen_tenant_id(current_user)
+    _loop = asyncio.get_running_loop()
+    _entry = _reopen_preview_locks.get(tid)
+    if _entry is None or _entry[0] is not _loop:
+        # Lock e por event loop (prod: um so; simuladores: um por asyncio.run).
+        _entry = _reopen_preview_locks[tid] = (_loop, asyncio.Lock())
+    lock = _entry[1]
+    async with lock:
+        cached = _reopen_preview_cache.get(tid)
+        if cached and not refresh and (_monotonic() - cached[0]) < _REOPEN_PREVIEW_TTL_S:
+            classif, cache_hit = cached[1], True
+        else:
+            classif, cache_hit = await _reopen_classify_for_preview(sys_settings), False
+            _reopen_preview_cache[tid] = (_monotonic(), classif)
+    availability = _reopen_bot_availability(sys_settings)
+    try:
+        daily_cap = await run_in_threadpool(_reopen_daily_cap, tid)
+    except Exception as exc:
+        logger.warning("reopen-batch preview: teto diario indisponivel: %s", exc)
+        daily_cap = {"cap": REOPEN_DAILY_CAP, "usados_24h": None, "disponiveis": None}
+    return {
+        **classif["audiences"]["reception"],
+        "audiences": classif["audiences"],
+        "bot_disponivel": availability["disponivel"],
+        "bot_indisponivel_motivo": availability["motivo"],
+        "daily_cap": daily_cap,
+        "criteria_version": classif.get("criteria_version"),
+        "cache_hit": cache_hit,
+    }
+
+
+def _parse_reopen_audience(raw) -> str:
+    """Publico do disparo: ausente/null = reception (tela atual); fora do
+    vocabulario = 422 (plano secao 5)."""
+    from database import REOPEN_AUDIENCES, REOPEN_AUDIENCE_RECEPTION
+    if raw is None:
+        return REOPEN_AUDIENCE_RECEPTION
+    if isinstance(raw, str) and raw.strip().lower() in REOPEN_AUDIENCES:
+        return raw.strip().lower()
+    raise HTTPException(status_code=422,
+                        detail="Publico invalido: use 'reception' (Recepcao) ou 'bot'.")
 
 
 @app.post("/api/admin/reopen-batch")
@@ -2945,16 +3561,31 @@ async def reopen_batch_execute(request: Request, background_tasks: BackgroundTas
                                current_user: dict = Depends(get_current_user)):
     """Dispara o lote (supervisor/admin — toggle reabrir_em_lote). O RE-SCAN
     aqui e a fonte da verdade (o preview pode ter envelhecido); execucao
-    assincrona via BackgroundTasks com pacing + circuit breakers."""
+    assincrona via BackgroundTasks com pacing + circuit breakers.
+
+    Plano v2.2: corpo {"audience": "reception"|"bot", "max_sends": n}
+    (audience ausente = reception; invalido = 422; bot indisponivel = 409).
+    Teto diario do portfolio (D7) checado aqui: planejados = min(enviaveis,
+    max_sends, disponiveis); disponivel zero = 409. Etapa 3: com audience=bot
+    o lote SO envia — o auto-resolve silencioso do Bot (D9) e da etapa 5."""
     ensure_permission(current_user, "reabrir_em_lote")
+    sys_settings = _ensure_reopen_batch_enabled()
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
+    audience = _parse_reopen_audience(body.get("audience"))
     try:
         max_sends = max(1, min(int(body.get("max_sends") or REOPEN_BATCH_MAX_SENDS), 250))
     except Exception:
         max_sends = REOPEN_BATCH_MAX_SENDS
+    if audience == "bot":
+        _avail = _reopen_bot_availability(sys_settings)
+        if not _avail["disponivel"]:
+            raise HTTPException(status_code=409,
+                                detail=f"Publico Bot indisponivel: {_avail['motivo']}.")
     # Trava de execucao unica (revisao adversarial C2): dois lotes em paralelo
     # (dois admins, ou fechar/reabrir o modal) mandariam o MESMO template pago
     # 2x pro mesmo lead. Lote "executando" com progresso recente bloqueia;
@@ -2969,33 +3600,62 @@ async def reopen_batch_execute(request: Request, background_tasks: BackgroundTas
                 detail=f"Lote {_bd.get('id')} ainda em execucao. Aguarde ele terminar.",
             )
         fs_document("reopen_batches", _bs.id).set({"status": "interrompido"}, merge=True)
-    scan, plano, canais, tpls = await _plan_reopen_batch()
-    if not plano and not scan["auto_resolve"]:
+    # Teto diario do portfolio (D7): fail-closed — sem saber o uso, nao dispara.
+    tid = _reopen_tenant_id(current_user)
+    try:
+        daily_cap = await run_in_threadpool(_reopen_daily_cap, tid)
+    except Exception as exc:
+        logger.warning("reopen-batch: teto diario indisponivel: %s", exc)
+        raise HTTPException(status_code=503,
+                            detail="Nao foi possivel conferir o teto diario de reaberturas. Tente de novo.")
+    if daily_cap["disponiveis"] <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Teto diario de reaberturas atingido ({daily_cap['usados_24h']} de "
+                    f"{daily_cap['cap']} nas ultimas 24h, somando todas as empresas). "
+                    "Tente de novo mais tarde."),
+        )
+    plan = await _plan_reopen_batch(sys_settings)
+    scan, canais, tpls = plan["scan"], plan["canais"], plan["tpls"]
+    view = scan["audiences"][audience]
+    plano = view["enviaveis"]
+    # Etapa 3: o auto-resolve do Bot (fechamento silencioso, D9) fica fora do
+    # disparo e so aparece na previa.
+    auto_resolve = view["auto_resolve"] if audience == "reception" else []
+    if not plano and not auto_resolve:
         raise HTTPException(status_code=400, detail="Nenhum lead elegivel para reabertura agora.")
+    planejados = min(len(plano), max_sends, daily_cap["disponiveis"])
     from database import next_sequence as _next_seq
-    from firestore_common import get_tenant_context as _get_tid
     batch_id = _next_seq("reopen_batches")
-    tid = _get_tid() or str(current_user.get("tenant_id") or "")
     fs_document("reopen_batches", batch_id).set({
         "id": batch_id, "status": "executando",
+        "audience": audience,
+        "criteria_version": scan.get("criteria_version"),
         "started_by": current_user["id"],
         "started_at": fs_utcnow().isoformat(),
-        "planejados": min(len(plano), max_sends),
-        "auto_resolve_planejados": len(scan["auto_resolve"]),
+        # Reserva do teto diario (max(enviados, planejados) enquanto executa).
+        "planejados": planejados,
+        "auto_resolve_planejados": len(auto_resolve),
+        "auto_resolve_fora_do_disparo": len(view["auto_resolve"]) - len(auto_resolve),
         "max_sends": max_sends,
-        "pulados_scan": scan["pulados"],
+        "elegiveis": len(plano),
+        "pulados_scan": view["pulados"],
+        "teto_diario": {"cap": daily_cap["cap"], "usados_24h": daily_cap["usados_24h"]},
         "enviados": 0, "resolvidos": 0, "falhas": 0,
         "last_progress_at": fs_utcnow().isoformat(),
     })
     log_audit(current_user["id"], "REOPEN_BATCH_START",
-              f"batch={batch_id} planejados={min(len(plano), max_sends)} auto_resolve={len(scan['auto_resolve'])} max={max_sends}")
+              f"batch={batch_id} audience={audience} planejados={planejados} "
+              f"auto_resolve={len(auto_resolve)} max={max_sends} "
+              f"teto_usado={daily_cap['usados_24h']}/{daily_cap['cap']}")
     background_tasks.add_task(
-        _run_reopen_batch, tid, batch_id, plano[:max_sends],
-        scan["auto_resolve"], canais, tpls, current_user["id"],
+        _run_reopen_batch, tid, batch_id, plano[:planejados],
+        auto_resolve, canais, tpls, current_user["id"], audience,
     )
-    return {"status": "ok", "batch_id": batch_id,
-            "planejados": min(len(plano), max_sends),
-            "auto_resolve": len(scan["auto_resolve"])}
+    _reopen_preview_invalidate(tid)
+    return {"status": "ok", "batch_id": batch_id, "audience": audience,
+            "planejados": planejados,
+            "auto_resolve": len(auto_resolve)}
 
 
 @app.get("/api/admin/reopen-batch/{batch_id}")
@@ -3015,9 +3675,15 @@ async def reopen_batch_status(batch_id: int, current_user: dict = Depends(get_cu
     return d
 
 
-async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tpls, starter_id):
+async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tpls, starter_id,
+                            audience="reception"):
     """Executa o lote FORA do request (BackgroundTasks). Re-seta o contexto de
     tenant (o middleware ja resetou o do request — mesmo padrao do cron).
+
+    audience = publico do lote (plano v2.2): vai no carimbo da tentativa
+    (last_reopen_audience + reopen_batch_sent_at). Cada item do plano leva a
+    thread candidata em _reopen_target (canal do envio); sem ela (chamada
+    antiga), cai no canal do contato e em {channel_id}__{wa_id}.
 
     Freios portados do scripts/send_template_bulk.py: pacing 1.5s, aborta em
     5 falhas consecutivas e em held_for_quality_assessment. Envio pelo
@@ -3025,8 +3691,12 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
     que silenciaria a Val (mark_contact_bot_done) — e sem avancar recencia
     (mil threads no topo do listener esconderiam as conversas reais)."""
     from firestore_common import set_tenant_context, reset_tenant_context
+    from database import build_reopen_attempt_stamp
     token_ctx = set_tenant_context(tenant_id)
     enviados = resolvidos = falhas = consecutivas = 0
+    # Recusa comercial registrada depois da previa: pulada sem carimbo, mas
+    # contada (senao o lote fecha com enviados < planejados sem motivo).
+    pulados_recusa = 0
     abortado = ""
     try:
         # 1) AUTO-RESOLVE (PO: "muito importante"): fecha SEM enviar quem ja
@@ -3079,13 +3749,19 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
             await asyncio.sleep(0.05)
         # 2) ENVIOS com pacing
         for i, c in enumerate(plano):
-            ch = canais.get(c.get("channel_id")) or {}
-            tpl = tpls.get(c.get("channel_id")) or {}
+            # Canal da THREAD CANDIDATA (plano 2.2), nao mais contact.channel_id.
+            _target = c.get("_reopen_target") or {}
+            _ch_id = _target.get("channel_id", c.get("channel_id"))
+            ch = canais.get(_ch_id) or {}
+            tpl = tpls.get(_ch_id) or {}
             try:
                 token, phone_id, api_base = _resolve_channel_creds_by_id(ch["id"])
                 wa_id = _wa_target(c["wa_id"])
+                _conv_id = (_target.get("conversation_id")
+                            or f"{ch['id']}__{normalize_br_phone(c['wa_id'])}")
                 nome = _reopen_first_name(c)
-                data = _reopen_last_conv_date(None, c)
+                data = _reopen_last_conv_date(
+                    {"last_message_at": _target.get("last_message_at")} if _target else None, c)
                 params = _reopen_template_params(tpl, nome, data)
                 payload = {
                     "messaging_product": "whatsapp", "to": wa_id, "type": "template",
@@ -3095,12 +3771,14 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                         **({"components": [{"type": "body", "parameters": params}]} if params else {}),
                     },
                 }
+                # Nunca confiar no preview: a recusa pode ter sido registrada
+                # depois da montagem do lote. Nao carimbar tentativa/cooldown.
+                fresh_contact = get_wa_contact(c["id"])
+                if not fresh_contact or is_commercial_contact_blocked(fresh_contact):
+                    pulados_recusa += 1
+                    await asyncio.sleep(0)
+                    continue
                 async with httpx.AsyncClient(timeout=15.0) as client:
-                    # Nunca confiar no preview: a recusa pode ter sido registrada
-                    # depois da montagem do lote. Nao carimbar tentativa/cooldown.
-                    fresh_contact = get_wa_contact(c["id"])
-                    if not fresh_contact or is_commercial_contact_blocked(fresh_contact):
-                        continue
                     resp = await client.post(
                         f"{api_base}/{phone_id}/messages",
                         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -3110,11 +3788,14 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                     # Carimbo PRIMEIRO (revisao adversarial C2): o template
                     # pago JA saiu — se o save da mensagem falhar ou a
                     # instancia morrer aqui, cooldown/attempts impedem que o
-                    # proximo lote reenvie pro mesmo cliente.
-                    fs_document("wa_contacts", c["id"]).set({
-                        "reopen_attempts": int(c.get("reopen_attempts") or 0) + 1,
-                        "last_reopen_template_at": fs_utcnow().isoformat(),
-                    }, merge=True)
+                    # proximo lote reenvie pro mesmo cliente. Plano de
+                    # reabertura (secao 6): + campos por tentativa e item
+                    # {at, audience} no teto por contato, com o PUBLICO DO
+                    # LOTE. A thread e a candidata do scan — a mesma que o
+                    # save abaixo recebe explicitamente.
+                    fs_document("wa_contacts", c["id"]).set(build_reopen_attempt_stamp(
+                        c, audience, _conv_id, ch["id"],
+                    ), merge=True)
                     try:
                         _rbody = resp.json()
                     except Exception:
@@ -3128,6 +3809,7 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                             operator_id=starter_id, sender_user_id=starter_id,
                             channel_id=ch.get("id"),
                             channel_owner_user_id=ch.get("owner_user_id"),
+                            conversation_id=_conv_id,
                             template_category=str(tpl.get("category") or "utility").lower(),
                             promote_qualification=False,
                             reopen_attendance=False,  # reabre so quando o CLIENTE responder
@@ -3180,6 +3862,7 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
             if (i + 1) % 10 == 0:
                 fs_document("reopen_batches", batch_id).set(
                     {"enviados": enviados, "falhas": falhas, "resolvidos": resolvidos,
+                     "pulados_recusa_comercial": pulados_recusa,
                      "last_progress_at": fs_utcnow().isoformat()}, merge=True)
             await asyncio.sleep(1.5)
     except Exception as exc:
@@ -3190,10 +3873,14 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
             "status": "abortado" if abortado else "concluido",
             "abort_motivo": abortado,
             "enviados": enviados, "resolvidos": resolvidos, "falhas": falhas,
+            "pulados_recusa_comercial": pulados_recusa,
             "finished_at": fs_utcnow().isoformat(),
         }, merge=True)
         log_audit(None, "REOPEN_BATCH_END",
-                  f"batch={batch_id} enviados={enviados} resolvidos={resolvidos} falhas={falhas} abort={abortado or '-'}")
+                  f"batch={batch_id} audience={audience} enviados={enviados} resolvidos={resolvidos} falhas={falhas} "
+                  f"pulados_recusa={pulados_recusa} abort={abortado or '-'}")
+        # Previa feita durante o lote nao pode sobreviver ao fim dele.
+        _reopen_preview_invalidate(tenant_id)
         reset_tenant_context(token_ctx)
 
 
@@ -3206,6 +3893,7 @@ async def wa_list_templates(
     from channel_service import get_channel, get_default_channel
 
     channel = get_channel(channel_id) if channel_id is not None else get_default_channel()
+    _require_impersonation_channel_scope(channel, current_user)
     if channel is None:
         raise HTTPException(status_code=503, detail="Nenhum canal WhatsApp configurado")
 
@@ -3798,9 +4486,12 @@ async def admin_conflicts(current_user: dict = Depends(get_current_user)):
                 return None
         return None
 
+    hide_backup = bool(current_user.get("impersonation")) and not can_see_all_tenant(current_user)
     by_contact: dict = {}
     for snap in fs_coll("wa_conversations").stream():
         c = snap.to_dict() or {}
+        if hide_backup and c.get("is_backup"):
+            continue
         if c.get("assigned_to") is None or c.get("channel_active") is False:
             continue
         lm = _to_dt(c.get("last_message_at"))
@@ -3819,6 +4510,8 @@ async def admin_conflicts(current_user: dict = Depends(get_current_user)):
         if len({c.get("assigned_to") for c, _ in items}) < 2:
             continue
         contact = contacts_by_id.get(cid) or {}
+        if hide_backup and contact.get("is_backup"):
+            continue
         items_sorted = sorted(items, key=lambda t: t[1], reverse=True)
         conflicts.append({
             "contact_id": cid,
@@ -3854,6 +4547,9 @@ async def admin_get_protocol(protocol_id: str, current_user: dict = Depends(get_
         raise HTTPException(status_code=404, detail="Protocolo nao encontrado")
     messages = get_messages_by_protocol(protocol_id)
     contact = get_wa_contact(atendimento.get("contact_id"))
+    if current_user.get("impersonation"):
+        from impersonation_views import filter_message_rows
+        messages = filter_message_rows(current_user, contact, messages)
     contact_brief = None
     if contact:
         contact_brief = {
@@ -3993,8 +4689,12 @@ async def list_pending_webhook_events(
     excecao no processamento). Garantia de zero perda — operador retenta
     apos o canal estar disponivel."""
     ensure_permission(current_user, "gerenciar_canais")
-    from pending_events import list_pending_events
-    events = list_pending_events(status=status, limit=limit)
+    from pending_events import list_pending_events, list_pending_events_for_channels
+    if current_user.get("impersonation"):
+        phone_ids = [channel.get("phone_number_id") for channel in _impersonation_channels(current_user)]
+        events = list_pending_events_for_channels(phone_ids, status=status, limit=limit)
+    else:
+        events = list_pending_events(status=status, limit=limit)
     return {"events": events, "count": len(events)}
 
 
@@ -4137,6 +4837,7 @@ async def channel_billing_status(channel_id: int, current_user: dict = Depends(g
     from channel_service import get_channel
 
     channel = get_channel(channel_id)
+    _require_impersonation_channel_scope(channel, current_user)
     if not channel:
         raise HTTPException(status_code=404, detail="Canal nao encontrado")
     waba_id = str(channel.get("waba_id") or "").strip()
@@ -4350,6 +5051,13 @@ def _verify_cron_auth(request: Request) -> None:
         status_code=401,
         detail="auth ausente: envie Authorization: Bearer <oidc> ou X-Cron-Secret",
     )
+
+
+@app.post("/api/internal/cron/cleanup-impersonation")
+async def cron_cleanup_impersonation(request: Request):
+    """Limpa somente contas temporarias registradas; funciona com flag off."""
+    _verify_cron_auth(request)
+    return await run_in_threadpool(cleanup_expired_sessions)
 
 
 @app.post("/api/internal/cron/health-check")
@@ -5641,6 +6349,17 @@ async def gc_list_spaces(current_user: dict = Depends(get_current_user)):
     """Lista spaces disponiveis no Google Chat."""
     if not FEATURE_GOOGLE_CHAT:
         raise HTTPException(status_code=404, detail="Google Chat desabilitado")
+    if current_user.get("impersonation"):
+        # A lista do app Google Chat e global. Somente salas com vinculo
+        # comprovado na colecao deste tenant podem aparecer na visualizacao.
+        spaces = {}
+        for snap in fs_coll("gc_conversations").where("space_id", "!=", "").stream():
+            row = snap.to_dict() or {}
+            space_id = row.get("space_id")
+            if space_id:
+                spaces[space_id] = {"space_id": space_id, "display_name": row.get("space_name") or space_id,
+                                    "type": "", "single_user_bot_dm": False}
+        return {"spaces": list(spaces.values())}
     from google_chat import list_spaces
     spaces = list_spaces()
     return {"spaces": spaces}
@@ -5740,7 +6459,106 @@ async def dashboard_ratings(
 ):
     ensure_permission(current_user, "ver_dashboard_uso")
     ratings = get_all_ratings(date_from or None, date_to or None)
+    if current_user.get("impersonation") and not can_see_all_tenant(current_user):
+        ratings = [row for row in ratings if not row.get("is_backup")]
     return {"ratings": ratings}
+
+
+# -- API: Monitor de atendimento (monitor_service.py) --
+# Fila de espera, metricas, origem e auditoria por atendente. So admin por
+# default (toggle ver_monitor_atendimento) e so tenants em MONITOR_TENANTS.
+# Tudo so-leitura; o unico write e o log_audit do export.
+
+
+def _monitor_tenant(current_user):
+    """(tenant_id, cfg) do monitor ou 403/404."""
+    import monitor_service
+    ensure_permission(current_user, "ver_monitor_atendimento")
+    tid = str(current_user.get("tenant_id") or "")
+    cfg = monitor_service.monitor_config(tid)
+    if not cfg:
+        raise HTTPException(status_code=404, detail="Monitor nao habilitado para esta empresa")
+    return tid, cfg
+
+
+async def _monitor_in_tenant(tid, fn, *args, **kwargs):
+    """Roda fn em threadpool com o tenant setado na thread (Firestore sincrono)."""
+    from firestore_common import set_tenant_context, reset_tenant_context
+
+    def _job():
+        token = set_tenant_context(tid or None)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            reset_tenant_context(token)
+
+    return await run_in_threadpool(_job)
+
+
+@app.get("/api/admin/monitor/fila")
+async def monitor_fila(current_user: dict = Depends(get_current_user)):
+    import monitor_service
+    tid, cfg = _monitor_tenant(current_user)
+    return await _monitor_in_tenant(tid, monitor_service.fila_de_espera, tid, cfg)
+
+
+@app.get("/api/admin/monitor/metricas")
+async def monitor_metricas(
+    dias: int = Query(14, ge=1, le=31),
+    refresh: bool = Query(False),
+    current_user: dict = Depends(get_current_user),
+):
+    import monitor_service
+    tid, cfg = _monitor_tenant(current_user)
+    payload = await _monitor_in_tenant(tid, monitor_service.metricas, tid, cfg, dias, refresh)
+    return {**payload, "rotulo": cfg.get("rotulo") or tid,
+            "origem_ativa": bool(cfg.get("origem")),
+            "exportar_auditoria": bool(cfg.get("exportar_auditoria"))}
+
+
+@app.get("/api/admin/monitor/auditoria")
+async def monitor_auditoria(
+    operador_id: int = Query(...),
+    inicio: str = Query(...),
+    fim: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Download .txt das conversas em que o atendente respondeu no periodo
+    (dias BR inclusivos), cliente anonimizado. Auditado (LGPD)."""
+    import monitor_service
+    tid, cfg = _monitor_tenant(current_user)
+    if not cfg.get("exportar_auditoria"):
+        raise HTTPException(status_code=403, detail="Exportacao de auditoria desabilitada para esta empresa")
+    try:
+        d_ini = datetime.strptime(inicio, "%Y-%m-%d").date()
+        d_fim = datetime.strptime(fim, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Datas no formato AAAA-MM-DD")
+    hoje = datetime.now(monitor_service.BR_TZ).date()
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="A data final e anterior a inicial")
+    if (d_fim - d_ini).days + 1 > monitor_service.AUDITORIA_MAX_DIAS:
+        raise HTTPException(status_code=400, detail=f"Periodo maximo de {monitor_service.AUDITORIA_MAX_DIAS} dias")
+    if (hoje - d_ini).days > monitor_service.AUDITORIA_MAX_IDADE_DIAS:
+        raise HTTPException(status_code=400, detail=f"Inicio ate {monitor_service.AUDITORIA_MAX_IDADE_DIAS} dias atras")
+    alvo = get_user_by_id(operador_id)
+    if not alvo:
+        raise HTTPException(status_code=404, detail="Atendente nao encontrado")
+    res = await _monitor_in_tenant(
+        tid, monitor_service.auditoria_atendente, tid, cfg, operador_id, d_ini, d_fim)
+    log_audit(current_user["id"], "MONITOR_AUDITORIA_EXPORT",
+              f"operador={operador_id} periodo={d_ini.isoformat()}..{d_fim.isoformat()} "
+              f"conversas={res['conversas']} truncado={res['truncado']}")
+    nome_arq = (f"auditoria_{monitor_service.slug(tid)}_{monitor_service.slug(res['nome'])}_"
+                f"{d_ini:%Y%m%d}_{d_fim:%Y%m%d}.txt")
+    return PlainTextResponse(
+        res["texto"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{nome_arq}"',
+            "Cache-Control": "no-store",
+            "X-Conversas": str(res["conversas"]),
+        },
+    )
 
 
 # -- API: Usage mensal per-tenant (Fase 2.10.4) --
@@ -5799,7 +6617,10 @@ async def export_data(
     """Exporta conversas e contatos em JSON ou CSV."""
     ensure_permission(current_user, "exportar_contatos")
 
-    contacts = get_all_wa_contacts(include_archived=True)
+    if current_user.get("impersonation") and not can_see_all_tenant(current_user):
+        contacts = get_wa_contacts_scoped_for_user(current_user.get("id"))
+    else:
+        contacts = get_all_wa_contacts(include_archived=True)
     # Filtrar por data se especificado
     if date_from:
         contacts = [c for c in contacts if str(c.get("first_seen_at", ""))[:10] >= date_from]
@@ -5881,6 +6702,15 @@ class EmbeddedSignupExchange(BaseModel):
     waba_id: str = ""
 
 
+def _coex_phone_key(raw) -> str:
+    """Forma canonica p/ comparar numero coex: so digitos, DDI 55 quando veio
+    so DDD+numero (10-11 digitos, inclusive DDD 55) e 9o digito BR normalizado."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) in (10, 11):
+        digits = "55" + digits
+    return normalize_br_phone(digits)
+
+
 def _meta_error_detail(resp: httpx.Response) -> str:
     """Extrai mensagem de erro estruturada de uma resposta da Graph API."""
     try:
@@ -5914,6 +6744,36 @@ async def embedded_signup_exchange(
         raise HTTPException(status_code=403, detail="Sem permissao para o signup. Peca a um admin para autorizar seu numero coexistence.")
     if not META_APP_ID or not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_ID e META_APP_SECRET sao obrigatorios")
+
+    is_privileged = has_permission(current_user, "gerenciar_canais")
+    # Signup EM NOME de outro operador: admin/supervisor conecta o coex no
+    # celular do operador sem precisar da senha dele. O dono tem que ter o
+    # numero coex autorizado (Usuarios > Coex) — o numero conectado e
+    # conferido contra o coex_phone DELE (passo 4), nao contra o do admin.
+    # Valida aqui, antes de queimar o code na Meta.
+    delegated_owner = None
+    if (
+        body.channel_type == "coexistence"
+        and is_privileged
+        and body.owner_user_id
+        and body.owner_user_id != current_user["id"]
+    ):
+        delegated_owner = get_user_by_id(body.owner_user_id)
+        if not delegated_owner:
+            raise HTTPException(status_code=404, detail="Operador dono nao encontrado ou inativo.")
+        if not delegated_owner.get("coex_authorized") or not str(delegated_owner.get("coex_phone") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Autorize antes o numero coexistence desse operador (Usuarios > Coex).",
+            )
+        # LGPD: sem firebase_uid (nunca entrou no CRM) o webhook carimba
+        # assigned_to_uid="" no historico/agenda do celular — a pool que todo
+        # operador le — e o primeiro login nao corrige depois.
+        if not str(delegated_owner.get("firebase_uid") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="O operador precisa entrar no CRM uma vez antes de conectar o coexistence dele.",
+            )
 
     # 1. Trocar code por access token
     token_url = (
@@ -6059,7 +6919,18 @@ async def embedded_signup_exchange(
         logger.warning("Embedded Signup: nenhum numero encontrado no WABA %s", waba_id)
         raise HTTPException(status_code=400, detail="Nenhum numero de telefone encontrado na conta")
 
-    phone_info = phone_numbers[0]
+    # WABA com mais de um numero: usa o numero da session-info do popup (o que
+    # acabou de ser conectado); sem ele, cai no primeiro (comportamento antigo).
+    session_phone_id = (body.phone_number_id or "").strip()
+    phone_info = next(
+        (p for p in phone_numbers if session_phone_id and str(p.get("id", "")) == session_phone_id),
+        phone_numbers[0],
+    )
+    if session_phone_id and str(phone_info.get("id", "")) != session_phone_id:
+        logger.warning(
+            "Embedded Signup: phone_number_id da sessao (%s) nao esta na WABA %s (%d numeros) — usando o primeiro",
+            session_phone_id, waba_id, len(phone_numbers),
+        )
     phone_number_id = phone_info.get("id", "")
     display_phone = phone_info.get("display_phone_number", "")
     verified_name = phone_info.get("verified_name", "")
@@ -6078,7 +6949,6 @@ async def embedded_signup_exchange(
     # 4. Determinar tipo do canal antes de assinar webhook (campos diferem)
     is_coexistence = body.channel_type == "coexistence"
     channel_type = CHANNEL_TYPE_COEXISTENCE if is_coexistence else CHANNEL_TYPE_STANDARD
-    is_privileged = has_permission(current_user, "gerenciar_canais")
     # Operador autorizado so conecta canal COEX do PROPRIO numero: ignora
     # owner_user_id do body (so admin/supervisor atribui canal a outro user) e
     # nao pode criar canal standard.
@@ -6088,20 +6958,45 @@ async def embedded_signup_exchange(
         owner_id = body.owner_user_id if (is_privileged and body.owner_user_id) else current_user["id"]
     else:
         owner_id = None
-    # Validacao do numero pre-autorizado: se o usuario tem numero coex autorizado
-    # pelo admin, o numero conectado no signup TEM que bater (LGPD + politica de
-    # numeros corporativos). normalize_br_phone trata o 9o digito BR.
-    expected_phone = "".join(ch for ch in str(current_user.get("coex_phone") or "") if ch.isdigit())
+    # Validacao do numero pre-autorizado: se o DONO do canal tem numero coex
+    # autorizado pelo admin, o numero conectado no signup TEM que bater (LGPD +
+    # politica de numeros corporativos). Signup em nome de outro operador
+    # confere contra o coex_phone do operador, nao do admin. normalize_br_phone
+    # trata o 9o digito BR.
+    phone_owner = delegated_owner or current_user
+    expected_phone = "".join(ch for ch in str(phone_owner.get("coex_phone") or "") if ch.isdigit())
     if is_coexistence and expected_phone:
         got_phone = "".join(ch for ch in str(display_phone or "") if ch.isdigit())
-        if normalize_br_phone(expected_phone) != normalize_br_phone(got_phone):
+        if _coex_phone_key(expected_phone) != _coex_phone_key(got_phone):
+            owner_hint = f" para {delegated_owner.get('display_name', 'o operador')}" if delegated_owner else ""
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Numero conectado (...{got_phone[-4:] or '????'}) difere do autorizado "
+                    f"Numero conectado (...{got_phone[-4:] or '????'}) difere do autorizado{owner_hint} "
                     f"(...{expected_phone[-4:]}). Conecte o numero cadastrado pelo admin."
                 ),
             )
+    elif is_coexistence and is_privileged:
+        # Admin/supervisor SEM numero proprio autorizado conectando "como ele
+        # mesmo": se o numero conectado esta autorizado para OUTRO usuario, o
+        # canal (e o historico/agenda do celular) iria pro admin. Recusa e pede
+        # pra escolher o dono certo.
+        got_key = _coex_phone_key(display_phone)
+        for u in get_all_users():
+            if (
+                u.get("id") != current_user["id"]
+                and u.get("is_active", 1)
+                and u.get("coex_authorized")
+                and str(u.get("coex_phone") or "").strip()
+                and _coex_phone_key(u.get("coex_phone")) == got_key
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Este numero esta autorizado para {u.get('display_name', 'outro operador')}. "
+                        "Selecione-o como dono do numero e conecte de novo."
+                    ),
+                )
 
     # 5. Registrar webhook do app no WABA com os fields apropriados
     if is_coexistence:
@@ -6292,7 +7187,7 @@ async def embedded_signup_exchange(
     log_audit(
         current_user["id"],
         "EMBEDDED_SIGNUP_REBIND" if rebound else "EMBEDDED_SIGNUP",
-        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} rebound={rebound} syncs={list(sync_results.keys())}",
+        f"WABA={waba_id} Phone={phone_number_id} ({display_phone}) status={status} channel_id={new_channel_id} rebound={rebound} owner={owner_id} delegated={bool(delegated_owner)} syncs={list(sync_results.keys())}",
     )
 
     return {
@@ -6300,6 +7195,8 @@ async def embedded_signup_exchange(
         "channel_id": new_channel_id,
         "rebound": rebound,
         "channel_type": channel_type,
+        "owner_user_id": owner_id,
+        "owner_display_name": (owner_user or {}).get("display_name", ""),
         "access_token": access_token,
         "token_expires_at": token_expires_at_iso,
         "waba_id": waba_id,

@@ -60,6 +60,7 @@ RESUMO_SISTEMA_E_ROTACAO.md
 build/
 dist/
 frontend/node_modules/
+.npm-cache/
 frontend_dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
@@ -85,3 +86,6 @@ docs/lista temp.md
 # Undos de scripts de manutencao (dados operacionais, nunca versionar)
 scripts/_cleanup_rating_undo_*.json
 scripts/_backfill_undo_*.json
+
+# Codigo de servicos da Val recebido para consulta (outro projeto, nao versionar)
+temp services/

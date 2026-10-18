@@ -6,6 +6,7 @@ import firebase_admin
 from firebase_admin import auth
 
 from config import FIREBASE_STORAGE_BUCKET, FIRESTORE_PROJECT_ID
+from impersonation_identity import require_real_uid
 
 logger = logging.getLogger("castro_crm.firebase_admin")
 
@@ -53,6 +54,7 @@ def set_tenant_claims(firebase_uid, tenant_id, role=None, base_claims=None, perf
     """
     if not firebase_uid:
         raise ValueError("firebase_uid obrigatorio")
+    require_real_uid(firebase_uid)
     if not tenant_id:
         raise ValueError("tenant_id obrigatorio")
     app = get_firebase_app()
@@ -102,6 +104,7 @@ def clear_tenant_claims(firebase_uid):
     """
     if not firebase_uid:
         return False
+    require_real_uid(firebase_uid)
     app = get_firebase_app()
     try:
         current_claims = dict(auth.get_user(firebase_uid, app=app).custom_claims or {})
@@ -139,6 +142,7 @@ def set_super_admin_claim(firebase_uid, value=True):
     """
     if not firebase_uid:
         raise ValueError("firebase_uid obrigatorio")
+    require_real_uid(firebase_uid)
     app = get_firebase_app()
     try:
         current_claims = dict(auth.get_user(firebase_uid, app=app).custom_claims or {})
@@ -203,7 +207,7 @@ def get_firebase_uid_by_email(email):
         return ""
     app = get_firebase_app()
     try:
-        return auth.get_user_by_email(email_norm, app=app).uid
+        return require_real_uid(auth.get_user_by_email(email_norm, app=app).uid)
     except auth.UserNotFoundError:
         return ""
 
@@ -224,7 +228,7 @@ def get_or_create_firebase_user(email, display_name=""):
         raise ValueError("email obrigatorio")
     app = get_firebase_app()
     try:
-        return auth.get_user_by_email(email_norm, app=app).uid, False
+        return require_real_uid(auth.get_user_by_email(email_norm, app=app).uid), False
     except auth.UserNotFoundError:
         pass
     user = auth.create_user(
@@ -232,6 +236,7 @@ def get_or_create_firebase_user(email, display_name=""):
         display_name=display_name or None,
         app=app,
     )
+    require_real_uid(user.uid)
     logger.info("Conta Firebase criada no provisionamento | uid=%s", user.uid)
     return user.uid, True
 
@@ -249,6 +254,7 @@ def revoke_refresh_tokens(firebase_uid):
     """
     if not firebase_uid:
         return False
+    require_real_uid(firebase_uid)
     app = get_firebase_app()
     try:
         auth.revoke_refresh_tokens(firebase_uid, app=app)

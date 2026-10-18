@@ -26,8 +26,10 @@ from firestore_common import (
 FIELD = "commercial_contact_block"
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-_REASONS = {"patient_request", "patient_reauthorized"}
+_REASONS = {"patient_request", "patient_reauthorized", "patient_wrote"}
 _SOURCE = "operator_recorded"
+# Recusa desfeita por mensagem nova do paciente (decisao do PO, 2026-10-18).
+_PATIENT_SOURCE = "patient_message"
 
 
 def _valid_record(value):
@@ -108,9 +110,46 @@ def _view(contact, strict=False):
             view[key] = raw[key]
     if raw.get("reason") in _REASONS:
         view["reason"] = raw["reason"]
-    if raw.get("source") == _SOURCE:
-        view["source"] = _SOURCE
+    if raw.get("source") in (_SOURCE, _PATIENT_SOURCE):
+        view["source"] = raw["source"]
     return view
+
+
+def released_by_patient_message(contact, message_at):
+    """Novo estado da recusa quando o PACIENTE escreve depois dela, ou None.
+
+    Decisao do PO (2026-10-18): a recusa comercial geral se desfaz com
+    mensagem nova do paciente, como o Encerrar da reabertura (D4). Vale so
+    para recusa ativa e valida (registro invalido segue bloqueando ate
+    revisao humana) e para mensagem POSTERIOR ao registro: historico
+    importado e reentrega de mensagem antiga nao desfazem. Quem chama
+    (save_wa_message) ja filtra inbound recebido, sem clique de controle e
+    sem reacao.
+    """
+    if not isinstance(contact, Mapping) or FIELD not in contact:
+        return None
+    raw = contact[FIELD]
+    if not _valid_record(raw) or raw["active"] is not True:
+        return None
+    stamp = raw.get("updated_at")
+    if isinstance(stamp, str):
+        try:
+            stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(stamp, datetime) or not isinstance(message_at, datetime):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    if message_at.tzinfo is None:
+        message_at = message_at.replace(tzinfo=timezone.utc)
+    if message_at <= stamp:
+        return None
+    # Os campos de autoria anteriores sao zerados: o merge do write manteria
+    # o operador que registrou a recusa como autor da liberacao.
+    return {"active": False, "version": raw["version"] + 1, "updated_at": utcnow(),
+            "updated_by_user_id": None, "updated_by_uid": None,
+            "reason": "patient_wrote", "source": _PATIENT_SOURCE}
 
 
 def get_commercial_contact_preference(tenant_id, contact_id, actor, authorize):

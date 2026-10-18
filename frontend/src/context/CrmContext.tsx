@@ -1,9 +1,9 @@
 import { ChangeEvent, createContext, FormEvent, KeyboardEvent, startTransition, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { onIdTokenChanged, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup, signOut, getMultiFactorResolver, TotpMultiFactorGenerator, type MultiFactorError, type MultiFactorResolver, type User } from "firebase/auth";
-import { collection, doc as firestoreDoc, getDocs, limit as firestoreLimit, onSnapshot, orderBy, query, where } from "firebase/firestore";
+import { collection, doc as firestoreDoc, limit as firestoreLimit, orderBy, query, where } from "firebase/firestore";
 
-import { deleteJson, getJson, putJson, sendForm, sendJson } from "../api";
-import { initializeFirebaseBundle, type FirebaseBundle } from "../firebase";
+import { deleteJson, endImpersonationRequest, getJson, invalidateImpersonationReads, putJson, sendForm, sendJson } from "../api";
+import { assertFirebaseSessionActive, disposeImpersonationFirebase, getSessionDocs, impersonationTab, initializeFirebaseBundle, isFirebaseSessionActive, onImpersonationStopped, stopImpersonationReading, watchSessionDocument, watchSessionQuery, type FirebaseBundle } from "../firebase";
 import type {
   ActiveView, Channel, ChatMessage, ClientConfig, ConflictLead, Contact, Conversation, Department,
   MessageReplyReference, Operator, PermissionKey, ProtocolSearchResult, SessionPerfil, SessionUser,
@@ -18,6 +18,8 @@ import { normalizeContact, normalizeConversation, normalizeMessage } from "../ut
 import { applyTheme, themePref, transportPref } from "../utils/storage";
 import type { LightboxMedia } from "../utils/media";
 import { installAudioUnlock, playBeep } from "../utils/audio";
+import { useImpersonationPolling, type PollCycle } from "../hooks/useImpersonationPolling";
+import { assertImpersonationRead, threadReadParams, type ImpersonationRead, type ImpersonationSnapshot, type ImpersonationPage, type ImpersonationThread, type RawDocument } from "../utils/impersonation";
 
 // ---------------------------------------------------------------------------
 // Context value shape
@@ -27,14 +29,31 @@ import { installAudioUnlock, playBeep } from "../utils/audio";
 // do operador. label pronto pra UI ("Standard - <numero>" / "Coex - <numero>").
 export type ChannelFilterOption = { id: string; type: "standard" | "coexistence"; label: string };
 
+function perfilFingerprint(perfil: SessionPerfil | null) {
+  return JSON.stringify([perfil?.id || "", Object.entries(perfil?.toggles || {}).sort(([a], [b]) => a.localeCompare(b))]);
+}
+
 type CrmContextValue = {
   // Core
   config: ClientConfig | null;
   bundle: FirebaseBundle | null;
   firebaseUser: User | null;
   sessionUser: SessionUser | null;
+  readOnly: boolean;
+  impersonationEndMessage: string;
+  impersonationLastUpdated: string;
+  impersonationStale: boolean;
+  impersonationRefreshing: boolean;
+  impersonationPollIntervalMs: number;
+  impersonationRefreshNonce: number;
+  impersonationScopeGeneration: number;
+  reportImpersonationRead: (source: string, failed: boolean) => void;
   // Nome do tenant (dado no super-admin) — branding do topbar por tenant.
   tenantName: string;
+  // Monitor de atendimento (monitor_service.py): o TENANT tem monitor. Com o
+  // toggle ver_monitor_atendimento (can(), ao vivo) o item "Dashboard" do
+  // menu vira "Monitor".
+  monitorEnabled: boolean;
   operators: Operator[];
   departments: Department[];
   channels: Channel[];
@@ -59,7 +78,7 @@ type CrmContextValue = {
   loginWithGoogle: () => Promise<void>;
   loginWithEmail: (email: string, password: string) => Promise<void>;
   resetPassword: (email: string) => Promise<void>;
-  logout: () => Promise<void>;
+  logout: () => Promise<boolean>;
   // MFA (TOTP): so entra em cena quando a conta tem 2o fator enrollado.
   // Operador comum (sem MFA) nunca ve isso — o login segue direto.
   mfaPending: boolean;
@@ -292,11 +311,15 @@ type CrmContextValue = {
   // picker v2 (F4): sem isso o modal decidiria o modo com os DEFAULTS.
   settingsLoaded: boolean;
   setSystemSettings: React.Dispatch<React.SetStateAction<SystemSettings>>;
+  // Ultimo estado vindo do SERVIDOR (load/save). systemSettings e o rascunho
+  // editado na tela; comparar os dois diz o que ainda nao foi salvo (ex.:
+  // aviso de troca da data da politica LGPD na aba Sistema).
+  savedSystemSettings: SystemSettings;
   userSettings: UserSettings;
   setUserSettings: React.Dispatch<React.SetStateAction<UserSettings>>;
   busySettings: boolean;
   toggleSettingsMenu: () => void;
-  openSettingsPage: (page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") => Promise<void>;
+  openSettingsPage: (page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard" | "monitor") => Promise<void>;
   saveSystemSettingsAction: () => Promise<void>;
   saveUserSettingsAction: () => Promise<void>;
   settingsMenuRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -381,6 +404,9 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   pool_wait_notice_enabled: false,
   pool_wait_notice_minutes: 15,
   pool_wait_notice_text: "",
+  lgpd_policy_date: "",
+  lgpd_privacy_url: "",
+  lgpd_notice: "",
 };
 
 const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -413,7 +439,31 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [bundle, setBundle] = useState<FirebaseBundle | null>(null);
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
+  const readOnly = impersonationTab || !!sessionUser?.impersonation;
+  const [impersonationEndMessage, setImpersonationEndMessage] = useState("");
+  const [impersonationLastUpdated, setImpersonationLastUpdated] = useState("");
+  const [impersonationFailures, setImpersonationFailures] = useState<Set<string>>(new Set());
+  const [impersonationRefreshing, setImpersonationRefreshing] = useState(false);
+  const [impersonationRefreshNonce, setImpersonationRefreshNonce] = useState(0);
+  const [impersonationScopeGeneration, setImpersonationScopeGeneration] = useState(0);
+  const impersonationScopeGenerationRef = useRef(0);
+  const impersonationPerfilFingerprintRef = useRef<string | null>(null);
+  const impersonationChannelsRefreshRef = useRef(false);
+  const [impersonationMineSaturated, setImpersonationMineSaturated] = useState(false);
+  const impersonationStale = impersonationFailures.size > 0;
+  const impersonationPollIntervalMs = config?.impersonation_polling_interval_ms || 15000;
+  const reportImpersonationRead = useCallback((source: string, failed: boolean) => {
+    setImpersonationFailures((previous) => {
+      if (previous.has(source) === failed) return previous;
+      const next = new Set(previous);
+      if (failed) next.add(source); else next.delete(source);
+      return next;
+    });
+  }, []);
+  const endingImpersonationRef = useRef(false);
+  const endingImpersonationPromiseRef = useRef<Promise<boolean> | null>(null);
   const [tenantName, setTenantName] = useState("");
+  const [monitorEnabled, setMonitorEnabled] = useState(false);
   // Perfil RBAC efetivo da sessao (M-B2). Nasce do /api/session (toggles ja
   // resolvidos com fallback de role) e e atualizado ao vivo pelo snapshot do
   // doc perfis_acesso/{id} do tenant.
@@ -458,6 +508,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // enganaria (30+25 >= 50 sem nenhum target saturado = clique sem pagina).
   const [poolLiveSaturated, setPoolLiveSaturated] = useState(false);
   const [loadingMoreConvs, setLoadingMoreConvs] = useState(false);
+  const impersonationPageGenerationRef = useRef(0);
+  const impersonationOpenGenerationRef = useRef(0);
   // Caixa ativa no momento em que um "Carregar mais" comecou: resposta tardia
   // do getDocs apos trocar de caixa e descartada (senao repovoava a camada
   // estatica que o reset de troca acabou de limpar).
@@ -529,6 +581,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const fetchedExtraRef = useRef<Set<number>>(new Set());
   useEffect(() => {
     if (!bundle) return;
+    const scopeGeneration = impersonationScopeGenerationRef.current;
     const localIds = new Set(contacts.map((c) => c.id));
     const missing = Array.from(new Set(
       allConversations
@@ -555,6 +608,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // allContactsInflightRef). Cada lote publica ao chegar (progressivo).
     const HYDRATE_BATCH = 8;
     const publishBatch = (fetched: (Contact | null)[]) => {
+      if (!isFirebaseSessionActive(bundle.auth)) return;
+      if (readOnly && scopeGeneration !== impersonationScopeGenerationRef.current) return;
       // SEM guard de dispose: o effect re-roda a cada publish do snapshot
       // (conversations muda o tempo todo) e o cleanup descartava o batch
       // inteiro — com os ids ja marcados em fetchedExtraRef, os contatos
@@ -570,6 +625,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     };
     void (async () => {
       for (let i = 0; i < missing.length; i += HYDRATE_BATCH) {
+        if (!isFirebaseSessionActive(bundle.auth)) return;
         const batch = missing.slice(i, i + HYDRATE_BATCH);
         publishBatch(await Promise.all(batch.map(fetchOne)));
       }
@@ -591,6 +647,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // -- Sidebar / nav --
   const [search, setSearch] = useState("");
   const [activeView, setActiveView] = useState<ActiveView>("novos");
+  if (readOnly) activeViewRef.current = activeView;
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
   // Filtro por canal do Equipe (espelho do "Meus"; PO 2026-09-03): separa as
   // conversas do operador selecionado por numero quando ele tem coexistence.
@@ -609,6 +666,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // estatica ja limpa.
   const unreadModeRef = useRef(false);
   const unreadReqRef = useRef(0);
+  if (readOnly) unreadModeRef.current = unreadMode;
   useEffect(() => { unreadModeRef.current = unreadMode; }, [unreadMode]);
   // "So espiar" (admin/supervisor): abrir conversa NAO marca como lida.
   // Lembrado por navegador e POR USUARIO (uid) — em PC compartilhado o proximo
@@ -621,9 +679,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }, [peekKey]);
   const setPeekMode = useCallback((v: boolean) => {
     setPeekModeState(v);
-    if (!peekKey) return;
+    if (!peekKey || readOnly) return;
     try { window.localStorage.setItem(peekKey, v ? "1" : "0"); } catch { /* storage indisponivel: vale so na sessao */ }
-  }, [peekKey]);
+  }, [peekKey, readOnly]);
   const [channelFilter, setChannelFilter] = useState("");
   const searchText = useDeferredValue(search.trim().toLowerCase());
 
@@ -699,6 +757,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // -- Settings --
   const [showSettings, setShowSettings] = useState<SettingsPage>(false);
   const [systemSettings, setSystemSettings] = useState<SystemSettings>(DEFAULT_SYSTEM_SETTINGS);
+  // Copia do ultimo estado do servidor: atualizada junto com setSystemSettings
+  // em TODO load/save vindo da API (nunca na edicao local).
+  const [savedSystemSettings, setSavedSystemSettings] = useState<SystemSettings>(DEFAULT_SYSTEM_SETTINGS);
   // true depois que /api/settings/system respondeu na sessao atual. Os efeitos
   // de som so armam com isso true: os DEFAULTS do frontend (beep ON, alarme ON)
   // nao podem valer enquanto as settings reais do tenant nao chegaram.
@@ -742,7 +803,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const loadedUidRef = useRef<string | null>(null);
 
   // -- Derived --
-  const snapshotMode = transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle);
+  const snapshotMode = !readOnly && transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle?.db);
   const selectedContact = selectedContactId != null ? (contactsById.get(selectedContactId) || null) : null;
   const activeContact = activeConversationId != null ? (contactsById.get(activeConversationId) || null) : null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
@@ -841,7 +902,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     () => conversations.filter((c) => c.assigned_to === sessionUser?.id || (!!c.assigned_to_uid && c.assigned_to_uid === sessionUser?.firebase_uid)).length,
     [conversations, sessionUser?.id, sessionUser?.firebase_uid],
   );
-  const canLoadMoreMine = !canSeeAll && activeView === "meus" && myConvHasMore && myLiveCount >= 50;
+  const canLoadMoreMine = !canSeeAll && activeView === "meus" && myConvHasMore && (readOnly ? impersonationMineSaturated : myLiveCount >= 50);
   // "Carregar mais" da POOL (operador comum em Novos/Recepcao): so pagina se
   // ALGUM target sem dono do listener ao vivo saturou os 50 (senao nao ha
   // pagina antiga). Nota: e a pool "crua" — a caixa ainda aplica seus filtros
@@ -871,6 +932,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // nao fica fantasma) e re-habilita o "Carregar mais" (hasMore) ao voltar.
   useEffect(() => {
     activeViewRef.current = activeView;
+    impersonationPageGenerationRef.current += 1;
+    reportImpersonationRead("page", false);
+    if (readOnly) setLoadingMoreConvs(false);
     setPagedConversations(new Map());
     setMyConvPageLimit(50);
     setMyConvHasMore(true);
@@ -884,6 +948,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Entrar no modo "Nao lidas" dispara a busca (pagina 1); sair limpa a camada
   // estatica que ela preencheu (senao threads antigas ficariam em "Todos").
   useEffect(() => {
+    impersonationPageGenerationRef.current += 1;
+    if (readOnly) setLoadingMoreConvs(false);
     if (unreadMode) {
       void loadUnreadConversations(true);
     } else {
@@ -1047,6 +1113,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function rememberConversationMessages(contactId: number, nextMessages: ChatMessage[]) {
+    if (!isFirebaseSessionActive(bundle?.auth || null)) return;
     const cache = messageCacheRef.current;
     if (cache.has(contactId)) cache.delete(contactId);
     cache.set(contactId, nextMessages);
@@ -1058,13 +1125,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function commitConversationMessages(contactId: number, nextMessages: ChatMessage[]) {
+    if (!isFirebaseSessionActive(bundle?.auth || null)) return;
     rememberConversationMessages(contactId, nextMessages);
     if (selectedContactIdRef.current === contactId) {
-      startTransition(() => setMessages(nextMessages));
+      if (readOnly) setMessages(nextMessages);
+      else startTransition(() => setMessages(nextMessages));
     }
   }
 
   function restoreConversationFromCache(contactId: number | null) {
+    if (readOnly) { setMessages([]); return; }
     if (!contactId) {
       startTransition(() => setMessages([]));
       return;
@@ -1247,7 +1317,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         if (cancelled) return;
         setConfig(c);
         setTransportMode(transportPref() || c.chat_delivery_mode || "snapshot");
-        if (c.auth_mode === "firebase" && firebaseReady(c)) setBundle(await initializeFirebaseBundle(c.firebase_web_config));
+        if (c.auth_mode === "firebase" && firebaseReady(c)) {
+          const initialized = await initializeFirebaseBundle(c.firebase_web_config, c.impersonation_environment);
+          if (!cancelled) setBundle(initialized);
+        }
       } catch (e) { if (!cancelled) setError(errorText(e)); }
       finally { if (!cancelled) setBooting(false); }
     })();
@@ -1261,13 +1334,24 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // arrays contacts/conversations — ficam visiveis ao proximo usuario
   // ate um hard refresh (vazamento LGPD em PC compartilhado).
   function resetUserScopedState() {
+    impersonationScopeGenerationRef.current += 1;
+    impersonationPerfilFingerprintRef.current = null;
+    impersonationChannelsRefreshRef.current = false;
+    impersonationPageGenerationRef.current += 1;
+    impersonationOpenGenerationRef.current += 1;
+    setImpersonationLastUpdated("");
+    setImpersonationFailures(new Set());
+    setImpersonationRefreshing(false);
+    setImpersonationMineSaturated(false);
     setPerfil(null);
     setSettingsLoaded(false);
     // Settings sao POR TENANT: nao deixar bot_enabled/pool_mode/alarme do
     // usuario anterior regerem as caixas do proximo (PC compartilhado).
     setSystemSettings(DEFAULT_SYSTEM_SETTINGS);
+    setSavedSystemSettings(DEFAULT_SYSTEM_SETTINGS);
     setUserSettings(DEFAULT_USER_SETTINGS);
     setTenantName("");
+    setMonitorEnabled(false);
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
@@ -1305,7 +1389,60 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setEquipeChannelFilter("");
     setNotice("");
     setError("");
+    setQualification(""); setNotes(""); setToUserId(""); setToDepartmentId("");
+    setTransferReason(""); setTransferSummary(""); setCoexPhoneInput("");
+    setChatSearch(""); setQuickSuggestions([]); setQuickSelectedIndex(-1);
+    setShowSettings(false); setLightboxMedia(null); setShowAttachMenu(false); setShowDotsMenu(false);
+    setEditingUserId(null); setCoexEditingUserId(null); setEditRole(""); setEditPerfilId(""); setEditDeptId("");
+    detailSeedRef.current = null;
+    selectedOwnerRef.current = null;
+    selectedContactIdRef.current = null;
+    markingReadContactIdRef.current = null;
+    unreadReqRef.current += 1;
+    unreadModeRef.current = false;
+    setUnreadHasMore(false);
+    discardRecording();
+    audioChunksRef.current = [];
+    soundConversationsRef.current = [];
+    beepBaselineRef.current = null;
+    overdueIdsRef.current.clear();
+    alarmAudioRef.current?.pause();
+    alarmAudioRef.current = null;
   }
+
+  const endImpersonation = useCallback((notifyServer = false, message = "A sessão de visualização foi encerrada."): Promise<boolean> => {
+    if (!bundle?.impersonationTab) return Promise.resolve(false);
+    if (endingImpersonationRef.current) return endingImpersonationPromiseRef.current || Promise.resolve(false);
+    endingImpersonationRef.current = true;
+    // Invalida callbacks e cancela listeners antes de aguardar a rede.
+    stopImpersonationReading(message);
+    resetUserScopedState();
+    setSessionUser(null); setFirebaseUser(null);
+    loadedUidRef.current = null;
+    setImpersonationEndMessage(message);
+    const task = (async () => {
+      let serverConfirmed = !notifyServer;
+      try {
+        if (notifyServer && bundle.auth.currentUser) {
+          await endImpersonationRequest(bundle.auth);
+          serverConfirmed = true;
+        }
+      } catch {
+        setImpersonationEndMessage("A visualização foi encerrada nesta aba. Sem confirmação do servidor, o acesso pode permanecer válido até o prazo original.");
+      } finally {
+        await disposeImpersonationFirebase(bundle);
+        setBundle(null);
+      }
+      return serverConfirmed;
+    })();
+    endingImpersonationPromiseRef.current = task;
+    return task;
+  }, [bundle]);
+
+  useEffect(() => {
+    if (!bundle?.impersonationTab) return;
+    return onImpersonationStopped((message) => { void endImpersonation(false, message); });
+  }, [bundle, endImpersonation]);
 
   // Auth listener
   useEffect(() => {
@@ -1320,24 +1457,54 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         resetUserScopedState();
         loadedUidRef.current = newUid;
       }
-      if (!user) { setSessionUser(null); return; }
+      if (!user) {
+        setSessionUser(null);
+        if (bundle.impersonationTab) void endImpersonation(false);
+        return;
+      }
+      if (!isFirebaseSessionActive(bundle.auth)) return;
+      const scopeGeneration = impersonationScopeGenerationRef.current;
       try {
         const session = await getJson<{
           user: SessionUser;
           tenant_id?: string;
           tenant?: { id: string; name?: string; plan?: string; modules?: string[] };
+          monitor?: { enabled?: boolean };
           firestore_collections?: Record<string, string>;
           perfil?: SessionPerfil;
         }>(bundle.auth, "/api/session");
+        if (!isFirebaseSessionActive(bundle.auth)) return;
+        if (bundle.impersonationTab && scopeGeneration !== impersonationScopeGenerationRef.current) return;
+        if (bundle.impersonationTab) {
+          const imp = session.user.impersonation;
+          const root = `${bundle.impersonationEnvironment}_tenants/${bundle.impersonationTenantId}/`;
+          if (!imp || imp.auth_uid !== user.uid || imp.auth_uid !== bundle.impersonationAuthUid
+            || imp.sid !== bundle.impersonationSessionId || imp.environment !== bundle.impersonationEnvironment
+            || session.user.firebase_uid !== bundle.impersonationTargetUid || session.tenant_id !== bundle.impersonationTenantId
+            || Date.parse(imp.expires_at) !== Date.parse(bundle.impersonationExpiresAt || "")
+            || !session.firestore_collections || Object.values(session.firestore_collections).some((path) => !path.startsWith(root))) {
+            await endImpersonation(false, "O contrato de visualização ficou inválido. Gere um novo acesso.");
+            return;
+          }
+        }
         const [ops, deps, chs] = await Promise.all([
           getJson<Operator[]>(bundle.auth, "/api/operators"),
           getJson<{ departments: Department[] }>(bundle.auth, "/api/departments"),
           getJson<{ channels: Channel[] }>(bundle.auth, "/api/admin/channels").catch(() => ({ channels: [] as Channel[] })),
         ]);
+        if (bundle.auth.currentUser?.uid !== user.uid || !isFirebaseSessionActive(bundle.auth)) return;
+        if (bundle.impersonationTab && scopeGeneration !== impersonationScopeGenerationRef.current) return;
         setSessionUser(session.user);
         // Branding por tenant: o nome dado no super-admin (tenant.name) vira o
         // titulo do topbar. Fallback = tenant_id (o backend ja faz isso).
         setTenantName(session.tenant?.name || "");
+        setMonitorEnabled(!!session.monitor?.enabled);
+        if (readOnly) {
+          const fingerprint = perfilFingerprint(session.perfil ?? null);
+          const wide = session.perfil?.toggles.ver_todos_leads === true && ["admin", "supervisor"].includes(session.user.role);
+          if (impersonationPerfilFingerprintRef.current !== null && impersonationPerfilFingerprintRef.current !== fingerprint) clearImpersonationScope(wide);
+          impersonationPerfilFingerprintRef.current = fingerprint;
+        }
         setPerfil(session.perfil ?? null);
         setOperators(ops);
         setDepartments(deps.departments);
@@ -1360,12 +1527,40 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // falha, os sons ficam desarmados ate o proximo refresh de token
         // (~1h, que re-executa este handler) ou ate abrir Configuracoes.
         getJson<SystemSettings>(bundle.auth, "/api/settings/system")
-          .then((sys) => { setSystemSettings(sys); setSettingsLoaded(true); })
-          .catch((e) => { console.warn("settings/system indisponivel — sons desarmados:", errorText(e)); });
-        getJson<UserSettings>(bundle.auth, "/api/settings/user").then((usr) => setUserSettings(usr)).catch(() => {});
-      } catch (e) { setError(errorText(e)); await signOut(bundle.auth); }
+          .then((sys) => { if (bundle.auth.currentUser?.uid !== user.uid || !isFirebaseSessionActive(bundle.auth)) return; setSystemSettings(sys); setSavedSystemSettings(sys); setSettingsLoaded(true); })
+          .catch((e) => { if (isFirebaseSessionActive(bundle.auth)) console.warn("settings/system indisponivel — sons desarmados:", errorText(e)); });
+        getJson<UserSettings>(bundle.auth, "/api/settings/user").then((usr) => { if (bundle.auth.currentUser?.uid === user.uid && isFirebaseSessionActive(bundle.auth)) setUserSettings(usr); }).catch(() => {});
+      } catch (e) {
+        if (bundle.impersonationTab && isFirebaseSessionActive(bundle.auth)) {
+          if (scopeGeneration !== impersonationScopeGenerationRef.current) return;
+          if (Number((e as { status?: number }).status) === 409 && impersonationPerfilFingerprintRef.current !== null) {
+            reportImpersonationRead("snapshot", true);
+            return;
+          }
+        }
+        if (bundle.impersonationTab) await endImpersonation(false, "Não foi possível validar a visualização. Gere um novo acesso.");
+        else { setError(errorText(e)); await signOut(bundle.auth); }
+      }
     });
-  }, [bundle]);
+  }, [bundle, endImpersonation]);
+
+  // O prazo absoluto persiste nos refreshes; nao depende de navegacao.
+  useEffect(() => {
+    const expiry = sessionUser?.impersonation?.expires_at || bundle?.impersonationExpiresAt;
+    if (!bundle || !expiry) return;
+    const check = () => { if (Date.now() >= Date.parse(expiry)) void endImpersonation(false, "A sessão de visualização expirou."); };
+    const timeoutId = window.setTimeout(check, Math.max(0, Date.parse(expiry) - Date.now()));
+    window.addEventListener("focus", check);
+    window.addEventListener("online", check);
+    document.addEventListener("visibilitychange", check);
+    check();
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.removeEventListener("focus", check);
+      window.removeEventListener("online", check);
+      document.removeEventListener("visibilitychange", check);
+    };
+  }, [bundle, sessionUser?.impersonation?.expires_at, endImpersonation]);
 
   // RBAC (M-B2): mantem os toggles do perfil ao vivo. Mescla o doc do
   // Firestore POR CIMA do mapa efetivo vindo do /api/session — edicao de
@@ -1376,7 +1571,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const path = config?.firestore.collections["perfis_acesso"];
     const perfilId = perfil?.id;
     if (!bundle?.db || !path || !perfilId || !snapshotMode) return undefined;
-    return onSnapshot(
+    return watchSessionDocument(bundle.auth,
       firestoreDoc(bundle.db, path, perfilId),
       (snap) => {
         const toggles = (snap.data()?.toggles ?? null) as Record<string, boolean> | null;
@@ -1453,7 +1648,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle?.db || !snapshotMode || !selectedThreadId || !path) return undefined;
     const id = selectedThreadId;
     let disposed = false;
-    const unsubscribe = onSnapshot(
+    const unsubscribe = watchSessionDocument(bundle.auth,
       firestoreDoc(bundle.db, path, id),
       (snap) => {
         if (disposed || !snap.exists()) return;
@@ -1494,6 +1689,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Debounce equivalente para a thread selecionada (V2 Fase 3).
   useEffect(() => {
+    if (readOnly) setMessages([]);
     if (!selectedThreadId) {
       setActiveThreadId(null);
       return undefined;
@@ -1579,7 +1775,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const id = selectedContactId;
     void getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
       .then((res) => {
-        if (disposed) return;
+        if (disposed || !isFirebaseSessionActive(bundle.auth)) return;
         const fresh = normalizeContact(res.contact, String(res.contact.id));
         setExtraContacts((prev) => { const next = new Map(prev); next.set(id, fresh); return next; });
       })
@@ -1637,6 +1833,143 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     releaseAudioStream();
   }, []);
 
+  function clearImpersonationScope(wide: boolean) {
+    invalidateImpersonationReads();
+    impersonationScopeGenerationRef.current += 1;
+    setImpersonationScopeGeneration((previous) => previous + 1);
+    setImpersonationRefreshNonce((previous) => previous + 1);
+    impersonationPageGenerationRef.current += 1;
+    impersonationOpenGenerationRef.current += 1;
+    unreadReqRef.current += 1;
+    unreadModeRef.current = false;
+    selectedOwnerRef.current = null;
+    selectedContactIdRef.current = null;
+    detailSeedRef.current = null;
+    markingReadContactIdRef.current = null;
+    allContactsInflightRef.current = null;
+    fetchedExtraRef.current.clear();
+    messageCacheRef.current.clear();
+    setContacts([]); setConversations([]);
+    setExtraContacts(new Map()); setExtraConversations(new Map()); setPagedConversations(new Map());
+    setAllContactsCache(null); setAllContactsCacheTotal(0); setContactsCountNonce((previous) => previous + 1);
+    setMessages([]); setSelectedThreadId(null); setActiveThreadId(null); setActiveConversationId(null);
+    holdEmptySelectionRef.current = true;
+    setMyConvPageLimit(50); setMyConvHasMore(true); setPoolConvPageLimit(50); setPoolConvHasMore(true);
+    setAllConvPageLimit(ADMIN_CONV_WINDOW); setAllConvHasMore(true); setUnreadPageLimit(UNREAD_PAGE); setUnreadHasMore(false);
+    setLoadingMoreConvs(false); setQualificationFilter(""); setTagFilter([]); setSearch(""); setChatSearch("");
+    setEquipeOperatorFilter(""); setEquipeChannelFilter(""); setChannelFilter("");
+    setDraft(""); setReplyTarget(null); correctionTargetRef.current = null; setCorrectionTarget(null);
+    setQualification(""); setNotes(""); setToUserId(""); setToDepartmentId(""); setTransferReason(""); setTransferSummary("");
+    setQuickSuggestions([]); setQuickSelectedIndex(-1);
+    setShowSettings(false); setLightboxMedia(null); setShowAttachMenu(false); setShowDotsMenu(false);
+    setEditingUserId(null); setCoexEditingUserId(null); setCoexPhoneInput("");
+    setEditRole(""); setEditPerfilId(""); setEditDeptId("");
+    setImpersonationFailures(new Set()); setError(""); setNotice("Permissões atualizadas; visualização recarregada.");
+    setChannels([]); impersonationChannelsRefreshRef.current = true;
+    soundConversationsRef.current = []; beepBaselineRef.current = null; overdueIdsRef.current.clear();
+    alarmAudioRef.current?.pause(); alarmAudioRef.current = null;
+    if (!wide && ["equipe", "backup", "bot"].includes(activeViewRef.current)) setActiveView("novos");
+  }
+
+  // Preview usa somente HTTP. Os targets e a saturacao vem do servidor,
+  // antes da remocao de backup; a composicao visual continua a mesma.
+  const pollImpersonationSnapshot = useCallback(async ({ signal, current }: PollCycle) => {
+    if (!bundle) return;
+    setImpersonationRefreshing(true);
+    try {
+      const result = await getJson<ImpersonationSnapshot>(bundle.auth, "/api/impersonation/view/snapshot", { signal });
+      assertImpersonationRead(bundle, result);
+      if (!current()) return;
+      const contactGroups = Object.values(result.contact_groups).map((group) => group.map((d) => normalizeContact(d, String(d.id))));
+      const conversationGroups = Object.values(result.conversation_groups).map((group) => group.map((d) => normalizeConversation(d, String(d.id))));
+      const wide = result.perfil.toggles.ver_todos_leads === true && ["admin", "supervisor"].includes(result.perfil.role);
+      const fingerprint = perfilFingerprint(result.perfil);
+      if (impersonationPerfilFingerprintRef.current !== null && impersonationPerfilFingerprintRef.current !== fingerprint) clearImpersonationScope(wide);
+      impersonationPerfilFingerprintRef.current = fingerprint;
+      setContacts(mergeVisibleContacts(contactGroups, wide ? 50 * contactGroups.length : 50));
+      setConversations(mergeVisibleConversations(conversationGroups));
+      setPerfil(result.perfil);
+      setPoolLiveSaturated(Object.entries(result.conversation_saturated).some(([key, saturated]) => key.startsWith("unassigned:") && saturated));
+      setImpersonationMineSaturated(result.mine_load_more === true);
+      setImpersonationLastUpdated(result.read_at);
+      reportImpersonationRead("snapshot", false);
+      if (impersonationChannelsRefreshRef.current) {
+        const generation = impersonationScopeGenerationRef.current;
+        try {
+          const freshChannels = await getJson<{ channels: Channel[] }>(bundle.auth, "/api/admin/channels");
+          assertFirebaseSessionActive(bundle.auth);
+          if (generation !== impersonationScopeGenerationRef.current) return;
+          setChannels(freshChannels.channels);
+          impersonationChannelsRefreshRef.current = false;
+          reportImpersonationRead("channels", false);
+        } catch {
+          if (isFirebaseSessionActive(bundle.auth) && generation === impersonationScopeGenerationRef.current) reportImpersonationRead("channels", true);
+        }
+      }
+    } catch {
+      if (current()) reportImpersonationRead("snapshot", true);
+    } finally {
+      if (current()) setImpersonationRefreshing(false);
+    }
+  }, [bundle, reportImpersonationRead]);
+  useImpersonationPolling(bundle?.auth || null, readOnly && !!sessionUser, impersonationPollIntervalMs, pollImpersonationSnapshot, impersonationRefreshNonce);
+
+  const selectedChannelId = selectedConversation?.channel_id ?? (selectedThreadId ? Number(selectedThreadId.split("__", 1)[0]) : undefined);
+  const pollImpersonationThread = useCallback(async ({ signal, current }: PollCycle) => {
+    if (!bundle || !selectedThreadId || !selectedContactId) return;
+    const closeSelected = () => {
+      holdEmptySelectionRef.current = true;
+      removeExtraConversation(selectedThreadId);
+      setSelectedThreadId(null);
+      setMessages([]);
+      setNotice("Este atendimento deixou de estar acessível para o usuário visualizado.");
+    };
+    try {
+      const params = threadReadParams(selectedContactId, selectedChannelId ?? undefined);
+      const result = await getJson<ImpersonationThread>(bundle.auth, `/api/impersonation/view/thread?${params}`, { signal });
+      assertImpersonationRead(bundle, result);
+      if (!current()) return;
+      reportImpersonationRead("thread", false);
+      if (!result.conversation) { closeSelected(); return; }
+      const fresh = normalizeConversation(result.conversation, String(result.conversation.id));
+      if (fresh.id !== selectedThreadId) { closeSelected(); return; }
+      const refresh = (previous: Map<string, Conversation>) => {
+        if (!previous.has(fresh.id)) return previous;
+        return new Map(previous).set(fresh.id, fresh);
+      };
+      setExtraConversations(refresh);
+      setPagedConversations(refresh);
+      setConversations((previous) => previous.map((item) => item.id === fresh.id ? fresh : item));
+    } catch (e) {
+      if (!current()) return;
+      if ([403, 404].includes(Number((e as { status?: number }).status))) closeSelected();
+      else reportImpersonationRead("thread", true);
+    }
+  }, [bundle, selectedThreadId, selectedContactId, selectedChannelId, removeExtraConversation, reportImpersonationRead]);
+  useImpersonationPolling(bundle?.auth || null, readOnly && !!sessionUser && !!selectedThreadId, impersonationPollIntervalMs, pollImpersonationThread, impersonationRefreshNonce);
+  useEffect(() => { if (!selectedThreadId) reportImpersonationRead("thread", false); }, [selectedThreadId, reportImpersonationRead]);
+
+  const activeChannelId = activeThreadId ? Number(activeThreadId.split("__", 1)[0]) : undefined;
+  const pollImpersonationMessages = useCallback(async ({ signal, current }: PollCycle) => {
+    if (!bundle || !activeConversationId) return;
+    try {
+      const params = threadReadParams(activeConversationId, activeChannelId);
+      params.set("limit", String(messageLimit));
+      const result = await getJson<ImpersonationRead & { messages: RawDocument[] }>(bundle.auth, `/api/impersonation/view/messages?${params}`, { signal });
+      assertImpersonationRead(bundle, result);
+      if (!current()) return;
+      const next = result.messages.map((d) => normalizeMessage(d, String(d.id))).sort((a, b) => (a.timestamp_wa || a.created_at || "").localeCompare(b.timestamp_wa || b.created_at || ""));
+      commitConversationMessages(activeConversationId, next);
+      reportImpersonationRead("messages", false);
+    } catch (e) {
+      if (!current()) return;
+      if ([403, 404].includes(Number((e as { status?: number }).status))) setMessages([]);
+      reportImpersonationRead("messages", true);
+    }
+  }, [bundle, activeConversationId, activeChannelId, messageLimit, reportImpersonationRead]);
+  useImpersonationPolling(bundle?.auth || null, readOnly && !!sessionUser && !!activeConversationId && (!selectedThreadId || activeThreadId === selectedThreadId), impersonationPollIntervalMs, pollImpersonationMessages, impersonationRefreshNonce);
+  useEffect(() => { if (!activeConversationId) reportImpersonationRead("messages", false); }, [activeConversationId, reportImpersonationRead]);
+
   // Snapshot: contacts
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
@@ -1651,7 +1984,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       startTransition(() => setContacts(nextContacts));
     };
 
-    const unsubscribers = targets.map(({ key, ref }) => onSnapshot(
+    const unsubscribers = targets.map(({ key, ref }) => watchSessionQuery(bundle.auth,
       ref,
       (snap) => {
         partialContacts.set(key, snap.docs.map((doc) => normalizeContact(doc.data() as Record<string, unknown>, doc.id)));
@@ -1691,7 +2024,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       startTransition(() => { setConversations(next); setPoolLiveSaturated(poolSaturated); });
     };
 
-    const unsubscribers = targets.map(({ key, ref }) => onSnapshot(
+    const unsubscribers = targets.map(({ key, ref }) => watchSessionQuery(bundle.auth,
       ref,
       (snap) => {
         if (disposed) return;
@@ -1714,7 +2047,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // (mostra so mensagens daquele canal). Senao, fallback para contact_id
   // (timeline cross-channel — comportamento legado).
   useEffect(() => {
-    if (!bundle || !sessionUser || !config) return undefined;
+    if (!bundle?.db || !sessionUser || !config) return undefined;
     if (!snapshotMode) return undefined;
     if (!activeConversationId || !config.firestore.collections.wa_messages) return undefined;
     let disposed = false;
@@ -1722,7 +2055,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const messagesQuery = activeThreadId
       ? query(baseRef, where("conversation_id", "==", activeThreadId), orderBy("timestamp_wa", "desc"), firestoreLimit(messageLimit))
       : query(baseRef, where("contact_id", "==", activeConversationId), orderBy("timestamp_wa", "desc"), firestoreLimit(messageLimit));
-    const unsubscribe = onSnapshot(
+    const unsubscribe = watchSessionQuery(bundle.auth,
       messagesQuery,
       (snap) => {
         // Ordena por timestamp_wa (data real da mensagem), com fallback
@@ -1741,17 +2074,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Polling fallback
   useEffect(() => {
-    if (!bundle || !sessionUser || !config || snapshotMode) return undefined;
+    if (readOnly || !bundle || !sessionUser || !config || snapshotMode) return undefined;
     let disposed = false;
     let intervalId = 0;
 
     const loadContacts = async () => {
       const r = await getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts");
+      if (!isFirebaseSessionActive(bundle.auth)) return;
       if (!disposed) startTransition(() => setContacts(r.contacts));
     };
     const loadConversations = async () => {
       try {
         const r = await getJson<{ conversations: Conversation[] }>(bundle.auth, "/api/wa/conversations");
+        if (!isFirebaseSessionActive(bundle.auth)) return;
         if (!disposed) startTransition(() => setConversations(r.conversations || []));
       } catch (e) {
         // Endpoint pode nao existir em ambientes legados; fallback silencioso.
@@ -1763,6 +2098,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // query param para filtrar mensagens daquela thread especifica.
       const threadParam = activeThreadId ? `&conversation_id=${encodeURIComponent(activeThreadId)}` : "";
       const r = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${cid}?limit=${messageLimit}${threadParam}`);
+      if (!isFirebaseSessionActive(bundle.auth)) return;
       if (!disposed) commitConversationMessages(cid, r.messages);
     };
     const tick = async () => {
@@ -1777,12 +2113,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     void tick();
     intervalId = window.setInterval(() => { void tick(); }, config.polling_interval_ms || 15000);
     return () => { disposed = true; if (intervalId) window.clearInterval(intervalId); };
-  }, [activeConversationId, activeThreadId, bundle, config, sessionUser, snapshotMode, messageLimit]);
+  }, [activeConversationId, activeThreadId, bundle, config, sessionUser, snapshotMode, messageLimit, readOnly]);
 
   // Mark selected conversation as read explicitly
   useEffect(() => {
     if (!bundle || !sessionUser || !activeConversationId) return undefined;
     if (selectedContactId !== activeConversationId) return undefined;
+    if (readOnly) return undefined;
     // "So espiar" (admin/supervisor): abrir NAO marca como lida — badge fica e
     // a thread segue contando como nao lida (inclusive no alarme do setor).
     if (canPeek && peekMode) return undefined;
@@ -1832,7 +2169,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, allConversations, bundle, selectedContactId, sessionUser, canPeek, peekMode]);
+  }, [activeContact?.unread, activeContact?.unread_count, activeConversationId, activeThreadId, allConversations, bundle, selectedContactId, sessionUser, canPeek, peekMode, readOnly]);
 
   // =========================================================================
   // Sound notifications
@@ -2040,6 +2377,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   function startReplyToMessage(message: ChatMessage) {
+    if (readOnly) return;
     if (busySend || correctionInFlightRef.current) return;
     if (correctionTargetRef.current) cancelCorrection();
     setReplyTarget(buildMessageReplyReference(message));
@@ -2074,6 +2412,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function refreshPollingViews() {
     if (!bundle) return;
+    if (readOnly) { setImpersonationRefreshNonce((previous) => previous + 1); return; }
     // Em snapshot mode os listeners ja entregam as mudancas (contacts,
     // conversations e mensagens) — o refresh manual e relicario do polling.
     // Pro admin, este par de GETs custa ~14k reads Firestore por clique
@@ -2085,12 +2424,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       getJson<{ contacts: Contact[] }>(bundle.auth, "/api/wa/contacts"),
       getJson<{ conversations: Conversation[] }>(bundle.auth, "/api/wa/conversations").catch(() => ({ conversations: [] })),
     ]);
+      assertFirebaseSessionActive(bundle.auth);
     startTransition(() => {
       setContacts(cr.contacts);
       setConversations(vr.conversations || []);
     });
     if (selectedContactId) {
       const mr = await getJson<{ messages: ChatMessage[] }>(bundle.auth, `/api/wa/messages/${selectedContactId}?limit=${messageLimit}`);
+      assertFirebaseSessionActive(bundle.auth);
       commitConversationMessages(selectedContactId, mr.messages);
     }
   }
@@ -2179,7 +2520,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setError("");
   }
 
-  async function logout() { if (bundle) await signOut(bundle.auth); }
+  async function logout() {
+    if (bundle?.impersonationTab) return endImpersonation(true);
+    if (bundle) await signOut(bundle.auth);
+    return true;
+  }
 
   // Resolve a chave de envio: preferimos conversation_id (thread atual)
   // — backend resolve canal pela thread, garantindo que mesmo wa_id em
@@ -2193,6 +2538,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   const [internalMode, setInternalMode] = useState(false);
   async function sendTextMessage() {
+    if (readOnly) return;
     if (!bundle || !selectedContact || !draft.trim() || busySend || busyAudio || busyUpload) return;
     // Enter, botao e submit do formulario seguem o mesmo fluxo.
     if (correctionTarget) { await correctMessage(correctionTarget.id, draft.trim()); return; }
@@ -2217,6 +2563,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Modo 1 (Sussurro): grava nota interna na thread; NAO chama a Meta.
   async function sendInternalNote() {
+    if (readOnly) return;
     if (!bundle || !selectedContact || !draft.trim()) return;
     try {
       setBusySend(true); setError(""); setNotice("");
@@ -2233,6 +2580,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   async function submitText(event: FormEvent<HTMLFormElement>) { event.preventDefault(); await sendTextMessage(); }
 
   async function submitMedia(file: File) {
+    if (readOnly) return;
     if (!bundle || !selectedContact) return;
     try {
       setBusyUpload(true); setError(""); setNotice("");
@@ -2250,6 +2598,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function startRecording() {
+    if (readOnly) return;
     if (!selectedContact || correctionTargetRef.current || recordingRequestRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === "undefined") { setError("O navegador nao oferece suporte para gravacao de audio."); return; }
     const request = {};
@@ -2280,6 +2629,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function sendRecordedAudio() {
+    if (readOnly) return;
     if (!bundle || !selectedContact) return;
     const recorder = mediaRecorderRef.current;
     if (!recorder) return;
@@ -2398,6 +2748,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   function openDocPicker() { setShowAttachMenu(false); documentInputRef.current?.click(); }
 
   async function submitFile(file: File, label: string) {
+    if (readOnly) return;
     if (!bundle || !selectedContact) return;
     try {
       setBusyUpload(true); setError(""); setNotice("");
@@ -2415,6 +2766,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function sendLocation() {
+    if (readOnly) return;
     if (!bundle || !selectedContact) return;
     setShowAttachMenu(false);
     if (!navigator.geolocation) { setError("Geolocalização não disponível neste navegador."); return; }
@@ -2428,6 +2780,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function transcribeMessage(messageId: number) {
+    if (readOnly) return;
     if (!bundle) return;
     try {
       setTranscribingMessageId(messageId); setError("");
@@ -2450,6 +2803,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   function closeLightbox() { setLightboxMedia(null); }
 
   function handlePrimaryAction() {
+    if (readOnly) return;
     if (busyComposerAction) return;
     if (correctionTarget) { if (hasDraft) void sendTextMessage(); return; }
     // Modo interno e texto-only: nunca grava audio (que iria pra Meta).
@@ -2460,6 +2814,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function saveQualification() {
+    if (readOnly) return;
     if (!bundle || !selectedContact) return;
     const contactId = selectedContact.id;
     try {
@@ -2498,6 +2853,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // max 12) e registra tag inedita como pessoal do operador — por isso o
   // refetch das user settings apos salvar (autocomplete ganha a tag nova).
   async function saveContactTags(contactId: number, tags: string[], tagLabels?: Record<string, string>): Promise<boolean> {
+    if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusySave(true); setError(""); setNotice("");
@@ -2524,6 +2880,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // — revisao B: a validacao das mensagens rapidas bloqueava salvar tags, e o
   // PUT parcial evita clobber de quick_messages com estado stale).
   async function saveUserTags(tags: TagDef[]): Promise<boolean> {
+    if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusySettings(true); setError(""); setNotice("");
@@ -2537,11 +2894,12 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // Frente B: registry de tags GLOBAIS (gerenciar_tags_globais).
   async function saveGlobalTags(tags: TagDef[]): Promise<boolean> {
+    if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusySettings(true); setError(""); setNotice("");
       const r = await putJson(bundle.auth, "/api/settings/tags-global", { tags_global: tags }) as SystemSettings;
-      setSystemSettings(r); setSettingsLoaded(true);
+      setSystemSettings(r); setSavedSystemSettings(r); setSettingsLoaded(true);
       setNotice("Tags globais salvas.");
       return true;
     } catch (e) { setError(errorText(e)); return false; }
@@ -2551,6 +2909,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   function startEditUser(op: Operator) { setEditingUserId(op.id); setEditRole(op.role); setEditPerfilId(op.perfil_acesso_id || ""); setEditDeptId(op.department_id ?? ""); }
 
   async function saveUserRole(userId: number) {
+    if (readOnly) return;
     if (!bundle) return;
     try {
       setBusyRoleUpdate(true); setError("");
@@ -2575,6 +2934,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   function startEditCoex(op: Operator) { setCoexEditingUserId(op.id); setCoexPhoneInput(op.coex_phone || ""); }
   function cancelEditCoex() { setCoexEditingUserId(null); setCoexPhoneInput(""); }
   async function saveCoex(userId: number) {
+    if (readOnly) return;
     if (!bundle) return;
     const digits = coexPhoneInput.replace(/\D/g, "");
     if (digits.length < 10) { setError("Numero invalido. Informe DDI+DDD+numero (ex: 5531999990000)."); return; }
@@ -2583,6 +2943,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyCoexUpdate(false); }
   }
   async function revokeCoex(userId: number) {
+    if (readOnly) return;
     if (!bundle) return;
     try { setBusyCoexUpdate(true); setError(""); await deleteJson(bundle.auth, `/api/admin/users/${userId}/coex`); setNotice("Autorizacao coexistence revogada."); setCoexEditingUserId(null); setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators")); }
     catch (e) { setError(errorText(e)); }
@@ -2592,6 +2953,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Takeover temporario: o snapshot realtime propaga a mudanca de status, entao
   // nao precisamos refresh manual aqui.
   async function takeoverConversation(conversationId: string, greetMessage?: string) {
+    if (readOnly) return;
     if (!bundle) return;
     try { setError(""); await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/takeover`); }
     catch (e) { setError(errorText(e)); return; }
@@ -2603,12 +2965,14 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     catch (e) { setNotice("Atendimento assumido. A mensagem nao pode ser enviada: " + errorText(e)); }
   }
   async function returnConversation(conversationId: string) {
+    if (readOnly) return;
     if (!bundle) return;
     try { setError(""); await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/return`); setNotice("Atendimento devolvido ao operador de origem."); }
     catch (e) { setError(errorText(e)); }
   }
 
   function startCorrection(message: ChatMessage) {
+    if (readOnly) return;
     if (busySend || busyAudio || busyUpload || recording || correctionInFlightRef.current) return;
     if (!selectedContact || message.contact_id !== selectedContact.id
       || (message.conversation_id && message.conversation_id !== selectedThreadId)) return;
@@ -2631,6 +2995,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function correctMessage(messageId: number, newContent: string): Promise<boolean> {
+    if (readOnly) return false;
     const target = correctionTargetRef.current;
     const content = newContent.trim();
     if (!bundle || !selectedContact || !target || target.id !== messageId || !content
@@ -2704,6 +3069,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     components?: TemplateSendComponent[];
     contactPurpose?: "commercial" | "service";
   }): Promise<boolean> {
+    if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusyTemplate(true); setError(""); setNotice("");
@@ -2732,6 +3098,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // resolvidos server-side (nome do cliente + data da ultima conversa) —
   // o operador nao digita nada.
   async function reopenConversation(conversationId: string, templateName?: string, language?: string): Promise<boolean> {
+    if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusyTemplate(true); setError(""); setNotice("");
@@ -2751,6 +3118,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function createManualContact(declared_name: string, phone: string, channel_id?: number): Promise<Contact | null> {
+    if (readOnly) return null;
     if (!bundle) return null;
     try {
       setBusyCreateContact(true); setError("");
@@ -2788,10 +3156,13 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (allContactsCache) return { base: allContactsCache, total: allContactsCacheTotal };
     if (allContactsInflightRef.current) return allContactsInflightRef.current;
     if (!bundle) return { base: [], total: 0 };
+    const scopeGeneration = impersonationScopeGenerationRef.current;
     const p = (async () => {
       const res = await getJson<{ contacts: Record<string, unknown>[]; total: number; returned: number }>(
         bundle.auth, "/api/wa/contacts/all?limit=10000",
       );
+      assertFirebaseSessionActive(bundle.auth);
+      if (readOnly && scopeGeneration !== impersonationScopeGenerationRef.current) throw new Error("Leitura descartada após mudança de permissões.");
       const base = (res.contacts || []).map((c) => normalizeContact(c, String(c.id)));
       const total = res.total ?? base.length;
       setAllContactsCache(base);
@@ -2804,7 +3175,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     } finally {
       // Libera pro proximo gatilho (em falha, permite nova tentativa —
       // mas 1 de cada vez, nunca a rajada de N simultaneas).
-      allContactsInflightRef.current = null;
+      if (allContactsInflightRef.current === p) allContactsInflightRef.current = null;
     }
   }
 
@@ -2835,6 +3206,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     let totalFromBackend: number;
     try {
       const r = await ensureAllContactsLoaded();
+      assertFirebaseSessionActive(bundle.auth);
       base = r.base;
       totalFromBackend = r.total;
     } catch (e) {
@@ -2913,7 +3285,46 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // ao vivo: operador = minhas ou pool; admin em Equipe = tenant inteiro.
   // Pagina crescente (100, 200...). Resultado vai pra camada estatica
   // (pagedConversations); contato hidrata sob demanda (extraContacts).
+  async function loadImpersonationPage(scope: "mine" | "pool" | "all" | "unread", pageLimit: number, reset = false) {
+    if (!bundle || !sessionUser || (loadingMoreConvs && !reset)) return;
+    const viewAtStart = activeViewRef.current;
+    if (scope === "unread" && !["meus", "novos", "bot", "equipe"].includes(viewAtStart)) { setUnreadHasMore(false); return; }
+    const generation = ++impersonationPageGenerationRef.current;
+    const requestId = scope === "unread" ? ++unreadReqRef.current : 0;
+    const keepId = selectedThreadId;
+    setLoadingMoreConvs(true);
+    try {
+      const params = new URLSearchParams({ scope, view: viewAtStart, limit: String(pageLimit) });
+      const result = await getJson<ImpersonationPage>(bundle.auth, `/api/impersonation/view/page?${params}`);
+      assertImpersonationRead(bundle, result);
+      if (generation !== impersonationPageGenerationRef.current || activeViewRef.current !== viewAtStart || (scope === "unread" && (!unreadModeRef.current || unreadReqRef.current !== requestId))) return;
+      const next = new Map<string, Conversation>();
+      for (const group of Object.values(result.groups)) for (const d of group) {
+        const conversation = normalizeConversation(d, String(d.id));
+        next.set(conversation.id, conversation);
+      }
+      setPagedConversations((previous) => {
+        const keep = keepId ? previous.get(keepId) : undefined;
+        if (scope === "unread" && keepId && keep && !next.has(keepId)) next.set(keepId, keep);
+        return next;
+      });
+      const more = Object.values(result.saturated).some(Boolean);
+      if (scope === "mine") { setMyConvPageLimit(pageLimit); setMyConvHasMore(more); }
+      if (scope === "pool") { setPoolConvPageLimit(pageLimit); setPoolConvHasMore(more); }
+      if (scope === "all") { setAllConvPageLimit(pageLimit); setAllConvHasMore(more); }
+      if (scope === "unread") { setUnreadPageLimit(pageLimit); setUnreadHasMore(more); }
+      reportImpersonationRead("page", false);
+    } catch (e) {
+      if (!isFirebaseSessionActive(bundle.auth) || generation !== impersonationPageGenerationRef.current || activeViewRef.current !== viewAtStart) return;
+      reportImpersonationRead("page", true);
+      setError(`Falha ao carregar conversas: ${errorText(e)}`);
+    } finally {
+      if (isFirebaseSessionActive(bundle.auth) && generation === impersonationPageGenerationRef.current) setLoadingMoreConvs(false);
+    }
+  }
+
   async function loadUnreadConversations(reset = false) {
+    if (readOnly) { await loadImpersonationPage("unread", reset ? UNREAD_PAGE : unreadPageLimit + UNREAD_PAGE, reset); return; }
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return;
     if (loadingMoreConvs && !reset) return;
     const limit = reset ? UNREAD_PAGE : unreadPageLimit + UNREAD_PAGE;
@@ -2939,7 +3350,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!scopes.length) { setUnreadHasMore(false); return; }
     setLoadingMoreConvs(true);
     try {
-      const snaps = await Promise.all(scopes.map((q) => getDocs(q)));
+      const snaps = await Promise.all(scopes.map((q) => getSessionDocs(bundle.auth, q)));
+      assertFirebaseSessionActive(bundle.auth);
       // Resposta tardia: trocou de caixa, saiu do modo ou ja ha busca mais nova.
       if (activeViewRef.current !== viewAtStart || !unreadModeRef.current || unreadReqRef.current !== reqId) return;
       const next = new Map<string, Conversation>();
@@ -2971,6 +3383,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function loadMoreMyConversations() {
+    if (readOnly) { if (!canSeeAll) await loadImpersonationPage("mine", myConvPageLimit + 50); return; }
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser?.firebase_uid) return;
     if (canSeeAll) return;
     if (loadingMoreConvs) return;
@@ -2985,7 +3398,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         orderBy("last_message_at", "desc"),
         firestoreLimit(nextLimit),
       );
-      const snap = await getDocs(q);
+      const snap = await getSessionDocs(bundle.auth, q);
+      assertFirebaseSessionActive(bundle.auth);
       if (activeViewRef.current !== viewAtStart) return; // trocou de caixa: reset ja limpou
       const fetched = snap.docs.map((d) => normalizeConversation(d.data() as Record<string, unknown>, d.id));
       const next = new Map<string, Conversation>();
@@ -3011,6 +3425,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // (novosConversations: lead sem dono, bot_completed, setor...) — o contato
   // e hidratado sob demanda pelo effect de extraContacts.
   async function loadMorePoolConversations() {
+    if (readOnly) { await loadImpersonationPage("pool", poolConvPageLimit + 50); return; }
     if (!bundle?.db || !config?.firestore.collections.wa_conversations || !sessionUser) return;
     if (loadingMoreConvs) return;
     const nextLimit = poolConvPageLimit + 50;
@@ -3024,7 +3439,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         orderBy("last_message_at", "desc"),
         firestoreLimit(nextLimit),
       );
-      const [blankSnap, nullSnap] = await Promise.all([getDocs(poolQuery("")), getDocs(poolQuery(null))]);
+      const [blankSnap, nullSnap] = await Promise.all([getSessionDocs(bundle.auth, poolQuery("")), getSessionDocs(bundle.auth, poolQuery(null))]);
+      assertFirebaseSessionActive(bundle.auth);
       if (activeViewRef.current !== viewAtStart) return; // trocou de caixa: reset ja limpou
       const next = new Map<string, Conversation>();
       for (const d of [...blankSnap.docs, ...nullSnap.docs]) {
@@ -3049,6 +3465,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // orderBy single-field = indice automatico. As rules ja autorizam a query
   // ampla pro role privilegiado (mesma shape do listener do target "all").
   async function loadMoreAllConversations() {
+    if (readOnly) { if (canSeeAll) await loadImpersonationPage("all", allConvPageLimit + ADMIN_CONV_WINDOW); return; }
     if (!bundle?.db || !config?.firestore.collections.wa_conversations) return;
     if (!canSeeAll) return;
     if (loadingMoreConvs) return;
@@ -3062,7 +3479,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         orderBy("last_message_at", "desc"),
         firestoreLimit(nextLimit),
       );
-      const snap = await getDocs(q);
+      const snap = await getSessionDocs(bundle.auth, q);
+      assertFirebaseSessionActive(bundle.auth);
       if (activeViewRef.current !== viewAtStart) return; // trocou de caixa: reset ja limpou
       const fetched = snap.docs.map((d) => normalizeConversation(d.data() as Record<string, unknown>, d.id));
       const next = new Map<string, Conversation>();
@@ -3082,12 +3500,31 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!bundle) return null;
     try {
       setError("");
+      if (readOnly) {
+        const generation = ++impersonationOpenGenerationRef.current;
+        // Abrir pelo picker nunca cria thread nem auto-atribui o lead.
+        const params = threadReadParams(contact_id, channel_id);
+        const result = await getJson<ImpersonationThread>(bundle.auth, `/api/impersonation/view/thread?${params}`);
+        assertImpersonationRead(bundle, result);
+        if (generation !== impersonationOpenGenerationRef.current) return null;
+        const thread = result.conversation ? normalizeConversation(result.conversation, String(result.conversation.id)) : null;
+        if (!thread) {
+          setNotice("Somente leitura: este contato ainda não tem um atendimento acessível neste canal.");
+          return null;
+        }
+        const existing = thread;
+        setExtraConversations((prev) => new Map(prev).set(existing.id, existing));
+        setSelectedThreadId(existing.id);
+        if (existing.assigned_to === sessionUser?.id || existing.assigned_to_uid === sessionUser?.firebase_uid) setActiveView("meus");
+        return existing.id;
+      }
       const payload: Record<string, unknown> = { contact_id };
       if (channel_id) payload.channel_id = channel_id;
       const res = await sendJson(bundle.auth, "/api/wa/conversation/open", payload) as {
         conversation_id: string; contact_id: number; channel_id: number;
         assigned_to?: number | null; assigned_to_uid?: string;
       };
+      assertFirebaseSessionActive(bundle.auth);
       // A conversa pode estar FORA do top-50 ao vivo (ex.: contato antigo
       // achado no picker). Fixa em extraConversations pra (a) selectedConversation
       // resolver o contact_id e o chat abrir, e (b) o auto-select nao derrubar o
@@ -3134,6 +3571,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function updateDeclaredName(contact_id: number, declared_name: string) {
+    if (readOnly) return;
     if (!bundle) return;
     try {
       setError("");
@@ -3145,6 +3583,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function assumeContact(contactId: number) {
+    if (readOnly) return;
     if (!bundle) return;
     // Manda a thread ABERTA: o backend carimba o dono nela (e nas demais
     // threads orfas do contato) explicitamente e grava a system message do
@@ -3159,6 +3598,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // ADR 0010: devolve o lead a POOL da recepcao (acao explicita do menu).
   async function returnContactToPool(contactId: number) {
+    if (readOnly) return;
     if (!bundle) return;
     try { setBusyAssume(true); setError(""); setNotice(""); await sendJson(bundle.auth, `/api/wa/contact/${contactId}/return-to-pool`, {}); setNotice("Lead devolvido à recepção."); if (!snapshotMode) await refreshPollingViews(); }
     catch (e) { setError(errorText(e)); }
@@ -3166,6 +3606,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }
 
   async function transferContact() {
+    if (readOnly) return;
     if (!bundle || !selectedContact || !toUserId || !transferSummary.trim()) return;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
@@ -3189,6 +3630,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // atendimentos (threads) mantem seus donos — a conversa aberta nao sai
   // da tela. Admin/supervisor.
   async function reassignLead(toUserId: number, toDeptId: number | null, reason: string, summary: string) {
+    if (readOnly) return;
     if (!bundle || !selectedContact || !toUserId) return;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
@@ -3202,6 +3644,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Modo 3: supervisor assume a thread (vira Dono do Atendimento; o Lead nao
   // muda). Backend avisa o lead se dentro de 24h.
   async function supervisorTakeover(conversationId: string) {
+    if (readOnly) return;
     if (!bundle) return;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
@@ -3217,6 +3660,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // de desfecho, no MESMO request — o backend recusa fechar lead novo/
   // em_atendimento sem desfecho. Retorna sucesso pro modal so fechar se salvou.
   async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string; tags?: string[]; tag_labels?: Record<string, string> }): Promise<boolean> {
+    if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
@@ -3265,31 +3709,37 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   function toggleSettingsMenu() { setShowSettings((prev) => prev === "menu" ? false : "menu"); }
 
-  async function openSettingsPage(page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard") {
+  async function openSettingsPage(page: "chat" | "quick" | "tags" | "reopen" | "admin" | "perfis" | "whatsapp" | "whatsapp-standard" | "dashboard" | "monitor") {
     if (!bundle) return;
-    if (page === "whatsapp" || page === "whatsapp-standard" || page === "perfis" || page === "reopen") {
+    if (page === "whatsapp" || page === "whatsapp-standard" || page === "perfis" || page === "reopen" || page === "monitor") {
       setShowSettings(page);
       return;
     }
     try {
       setBusySettings(true);
       const [sys, usr] = await Promise.all([getJson<SystemSettings>(bundle.auth, "/api/settings/system"), getJson<UserSettings>(bundle.auth, "/api/settings/user")]);
-      setSystemSettings(sys); setUserSettings(usr); setSettingsLoaded(true); setShowSettings(page);
+      assertFirebaseSessionActive(bundle.auth);
+      setSystemSettings(sys); setSavedSystemSettings(sys); setUserSettings(usr); setSettingsLoaded(true); setShowSettings(page);
     } catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
 
   async function saveSystemSettingsAction() {
+    if (readOnly) return;
     if (!bundle) return;
     // Trava: mensagem global sem titulo/atalho/texto ou atalho repetido nao salva.
     const problem = quickMessagesProblem(systemSettings.quick_messages_global, "Mensagens globais");
     if (problem) { setError(problem); return; }
-    try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
-    catch (e) { setError(errorText(e)); }
+    // setError("") antes: o modal de Administracao mostra o erro inline (o 400
+    // do backend, ex.: data da politica LGPD futura) — sem limpar, um erro
+    // velho ficaria la depois de um save que deu certo.
+    try { setBusySettings(true); setError(""); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSavedSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
+    catch (e) { setNotice(""); setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
 
   async function saveUserSettingsAction() {
+    if (readOnly) return;
     if (!bundle) return;
     const problem = quickMessagesProblem(userSettings.quick_messages, "Minhas mensagens rapidas");
     if (problem) { setError(problem); return; }
@@ -3303,7 +3753,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, tenantName, operators, departments, channels, booting, busyLogin, snapshotMode,
+    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,
@@ -3332,7 +3782,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,
-    showSettings, setShowSettings, systemSettings, settingsLoaded, setSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
+    showSettings, setShowSettings, systemSettings, settingsLoaded, setSystemSettings, savedSystemSettings, userSettings, setUserSettings, busySettings, toggleSettingsMenu, openSettingsPage, saveSystemSettingsAction, saveUserSettingsAction, settingsMenuRef,
     search, setSearch, searchText, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, saveContactTags, saveGlobalTags, saveUserTags, channelFilter, setChannelFilter, myChannelOptions, filteredConversations, viewConversations,
     error, setError, notice, setNotice,
     loadMoreMyConversations, canLoadMoreMine, loadingMoreConvs,
