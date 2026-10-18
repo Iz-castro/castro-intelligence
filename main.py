@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from typing import Literal
 from datetime import datetime, timedelta, timezone
 from time import monotonic as _monotonic
 
@@ -29,7 +30,7 @@ from pydantic import BaseModel, Field as PydanticField, field_validator
 from config import (
     HOST, PORT, MAX_MESSAGE_LENGTH, BASE_DIR, LOG_FILE, LOG_LEVEL, LOG_TO_FILE,
     FEATURE_AUDIO_TRANSCRIPTION, FEATURE_MESSAGE_STATUS, FEATURE_GOOGLE_CHAT,
-    FEATURE_ASSUME_COUNTER,
+    FEATURE_ASSUME_COUNTER, FEATURE_FOLLOWUP,
     WHATSAPP_VERIFY_TOKEN, WHATSAPP_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_WABA_ID, GRAPH_API_BASE, GRAPH_API_VERSION,
     AVATAR_MAX_SIZE_KB, AVATAR_ALLOWED_MIME,
@@ -102,6 +103,7 @@ from rbac import (
     ensure_permission, get_perfil, has_permission, toggles_beyond_user,
 )
 from pii_redaction import redact_phone, redact_name
+from commercial_contact_policy import is_commercial_contact_blocked
 from webhook import process_webhook_payload, validate_signature, process_claimed_bot_buffer
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
@@ -162,7 +164,7 @@ async def add_security_headers(request: Request, call_next):
     # cache de disco de maquina compartilhada. Carimbado AQUI porque o
     # header setado dentro da rota nao sobrevive a HTTPException/422 — os
     # caminhos de ERRO saiam sem no-store.
-    if request.url.path.startswith("/api/wa/contacts/picker"):
+    if request.url.path.startswith(("/api/wa/contacts/picker", "/api/followup")):
         response.headers["Cache-Control"] = "private, no-store"
     return response
 
@@ -599,6 +601,7 @@ async def client_config():
         },
         "feature_message_status": FEATURE_MESSAGE_STATUS,
         "feature_google_chat": FEATURE_GOOGLE_CHAT,
+        "feature_followup": FEATURE_FOLLOWUP,
         "firestore": {
             "collections": {
                 "departments": collection_name("departments"),
@@ -2508,6 +2511,8 @@ class WaSendTemplateRequest(BaseModel):
     # informada pelo frontend que ja conhece via /api/wa/templates.
     # Quando ausente, contabilizada em templates_sent.unknown.
     template_category: str | None = None
+    # Finalidade declarada pela equipe; categoria Meta nao define finalidade.
+    contact_purpose: Literal["commercial", "service"] = "commercial"
 
 
 @app.post("/api/wa/send-template")
@@ -2538,6 +2543,10 @@ async def wa_send_template(
 
     conv, contact, channel = _resolve_send_target(effective_conversation_id, effective_contact_id)
     ensure_permission(current_user, "enviar_template")
+    commercial = (body is None or body.contact_purpose == "commercial"
+                  or effective_template_name == REOPEN_TEMPLATE_NAME)
+    if commercial:
+        _require_commercial_contact_allowed(contact)
     _check_conv_send_permission(conv, current_user, contact, channel=channel)
     token, phone_id, api_base = _resolve_channel_creds_by_id(
         channel["id"] if channel else conv.get("channel_id")
@@ -2551,16 +2560,15 @@ async def wa_send_template(
     # cache de listagem (TTL=60s) pra nao bater na Meta extra.
     # Falha do helper (Meta indisponivel) NAO bloqueia o envio — deixa
     # a Meta decidir; so 422 do mismatch sobe.
+    resolved_template = None
     if channel:
         try:
             approved = await _load_approved_templates_for_channel(channel)
             templates_list = approved.get("templates", []) or []
-            matched = any(
+            resolved_template = next((t for t in templates_list if
                 t.get("name") == effective_template_name
-                and str(t.get("language", "")) == effective_language
-                for t in templates_list
-            )
-            if not matched:
+                and str(t.get("language", "")) == effective_language), None)
+            if resolved_template is None:
                 waba_id = approved.get("waba_id", "?")
                 display = channel.get("display_phone_number") or channel.get("phone_number_id") or "?"
                 logger.warning(
@@ -2586,6 +2594,12 @@ async def wa_send_template(
         except ValueError as exc:
             logger.warning("send-template guard skip (canal sem waba_id): %s", exc)
 
+    # O cliente nao pode reclassificar um template conhecido de retomada
+    # como servico. Nao inferir finalidade por categoria Utility.
+    commercial = commercial or _template_is_reopen_shape(resolved_template or {})
+    if commercial:
+        _require_commercial_contact_allowed(get_wa_contact(contact["id"]))
+
     logger.info(
         "WA_SEND_TEMPLATE channel_id=%s waba=%s template=%s lang=%s",
         channel.get("id") if channel else None,
@@ -2609,6 +2623,9 @@ async def wa_send_template(
         "template": template_payload,
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
+        if commercial:
+            # A listagem de templates faz await: revalidar a preferencia atual.
+            _require_commercial_contact_allowed(get_wa_contact(contact["id"]))
         resp = await client.post(url, json=payload, headers=headers)
         result = resp.json()
     if resp.status_code == 200:
@@ -2784,6 +2801,13 @@ def _reopen_last_conv_date(conv: dict, contact: dict) -> str:
     return dt.astimezone(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
 
 
+def _require_commercial_contact_allowed(contact):
+    if not contact:
+        raise HTTPException(404, "Contato não encontrado")
+    if is_commercial_contact_blocked(contact):
+        raise HTTPException(409, "Paciente pediu para não receber novas retomadas comerciais.")
+
+
 @app.post("/api/wa/conversation/{conversation_id}/reopen")
 async def wa_reopen_conversation(
     conversation_id: str,
@@ -2795,6 +2819,7 @@ async def wa_reopen_conversation(
     ultima conversa). Reusa /send-template (guard WABA + billing + persist).
     Nome/idioma do template vem do frontend (ou env default)."""
     conv, contact, channel = _resolve_send_target(conversation_id, None)
+    _require_commercial_contact_allowed(contact)
     _check_conv_send_permission(conv, current_user, contact, channel=channel)
 
     # Frente C1 (ADR 0009 D2): cliente que respondeu Encerrar a uma
@@ -2827,6 +2852,7 @@ async def wa_reopen_conversation(
         language=language,
         components=components,
         template_category="utility",
+        contact_purpose="commercial",
     )
     result = await wa_send_template(body=send_body, current_user=current_user)
     # Frente C1: contador do auto-resolve do lote (legado REOPEN_MAX_ATTEMPTS)
@@ -3070,6 +3096,11 @@ async def _run_reopen_batch(tenant_id, batch_id, plano, auto_resolve, canais, tp
                     },
                 }
                 async with httpx.AsyncClient(timeout=15.0) as client:
+                    # Nunca confiar no preview: a recusa pode ter sido registrada
+                    # depois da montagem do lote. Nao carimbar tentativa/cooldown.
+                    fresh_contact = get_wa_contact(c["id"])
+                    if not fresh_contact or is_commercial_contact_blocked(fresh_contact):
+                        continue
                     resp = await client.post(
                         f"{api_base}/{phone_id}/messages",
                         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -6297,6 +6328,10 @@ async def embedded_signup_exchange(
         ],
     }
 
+
+from followup_routes import create_followup_router
+
+app.include_router(create_followup_router(get_current_user, _require_contact_access))
 
 # -- Execucao --
 

@@ -4079,6 +4079,8 @@ def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
     evidencia de janela fechada); cooldown por lead; attempts >= max vira
     AUTO-RESOLVE (fecha sem enviar — "muito importante", PO); exclui opt-out
     (ADR 0009 D2), lgpd_revoked, arquivado e backup."""
+    from commercial_contact_policy import is_commercial_contact_blocked
+
     now = utcnow()
     janela_cutoff = now - timedelta(hours=window_hours)
     cooldown_cutoff = now - timedelta(hours=cooldown_hours)
@@ -4107,6 +4109,9 @@ def scan_reopen_candidates(max_attempts=1, cooldown_hours=24, window_hours=24):
             continue
         if c.get("is_backup"):
             _skip("backup")
+            continue
+        if is_commercial_contact_blocked(c):
+            _skip("commercial_contact_blocked")
             continue
         if c.get("reopen_opt_out"):
             _skip("opt_out")

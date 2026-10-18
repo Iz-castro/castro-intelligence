@@ -68,6 +68,7 @@ from firestore_common import (  # noqa: E402
 )
 from channel_service import get_channel, get_send_credentials  # noqa: E402
 from database import save_wa_message, log_audit, next_sequence  # noqa: E402
+from commercial_contact_policy import is_commercial_contact_blocked  # noqa: E402
 
 REOPEN_TEMPLATE_NAME = os.getenv("REOPEN_TEMPLATE_NAME", "atualizao_de_solicitao")
 REOPEN_DAILY_CAP = int(os.getenv("REOPEN_DAILY_CAP", "250"))
@@ -271,6 +272,8 @@ def _select(tenant_id, args):
             continue
         if int(c.get("is_archived") or 0) or c.get("is_backup"):
             skip("arquivado_ou_backup"); continue
+        if is_commercial_contact_blocked(c):
+            skip("commercial_contact_blocked"); continue
         if c.get("lgpd_revoked"):
             skip("lgpd_revogado"); continue
         if c.get("lgpd_consent") is not True:
@@ -333,6 +336,23 @@ def _select(tenant_id, args):
     ordem = {"em_atendimento": 0, "novo": 1}
     plano.sort(key=lambda p: (ordem.get(p["c"].get("qualification"), 9), -p["li"].timestamp()))
     return plano, skips
+
+
+def _post_commercial_template(client, url, *, contact_id, payload, headers):
+    """Rele a preferencia no ultimo ponto antes da chamada externa.
+
+    Falha de leitura nao vira envio nem tentativa/cooldown. Nao usa o gate
+    humano e nao limpa opt-out/LGPD. Nao desfaz envio ja iniciado na Meta.
+    """
+    try:
+        snapshot = document("wa_contacts", contact_id).get()
+    except Exception:
+        return None, "preferencia_indisponivel"
+    if not snapshot.exists:
+        return None, "contato_indisponivel"
+    if is_commercial_contact_blocked(snapshot.to_dict() or {}):
+        return None, "commercial_contact_blocked"
+    return client.post(url, json=payload, headers=headers), ""
 
 
 def _age_hist(plano):
@@ -433,8 +453,15 @@ def main():
                                      **({"components": [{"type": "body", "parameters": params}]} if params else {})},
                     }
                     with httpx.Client(timeout=15.0) as client:
-                        resp = client.post(f"{api_base}/{phone_id}/messages", json=payload,
-                                           headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+                        resp, skipped = _post_commercial_template(
+                            client, f"{api_base}/{phone_id}/messages", contact_id=c["id"],
+                            payload=payload,
+                            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        )
+                    if skipped:
+                        row["resultado"], row["detalhe"] = "pulado", skipped
+                        print(f"  [{i + 1}/{efetivo}] #{c['id']} pulado {skipped}")
+                        continue
                     if resp.status_code == 200:
                         now_iso = _now().isoformat()
                         # Carimbo PRIMEIRO (template pago ja saiu)

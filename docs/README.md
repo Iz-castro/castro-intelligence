@@ -52,6 +52,7 @@ A leitura recomendada agora e:
 - [Runbook de Cutover Prod](deploy/RUNBOOK_CUTOVER_PROD.md) — ⚠️ STALE (cita SP/`southamerica-east1`); so referencia historica
 
 ### Planos e refactors
+- [Follow-up no CRM — revisão da operação Varizemed](followup_crm_varizemed.md) — 2026-10-18: F1 humana implementada localmente sob flag desligada; filas, histórico, calendário e preferência comercial comum. Automação futura e objetivo compartilhado de 500/dia não ativados; validação e preparo de liberação na seção 16
 - [Plano Reabertura em lote — Recepção e Bot (v2)](PLANO_REABERTURA_LOTE_BOT_RECEPCAO.md) — 2026-09-23: decisões fechadas do PO, públicos por estado, 24 casos de aceitação; ADR 0013
 - [Retomada em lote pela Val — pedido ao dev de IA](CX_RETOMADA_LOTE_DEV_IA.md) — 2026-10-05: params `origem`, `midia_tipo`, `desfecho_bot`, roteiro de teste e nome de exibição da Hubloc
 - [Pendencias e Roadmap](PENDENCIAS_E_ROADMAP.md) — estado por frente (revisado em 2026-08-21)

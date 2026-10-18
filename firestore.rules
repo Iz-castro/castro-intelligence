@@ -226,6 +226,15 @@ service cloud.firestore {
         allow read, write: if false;
       }
 
+      // Follow-up e historico passam exclusivamente pelo backend, que
+      // revalida acesso atual ao contato E a thread em cada operacao.
+      match /crm_tasks/{taskId} {
+        allow read, write: if false;
+      }
+      match /crm_activities/{activityId} {
+        allow read, write: if false;
+      }
+
       match /departments/{deptId} {
         allow read: if ownsTenant(tenantId);
         allow write: if false;
@@ -353,7 +362,9 @@ service cloud.firestore {
     }
 
     match /castro_crm_staging_channels/{channelId} {
-      allow read, write: if emailAllowed();
+      // Metadados de canal participam da autorizacao da pool no follow-up.
+      allow read: if emailAllowed() && ownsTenant(resource.data.tenant_id);
+      allow write: if false;
     }
 
     match /castro_crm_staging_wa_contacts/{contactId} {
@@ -429,14 +440,32 @@ service cloud.firestore {
 
     // Doc do tenant em si (lista de tenants ainda flat, indice global).
     match /castro_crm_staging_tenants/{tenantId} {
-      allow read, write: if emailAllowed();
+      allow read: if emailAllowed() && ownsTenant(tenantId);
+      allow write: if false;
 
-      // Subcolecoes de cada tenant — em staging libera tudo para
-      // qualquer email autorizado (modelo simplificado de teste).
-      // Sera substituido por rules tenant-based estritas com claim no
-      // JWT quando o frontend renovar tokens (sub-fase futura).
-      match /{subcol=**} {
-        allow read, write: if emailAllowed();
+      // Nao usar wildcard permissivo: um deny especifico nao revoga
+      // outro allow. Escritas via Admin SDK; tarefas/historico so REST.
+      match /{subcol}/{document=**} {
+        allow read: if emailAllowed() && ownsTenant(tenantId)
+          && !(subcol in ['crm_tasks', 'crm_activities', 'users', 'audit_log',
+                         'bot_states', 'wa_message_status', 'internal_unread',
+                         'operator_assume_counters', '_meta', 'wa_contacts',
+                         'wa_conversations', 'wa_messages']);
+        allow write: if false;
+      }
+      match /wa_contacts/{contactId} {
+        allow read: if emailAllowed() && canSeeContactScoped(tenantId);
+        allow write: if false;
+      }
+      match /wa_conversations/{conversationId} {
+        allow read: if emailAllowed() && canSeeContactScoped(tenantId);
+        allow write: if false;
+      }
+      match /wa_messages/{messageId} {
+        allow read: if emailAllowed() && ownsTenant(tenantId)
+          && (isPrivilegedInTenant(tenantId) || resource.data.get('is_backup', false) != true)
+          && (isPrivilegedInTenant(tenantId) || resource.data.get('visibility', 'all') != 'admin_only');
+        allow write: if false;
       }
     }
   }

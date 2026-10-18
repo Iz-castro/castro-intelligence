@@ -15,6 +15,8 @@
 
 Visao funcional do CRM hoje.
 
+- [Guia das operadoras — Follow-up](GUIA_OPERADORAS_FOLLOWUP.md): F1 implementada localmente sob flag, com filas, tentativas, calendário e recusas; aguarda liberação.
+
 ## Objetivo do produto
 
 O repositorio implementa um CRM operacional com foco em:

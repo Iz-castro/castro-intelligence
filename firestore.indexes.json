@@ -296,6 +296,66 @@
         { "fieldPath": "tags", "arrayConfig": "CONTAINS" },
         { "fieldPath": "sort_key", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "crm_tasks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "due_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "crm_tasks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "contact_id", "order": "ASCENDING"},
+        {"fieldPath": "due_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "crm_activities",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "task_id", "order": "ASCENDING"},
+        {"fieldPath": "recorded_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "crm_activities",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "contact_id", "order": "ASCENDING"},
+        {"fieldPath": "recorded_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "contact_id", "order": "ASCENDING"},
+        {"fieldPath": "direction", "order": "ASCENDING"},
+        {"fieldPath": "timestamp_wa", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "contact_id", "order": "ASCENDING"},
+        {"fieldPath": "direction", "order": "ASCENDING"},
+        {"fieldPath": "conversation_id", "order": "ASCENDING"},
+        {"fieldPath": "timestamp_wa", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "conversation_id", "order": "ASCENDING"},
+        {"fieldPath": "timestamp_wa", "order": "DESCENDING"}
+      ]
     }
   ],
   "fieldOverrides": []

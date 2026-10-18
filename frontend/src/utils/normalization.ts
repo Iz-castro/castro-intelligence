@@ -21,6 +21,10 @@ export function num(value: unknown) {
 }
 
 export function normalizeContact(record: Record<string, unknown>, docId: string): Contact {
+  const preference = record.commercial_contact_block;
+  const block = preference && typeof preference === "object" ? preference as Record<string, unknown> : null;
+  const validBlock = typeof block?.active === "boolean" && typeof block.version === "number"
+    && Number.isInteger(block.version) && block.version >= 1;
   return {
     id: num(record.id ?? docId),
     wa_id: String(record.wa_id || ""),
@@ -62,6 +66,11 @@ export function normalizeContact(record: Record<string, unknown>, docId: string)
     first_human_contact_at: iso(record.first_human_contact_at),
     // Frente B: slugs das tags do lead (whitelist obrigatoria em snapshot).
     tags: Array.isArray(record.tags) ? record.tags.map((t) => String(t)) : [],
+    commercial_contact_block: !Object.prototype.hasOwnProperty.call(record, "commercial_contact_block") ? undefined : {
+      active: validBlock ? block!.active as boolean : true,
+      version: num(block?.version),
+      updated_at: iso(block?.updated_at),
+    },
   };
 }
 

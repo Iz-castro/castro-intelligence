@@ -135,6 +135,7 @@ FEATURE_AUDIO_TRANSCRIPTION = _bool_env("FEATURE_AUDIO_TRANSCRIPTION", "false")
 # Contador de "assumidas sem resposta" (bloqueia assume com 2+ pendentes).
 # Desligado a pedido do cliente; religar via env sem mudar codigo.
 FEATURE_ASSUME_COUNTER = _bool_env("FEATURE_ASSUME_COUNTER", "false")
+FEATURE_FOLLOWUP = _bool_env("FEATURE_FOLLOWUP", "false")
 
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
 # CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em

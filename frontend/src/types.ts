@@ -18,6 +18,7 @@ export type ClientConfig = {
   media_storage_backend: string;
   feature_message_status: boolean;
   feature_google_chat: boolean;
+  feature_followup?: boolean;
   allowed_email_domain: string;
   firebase_web_config: FirebaseWebConfig;
   firestore: {
@@ -61,6 +62,11 @@ export type PermissionKey =
   | "gerenciar_tags_globais"
   | "filtrar_leads_por_tag"
   | "reabrir_em_lote"
+  | "gerenciar_followup"
+  | "redistribuir_followup"
+  | "gerenciar_horarios_followup"
+  | "registrar_recusa_comercial"
+  | "reativar_contato_comercial"
   | "editar_declared_name"
   | "arquivar_lead"
   | "adicionar_contato_manual"
@@ -188,6 +194,7 @@ export type Contact = {
   bot_setor_nome?: string;
   // Temperatura do lead (tenants com motor CX; gravada UMA vez, no handoff).
   lead_temperature?: "quente" | "morno" | "frio" | string;
+  commercial_contact_block?: { active: boolean; version: number; updated_at?: string };
 };
 
 // Conversation = thread unica (channel_id + wa_id). Mesmo wa_id em
