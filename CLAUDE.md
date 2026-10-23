@@ -29,9 +29,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (225).
+  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (229).
   Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
-  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (59).
+  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (61).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
   History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
@@ -239,6 +239,9 @@ Modelo de dados WhatsApp: `wa_contacts` (Lead único por `wa_id`) · `wa_convers
   (cache de 60 s); NUNCA `status=paused` (bot mudo). O builtin trata o step `cx` como LGPD aceita e
   finaliza no Comercial. `settings.ai.omit_session_params` (lista fechada: `retorno_previsto`,
   `fora_do_expediente`, `tenant_id`) tira do turno CX o param que o agente declara com outro tipo.
+  `settings.ai.lgpd_by_agent=true` (decisao do PO p/ o Hugo): o CRM NAO faz o gate LGPD nem grava prova de
+  aceite; o agente trata aviso e recusa, e o CRM nao manda `lgpd_consent`. So com True explicito; a Val
+  segue com o gate local. Emenda no ADR 0009.
 
 ## Convenções
 

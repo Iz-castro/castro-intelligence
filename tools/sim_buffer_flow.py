@@ -859,8 +859,21 @@ def scenario_transaction_contracts():
         dbf.utcnow = real_utcnow
 
 
+def scenario_lgpd_by_agent():
+    print("\n=== lgpd_by_agent: agente trata a LGPD, buffer arma sem aceite no CRM (Hugo, 2026-10-23) ===")
+    check(wh._bot_buffer_consent_resolved(9901, {"id": 9901}) is False,
+          "sem a opcao, contato sem aceite no CRM nao arma o buffer")
+    AI_CFG["lgpd_by_agent"] = True
+    try:
+        check(wh._bot_buffer_consent_resolved(9901, {"id": 9901}) is True,
+              "com lgpd_by_agent nao ha fase de consentimento no CRM: o buffer arma")
+    finally:
+        AI_CFG.pop("lgpd_by_agent", None)
+
+
 async def main():
     _install_patches()
+    scenario_lgpd_by_agent()
     await scenario_separate_payloads()
     await scenario_same_payload()
     await scenario_lgpd()

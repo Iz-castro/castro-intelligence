@@ -1433,6 +1433,27 @@ finally:
     _AI_CFG.pop("omit_session_params", None)
     CX_SCRIPT.clear()
 
+print("\n=== lgpd_by_agent: o agente trata a LGPD, sem aviso do CRM (Hugo/Hubloc, 2026-10-23) ===")
+_AI_CFG["lgpd_by_agent"] = True
+_aceites_antes = sum(1 for a in AUDIT if a["action"] == "LGPD_CONSENT_ACCEPTED")
+try:
+    CX_CALLS.clear()
+    novo_contato(88, wa_id="5571988887777")
+    CX_SCRIPT.append(_cx_ok("Aqui é o Hugo, atendente virtual."))
+    _r88 = envia(88, "Vim pelo site da Hub Loc")
+    check(isinstance(_r88, str) and "Hugo" in _r88,
+          "1a mensagem vai direto ao agente, sem o aviso LGPD do CRM")
+    check(len(CX_CALLS) == 1 and CX_CALLS[0]["text"] == "Vim pelo site da Hub Loc",
+          "agente recebe o texto original no 1o turno")
+    check(bool(CX_CALLS) and "lgpd_consent" not in CX_CALLS[0]["params"],
+          "CRM nao afirma lgpd_consent sem gate local")
+    check(not STORE["wa_contacts"]["88"].get("lgpd_consent")
+          and sum(1 for a in AUDIT if a["action"] == "LGPD_CONSENT_ACCEPTED") == _aceites_antes,
+          "CRM nao grava prova de aceite (fica com o agente)")
+finally:
+    _AI_CFG.pop("lgpd_by_agent", None)
+    CX_SCRIPT.clear()
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")

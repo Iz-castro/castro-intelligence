@@ -876,11 +876,14 @@ async def _process_cx_message(
     # fallback no settings.ai. Puro — reaproveita a leitura do toggle acima.
     lgpd_cfg = lgpd_policy_config(sys_settings, ai_cfg, cx=True)
     policy_date = lgpd_cfg["policy_date"]
+    # Tenant cujo agente trata a LGPD: sem gate, sem rebaixar e sem hidratar.
+    lgpd_by_agent = lgpd_handled_by_agent(ai_cfg)
 
     # P2b: estado "aceito" com aceite do contato ANTERIOR a data da politica
     # vigente -> rebaixa; o gate abaixo mostra o aviso novo e guarda esta
     # mensagem como user_first_input. Sem data configurada, nada muda.
-    _demote_outdated_consent(contact_id, state, contact, policy_date)
+    if not lgpd_by_agent:
+        _demote_outdated_consent(contact_id, state, contact, policy_date)
 
     # Hidratacao da prova pelo CONTATO (PLANO_MODELOS Fase 2 item 9): apos o
     # release_lead_to_bot (fechamento devolve ao agente), o bot_states do
@@ -891,7 +894,7 @@ async def _process_cx_message(
     # Recusa registrada em bot_states tem precedencia (guarda is None);
     # revogado (J-3 D8) nunca hidrata. NAO re-chama _record_lgpd_consent
     # (prova ja existe).
-    if state.get("lgpd_consent") is None \
+    if not lgpd_by_agent and state.get("lgpd_consent") is None \
             and _contact_consent_hydrates(contact, policy_date, ai_cfg):
         state["lgpd_consent"] = True
         state["lgpd_status"] = "accepted"
@@ -900,8 +903,9 @@ async def _process_cx_message(
     # Gate LGPD local — SEMPRE antes do motor. A prova de consentimento
     # (contato + audit + versao) fica no CRM; o agente CX recebe
     # lgpd_consent=true e nunca refaz a pergunta (flow neutralizado).
+    # Excecao: lgpd_by_agent (o proprio agente trata aviso e recusa).
     # ------------------------------------------------------------------
-    lgpd_response = handle_lgpd(state, text, aviso_text=lgpd_cfg["aviso"])
+    lgpd_response = None if lgpd_by_agent else handle_lgpd(state, text, aviso_text=lgpd_cfg["aviso"])
 
     first_cx_text = None
     if lgpd_response is not None:
@@ -952,6 +956,9 @@ async def _process_cx_message(
             "tenant_id": str(get_tenant_context() or ""),
             "lgpd_consent": True,
         }
+        if lgpd_by_agent:
+            # Sem gate local o CRM nao tem prova de aceite para afirmar.
+            session_params.pop("lgpd_consent", None)
         # Horario comercial (frente b): SEMPRE as duas chaves, todo turno —
         # o agente ramifica em fora_do_expediente e interpola retorno_previsto
         # (nunca decide horario sozinho nem escreve hora no texto). Agente que
@@ -1195,6 +1202,14 @@ def _omitted_session_params(ai_cfg) -> tuple:
     if not isinstance(raw, (list, tuple)):
         return ()
     return tuple(key for key in raw if key in _OMITTABLE_SESSION_PARAMS)
+
+
+def lgpd_handled_by_agent(ai_cfg) -> bool:
+    """settings.ai.lgpd_by_agent=True: o agente do tenant trata o aviso e a
+    recusa da LGPD (decisao do PO para o Hugo/Hubloc, 2026-10-23). O CRM nao
+    mostra o aviso, nao grava a prova de aceite e nao manda lgpd_consent ao
+    agente. So vale com True explicito; ausente = gate local, como na Val."""
+    return isinstance(ai_cfg, dict) and ai_cfg.get("lgpd_by_agent") is True
 
 
 _CX_HANDOFF_HEADER = "Bot IA finalizado | Transferido para atendimento humano"

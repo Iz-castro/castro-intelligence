@@ -790,6 +790,18 @@ def _tenant_bot_buffer_seconds() -> float:
     return seconds
 
 
+def _tenant_lgpd_by_agent() -> bool:
+    """settings.ai.lgpd_by_agent do tenant atual (o agente trata a LGPD)."""
+    tid = get_tenant_context()
+    try:
+        tenant = get_tenant(tid) or {} if tid else {}
+    except Exception:
+        return False
+    settings = tenant.get("settings")
+    ai_cfg = settings.get("ai") if isinstance(settings, dict) else None
+    return isinstance(ai_cfg, dict) and ai_cfg.get("lgpd_by_agent") is True
+
+
 def _bot_buffer_consent_resolved(contact_id, contact=None) -> bool:
     """O debounce so arma na fase CX plena; pre-consentimento fica intacto.
 
@@ -797,7 +809,10 @@ def _bot_buffer_consent_resolved(contact_id, contact=None) -> bool:
     True, ou estado AUSENTE com prova valida no contato. Sem a 2a parte, a 1a
     mensagem apos release_lead_to_bot (bot_states recriado sem lgpd_*) rodava
     turno direto e a seguinte virava resposta dupla (canario 2026-09-14).
+    Tenant com lgpd_by_agent nao tem fase de consentimento no CRM.
     """
+    if _tenant_lgpd_by_agent():
+        return True
     snapshot = document("bot_states", contact_id).get()
     state = snapshot.to_dict() or {} if snapshot.exists else {}
     if state.get("lgpd_consent") is None and contact is None:

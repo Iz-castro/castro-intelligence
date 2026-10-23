@@ -74,3 +74,20 @@ revogação LGPD (D8/J-3) — são registros distintos.
   booleano — implementação deve seguir o desenho do PLANO_MODELOS.
 - ADR 0005 (campanhas) ganha dois requisitos: filtro de opt-out (D2) e
   confirmação de departamento-destino no disparo em massa (D3).
+
+## Emenda 2026-10-23: LGPD tratada pelo agente (Hubloc/Hugo)
+
+Decisão do PO: na Hubloc, o agente de IA Hugo trata o aviso e a recusa da LGPD;
+o CRM não deve mandar o próprio aviso antes dele (o cliente veria dois).
+
+- Opção por tenant `settings.ai.lgpd_by_agent` (só vale com `true`). Com ela, o
+  turno CX pula o gate local, não rebaixa nem hidrata consentimento, não grava
+  prova de aceite no contato e não envia `lgpd_consent` ao agente. O buffer CX
+  arma sem fase de consentimento no CRM.
+- Sem a opção, nada muda: a Val segue com o gate local antes do motor.
+- Consequências aceitas: a prova do aceite passa a existir só no agente (no
+  Hugo, em `hugo/conversas`, banco do projeto castro-ia); a recusa dentro do
+  agente não sinaliza o CRM; recursos que dependem do aceite no CRM (público
+  Bot da reabertura em lote) não enxergam esses contatos. Voltar ao builtin
+  (`bot_engine` vazio) restaura o gate do CRM para as mensagens seguintes.
+- Validar o texto do aviso e a base legal com o jurídico da Hub Loc.
