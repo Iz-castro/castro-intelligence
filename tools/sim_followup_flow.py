@@ -107,15 +107,39 @@ class Query:
         return iter(Snapshot(Reference(self.tenant, self.name, doc_id), value) for doc_id, value in rows[:self.cap])
 
 
+def firestore_compat(value, path="doc", in_array=False):
+    """Restricoes do Firestore real que o fake em memoria nao tinha (o PUT de
+    horarios deu 500 em staging, 2026-10-18): lista dentro de lista ("invalid
+    nested entity"), tipo sem conversao (date sem hora, Decimal, objeto) e
+    chave de mapa vazia ou nao-texto."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes, datetime)):
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise AssertionError("Firestore: chave invalida em %s: %r" % (path, key))
+            firestore_compat(item, "%s.%s" % (path, key))
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if in_array:
+            raise AssertionError("Firestore: lista dentro de lista em %s" % path)
+        for index, item in enumerate(value):
+            firestore_compat(item, "%s[%d]" % (path, index), in_array=True)
+        return
+    raise AssertionError("Firestore: tipo %s nao gravavel em %s" % (type(value).__name__, path))
+
+
 class Transaction:
     def __init__(self):
         self.view = {}
         self.writes = []
 
     def set(self, reference, value):
+        firestore_compat(value, "/".join(reference.key))
         self.writes.append((reference.key, copy.deepcopy(value), False))
 
     def create(self, reference, value):
+        firestore_compat(value, "/".join(reference.key))
         self.writes.append((reference.key, copy.deepcopy(value), True))
 
 
@@ -224,6 +248,11 @@ def run():
     settings = {"version": 0, "contact_hours": {str(day): [["08:00", "12:00"], ["13:00", "18:00"]] for day in range(5)}}
     configured = manager.save_settings(settings)["settings"]
     check(configured["configured"] and configured["version"] == 1, "configuracao explicita salva")
+    stored = DATA[(TENANT, "system_settings", "followup")]["contact_hours"]
+    check(stored["0"] == [{"start": "08:00", "end": "12:00"}, {"start": "13:00", "end": "18:00"}],
+          "faixas gravadas como mapas (Firestore recusa lista dentro de lista)")
+    check(manager.get_settings()["settings"]["contact_hours"]["0"] == [["08:00", "12:00"], ["13:00", "18:00"]],
+          "leitura devolve faixas no contrato [inicio, fim]")
     expect(403, lambda: service().save_settings(settings), "operador nao altera horarios")
     expect(409, lambda: manager.save_settings(settings), "configuracao concorrente nao sobrescreve")
     expect(422, lambda: manager.save_settings({"version": 1, "contact_hours": {"0": [["10:00", "09:00"]]}}), "intervalo invalido recusado")

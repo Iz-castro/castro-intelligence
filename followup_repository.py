@@ -18,6 +18,30 @@ def _row(snapshot):
     return result
 
 
+def _hours_to_storage(hours):
+    """Firestore recusa lista dentro de lista ("invalid nested entity"): cada
+    faixa [inicio, fim] do servico e gravada como mapa {start, end}."""
+    return {str(day): [{"start": start, "end": end} for start, end in (ranges or [])]
+            for day, ranges in (hours or {}).items()}
+
+
+def _hours_from_storage(hours):
+    """Devolve o contrato do servico ([inicio, fim]). Aceita o formato antigo
+    e descarta faixa malformada (menos horario permitido, nunca mais)."""
+    if not isinstance(hours, dict):
+        return hours
+    result = {}
+    for day, ranges in hours.items():
+        clean = []
+        for item in ranges if isinstance(ranges, list) else []:
+            if isinstance(item, dict):
+                item = (item.get("start"), item.get("end"))
+            if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(v, str) for v in item):
+                clean.append([item[0], item[1]])
+        result[str(day)] = clean
+    return result
+
+
 class FollowupRepository:
     """Nao depende do contexto implicito de requests ou de main.py."""
 
@@ -42,7 +66,10 @@ class FollowupRepository:
         return self.get("users", user_id)
 
     def settings(self):
-        return self.get("system_settings", "followup")
+        row = self.get("system_settings", "followup")
+        if row and "contact_hours" in row:
+            row["contact_hours"] = _hours_from_storage(row["contact_hours"])
+        return row
 
     def operation_key(self, actor_uid, operation_id):
         value = "\x1f".join((self.tenant_id, actor_uid, operation_id))
@@ -123,7 +150,7 @@ class FollowupRepository:
             current = _row(ref.get(transaction=transaction)) or {}
             if int(current.get("version", 0)) != expected_version:
                 raise HTTPException(409, "Os horários mudaram. Atualize a configuração.")
-            transaction.set(ref, settings)
+            transaction.set(ref, dict(settings, contact_hours=_hours_to_storage(settings.get("contact_hours"))))
             return settings
 
         return apply(get_firestore_client().transaction())
