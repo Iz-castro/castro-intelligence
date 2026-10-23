@@ -548,12 +548,37 @@ def cenario_p2b_lgpd_builtin():
         bot.get_system_settings = bak
 
 
+def cenario_rollback_agente_ia():
+    titulo("CENARIO 5b — ROLLBACK: contato que estava com o agente de IA (step=cx) volta ao builtin")
+    cid = 77
+    _novo_contato(cid)
+    STORE.setdefault("wa_conversations", {})["conv77"] = {
+        "id": "conv77", "contact_id": cid,
+        "assigned_to": None, "assigned_to_uid": "", "department_id": None,
+    }
+    # Estado que o caminho CX deixa depois do aceite (bot_service: step="cx").
+    STORE.setdefault("bot_states", {})[str(cid)] = {
+        "step": "cx", "lgpd_consent": True, "lgpd_status": "accepted",
+    }
+
+    reply, _, _ = cliente_envia(cid, text="ainda quero a betoneira")
+    contato = STORE["wa_contacts"][str(cid)]
+    check(isinstance(reply, str) and "comercial" in reply.lower(),
+          "responde com a fila do Comercial (sem repetir o aviso LGPD)")
+    check(contato.get("bot_completed") is True, "bot finalizado (bot_completed=True)")
+    check(contato.get("department_id") == 1, "encaminhado ao Comercial (department_id=1)")
+    check(STORE["wa_conversations"]["conv77"].get("department_id") == 1,
+          "thread recebeu department_id=1")
+    check(str(cid) not in STORE.get("bot_states", {}), "bot_state drenado, nao resetado para a LGPD")
+
+
 def main():
     cenario_fluxo_feliz_botoes()
     cenario_recusa_reconsentimento()
     cenario_fallback_texto()
     cenario_legado_escolha_setor()
     cenario_legado_invalida_vai_comercial()
+    cenario_rollback_agente_ia()
     cenario_limites_payload()
     cenario_horario_comercial()
     cenario_p2b_lgpd_builtin()

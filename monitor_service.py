@@ -534,8 +534,11 @@ def metricas_origem(mensagens, cfg, corte) -> dict:
 
 
 # Entrada na fila nas metricas de origem: a mensagem de sistema que
-# _finalize_bot grava ("Bot finalizado | Bot: Setor=X | Encaminhado para X").
-RE_FILA = re.compile(r"^bot finalizado\b.*\|\s*encaminhado para\s+(.+?)\s*$")
+# _finalize_bot grava ("Bot finalizado | Bot: Setor=X | Encaminhado para X")
+# ou a 1a linha do handoff do agente de IA (bot_service._CX_HANDOFF_HEADER,
+# seguida das linhas do resumo), para tenant com agente CX (Hubloc com o Hugo).
+RE_FILA = re.compile(r"^(?:bot finalizado\b.*\|\s*encaminhado para\s+(.+?)\s*$"
+                     r"|bot ia finalizado\s*\|\s*transferido para atendimento humano\b)")
 
 
 def _eh_entrada_na_fila(m: dict) -> bool:

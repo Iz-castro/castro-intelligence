@@ -1416,6 +1416,23 @@ try:
 finally:
     _bot_logger.removeHandler(_lh)
 
+print("\n=== omit_session_params: param que o agente declara com outro tipo (Hugo, 2026-10-23) ===")
+_AI_CFG["omit_session_params"] = ["retorno_previsto", "user_id", "lgpd_consent", "inexistente"]
+try:
+    CX_CALLS.clear()
+    CX_SCRIPT.append(_cx_ok("Certo."))
+    envia(70, "mais uma pergunta")
+    _p = CX_CALLS[-1]["params"] if CX_CALLS else {}
+    check(bool(CX_CALLS) and "retorno_previsto" not in _p,
+          "retorno_previsto omitido para o tenant que configurou")
+    check(str(_p.get("user_id") or "").startswith("+") and _p.get("lgpd_consent") is True,
+          "user_id e lgpd_consent nunca sao omitidos (contrato do gate)")
+    check(isinstance(_p.get("fora_do_expediente"), bool) and _p.get("tenant_id") == _TENANT_ID,
+          "params fora da lista seguem iguais")
+finally:
+    _AI_CFG.pop("omit_session_params", None)
+    CX_SCRIPT.clear()
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")

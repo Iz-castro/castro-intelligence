@@ -29,17 +29,17 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 71 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (222).
+  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (225).
   Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (59).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
-  Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (69).
+  Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
   History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
   `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
   `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
   (rules combinadas com o follow-up: 861 verificacoes em 2026-10-18).
-  Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (79),
+  Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
   `tools\sim_followup_api.py` (53), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
@@ -235,6 +235,10 @@ Modelo de dados WhatsApp: `wa_contacts` (Lead único por `wa_id`) · `wa_convers
 - **Motor CX**: `settings.ai.environment_id` vazio = produção roda no **DRAFT** do agente
   Dialogflow (edição no console entra em prod na hora — já causou o bug dos params em struct,
   2026-07-29). Ver `docs/CX_AGENTE_PENDENCIAS_DEV_IA.md`.
+- **Troca de motor (Hubloc -> agente Hugo, 2026-10-23):** voltar ao builtin = `settings.ai.bot_engine` vazio
+  (cache de 60 s); NUNCA `status=paused` (bot mudo). O builtin trata o step `cx` como LGPD aceita e
+  finaliza no Comercial. `settings.ai.omit_session_params` (lista fechada: `retorno_previsto`,
+  `fora_do_expediente`, `tenant_id`) tira do turno CX o param que o agente declara com outro tipo.
 
 ## Convenções
 

@@ -488,8 +488,13 @@ def process_bot_message(
     # =================================================================
     # LGPD ja aceita: encaminha direto pra fila do Comercial
     # =================================================================
+    # "cx": contato que estava com o agente de IA quando o tenant voltou ao
+    # builtin (rollback da troca de motor, ou instancia ainda com o cache de
+    # 60 s do motor anterior). O aceite ja foi gravado pelo caminho CX:
+    # finaliza no Comercial em vez de cair no "step desconhecido", que
+    # apagava o estado, nao respondia e repetia a LGPD na mensagem seguinte.
 
-    if not step or step == "lgpd":
+    if not step or step in ("lgpd", "cx"):
         _finalize_bot(contact_id, state, SETOR_COMERCIAL)
         return _msg_pos_aceite("Olá!")
 
@@ -952,6 +957,11 @@ async def _process_cx_message(
         # (nunca decide horario sozinho nem escreve hora no texto). Agente que
         # ainda nao usa os params simplesmente os ignora.
         session_params.update(cx_hours_params(get_tenant_context() or ""))
+        # Param que o agente do tenant declara com outro tipo (o Hugo declara
+        # retorno_previsto como BOOLEAN e o CRM manda texto) sai por
+        # settings.ai.omit_session_params. user_id e lgpd_consent nunca saem.
+        for key in _omitted_session_params(ai_cfg):
+            session_params.pop(key, None)
         turn_text = first_cx_text if first_cx_text is not None else text
         # Orcamento do TURNO (CX_DETECT_TIMEOUT_SECONDS, 60s): a 1a chamada
         # tem o teto inteiro; os reenvios por frase de erro abaixo so usam o
@@ -1171,6 +1181,21 @@ _CX_SUMMARY_KEYS = (
     "user_name", "user_symptom", "user_insurance", "user_specialty",
     "wants_appointment", "wants_treatment", "insurance_validated",
 )
+
+# settings.ai.omit_session_params: params do turno CX que o agente de um
+# tenant nao aceita no tipo que o CRM envia. Lista fechada: user_id e
+# lgpd_consent sao contrato do gate LGPD e vao em todo turno.
+_OMITTABLE_SESSION_PARAMS = ("retorno_previsto", "fora_do_expediente", "tenant_id")
+
+
+def _omitted_session_params(ai_cfg) -> tuple:
+    raw = (ai_cfg or {}).get("omit_session_params") if isinstance(ai_cfg, dict) else None
+    if isinstance(raw, str):
+        raw = (raw,)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(key for key in raw if key in _OMITTABLE_SESSION_PARAMS)
+
 
 _CX_HANDOFF_HEADER = "Bot IA finalizado | Transferido para atendimento humano"
 _CX_ASSUME_HEADER = "Resumo do bot IA | Atendimento assumido durante a conversa"

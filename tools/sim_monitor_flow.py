@@ -220,6 +220,20 @@ def cenario_config_e_texto():
           "template + texto extra -> Indeterminada (regra ao pe da letra)")
     check(co("Bom dia") == "indeterminada", "texto livre -> Indeterminada")
 
+    fila = ms._eh_entrada_na_fila
+    check(fila({"direction": "system",
+                "content": "Bot finalizado | Bot: Setor=Comercial | Encaminhado para Comercial"}),
+          "handoff do bot simples conta como entrada na fila")
+    check(fila({"direction": "system",
+                "content": "Bot IA finalizado | Transferido para atendimento humano\nNome: Joao\nResumo: quer betoneira"}),
+          "handoff do agente de IA (Hugo) conta como entrada na fila")
+    check(not fila({"direction": "system",
+                    "content": "Resumo do bot IA | Atendimento assumido durante a conversa\nResumo: x"}),
+          "assumir durante a conversa do agente nao e entrada na fila")
+    check(not fila({"direction": "inbound",
+                    "content": "Bot IA finalizado | Transferido para atendimento humano"}),
+          "so mensagem de sistema conta como entrada na fila")
+
 
 def cenario_fila():
     titulo("CENARIO 2 — fila de espera (casos A-I do painel + extras), segunda 10h")
