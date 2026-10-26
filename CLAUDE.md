@@ -40,7 +40,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
   (rules combinadas com o follow-up: 861 verificacoes em 2026-10-18).
   Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
-  `tools\sim_followup_api.py` (53), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
+  `tools\sim_followup_api.py` (56), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
@@ -174,8 +174,12 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
   transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
   mesmo áudio por dias (incidente 2026-08-14/18).
-- **Follow-up (PR #2, 2026-10-18):** `FEATURE_FOLLOWUP` (default false) e GLOBAL — antes de ligar,
-  criar gate por tenant (ou desligar as 5 chaves de Follow-up nos perfis dos outros tenants). A recusa
+- **Follow-up (PR #2, 2026-10-18):** liga POR TENANT (2026-10-26): `FEATURE_FOLLOWUP` (env, chave
+  geral) **E** `tenants/{id}.settings.followup_enabled is True` (`tenant_followup_enabled`, em
+  `followup_routes.py`); sem as duas, a API `/api/followup` da 404 e a sessao manda
+  `followup.enabled=false` (tela, Finalidade do template e chaves de perfil somem). Template comercial
+  e reabertura pontual checam `_require_contact_access` ANTES do 409 da recusa (senao o 409 revela a
+  recusa de lead alheio — LGPD); o gate de envio, que silencia a Val na Recepcao, segue depois. A recusa
   comercial (`wa_contacts.commercial_contact_block`) barra template comercial, reabertura pontual, o scan
   v2 do lote (`scan_reopen_audiences`), o worker (pulo contado em `pulados_recusa_comercial`) e o script
   one-off; **se desfaz quando o paciente manda mensagem nova** (decisao do PO, mesmo D4 do Encerrar),

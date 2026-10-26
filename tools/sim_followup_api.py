@@ -160,6 +160,18 @@ def run():
         routes.FEATURE_FOLLOWUP = False
         request(client, "GET", "/settings", 404, label="flag desligada nega API")
         routes.FEATURE_FOLLOWUP = True
+        # Chave por tenant (2026-10-26): alem da flag geral, settings.followup_enabled=True no doc do tenant.
+        import tenant_service as _ts
+        _ts.get_tenant = lambda tid: {"id": tid, "settings": {}}
+        session()
+        request(client, "GET", "/settings", 404, label="tenant sem a chave do follow-up nao ve a API (flag geral ligada)")
+        check(routes.tenant_followup_enabled(fake.TENANT, {"settings": {"followup_enabled": "sim"}}) is False,
+              "chave do tenant so vale com True explicito")
+        routes.FEATURE_FOLLOWUP = False
+        check(routes.tenant_followup_enabled(fake.TENANT, {"settings": {"followup_enabled": True}}) is False,
+              "flag geral desligada vence a chave do tenant")
+        routes.FEATURE_FOLLOWUP = True
+        _ts.get_tenant = lambda tid: {"id": tid, "settings": {"followup_enabled": tid == fake.TENANT}}
         session({**fake.ALICE, "tenant_id": ""})
         request(client, "GET", "/settings", 403, label="sessao sem tenant negada")
         session(context="other_tenant")

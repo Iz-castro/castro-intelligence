@@ -1770,7 +1770,7 @@ function ContactTagsCard({ contact }: { contact: Contact }) {
 }
 
 function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
-  const { readOnly, config } = useCrm();
+  const { readOnly, config, followupEnabled } = useCrm();
   const { fetchTemplates, sendTemplate, reopenConversation, busyTemplate } = useCrm();
   const [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
@@ -1915,7 +1915,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
               {selected ? (
                 <>
                   {/* Finalidade so existe com o follow-up ligado; desligado, o envio segue comercial como antes. */}
-                  {config?.feature_followup ? <label htmlFor="template-contact-purpose" style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginBottom: "1rem", fontSize: "0.85rem" }}>
+                  {followupEnabled ? <label htmlFor="template-contact-purpose" style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginBottom: "1rem", fontSize: "0.85rem" }}>
                     <span>Finalidade deste contato</span>
                     <select id="template-contact-purpose" value={isReopen ? "commercial" : contactPurpose} disabled={isReopen || busyTemplate} onChange={(event) => setContactPurpose(event.target.value as "commercial" | "service")}>
                       <option value="commercial">Retomada comercial</option>
@@ -2874,7 +2874,7 @@ function ReopenBatchModal() {
 // ---------------------------------------------------------------------------
 
 function PerfisAcessoModal() {
-  const { readOnly, config } = useCrm();
+  const { readOnly, config, followupEnabled } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
@@ -2916,7 +2916,7 @@ function PerfisAcessoModal() {
   // salvo, entao salvar o perfil nao a altera).
   const ocultas = new Set<string>([
     ...(config?.feature_impersonate ? [] : ["ver_como_usuario"]),
-    ...(config?.feature_followup ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
+    ...(followupEnabled ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
       "registrar_recusa_comercial", "reativar_contato_comercial"]),
   ]);
   const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {

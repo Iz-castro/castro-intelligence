@@ -83,6 +83,13 @@ def run():
         expect(409, main.wa_send_template(main.WaSendTemplateRequest(contact_id=12), current_user=user))
         assert calls["gate"] == calls["posts"] == 0
 
+        # LGPD (2026-10-26): lead de OUTRA operadora com recusa -> 403 de acesso,
+        # nunca o 409 que revelaria a recusa a quem nao ve o lead.
+        current = dict(blocked, assigned_to=99, assigned_to_uid="uid99")
+        expect(403, main.wa_reopen_conversation(conv["id"], current_user=user))
+        expect(403, main.wa_send_template(main.WaSendTemplateRequest(contact_id=12), current_user=user))
+        assert calls["gate"] == calls["posts"] == 0, "Sem acesso: nem recusa revelada nem gate que silencia a Val"
+
         current = deepcopy(clean)
         changed_during_listing = True
         body = main.WaSendTemplateRequest(contact_id=12, template_name="template_sim")

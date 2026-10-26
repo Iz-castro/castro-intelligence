@@ -756,8 +756,11 @@ async def session_info(current_user: dict = Depends(get_current_user)):
     # frontend, ao vivo pelo snapshot do perfil) estao ligados — conceder o
     # toggle a outro perfil vale sem relogin.
     from monitor_service import monitor_config
+    from followup_routes import tenant_followup_enabled
     return {
         "monitor": {"enabled": bool(monitor_config(tenant_id))},
+        # Follow-up por tenant (chave geral + settings.followup_enabled).
+        "followup": {"enabled": tenant_followup_enabled(tenant_id, tenant_doc)},
         "user": current_user,
         "auth_mode": AUTH_MODE,
         "tenant_id": tenant_id,
@@ -3005,6 +3008,11 @@ async def wa_send_template(
     commercial = (body is None or body.contact_purpose == "commercial"
                   or effective_template_name == REOPEN_TEMPLATE_NAME)
     if commercial:
+        # Acesso de leitura ANTES da recusa: sem isto o 409 revelava a recusa
+        # comercial de lead alheio (LGPD). Checagem sem efeito colateral; a de
+        # envio abaixo (que silencia o bot na Recepcao) segue depois do 409.
+        if contact:
+            _require_contact_access(contact, current_user)
         _require_commercial_contact_allowed(contact)
     _check_conv_send_permission(conv, current_user, contact, channel=channel)
     token, phone_id, api_base = _resolve_channel_creds_by_id(
@@ -3278,6 +3286,9 @@ async def wa_reopen_conversation(
     ultima conversa). Reusa /send-template (guard WABA + billing + persist).
     Nome/idioma do template vem do frontend (ou env default)."""
     conv, contact, channel = _resolve_send_target(conversation_id, None)
+    # Acesso de leitura antes da recusa (mesmo motivo do send-template).
+    if contact:
+        _require_contact_access(contact, current_user)
     _require_commercial_contact_allowed(contact)
     _check_conv_send_permission(conv, current_user, contact, channel=channel)
 

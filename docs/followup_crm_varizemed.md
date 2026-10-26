@@ -860,3 +860,19 @@ verificações de respostas tardias, atualização, troca de contato e perda de
 acesso executando TSX real com hooks/HTTP/timers simulados. Não houve teste visual em navegador autenticado, teste
 no motor de regras do emulador, publicação de índices ou smoke com serviços
 reais; esses checks pertencem ao preparo da liberação.
+
+### 16.1 Liberação por cliente — 26/10/2026
+
+`FEATURE_FOLLOWUP` deixou de ser a única chave: o follow-up só aparece para um
+cliente com a chave geral ligada **e** `settings.followup_enabled = true` no
+documento do tenant (gravado pela Castro, como `settings.ai`). Sem as duas, a API
+responde 404, a sessão informa `followup.enabled = false` e a interface esconde o
+painel, a Finalidade do template e as chaves de Follow-up nos perfis. Ligado só
+para a Varizemed; Hubloc e `varizemed-test` continuam sem.
+
+Correção de privacidade no mesmo pacote: o envio de template comercial e a
+reabertura pontual passaram a conferir o acesso ao contato antes de responder
+"paciente pediu para não receber". Antes, uma operadora sem acesso ao lead
+recebia esse 409 e ficava sabendo da recusa; agora recebe 403. A checagem não
+silencia a Val (o gate de envio, que silencia na Recepção, continua depois).
+Coberto em `sim_followup_api.py` (56) e `sim_followup_send_guards.py`.

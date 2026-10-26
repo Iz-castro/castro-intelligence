@@ -54,6 +54,9 @@ type CrmContextValue = {
   // toggle ver_monitor_atendimento (can(), ao vivo) o item "Dashboard" do
   // menu vira "Monitor".
   monitorEnabled: boolean;
+  // Follow-up ligado PARA ESTE TENANT (chave geral + chave do tenant, decididas
+  // no servidor e entregues na /api/session).
+  followupEnabled: boolean;
   operators: Operator[];
   departments: Department[];
   channels: Channel[];
@@ -464,6 +467,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const endingImpersonationPromiseRef = useRef<Promise<boolean> | null>(null);
   const [tenantName, setTenantName] = useState("");
   const [monitorEnabled, setMonitorEnabled] = useState(false);
+  const [followupEnabled, setFollowupEnabled] = useState(false);
   // Perfil RBAC efetivo da sessao (M-B2). Nasce do /api/session (toggles ja
   // resolvidos com fallback de role) e e atualizado ao vivo pelo snapshot do
   // doc perfis_acesso/{id} do tenant.
@@ -1352,6 +1356,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setUserSettings(DEFAULT_USER_SETTINGS);
     setTenantName("");
     setMonitorEnabled(false);
+    setFollowupEnabled(false);
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
@@ -1470,6 +1475,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           tenant_id?: string;
           tenant?: { id: string; name?: string; plan?: string; modules?: string[] };
           monitor?: { enabled?: boolean };
+          followup?: { enabled?: boolean };
           firestore_collections?: Record<string, string>;
           perfil?: SessionPerfil;
         }>(bundle.auth, "/api/session");
@@ -1499,6 +1505,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // titulo do topbar. Fallback = tenant_id (o backend ja faz isso).
         setTenantName(session.tenant?.name || "");
         setMonitorEnabled(!!session.monitor?.enabled);
+        setFollowupEnabled(!!session.followup?.enabled);
         if (readOnly) {
           const fingerprint = perfilFingerprint(session.perfil ?? null);
           const wide = session.perfil?.toggles.ver_todos_leads === true && ["admin", "supervisor"].includes(session.user.role);
@@ -3753,7 +3760,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
+    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, followupEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,

@@ -28,6 +28,22 @@ def _page_alias(response, key):
     return {**response, "items": response.get(key, [])}
 
 
+def tenant_followup_enabled(tenant_id, tenant_doc=None) -> bool:
+    """Follow-up ligado PARA O TENANT: chave geral (FEATURE_FOLLOWUP) E
+    settings.followup_enabled=True no doc do tenant (so a Castro grava, como o
+    settings.ai). Desligado no tenant = API 404 e tela escondida."""
+    if not FEATURE_FOLLOWUP or not tenant_id:
+        return False
+    if tenant_doc is None:
+        try:
+            from tenant_service import get_tenant
+            tenant_doc = get_tenant(tenant_id) or {}
+        except Exception:
+            return False
+    settings = tenant_doc.get("settings") if isinstance(tenant_doc, dict) else None
+    return isinstance(settings, dict) and settings.get("followup_enabled") is True
+
+
 def create_followup_router(get_current_user, require_contact_access):
     router = APIRouter(prefix="/api/followup", tags=["followup"])
 
@@ -37,6 +53,8 @@ def create_followup_router(get_current_user, require_contact_access):
         tenant_id = str(current_user.get("tenant_id") or "")
         if not tenant_id or get_tenant_context() != tenant_id:
             raise HTTPException(403, "Sessão sem contexto de tenant válido")
+        if not tenant_followup_enabled(tenant_id):
+            raise HTTPException(404, "Follow-up indisponível para este cliente")
         row = get_user_raw_by_id(current_user.get("id"))
         if (not row or not row.get("is_active", True)
                 or str(row.get("firebase_uid") or "") != str(current_user.get("firebase_uid") or "")
