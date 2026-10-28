@@ -196,6 +196,13 @@ def authenticate_firebase_token(id_token, ip_address="", *, decoded_token=None, 
     try:
         decoded = decoded_token if decoded_token is not None else verify_firebase_id_token(id_token)
     except Exception as exc:
+        # Falha de INFRA na verificacao (nao conseguiu buscar as chaves publicas
+        # do Google: CertificateFetchError/rede) NAO e token invalido. 401 derruba
+        # a sessao viva no refresh de ~1h; 503 faz o frontend tentar de novo
+        # (revisao 2026-10-28).
+        if type(exc).__name__ == "CertificateFetchError" or isinstance(exc, (ConnectionError, TimeoutError)):
+            logger.warning("Verificacao do Firebase ID token indisponivel: %s", exc)
+            return {"success": False, "status_code": 503, "error": "Verificacao do token indisponivel; tente novamente"}
         logger.warning("Falha ao validar Firebase ID token: %s", exc)
         return {"success": False, "status_code": 401, "error": "Token Firebase invalido"}
 

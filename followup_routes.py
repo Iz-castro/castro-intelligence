@@ -103,7 +103,7 @@ def create_followup_router(get_current_user, require_contact_access):
             try:
                 authorize(contact_id, conversation_id, target)
             except HTTPException as exc:
-                if exc.status_code in (403, 404):
+                if exc.status_code in (403, 404, 503):  # 503 = checagem indisponivel: pula o candidato
                     continue
                 raise
             result.append({"id": user_id, "display_name": str(row.get("display_name") or "Operador"),
@@ -210,7 +210,7 @@ def create_followup_router(get_current_user, require_contact_access):
                 try:
                     row = authorize(contact_id, snap.id, user)["conversation"]
                 except HTTPException as exc:
-                    if exc.status_code in (403, 404):
+                    if exc.status_code in (403, 404, 503):  # 503 = checagem indisponivel: pula o candidato
                         continue
                     raise
                 rows.append(row)

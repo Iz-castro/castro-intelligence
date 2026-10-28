@@ -30,11 +30,11 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (229).
-  Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
+  Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover: `tools\sim_reception_flow.py` (324).
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (61).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
-  History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
+  History sync/eco do coex (recência real, janela de 24h, dono da thread, idempotência por bloco): `tools\sim_history_recency.py` (62).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
   `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
   `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
@@ -186,6 +186,24 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   no `save_wa_message`, so para inbound recebido posterior ao registro (clique, reacao e historico nao
   contam). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
   250/dia). Tarefas e historico (`crm_tasks`, `crm_activities`) sao so do backend nas rules.
+- **Event loop único (`--workers 1`): trabalho síncrono pesado roda em `run_in_threadpool`** (2026-10-28).
+  O cliente Firestore é síncrono; uma chamada longa dentro de `async def` congela TODAS as requests da
+  instância. Já estão fora do loop: Whisper (`_transcribe_off_loop`, semáforo de 1), os crons
+  (`_verify_cron_auth` + `expire_stale_takeovers`/`close_stale_attendances`/pool-wait) e o `smb_app_state_sync`.
+  `close_stale_attendances` retorna cedo em tenant legacy com auto_close OFF (lia 2.351 threads por execução).
+  **History do coex é idempotente por BLOCO** (`history_chunks/{numero__c<canal>__fase__ordem__hash}`,
+  `claim_history_chunk`/`finish_history_chunk`, `claim_id` por tentativa): a Meta reenviava o mesmo bloco ~1x/h
+  por ~6 dias e cada reentrega travava o loop 43–63 s (apuração 2026-10-27: 75/75 congelamentos vistos pelas
+  operadoras). `done` só depois de persistir tudo; `failed` libera o lease (mídia inline sem download também é
+  `failed` + fila de pendentes). **Reentrega durante a importação (`busy`) responde 503** — única resposta não-2xx
+  do `/webhook` — para a Meta reentregar até cair em `done`; um 200 sem cópia durável perderia o bloco se o dono do
+  lease morresse. Ainda inline no loop: a PRIMEIRA entrega de cada bloco (194–210 s) — não conectar número coex
+  novo em horário de pico até levar `_process_history_threads` para thread.
+- **Transfer/return/takeover exigem posse da origem** (`_require_transfer_source_access`, 2026-10-28): operador
+  comum só transfere thread própria ou da pool **com lead sem dono (ou seu)** — órfã de lead alheio não é pool;
+  por `contact_id`, só lead próprio/pool, e o gate roda ANTES do `_resolve_send_target` (que faz upsert). Sem ramo
+  de takeover: o handler é gravado pelo próprio `/takeover`, que agora só aceita `pending` com handler = eu ou número
+  meu (antes qualquer operador virava handler de thread sem conflito, silenciava o bot e forjava posse).
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar

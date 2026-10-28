@@ -65,7 +65,19 @@ def run():
         else:
             raise AssertionError("HTTP esperado")
 
-    with patch.multiple(main,
+    class EmptyQuery:
+        # Thread-check do _require_contact_access: nenhuma thread do operador
+        # (403 genuino; falha de infra na consulta agora responde 503).
+        def where(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def stream(self):
+            return iter(())
+
+    with patch("firestore_common.collection", lambda name: EmptyQuery()), patch.multiple(main,
         _resolve_send_target=lambda *args: (conv, deepcopy(current), {"id": 6}),
         _check_conv_send_permission=gate,
         ensure_permission=lambda *args: None,

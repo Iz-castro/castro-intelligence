@@ -8,6 +8,7 @@ Trata mensagens de texto, imagem, audio, video, sticker, localizacao e documento
 import asyncio
 import hmac
 import hashlib
+import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,7 @@ from database import (
     append_bot_buffer, claim_and_drain_bot_buffer,
     drain_claimed_bot_buffer, release_bot_buffer_claim,
     bot_buffer_claim_ttl_seconds,
+    claim_history_chunk, finish_history_chunk,
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
@@ -553,6 +555,41 @@ _CHANNEL_DEPENDENT_FIELDS = ("smb_message_echoes", "history", "messages", "smb_a
 _COEX_OWNER_REQUIRED_FIELDS = ("smb_message_echoes", "history", "messages")
 
 
+_STT_SEMAPHORE = None
+# contact_id -> asyncio.Event de transcricao EM ANDAMENTO nesta instancia.
+_STT_INFLIGHT: dict = {}
+STT_ORDER_WAIT_SECONDS = 60
+
+
+async def _await_stt_inflight(contact_id):
+    """Texto que chega enquanto um AUDIO anterior do mesmo contato ainda esta
+    sendo transcrito espera a transcricao (com teto). Com o Whisper fora do
+    loop, o texto passava na frente e o bot recebia os turnos invertidos
+    (revisao 2026-10-28). O evento e setado assim que a transcricao termina,
+    antes do despacho do audio ao bot/buffer: o audio entra primeiro."""
+    event = _STT_INFLIGHT.get(contact_id)
+    if event is None:
+        return
+    try:
+        await asyncio.wait_for(event.wait(), timeout=STT_ORDER_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("[STT] texto seguiu sem esperar a transcricao | contact=%s", contact_id)
+
+
+async def _transcribe_off_loop(audio_bytes, **kwargs):
+    """Whisper FORA do event loop (2026-10-28). transcribe_audio_bytes e
+    sincrona (ffmpeg em subprocess + CTranslate2) e segurava o unico worker
+    por 5-45 s a cada audio — toda request da tela esperava. Threadpool +
+    semaforo de 1 transcricao por instancia (1 vCPU; CTranslate2 solta o GIL).
+    O guard was_dup continua valendo no caller (reentrega nao re-transcreve)."""
+    global _STT_SEMAPHORE
+    if _STT_SEMAPHORE is None:
+        _STT_SEMAPHORE = asyncio.Semaphore(1)
+    from transcription_service import transcribe_audio_bytes
+    async with _STT_SEMAPHORE:
+        return await run_in_threadpool(transcribe_audio_bytes, audio_bytes, **kwargs)
+
+
 async def process_webhook_payload(payload, ws_notify_callback=None):
     """
     Processa o payload completo do webhook.
@@ -575,6 +612,12 @@ async def process_webhook_payload(payload, ws_notify_callback=None):
     ctx_token = set_tenant_context(tenant_id)
     try:
         await _process_webhook_payload_inner(payload, ws_notify_callback)
+    except HistoryChunkBusy:
+        # Bloco do history em importacao por OUTRA request (lease valido):
+        # nao ha copia duravel aqui, entao nao e sucesso. Propaga: o handler
+        # HTTP responde 503 e a Meta reentrega ate cair em 'done' (ou o lease
+        # vencer, se o dono morreu). Revisao 2026-10-28.
+        raise
     except Exception as exc:
         # Erro nao tratado durante processamento → enfileira pra retry
         # humano em vez de devolver 5xx pra Meta.
@@ -1501,6 +1544,9 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 # was_dup=True pularia o bot permanentemente (achado da revisao).
                 # Degrada so a resposta do bot; auto-recupera na proxima msg.
                 try:
+                    # Audio anterior do mesmo contato ainda transcrevendo? Espera,
+                    # para o bot receber os turnos na ordem em que o cliente falou.
+                    await _await_stt_inflight(contact_id)
                     _bot_token = (channel_token or WHATSAPP_TOKEN or "").strip()
                     _bot_phone_id = channel_phone_id or WHATSAPP_PHONE_NUMBER_ID
                     _bot_buffer_outcome = await _buffered_bot_turn(
@@ -1589,15 +1635,24 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # no meio, o audio fica sem transcricao (operador ainda ouve).
         if FEATURE_AUDIO_TRANSCRIPTION and _audio_bytes_for_stt and db_id and not was_dup:
             try:
-                from transcription_service import get_speech_client, transcribe_audio_bytes
+                from transcription_service import get_speech_client
                 speech_client = get_speech_client()
                 if speech_client:
-                    transcript = transcribe_audio_bytes(
-                        _audio_bytes_for_stt,
-                        media_mime=_audio_mime_for_stt,
-                        language_code=STT_LANGUAGE_CODE,
-                        timeout_s=STT_TIMEOUT_SECONDS,
-                    )
+                    _stt_event = asyncio.Event()
+                    _STT_INFLIGHT[contact_id] = _stt_event
+                    try:
+                        transcript = await _transcribe_off_loop(
+                            _audio_bytes_for_stt,
+                            media_mime=_audio_mime_for_stt,
+                            language_code=STT_LANGUAGE_CODE,
+                            timeout_s=STT_TIMEOUT_SECONDS,
+                        )
+                    finally:
+                        # Libera o texto que espera (ver _await_stt_inflight);
+                        # o despacho do audio abaixo e sincrono ate o 1o await.
+                        _stt_event.set()
+                        if _STT_INFLIGHT.get(contact_id) is _stt_event:
+                            _STT_INFLIGHT.pop(contact_id, None)
                     if not transcript and STT_FALLBACK_TEXT:
                         transcript = STT_FALLBACK_TEXT
                     if transcript:
@@ -2054,6 +2109,29 @@ def _process_smb_app_state_sync(value, channel=None):
 # Coexistence: history (importacao de 180 dias)
 # ---------------------------------------------------------------------------
 
+class HistoryChunkBusy(Exception):
+    """Bloco do history em importacao por outra request (lease valido)."""
+
+
+class HistoryChunkIncomplete(Exception):
+    """Bloco importado com midia inline que falhou no download: marcador
+    'failed' e payload para a fila de pendentes (reentrega re-baixa so o que
+    faltou, via skip_media)."""
+
+
+def _history_chunk_key(channel_key, channel_id, phase, chunk_order, threads):
+    """Chave estavel do bloco do history: numero + canal + fase + ordem + hash
+    dos ids das mensagens. O envelope muda alguns bytes entre reentregas
+    (metadata), os ids das mensagens nao. channel_id entra para um canal
+    recriado (wipe + novo signup, mesmo numero) nao herdar 'done' do antigo."""
+    canon = sorted(
+        (str(t.get("id", "")), sorted(str(m.get("id", "")) for m in (t.get("messages") or []) if isinstance(m, dict)))
+        for t in threads if isinstance(t, dict)
+    )
+    digest = hashlib.sha256(json.dumps(canon, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return f"{channel_key or 'sem-canal'}__c{channel_id if channel_id is not None else 'x'}__{phase}__{chunk_order}__{digest}"
+
+
 async def _process_history(value, ws_notify_callback=None, channel=None):
     """
     Processa webhooks de historico do app WhatsApp Business.
@@ -2099,239 +2177,52 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
         )
 
         threads = hist.get("threads", [])
-        for thread in threads:
-            thread_phone = str(thread.get("id", "")).strip()
-            if not thread_phone:
-                continue
-
-            normalized_thread_phone = normalize_br_phone(thread_phone)
-            # History NAO e evento de mensagem ao vivo: nao carimba
-            # last_message_at/last_inbound_at com a hora da importacao nem cria
-            # a conversa com "agora". Cada fase/re-entrega do history fazia
-            # centenas de conversas antigas parecerem recentes — tomavam a
-            # janela top-50 do Meus e abriam a janela de 24h de contato antigo
-            # (incidente Roberta/hubloc 2026-10-14). Conversa e recencia nascem
-            # dos save_wa_message abaixo, com o timestamp_wa REAL (monotonico).
-            contact_id = upsert_wa_contact(
-                normalized_thread_phone, "",
-                channel_id=hist_channel_id,
-                phone_number_id=hist_channel_phone,
-                source_channel_type=hist_channel_type,
-                auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
-                from_message_event=False,
-                created_source="history",
-            )
-            messages = thread.get("messages", [])
-            # Ultima inbound REAL do cliente nesta thread: alimenta a janela de
-            # 24h (bump monotonico apos o loop) — so abre se o cliente de fato
-            # escreveu nas ultimas 24h.
-            thread_last_inbound_at = None
-            # Datas REAIS da thread (unix da Meta; timestamp invalido nao conta
-            # — o fallback de _parse_unix_timestamp e "agora").
-            _thread_ts = []
-            for _m in messages:
-                try:
-                    _thread_ts.append(datetime.fromtimestamp(int(_m.get("timestamp", "")), tz=timezone.utc))
-                except (TypeError, ValueError, OSError):
-                    pass
-            if messages and hist_channel_id is not None:
-                # Garante que a thread NASCE com o DONO DO NUMERO (coex) e com a
-                # recencia REAL — o que o upsert do contato fazia antes, so que
-                # com "agora". Sem isto a 1a save_wa_message criaria a thread
-                # herdando o Dono do LEAD: o historico do celular pessoal de um
-                # operador iria pro colega dono do lead (LGPD). Thread que ja tem
-                # dono nao muda; recencia so avanca (monotonico) e so com data
-                # real. Depois de criada, a posse segue as regras normais (ex.:
-                # fechamento por inatividade reverte ao sale_owner — ADR 0008).
-                upsert_wa_conversation(
-                    contact_id=contact_id,
-                    wa_id=normalized_thread_phone,
-                    channel_id=hist_channel_id,
-                    source_channel_type=hist_channel_type,
-                    phone_number_id=hist_channel_phone,
-                    auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
-                    message_at=max(_thread_ts) if _thread_ts else None,
-                    advance_recency=bool(_thread_ts),
-                )
-
-            # Normaliza business_phone uma vez (nono digito BR) — comparacao
-            # com msg_from/msg_to crus dava direction errada quando empresa
-            # cadastrou o numero sem 9 e o webhook entrega com (ou vice-versa).
-            business_phone_normalized = normalize_br_phone(business_phone) if business_phone else ""
-
-            for msg in messages:
-                msg_from_raw = str(msg.get("from", "")).replace("+", "").replace(" ", "").replace("-", "")
-                msg_to_raw = str(msg.get("to", "")).replace("+", "").replace(" ", "").replace("-", "")
-                msg_from = normalize_br_phone(msg_from_raw) if msg_from_raw else ""
-                msg_to = normalize_br_phone(msg_to_raw) if msg_to_raw else ""
-                msg_id = msg.get("id", "")
-                msg_type = msg.get("type", "unknown")
-                timestamp = msg.get("timestamp", "")
-                ts_iso = _parse_unix_timestamp(timestamp)
-                history_context = msg.get("history_context", {})
-                msg_status = str(history_context.get("status", "")).lower()
-                # Reentrega de chunk de history (retry Meta / pending_events):
-                # nao re-baixar midia ja persistida.
-                skip_media = _media_already_downloaded(msg_id)
-
-                # Determinar direcao: se 'from' e o telefone da empresa, e outbound
-                is_outbound = (msg_from == business_phone_normalized) or bool(msg_to)
-                direction = "outbound" if is_outbound else "inbound"
-                # Data REAL da mensagem (unix da Meta). Invalida = None: nao
-                # avanca recencia nem abre a janela de 24h (o fallback de
-                # _parse_unix_timestamp e "agora").
-                try:
-                    _msg_at = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
-                except (TypeError, ValueError, OSError):
-                    _msg_at = None
-                if direction == "inbound" and _msg_at and (
-                        thread_last_inbound_at is None or _msg_at > thread_last_inbound_at):
-                    thread_last_inbound_at = _msg_at
-
-                # media_placeholder: midia sera enviada em webhook separado
-                if msg_type == "media_placeholder":
-                    save_wa_message(
-                        wa_message_id=msg_id,
-                        contact_id=contact_id,
-                        direction=direction,
-                        msg_type="media_placeholder",
-                        content="[Midia do historico - aguardando]",
-                        status=msg_status or "delivered",
-                        timestamp_wa=ts_iso,
-                        operator_id=hist_channel_owner if direction == "outbound" else None,
-                        channel_id=hist_channel_id,
-                        phone_number_id=hist_channel_phone,
-                        channel_owner_user_id=hist_channel_owner,
-                        sender_user_id=hist_channel_owner if direction == "outbound" else None,
-                        # Mensagem ANTIGA importada: nao reabre atendimento
-                        # fechado e so mexe na recencia com data real.
-                        advance_recency=_msg_at is not None,
-                        reopen_attendance=False,
-                    )
-                    continue
-
-                # Extrair conteudo conforme tipo
-                content = ""
-                media_path = ""
-                media_mime = ""
-                media_id_str = ""
-                latitude = None
-                longitude = None
-                filename = ""
-                effective_msg_type = msg_type
-
-                if msg_type == "text":
-                    text_obj = msg.get("text", {})
-                    content = text_obj.get("body", "") if isinstance(text_obj, dict) else ""
-
-                elif msg_type == "image":
-                    image = msg.get("image", {}) if isinstance(msg.get("image"), dict) else {}
-                    media_id_str = image.get("id", "")
-                    media_mime = image.get("mime_type", "")
-                    content = image.get("caption", "")
-                    if media_id_str and not skip_media:
-                        media_result = await download_media(media_id_str, "image")
-                        if media_result:
-                            media_path = media_result["path"]
-                            media_mime = media_result["mime_type"]
-
-                elif msg_type == "audio":
-                    audio = msg.get("audio", {}) if isinstance(msg.get("audio"), dict) else {}
-                    media_id_str = audio.get("id", "")
-                    media_mime = audio.get("mime_type", "")
-                    if media_id_str and not skip_media:
-                        media_result = await download_media(media_id_str, "audio")
-                        if media_result:
-                            media_path = media_result["path"]
-                            media_mime = media_result["mime_type"]
-
-                elif msg_type == "video":
-                    video = msg.get("video", {}) if isinstance(msg.get("video"), dict) else {}
-                    effective_msg_type = "gif" if video.get("gif") else "video"
-                    media_id_str = video.get("id", "")
-                    media_mime = video.get("mime_type", "")
-                    content = video.get("caption", "")
-                    if media_id_str and not skip_media:
-                        media_result = await download_media(media_id_str, "video")
-                        if media_result:
-                            media_path = media_result["path"]
-                            media_mime = media_result["mime_type"]
-
-                elif msg_type == "document":
-                    doc = msg.get("document", {}) if isinstance(msg.get("document"), dict) else {}
-                    media_id_str = doc.get("id", "")
-                    media_mime = doc.get("mime_type", "")
-                    filename = doc.get("filename", "")
-                    content = doc.get("caption", "")
-                    if media_id_str and not skip_media:
-                        media_result = await download_media(media_id_str, "document", filename)
-                        if media_result:
-                            media_path = media_result["path"]
-                            media_mime = media_result["mime_type"]
-
-                elif msg_type == "sticker":
-                    sticker = msg.get("sticker", {}) if isinstance(msg.get("sticker"), dict) else {}
-                    media_id_str = sticker.get("id", "")
-                    media_mime = sticker.get("mime_type", "image/webp")
-                    if media_id_str and not skip_media:
-                        media_result = await download_media(media_id_str, "sticker")
-                        if media_result:
-                            media_path = media_result["path"]
-                            media_mime = media_result["mime_type"]
-
-                elif msg_type == "location":
-                    loc = msg.get("location", {}) if isinstance(msg.get("location"), dict) else {}
-                    latitude = loc.get("latitude")
-                    longitude = loc.get("longitude")
-                    loc_name = loc.get("name", "")
-                    loc_address = loc.get("address", "")
-                    content = f"{loc_name} {loc_address}".strip() if (loc_name or loc_address) else ""
-
-                elif msg_type == "contacts":
-                    content = str(msg.get("contacts", []))
-
-                elif msg_type == "reaction":
-                    reaction = msg.get("reaction", {}) if isinstance(msg.get("reaction"), dict) else {}
-                    content = reaction.get("emoji", "")
-
-                else:
-                    content = f"[{msg_type}]"
-
-                save_wa_message(
-                    wa_message_id=msg_id,
-                    contact_id=contact_id,
-                    direction=direction,
-                    msg_type=effective_msg_type,
-                    content=content,
-                    media_path=media_path,
-                    media_mime=media_mime,
-                    media_id=media_id_str,
-                    latitude=latitude,
-                    longitude=longitude,
-                    filename=filename,
-                    status=msg_status or ("received" if direction == "inbound" else "sent"),
-                    timestamp_wa=ts_iso,
-                    operator_id=hist_channel_owner if direction == "outbound" else None,
-                    channel_id=hist_channel_id,
-                    phone_number_id=hist_channel_phone,
-                    channel_owner_user_id=hist_channel_owner,
-                    sender_user_id=hist_channel_owner if direction == "outbound" else None,
-                    # Mensagem ANTIGA importada: nao reabre atendimento fechado
-                    # e so mexe na recencia com data real.
-                    advance_recency=_msg_at is not None,
-                    reopen_attendance=False,
-                )
-
-            if thread_last_inbound_at is not None:
-                try:
-                    bump_contact_last_inbound_at(contact_id, thread_last_inbound_at)
-                except Exception as exc:
-                    logger.warning("[HISTORY] bump last_inbound_at falhou | contact=%s: %s", contact_id, exc)
-
+        # Idempotencia por BLOCO (2026-10-28): a Meta reenvia o mesmo chunk
+        # ~1x/h por ~6 dias quando o 200 chega tarde, e cada reentrega
+        # travava o loop por 43-63 s sem gravar nada novo. Bloco ja 'done'
+        # ou em processamento por outra copia -> pula (200 em ms). Ver
+        # claim_history_chunk em database_firestore.
+        chunk_key = _history_chunk_key(hist_channel_phone or business_phone, hist_channel_id, phase, chunk_order, threads)
+        state = claim_history_chunk(chunk_key, {
+            "channel_id": hist_channel_id, "phone_number_id": hist_channel_phone or business_phone,
+            "phase": phase, "chunk_order": chunk_order, "progress": progress, "threads": len(threads),
+        })
+        if state == "done":
             logger.info(
-                "[HISTORY] Thread processada | phone=%s msgs=%d phase=%s",
-                redact_phone(thread_phone), len(messages), phase,
+                "[HISTORY] Bloco ja importado | phase=%s chunk=%s progress=%s%%",
+                phase, chunk_order, progress,
             )
+            continue
+        if state == "busy":
+            # 'busy' NAO e sucesso: sem copia duravel, um 200 aqui faria a Meta
+            # parar de reentregar e, se o dono do lease morrer (SIGKILL/OOM/
+            # timeout de 300 s), o bloco sumiria. Propaga ate o HTTP (503).
+            logger.info(
+                "[HISTORY] Bloco em importacao por outra request | phase=%s chunk=%s progress=%s%%",
+                phase, chunk_order, progress,
+            )
+            raise HistoryChunkBusy(chunk_key)
+        try:
+            msgs_total, media_failures = await _process_history_threads(
+                threads, business_phone=business_phone, hist_channel_id=hist_channel_id,
+                hist_channel_owner=hist_channel_owner, hist_channel_phone=hist_channel_phone,
+                hist_channel_type=hist_channel_type, phase=phase,
+            )
+        except Exception as exc:
+            # Libera o lease: a reentrega (Meta ou fila de pendentes) reprocessa.
+            # O finish pode falhar pela MESMA queda do Firestore: nao pode
+            # engolir a excecao original (ela e que leva o payload a fila).
+            try:
+                finish_history_chunk(chunk_key, "failed", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            except Exception as finish_exc:
+                logger.warning("[HISTORY] finish 'failed' falhou | key=%s: %s", chunk_key, finish_exc)
+            raise
+        if media_failures:
+            # download_media engole erro e devolve None: 'done' congelaria a
+            # midia perdida (antes cada reentrega re-baixava). 'failed' + fila.
+            finish_history_chunk(chunk_key, "failed", msgs=msgs_total, media_failures=media_failures)
+            raise HistoryChunkIncomplete(f"{chunk_key}: {media_failures} midia(s) sem download")
+        finish_history_chunk(chunk_key, "done", msgs=msgs_total)
 
         if progress == 100:
             logger.info("[HISTORY] Sincronizacao completa (100%%)")
@@ -2340,6 +2231,261 @@ async def _process_history(value, ws_notify_callback=None, channel=None):
                 action="history_sync_complete",
                 detail=f"Importacao do historico de mensagens concluida (phase={phase})",
             )
+
+
+async def _process_history_threads(threads, *, business_phone, hist_channel_id,
+                                   hist_channel_owner, hist_channel_phone,
+                                   hist_channel_type, phase):
+    """Grava as threads de UM bloco do history (corpo extraido de
+    _process_history em 2026-10-28 para o claim por bloco). Retorna o total
+    de mensagens do bloco e quantos downloads de midia inline falharam."""
+    msgs_total = 0
+    media_failures = 0
+    for thread in threads:
+        thread_phone = str(thread.get("id", "")).strip()
+        if not thread_phone:
+            continue
+
+        normalized_thread_phone = normalize_br_phone(thread_phone)
+        # History NAO e evento de mensagem ao vivo: nao carimba
+        # last_message_at/last_inbound_at com a hora da importacao nem cria
+        # a conversa com "agora". Cada fase/re-entrega do history fazia
+        # centenas de conversas antigas parecerem recentes — tomavam a
+        # janela top-50 do Meus e abriam a janela de 24h de contato antigo
+        # (incidente Roberta/hubloc 2026-10-14). Conversa e recencia nascem
+        # dos save_wa_message abaixo, com o timestamp_wa REAL (monotonico).
+        contact_id = upsert_wa_contact(
+            normalized_thread_phone, "",
+            channel_id=hist_channel_id,
+            phone_number_id=hist_channel_phone,
+            source_channel_type=hist_channel_type,
+            auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+            from_message_event=False,
+            created_source="history",
+        )
+        messages = thread.get("messages", [])
+        msgs_total += len(messages)
+        # Ultima inbound REAL do cliente nesta thread: alimenta a janela de
+        # 24h (bump monotonico apos o loop) — so abre se o cliente de fato
+        # escreveu nas ultimas 24h.
+        thread_last_inbound_at = None
+        # Datas REAIS da thread (unix da Meta; timestamp invalido nao conta
+        # — o fallback de _parse_unix_timestamp e "agora").
+        _thread_ts = []
+        for _m in messages:
+            try:
+                _thread_ts.append(datetime.fromtimestamp(int(_m.get("timestamp", "")), tz=timezone.utc))
+            except (TypeError, ValueError, OSError):
+                pass
+        if messages and hist_channel_id is not None:
+            # Garante que a thread NASCE com o DONO DO NUMERO (coex) e com a
+            # recencia REAL — o que o upsert do contato fazia antes, so que
+            # com "agora". Sem isto a 1a save_wa_message criaria a thread
+            # herdando o Dono do LEAD: o historico do celular pessoal de um
+            # operador iria pro colega dono do lead (LGPD). Thread que ja tem
+            # dono nao muda; recencia so avanca (monotonico) e so com data
+            # real. Depois de criada, a posse segue as regras normais (ex.:
+            # fechamento por inatividade reverte ao sale_owner — ADR 0008).
+            upsert_wa_conversation(
+                contact_id=contact_id,
+                wa_id=normalized_thread_phone,
+                channel_id=hist_channel_id,
+                source_channel_type=hist_channel_type,
+                phone_number_id=hist_channel_phone,
+                auto_assign_user_id=hist_channel_owner if hist_channel_type == CHANNEL_TYPE_COEXISTENCE else None,
+                message_at=max(_thread_ts) if _thread_ts else None,
+                advance_recency=bool(_thread_ts),
+            )
+
+        # Normaliza business_phone uma vez (nono digito BR) — comparacao
+        # com msg_from/msg_to crus dava direction errada quando empresa
+        # cadastrou o numero sem 9 e o webhook entrega com (ou vice-versa).
+        business_phone_normalized = normalize_br_phone(business_phone) if business_phone else ""
+
+        for msg in messages:
+            msg_from_raw = str(msg.get("from", "")).replace("+", "").replace(" ", "").replace("-", "")
+            msg_to_raw = str(msg.get("to", "")).replace("+", "").replace(" ", "").replace("-", "")
+            msg_from = normalize_br_phone(msg_from_raw) if msg_from_raw else ""
+            msg_to = normalize_br_phone(msg_to_raw) if msg_to_raw else ""
+            msg_id = msg.get("id", "")
+            msg_type = msg.get("type", "unknown")
+            timestamp = msg.get("timestamp", "")
+            ts_iso = _parse_unix_timestamp(timestamp)
+            history_context = msg.get("history_context", {})
+            msg_status = str(history_context.get("status", "")).lower()
+            # Reentrega de chunk de history (retry Meta / pending_events):
+            # nao re-baixar midia ja persistida.
+            skip_media = _media_already_downloaded(msg_id)
+
+            # Determinar direcao: se 'from' e o telefone da empresa, e outbound
+            is_outbound = (msg_from == business_phone_normalized) or bool(msg_to)
+            direction = "outbound" if is_outbound else "inbound"
+            # Data REAL da mensagem (unix da Meta). Invalida = None: nao
+            # avanca recencia nem abre a janela de 24h (o fallback de
+            # _parse_unix_timestamp e "agora").
+            try:
+                _msg_at = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                _msg_at = None
+            if direction == "inbound" and _msg_at and (
+                    thread_last_inbound_at is None or _msg_at > thread_last_inbound_at):
+                thread_last_inbound_at = _msg_at
+
+            # media_placeholder: midia sera enviada em webhook separado
+            if msg_type == "media_placeholder":
+                save_wa_message(
+                    wa_message_id=msg_id,
+                    contact_id=contact_id,
+                    direction=direction,
+                    msg_type="media_placeholder",
+                    content="[Midia do historico - aguardando]",
+                    status=msg_status or "delivered",
+                    timestamp_wa=ts_iso,
+                    operator_id=hist_channel_owner if direction == "outbound" else None,
+                    channel_id=hist_channel_id,
+                    phone_number_id=hist_channel_phone,
+                    channel_owner_user_id=hist_channel_owner,
+                    sender_user_id=hist_channel_owner if direction == "outbound" else None,
+                    # Mensagem ANTIGA importada: nao reabre atendimento
+                    # fechado e so mexe na recencia com data real.
+                    advance_recency=_msg_at is not None,
+                    reopen_attendance=False,
+                )
+                continue
+
+            # Extrair conteudo conforme tipo
+            content = ""
+            media_path = ""
+            media_mime = ""
+            media_id_str = ""
+            latitude = None
+            longitude = None
+            filename = ""
+            effective_msg_type = msg_type
+
+            if msg_type == "text":
+                text_obj = msg.get("text", {})
+                content = text_obj.get("body", "") if isinstance(text_obj, dict) else ""
+
+            elif msg_type == "image":
+                image = msg.get("image", {}) if isinstance(msg.get("image"), dict) else {}
+                media_id_str = image.get("id", "")
+                media_mime = image.get("mime_type", "")
+                content = image.get("caption", "")
+                if media_id_str and not skip_media:
+                    media_result = await download_media(media_id_str, "image")
+                    if media_result:
+                        media_path = media_result["path"]
+                        media_mime = media_result["mime_type"]
+                    else:
+                        media_failures += 1
+
+            elif msg_type == "audio":
+                audio = msg.get("audio", {}) if isinstance(msg.get("audio"), dict) else {}
+                media_id_str = audio.get("id", "")
+                media_mime = audio.get("mime_type", "")
+                if media_id_str and not skip_media:
+                    media_result = await download_media(media_id_str, "audio")
+                    if media_result:
+                        media_path = media_result["path"]
+                        media_mime = media_result["mime_type"]
+                    else:
+                        media_failures += 1
+
+            elif msg_type == "video":
+                video = msg.get("video", {}) if isinstance(msg.get("video"), dict) else {}
+                effective_msg_type = "gif" if video.get("gif") else "video"
+                media_id_str = video.get("id", "")
+                media_mime = video.get("mime_type", "")
+                content = video.get("caption", "")
+                if media_id_str and not skip_media:
+                    media_result = await download_media(media_id_str, "video")
+                    if media_result:
+                        media_path = media_result["path"]
+                        media_mime = media_result["mime_type"]
+                    else:
+                        media_failures += 1
+
+            elif msg_type == "document":
+                doc = msg.get("document", {}) if isinstance(msg.get("document"), dict) else {}
+                media_id_str = doc.get("id", "")
+                media_mime = doc.get("mime_type", "")
+                filename = doc.get("filename", "")
+                content = doc.get("caption", "")
+                if media_id_str and not skip_media:
+                    media_result = await download_media(media_id_str, "document", filename)
+                    if media_result:
+                        media_path = media_result["path"]
+                        media_mime = media_result["mime_type"]
+                    else:
+                        media_failures += 1
+
+            elif msg_type == "sticker":
+                sticker = msg.get("sticker", {}) if isinstance(msg.get("sticker"), dict) else {}
+                media_id_str = sticker.get("id", "")
+                media_mime = sticker.get("mime_type", "image/webp")
+                if media_id_str and not skip_media:
+                    media_result = await download_media(media_id_str, "sticker")
+                    if media_result:
+                        media_path = media_result["path"]
+                        media_mime = media_result["mime_type"]
+                    else:
+                        media_failures += 1
+
+            elif msg_type == "location":
+                loc = msg.get("location", {}) if isinstance(msg.get("location"), dict) else {}
+                latitude = loc.get("latitude")
+                longitude = loc.get("longitude")
+                loc_name = loc.get("name", "")
+                loc_address = loc.get("address", "")
+                content = f"{loc_name} {loc_address}".strip() if (loc_name or loc_address) else ""
+
+            elif msg_type == "contacts":
+                content = str(msg.get("contacts", []))
+
+            elif msg_type == "reaction":
+                reaction = msg.get("reaction", {}) if isinstance(msg.get("reaction"), dict) else {}
+                content = reaction.get("emoji", "")
+
+            else:
+                content = f"[{msg_type}]"
+
+            save_wa_message(
+                wa_message_id=msg_id,
+                contact_id=contact_id,
+                direction=direction,
+                msg_type=effective_msg_type,
+                content=content,
+                media_path=media_path,
+                media_mime=media_mime,
+                media_id=media_id_str,
+                latitude=latitude,
+                longitude=longitude,
+                filename=filename,
+                status=msg_status or ("received" if direction == "inbound" else "sent"),
+                timestamp_wa=ts_iso,
+                operator_id=hist_channel_owner if direction == "outbound" else None,
+                channel_id=hist_channel_id,
+                phone_number_id=hist_channel_phone,
+                channel_owner_user_id=hist_channel_owner,
+                sender_user_id=hist_channel_owner if direction == "outbound" else None,
+                # Mensagem ANTIGA importada: nao reabre atendimento fechado
+                # e so mexe na recencia com data real.
+                advance_recency=_msg_at is not None,
+                reopen_attendance=False,
+            )
+
+        if thread_last_inbound_at is not None:
+            try:
+                bump_contact_last_inbound_at(contact_id, thread_last_inbound_at)
+            except Exception as exc:
+                logger.warning("[HISTORY] bump last_inbound_at falhou | contact=%s: %s", contact_id, exc)
+
+        logger.info(
+            "[HISTORY] Thread processada | phone=%s msgs=%d phase=%s",
+            redact_phone(thread_phone), len(messages), phase,
+        )
+    return msgs_total, media_failures
 
 
 async def _process_history_media_assets(value, business_phone):

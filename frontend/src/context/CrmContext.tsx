@@ -63,6 +63,10 @@ type CrmContextValue = {
   booting: boolean;
   busyLogin: boolean;
   snapshotMode: boolean;
+  // Listas da sidebar prontas: todo target dos listeners de conversas e de
+  // contatos ja entregou o 1o snapshot (ou falhou de vez). Fora do modo
+  // snapshot e sempre true. Enquanto false, a caixa vazia mostra "Carregando".
+  listsReady: boolean;
   // RBAC dinamico (M-B2): toggles efetivos da sessao + helper de checagem.
   // (Nao ha mais gate por role exportado — checagens de UI usam can(), e
   // escopo de dados usa canSeeAll; role cru so vive dentro do contexto.)
@@ -91,6 +95,10 @@ type CrmContextValue = {
   // Contacts
   contacts: Contact[];
   contactsById: Map<number, Contact>;
+  // Contatos que o backend negou/nao achou (403/404) na hidratacao sob
+  // demanda: a linha da conversa segue escondida na sidebar (sem placeholder
+  // "Carregando contato" eterno).
+  unavailableContactIds: ReadonlySet<number>;
   conversations: Conversation[];
   // selectedContactId é derivado de selectedThreadId -> conversation.contact_id.
   // Para selecionar uma conversa, chame setSelectedThreadId(conversationId).
@@ -431,6 +439,13 @@ const UNREAD_FILTER = "nao_lidos";
 const UNREAD_PAGE = 50;
 const PEEK_STORAGE_KEY = "castro_crm.peek_mode";
 const RECENT_CONVERSATION_CACHE_LIMIT = 12;
+// Ultima caixa e ultimo filtro de canal do "Meus", lembrados POR USUARIO (uid)
+// neste navegador: o F5 abria sempre em "Novos" e no Standard.
+const VIEW_STORAGE_KEY = "castro_crm.active_view";
+const CHANNEL_FILTER_STORAGE_KEY = "castro_crm.meus_channel_filter";
+const ACTIVE_VIEWS: readonly ActiveView[] = ["novos", "meus", "nao_qualificados", "equipe", "bot", "backup"];
+// Caixas que exigem escopo amplo (canSeeAll) — mesma lista do clearImpersonationScope.
+const WIDE_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["equipe", "backup", "bot"]);
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -547,6 +562,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // atribuida a este operador mas estao FORA do snapshot escopado dele
   // (ex.: takeover — lead de outro operador escreveu no numero dele).
   const [extraContacts, setExtraContacts] = useState<Map<number, Contact>>(new Map());
+  // 403/404 definitivos da hidratacao/revalidacao (ver unavailableContactIds).
+  const [unavailableContactIds, setUnavailableContactIds] = useState<Set<number>>(new Set());
   const contactsById = useMemo(() => {
     const m = new Map<number, Contact>(contacts.map((c) => [c.id, c]));
     extraContacts.forEach((c, id) => { if (!m.has(id)) m.set(id, c); });
@@ -594,6 +611,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     ));
     if (missing.length === 0) return;
     missing.forEach((id) => fetchedExtraRef.current.add(id));
+    // 403/404 deste run: vao pra unavailableContactIds junto com o lote (a
+    // sidebar segue escondendo a linha, sem placeholder eterno).
+    const denied: number[] = [];
     const fetchOne = (id: number) =>
       getJson<{ contact: Record<string, unknown> }>(bundle.auth, `/api/wa/contact/${id}`)
         .then((res) => normalizeContact(res.contact, String(res.contact.id)))
@@ -603,6 +623,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         .catch((e) => {
           const st = Number((e as { status?: number })?.status ?? 0);
           if (st !== 403 && st !== 404) fetchedExtraRef.current.delete(id);
+          else denied.push(id);
           return null;
         });
     // Concorrencia LIMITADA (lotes de 8): uma pagina do "Carregar mais" pode
@@ -613,12 +634,23 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const HYDRATE_BATCH = 8;
     const publishBatch = (fetched: (Contact | null)[]) => {
       if (!isFirebaseSessionActive(bundle.auth)) return;
-      if (readOnly && scopeGeneration !== impersonationScopeGenerationRef.current) return;
+      // Geracao muda no reset (logout/troca de usuario) em QUALQUER aba: um
+      // lote em voo do usuario anterior (200 ou 403 tardio) nao pode entrar
+      // no estado do proximo (PC compartilhado; revisao 2026-10-28).
+      if (scopeGeneration !== impersonationScopeGenerationRef.current) return;
       // SEM guard de dispose: o effect re-roda a cada publish do snapshot
       // (conversations muda o tempo todo) e o cleanup descartava o batch
       // inteiro — com os ids ja marcados em fetchedExtraRef, os contatos
       // nunca chegavam ao estado (join preso nos 50 do snapshot). O provider
       // vive a sessao inteira; armazenar apos re-run e seguro e correto.
+      const deniedNow = denied.splice(0);
+      if (deniedNow.length) {
+        setUnavailableContactIds((prev) => {
+          const next = new Set(prev);
+          deniedNow.forEach((id) => next.add(id));
+          return next;
+        });
+      }
       const valid = fetched.filter((c): c is Contact => !!c);
       if (!valid.length) return;
       setExtraContacts((prev) => {
@@ -637,6 +669,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   }, [allConversations, contacts, bundle]);
 
   const [transportMode, setTransportMode] = useState<TransportMode>("snapshot");
+  // Gate do listsReady: cada listener (conversas / contatos) marca true quando
+  // TODOS os seus targets entregaram o 1o snapshot ou falharam de vez.
+  const [conversationsReady, setConversationsReady] = useState(false);
+  const [contactsReady, setContactsReady] = useState(false);
   const [booting, setBooting] = useState(true);
   const [busyLogin, setBusyLogin] = useState(false);
   const [mfaPending, setMfaPending] = useState(false);
@@ -650,7 +686,17 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   // -- Sidebar / nav --
   const [search, setSearch] = useState("");
-  const [activeView, setActiveView] = useState<ActiveView>("novos");
+  const [activeView, setActiveViewState] = useState<ActiveView>("novos");
+  // Preferencias de UI lembradas por uid (caixa e canal do Meus). Vazio = nao
+  // le nem grava: sem sessao ou aba de Ver como (readOnly — nada do alvo).
+  const uiPrefsUid = !readOnly && sessionUser?.firebase_uid ? sessionUser.firebase_uid : "";
+  // Toda troca de caixa pelo setter (clique, picker, contato manual) e lembrada;
+  // o default e o restore (efeito mais abaixo) usam o setter cru e nao gravam.
+  const setActiveView = useCallback((v: ActiveView) => {
+    setActiveViewState(v);
+    if (!uiPrefsUid) return;
+    try { window.localStorage.setItem(`${VIEW_STORAGE_KEY}.${uiPrefsUid}`, v); } catch { /* storage indisponivel: vale so na sessao */ }
+  }, [uiPrefsUid]);
   if (readOnly) activeViewRef.current = activeView;
   const [equipeOperatorFilter, setEquipeOperatorFilter] = useState("");
   // Filtro por canal do Equipe (espelho do "Meus"; PO 2026-09-03): separa as
@@ -686,7 +732,17 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!peekKey || readOnly) return;
     try { window.localStorage.setItem(peekKey, v ? "1" : "0"); } catch { /* storage indisponivel: vale so na sessao */ }
   }, [peekKey, readOnly]);
-  const [channelFilter, setChannelFilter] = useState("");
+  const [channelFilter, setChannelFilterState] = useState("");
+  // Canal do Meus RESTAURADO do storage no login: as opcoes do select so
+  // existem depois do snapshot, entao o valor fica "armado" aqui e e aplicado
+  // UMA vez pela auto-correcao, quando houver opcoes. Escolha explicita no
+  // select aplica na hora (e grava no storage), sem armar nada.
+  const [preferredChannelFilter, setPreferredChannelFilter] = useState("");
+  const setChannelFilter = useCallback((v: string) => {
+    setChannelFilterState(v);
+    if (!uiPrefsUid) return;
+    try { window.localStorage.setItem(`${CHANNEL_FILTER_STORAGE_KEY}.${uiPrefsUid}`, v); } catch { /* storage indisponivel: vale so na sessao */ }
+  }, [uiPrefsUid]);
   const searchText = useDeferredValue(search.trim().toLowerCase());
 
   // -- Composer --
@@ -805,9 +861,15 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // (~1h, mesmo uid). Evita vazamento LGPD entre sessoes (ex.: operador
   // logando no PC de um admin via dados ainda em memoria).
   const loadedUidRef = useRef<string | null>(null);
+  // UID cuja sessao (/api/session + listas de apoio) ja carregou nesta aba:
+  // distingue o refresh de token de uma sessao viva (falha transitoria nao
+  // derruba nada) da carga inicial (tela "Conectando" + nova tentativa).
+  const liveSessionUidRef = useRef<string | null>(null);
 
   // -- Derived --
   const snapshotMode = !readOnly && transportMode === "snapshot" && config?.data_backend === "firestore" && config?.firestore.snapshot_enabled && firebaseReady(config) && Boolean(bundle?.db);
+  // Sem snapshot (polling / Ver como) nao ha listener a esperar: sempre pronto.
+  const listsReady = !snapshotMode || (conversationsReady && contactsReady);
   const selectedContact = selectedContactId != null ? (contactsById.get(selectedContactId) || null) : null;
   const activeContact = activeConversationId != null ? (contactsById.get(activeConversationId) || null) : null;
   const isManagerRole = sessionUser?.role === "admin" || sessionUser?.role === "supervisor";
@@ -891,14 +953,54 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     [meusConversations]);  // eslint-disable-line react-hooks/exhaustive-deps
   // Sem opcao "Todos" (decisao de produto): com 2+ canais o filtro abre no
   // primeiro (standard vem antes); com 0-1 canal a caixa some e o filtro
-  // desarma pra nao esconder nada.
+  // desarma pra nao esconder nada. O canal restaurado do storage vale UMA
+  // vez, na 1a vez em que ha opcoes, e e descartado em seguida: se ficasse
+  // armado, o filtro pularia sozinho quando o canal voltasse as opcoes horas
+  // depois e esconderia a lista em uso (revisao 2026-10-28).
   useEffect(() => {
     if (myChannelOptions.length > 1) {
-      if (!myChannelOptions.some((o) => o.id === channelFilter)) setChannelFilter(myChannelOptions[0].id);
+      if (preferredChannelFilter) {
+        setPreferredChannelFilter("");
+        if (myChannelOptions.some((o) => o.id === preferredChannelFilter)) { setChannelFilterState(preferredChannelFilter); return; }
+      }
+      if (!myChannelOptions.some((o) => o.id === channelFilter)) setChannelFilterState(myChannelOptions[0].id);
     } else if (channelFilter) {
-      setChannelFilter("");
+      setChannelFilterState("");
     }
-  }, [myChannelOptions, channelFilter]);
+  }, [myChannelOptions, channelFilter, preferredChannelFilter]);
+  // Restaura caixa e canal do Meus 1x por uid, na carga da sessao (sessionUser
+  // e perfil chegam no mesmo batch, entao canSeeAll ja vale aqui). Caixa
+  // desconhecida ou nao permitida pro perfil (equipe/backup/bot exigem
+  // canSeeAll) cai em "novos", que segue o default de quem nunca escolheu.
+  const restoredPrefsUidRef = useRef("");
+  const pendingBotViewCheckRef = useRef(false);
+  useEffect(() => {
+    if (!uiPrefsUid) { restoredPrefsUidRef.current = ""; return; }
+    if (restoredPrefsUidRef.current === uiPrefsUid) return;
+    restoredPrefsUidRef.current = uiPrefsUid;
+    let storedView = "";
+    let storedChannel = "";
+    try {
+      storedView = window.localStorage.getItem(`${VIEW_STORAGE_KEY}.${uiPrefsUid}`) || "";
+      storedChannel = window.localStorage.getItem(`${CHANNEL_FILTER_STORAGE_KEY}.${uiPrefsUid}`) || "";
+    } catch { /* storage indisponivel: fica no default */ }
+    const known = ACTIVE_VIEWS.find((v) => v === storedView);
+    const view: ActiveView = known && (canSeeAll || !WIDE_VIEWS.has(known)) ? known : "novos";
+    // "bot" depende de bot_enabled, que chega DEPOIS da sessao (settings do
+    // tenant): restaura em "novos" e so troca pra "bot" quando confirmar —
+    // senao a aba Bot nem existe e a caixa fica vazia sem destaque.
+    pendingBotViewCheckRef.current = view === "bot";
+    setActiveViewState(view === "bot" ? "novos" : view);
+    setPreferredChannelFilter(storedChannel);
+    // So na troca de uid: canSeeAll e lido no momento do login de proposito.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uiPrefsUid]);
+  // Confere 1x quando as settings do tenant carregarem (bot ligado -> "bot").
+  useEffect(() => {
+    if (!pendingBotViewCheckRef.current || !settingsLoaded) return;
+    pendingBotViewCheckRef.current = false;
+    if (savedSystemSettings.bot_enabled) setActiveViewState("bot");
+  }, [settingsLoaded, savedSystemSettings.bot_enabled]);
   // "Carregar mais" do "Meus" so faz sentido se o mine AO VIVO saturou os 50
   // (senao nao ha pagina antiga e um getDocs seria leitura desperdicada). Conta
   // a camada ao vivo (conversations), nao allConversations (que ja inclui paged).
@@ -1231,8 +1333,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return targets;
   }
 
-  // `cap`: admin/supervisor tem mais targets (pool + minhas + all) e o corte
-  // em 50 descartaria os contatos da pool mais velhos que a janela global.
+  // `cap`: 50 por target (pool + minhas [+ all]) — o corte em 50 no total
+  // descartava contatos que o listener ja tinha entregado.
   function mergeVisibleContacts(groups: Contact[][], cap = 50) {
     const merged = new Map<number, Contact>();
     for (const group of groups) {
@@ -1315,10 +1417,28 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Boot
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    let retryTimer: number | undefined;
+    const BOOT_RETRY_MS = [5000, 10000, 20000, 40000, 60000];
+    const boot = async (attempt: number) => {
+      let c: ClientConfig;
       try {
-        const c = await getJson<ClientConfig>(null, "/api/client-config");
+        c = await getJson<ClientConfig>(null, "/api/client-config");
+      } catch (e) {
         if (cancelled) return;
+        setError(errorText(e));
+        const status = Number((e as { status?: number })?.status ?? 0);
+        if (status === 0 || status === 429 || status >= 500) {
+          // Backend congelado/indisponivel (5xx/429/rede): segue na tela de
+          // carregamento e tenta de novo com espera crescente. Antes caia em
+          // "Configuracao invalida" sem saida alem do F5 (revisao 2026-10-28).
+          retryTimer = window.setTimeout(() => { void boot(attempt + 1); }, BOOT_RETRY_MS[Math.min(attempt, BOOT_RETRY_MS.length - 1)]);
+          return;
+        }
+        setBooting(false);
+        return;
+      }
+      if (cancelled) return;
+      try {
         setConfig(c);
         setTransportMode(transportPref() || c.chat_delivery_mode || "snapshot");
         if (c.auth_mode === "firebase" && firebaseReady(c)) {
@@ -1327,8 +1447,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         }
       } catch (e) { if (!cancelled) setError(errorText(e)); }
       finally { if (!cancelled) setBooting(false); }
-    })();
-    return () => { cancelled = true; };
+    };
+    void boot(0);
+    return () => { cancelled = true; if (retryTimer !== undefined) window.clearTimeout(retryTimer); };
   }, []);
 
   // Zera TODO estado sensivel/por-usuario em memoria. Chamado ao
@@ -1359,6 +1480,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setFollowupEnabled(false);
     setContacts([]);
     setConversations([]);
+    // Listas do proximo usuario ainda nao chegaram (evita "Nenhum atendimento"
+    // no 1o render apos o login, antes de o listener reabrir o gate).
+    setConversationsReady(false);
+    setContactsReady(false);
     setExtraConversations(new Map());
     setPagedConversations(new Map());
     setMyConvPageLimit(50);
@@ -1371,6 +1496,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setLoadingMoreConvs(false);
     setExtraContacts(new Map());
     fetchedExtraRef.current.clear();
+    setUnavailableContactIds(new Set());
     setMessages([]);
     setAllContactsCache(null);
     setAllContactsCacheTotal(0);
@@ -1452,23 +1578,42 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Auth listener
   useEffect(() => {
     if (!bundle) return undefined;
-    return onIdTokenChanged(bundle.auth, async (user) => {
-      setFirebaseUser(user);
-      const newUid = user?.uid ?? null;
-      // Logout OU troca de identidade -> limpa tudo do usuario anterior
-      // ANTES de carregar a nova sessao. Refresh de token (mesmo uid)
-      // NAO reseta (senao limparia a sessao ativa a cada ~1h).
-      if (newUid !== loadedUidRef.current) {
-        resetUserScopedState();
-        loadedUidRef.current = newUid;
-      }
-      if (!user) {
-        setSessionUser(null);
-        if (bundle.impersonationTab) void endImpersonation(false);
-        return;
-      }
-      if (!isFirebaseSessionActive(bundle.auth)) return;
+    // Falha TRANSITORIA (5xx/429/timeout/rede) ao carregar a sessao nao desloga
+    // mais a aba normal: so 401/403 fazem signOut. O resto agenda nova
+    // tentativa com espera crescente (5s, 10s, 20s, 40s, teto 60s), cancelada
+    // no cleanup e na troca de usuario. A aba de Ver como segue igual.
+    let disposed = false;
+    let retryTimer: number | undefined;
+    let retryAttempt = 0;
+    // Id da carga em voo: uma carga superada (token novo, relogin, retry) nao
+    // pode agir na falha — um 401/403 atrasado da conta anterior deslogaria a
+    // conta nova e um 5xx velho agendaria carga extra (revisao 2026-10-28).
+    let attemptSeq = 0;
+    // Motivo do 401/403: o reset disparado pelo signOut apaga o erro; guardado
+    // aqui e reaplicado na tela de login, senao ela fica sem mensagem.
+    let pendingAuthFailure = "";
+    const clearRetry = () => {
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      retryTimer = undefined;
+    };
+    const scheduleSessionRetry = (user: User, e: unknown) => {
+      if (disposed || bundle.auth.currentUser?.uid !== user.uid) return;
+      const delayMs = Math.min(5000 * 2 ** retryAttempt, 60000);
+      retryAttempt += 1;
+      // Sessao viva (refresh de token): mantem tudo como esta e so avisa no
+      // console. Carga inicial: a tela "Conectando" mostra o erro e espera.
+      if (liveSessionUidRef.current === user.uid) console.warn(`Renovacao da sessao falhou (${errorText(e)}); sessao mantida, nova tentativa em ${delayMs / 1000}s.`);
+      else setError(errorText(e));
+      clearRetry();
+      retryTimer = window.setTimeout(() => {
+        retryTimer = undefined;
+        if (disposed || bundle.auth.currentUser?.uid !== user.uid) return;
+        void loadSession(user);
+      }, delayMs);
+    };
+    const loadSession = async (user: User) => {
       const scopeGeneration = impersonationScopeGenerationRef.current;
+      const attempt = ++attemptSeq;
       try {
         const session = await getJson<{
           user: SessionUser;
@@ -1501,6 +1646,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         if (bundle.auth.currentUser?.uid !== user.uid || !isFirebaseSessionActive(bundle.auth)) return;
         if (bundle.impersonationTab && scopeGeneration !== impersonationScopeGenerationRef.current) return;
         setSessionUser(session.user);
+        liveSessionUidRef.current = user.uid;
+        clearRetry();  // tentativa paralela que falhou nao agenda carga extra
+        retryAttempt = 0;
         // Branding por tenant: o nome dado no super-admin (tenant.name) vira o
         // titulo do topbar. Fallback = tenant_id (o backend ja faz isso).
         setTenantName(session.tenant?.name || "");
@@ -1535,7 +1683,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // (~1h, que re-executa este handler) ou ate abrir Configuracoes.
         getJson<SystemSettings>(bundle.auth, "/api/settings/system")
           .then((sys) => { if (bundle.auth.currentUser?.uid !== user.uid || !isFirebaseSessionActive(bundle.auth)) return; setSystemSettings(sys); setSavedSystemSettings(sys); setSettingsLoaded(true); })
-          .catch((e) => { if (isFirebaseSessionActive(bundle.auth)) console.warn("settings/system indisponivel — sons desarmados:", errorText(e)); });
+          .catch((e) => {
+            // Sem settings nao da pra confirmar "bot": fica em "novos".
+            pendingBotViewCheckRef.current = false;
+            if (isFirebaseSessionActive(bundle.auth)) console.warn("settings/system indisponivel — sons desarmados:", errorText(e));
+          });
         getJson<UserSettings>(bundle.auth, "/api/settings/user").then((usr) => { if (bundle.auth.currentUser?.uid === user.uid && isFirebaseSessionActive(bundle.auth)) setUserSettings(usr); }).catch(() => {});
       } catch (e) {
         if (bundle.impersonationTab && isFirebaseSessionActive(bundle.auth)) {
@@ -1546,9 +1698,52 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           }
         }
         if (bundle.impersonationTab) await endImpersonation(false, "Não foi possível validar a visualização. Gere um novo acesso.");
-        else { setError(errorText(e)); await signOut(bundle.auth); }
+        else {
+          // Carga superada ou de outro usuario: nao age (ver attemptSeq).
+          if (attempt !== attemptSeq || bundle.auth.currentUser?.uid !== user.uid) return;
+          const status = Number((e as { status?: number })?.status ?? 0);
+          if (status === 401 || status === 403) {
+            pendingAuthFailure = errorText(e);
+            setError(pendingAuthFailure);
+            await signOut(bundle.auth);
+          } else scheduleSessionRetry(user, e);
+        }
       }
+    };
+    const unsubscribe = onIdTokenChanged(bundle.auth, async (user) => {
+      setFirebaseUser(user);
+      const newUid = user?.uid ?? null;
+      // Logout OU troca de identidade -> limpa tudo do usuario anterior
+      // ANTES de carregar a nova sessao. Refresh de token (mesmo uid)
+      // NAO reseta (senao limparia a sessao ativa a cada ~1h).
+      if (newUid !== loadedUidRef.current) {
+        resetUserScopedState();
+        loadedUidRef.current = newUid;
+        liveSessionUidRef.current = null;
+        clearRetry();
+        retryAttempt = 0;
+        attemptSeq += 1;  // cargas em voo do usuario anterior ficam superadas
+      }
+      if (!user) {
+        setSessionUser(null);
+        if (pendingAuthFailure) {
+          // Reaplica o motivo do 401/403 que o reset acabou de apagar.
+          setError(pendingAuthFailure);
+          pendingAuthFailure = "";
+        }
+        if (bundle.impersonationTab) void endImpersonation(false);
+        return;
+      }
+      if (!isFirebaseSessionActive(bundle.auth)) return;
+      // Evento novo de token ja recarrega a sessao: descarta tentativa agendada.
+      clearRetry();
+      await loadSession(user);
     });
+    return () => {
+      disposed = true;
+      clearRetry();
+      unsubscribe();
+    };
   }, [bundle, endImpersonation]);
 
   // O prazo absoluto persiste nos refreshes; nao depende de navegacao.
@@ -1801,6 +1996,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           next.delete(id);
           return next;
         });
+        // O id segue em fetchedExtraRef (nao re-hidrata): sem isto a linha
+        // viraria placeholder "Carregando contato" pra sempre na sidebar.
+        setUnavailableContactIds((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
       });
     return () => { disposed = true; };
     // So na troca de selecao — contacts/extraContacts sao lidos no momento
@@ -1857,7 +2055,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     fetchedExtraRef.current.clear();
     messageCacheRef.current.clear();
     setContacts([]); setConversations([]);
-    setExtraContacts(new Map()); setExtraConversations(new Map()); setPagedConversations(new Map());
+    setExtraContacts(new Map()); setExtraConversations(new Map()); setPagedConversations(new Map()); setUnavailableContactIds(new Set());
     setAllContactsCache(null); setAllContactsCacheTotal(0); setContactsCountNonce((previous) => previous + 1);
     setMessages([]); setSelectedThreadId(null); setActiveThreadId(null); setActiveConversationId(null);
     holdEmptySelectionRef.current = true;
@@ -1981,23 +2179,44 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
     let disposed = false;
-    if (!snapshotMode || !config.firestore.collections.wa_contacts) return undefined;
+    // Sem listener (nada a esperar) a lista ja esta "pronta" pro gate.
+    if (!snapshotMode || !config.firestore.collections.wa_contacts) { setContactsReady(true); return undefined; }
     const targets = buildContactSnapshotTargets();
     const partialContacts = new Map<string, Contact[]>();
+    // Targets que ja entregaram o 1o snapshot ou falharam (gate do listsReady).
+    const settled = new Set<string>();
+    setContactsReady(targets.length === 0);
 
     const publish = () => {
       if (disposed) return;
-      const nextContacts = mergeVisibleContacts(Array.from(partialContacts.values()), canSeeAll ? 50 * targets.length : 50);
-      startTransition(() => setContacts(nextContacts));
+      // Teto = 50 por target para TODO perfil: os docs ja foram lidos (e pagos)
+      // pelo listener. Com 50 no total, o operador descartava contatos da pool
+      // que o listener entregou e ia busca-los por GET /api/wa/contact — a
+      // caixa Novos ficava em "Nenhum lead" ate o GET voltar (revisao 2026-10-28).
+      const nextContacts = mergeVisibleContacts(Array.from(partialContacts.values()), 50 * targets.length);
+      // No MESMO transition dos dados: a caixa nunca fica pronta com a lista velha.
+      const ready = settled.size >= targets.length;
+      startTransition(() => { setContacts(nextContacts); if (ready) setContactsReady(true); });
     };
 
     const unsubscribers = targets.map(({ key, ref }) => watchSessionQuery(bundle.auth,
       ref,
       (snap) => {
         partialContacts.set(key, snap.docs.map((doc) => normalizeContact(doc.data() as Record<string, unknown>, doc.id)));
+        // So conta como "pronto" com resposta do SERVIDOR (ou cache com dados):
+        // o SDK entrega {docs: [], fromCache: true} em ~10 s quando o Watch nao
+        // responde (Offline) e o "Nenhum..." voltaria no meio da espera.
+        if (!snap.metadata?.fromCache || snap.docs.length > 0) settled.add(key);
         publish();
       },
-      (e) => !disposed && setError(`Snapshot de contatos falhou: ${errorText(e)}`),
+      (e) => {
+        if (disposed) return;
+        setError(`Snapshot de contatos falhou: ${errorText(e)}`);
+        // Listener que falhou nao entrega mais nada: conta como resolvido.
+        settled.add(key);
+        if (settled.size >= targets.length) setContactsReady(true);
+      },
+      { includeMetadataChanges: true },
     ));
 
     return () => {
@@ -2017,10 +2236,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // de leitura. Admin/supervisor segue recebendo todas (paridade #1).
   useEffect(() => {
     if (!bundle || !sessionUser || !config) return undefined;
-    if (!snapshotMode || !config.firestore.collections.wa_conversations) return undefined;
+    // Sem listener (nada a esperar) a lista ja esta "pronta" pro gate.
+    if (!snapshotMode || !config.firestore.collections.wa_conversations) { setConversationsReady(true); return undefined; }
     let disposed = false;
     const targets = buildConversationSnapshotTargets();
     const partialConversations = new Map<string, Conversation[]>();
+    // Targets que ja entregaram o 1o snapshot ou falharam (gate do listsReady).
+    // Antes nao havia estado "carregando": a caixa vazia dizia "Nenhum
+    // atendimento ativo." por minutos enquanto os snapshots nao chegavam.
+    const settled = new Set<string>();
+    setConversationsReady(targets.length === 0);
 
     const publish = () => {
       if (disposed) return;
@@ -2028,7 +2253,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // Saturacao por target da pool (gate do "Carregar mais" de Novos/Recepcao).
       const poolSaturated = Array.from(partialConversations.entries())
         .some(([key, list]) => key.startsWith("unassigned:") && list.length >= 50);
-      startTransition(() => { setConversations(next); setPoolLiveSaturated(poolSaturated); });
+      const ready = settled.size >= targets.length;
+      startTransition(() => { setConversations(next); setPoolLiveSaturated(poolSaturated); if (ready) setConversationsReady(true); });
     };
 
     const unsubscribers = targets.map(({ key, ref }) => watchSessionQuery(bundle.auth,
@@ -2036,9 +2262,19 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       (snap) => {
         if (disposed) return;
         partialConversations.set(key, snap.docs.map((doc) => normalizeConversation(doc.data() as Record<string, unknown>, doc.id)));
+        // Pronto so com resposta do servidor ou cache com dados (ver listener
+        // de contatos): snapshot vazio fromCache nao fecha o "carregando".
+        if (!snap.metadata?.fromCache || snap.docs.length > 0) settled.add(key);
         publish();
       },
-      (e) => !disposed && setError(`Snapshot de conversations falhou: ${errorText(e)}`),
+      (e) => {
+        if (disposed) return;
+        setError(`Snapshot de conversations falhou: ${errorText(e)}`);
+        // Listener que falhou nao entrega mais nada: conta como resolvido.
+        settled.add(key);
+        if (settled.size >= targets.length) setConversationsReady(true);
+      },
+      { includeMetadataChanges: true },
     ));
 
     return () => {
@@ -3760,11 +3996,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, followupEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
+    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, followupEnabled, operators, departments, channels, booting, busyLogin, snapshotMode, listsReady,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,
-    contacts, contactsById, conversations, selectedContactId, selectedContact, selectedConversation,
+    contacts, contactsById, unavailableContactIds, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
     activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeChannelFilter, setEquipeChannelFilter, equipeChannelOptions, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,

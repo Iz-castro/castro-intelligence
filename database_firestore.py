@@ -68,6 +68,81 @@ def _get_first_by_field(name, field_name, value):
 
 
 # ---------------------------------------------------------------------------
+# Idempotencia do history sync do coexistence, por BLOCO (2026-10-28)
+# ---------------------------------------------------------------------------
+# A Meta reenvia o mesmo chunk de history ~1x/h por ~6 dias quando o 200
+# chega tarde: um bloco de ~1.400 msgs levava 43-63 s com o event loop
+# travado, mesmo sem gravar nada novo (apuracao 2026-10-27; canais 8, 9, 11
+# e 12 da hubloc). Marcador em history_chunks/{key}: 'done' -> o webhook
+# responde 200 em ms; 'processing' com lease valido -> outra copia esta
+# gravando (rajadas a cada ~30 s), tambem 200. 'done' so depois de persistir
+# tudo (zero perda). Lease vencido ou 'failed' -> reprocessa (reentrega da
+# Meta ou da fila de pendentes). Sem transacao: create() e atomico e o store
+# em memoria dos simuladores nao expoe transaction().
+HISTORY_CHUNK_LEASE_SECONDS = 15 * 60
+# Marcador 'done' expira (politica de TTL no console, opcional): acima da
+# janela de ~7 dias de reentrega da Meta, abaixo de um re-onboarding tipico.
+HISTORY_CHUNK_TTL_DAYS = 30
+
+
+def _lease_aware(value):
+    """Lease em UTC aware (naive = UTC). Nome proprio: o modulo ja tem um
+    _aware fail-closed para o aviso de espera (naive -> None)."""
+    value = _coerce_timestamp(value)
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def claim_history_chunk(key, meta=None, lease_seconds=HISTORY_CHUNK_LEASE_SECONDS):
+    """Reserva o bloco. Retorna 'claimed' (processar), 'done' (ja importado)
+    ou 'busy' (outra request esta importando e o lease ainda vale).
+
+    claim_id identifica ESTA tentativa: o Commit do create() tem retry
+    automatico no cliente (UNAVAILABLE depois de aplicado -> ALREADY_EXISTS na
+    repeticao); sem a identidade o dono releria o proprio marcador e receberia
+    'busy' — e o bloco ficaria sem importar (revisao 2026-10-28)."""
+    from uuid import uuid4
+    from google.api_core import exceptions as _gexc
+    now = utcnow()
+    claim_id = uuid4().hex
+    fresh = dict(meta or {}, status="processing", claim_id=claim_id, claimed_at=now,
+                 lease_until=now + timedelta(seconds=lease_seconds), finished_at=None,
+                 expire_at=now + timedelta(days=HISTORY_CHUNK_TTL_DAYS))
+    ref = document("history_chunks", key)
+
+    def _read():
+        snap = ref.get()
+        return (snap.to_dict() or {}) if snap.exists else None
+
+    current = _read()
+    if current is None:
+        try:
+            ref.create(dict(fresh, attempts=1))
+            return "claimed"
+        except _gexc.AlreadyExists:
+            current = _read() or {}
+            if current.get("claim_id") == claim_id:
+                return "claimed"  # o proprio create, repetido pelo cliente
+    status = str(current.get("status") or "")
+    if status == "done":
+        return "done"
+    lease = _lease_aware(current.get("lease_until"))
+    if status == "processing" and lease is not None and lease > now:
+        return "busy"
+    ref.set(dict(fresh, attempts=int(current.get("attempts") or 0) + 1), merge=True)
+    return "claimed"
+
+
+def finish_history_chunk(key, status, **fields):
+    """Fecha o marcador: 'done' (tudo persistido) ou 'failed' (libera o lease
+    para a proxima reentrega)."""
+    document("history_chunks", key).set(
+        dict(fields, status=status, finished_at=utcnow(), lease_until=None), merge=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Buffer persistido do bot CX (debounce de mensagens picadas)
 # ---------------------------------------------------------------------------
 
@@ -1565,6 +1640,12 @@ def close_stale_attendances(max_idle_hours, unattended_release_days=7,
     # tambem fecham por inatividade — senao nunca fecham e o protocolo nunca
     # sai. Thread ainda no fluxo do bot continua fora (fila/bot nao fecham).
     _reception = is_reception_mode()
+    if not _reception and not inactivity_enabled:
+        # Legacy com o toggle OFF: NADA pode fechar (thread com dono exige o
+        # toggle; thread da pool so fecha em reception). Antes lia TODAS as
+        # threads abertas (~2.351 na hubloc) a cada 30 min so pra descartar
+        # cada uma — ~14 s de event loop travado por execucao (2026-10-27).
+        return closed
     for snap in collection("wa_conversations").where("attendance_status", "==", "aberto").stream():
         conv = snap.to_dict() or {}
         if not conv.get("assigned_to") and not _reception:

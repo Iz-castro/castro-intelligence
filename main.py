@@ -702,7 +702,14 @@ async def webhook_receive(request: Request):
         logger.warning("Assinatura invalida no webhook")
         return JSONResponse(status_code=403, content={"error": "Assinatura invalida"})
     payload = await request.json()
-    await process_webhook_payload(payload, ws_notify_callback=broadcast_to_operators)
+    from webhook import HistoryChunkBusy as _HistoryChunkBusy
+    try:
+        await process_webhook_payload(payload, ws_notify_callback=broadcast_to_operators)
+    except _HistoryChunkBusy:
+        # Unica resposta nao-2xx deste handler (2026-10-28): bloco do history
+        # ja em importacao por outra request. Sem copia duravel, um 200 faria a
+        # Meta parar de reentregar; com 503 ela reentrega e cai em 'done'.
+        return JSONResponse(status_code=503, content={"status": "busy"})
     return {"status": "ok"}
 
 
@@ -2239,8 +2246,48 @@ def _require_contact_access(contact: dict, current_user: dict):
                 elif any(True for _ in _q.limit(1).stream()):
                     return
         except Exception as exc:
+            # Falha de INFRA na checagem (Firestore indisponivel num
+            # congelamento) nao e "sem acesso": o frontend trata 403 como
+            # permanente e a linha do Meus sumia pela sessao inteira
+            # (2026-10-28). 503 -> o cliente tenta de novo e mostra placeholder.
             logger.warning("_require_contact_access thread-check falhou: %s", exc)
+            raise HTTPException(status_code=503, detail="Verificacao de acesso indisponivel; tente novamente")
     raise HTTPException(status_code=403, detail="Acesso negado: contato de outro operador")
+
+
+def _require_transfer_source_access(conv, contact, current_user):
+    """IDOR/LGPD (2026-10-28): operador comum so transfere o que ATENDE — thread
+    propria (dono) ou da pool (sem dono), ou thread em takeover 'active' dele;
+    pelo ramo legado por contact_id, so lead proprio ou da pool. Antes o
+    endpoint so exigia o toggle transferir_atendimento (ON no perfil operador):
+    qualquer operador puxava pra si qualquer thread pelo id deterministico
+    '{canal}__{telefone}' — inclusive coex de colega — e passava a enviar pelo
+    numero dela. admin/supervisor seguem transferindo tudo."""
+    if can_see_all_tenant(current_user):
+        return
+    me = current_user.get("id")
+    uid = str(current_user.get("firebase_uid") or "")
+    if conv:
+        if conv.get("is_backup"):
+            raise HTTPException(status_code=403, detail="Acesso negado: conversa de backup")
+        owner_uid = conv.get("assigned_to_uid")
+        if conv.get("assigned_to") == me or (uid and owner_uid == uid):
+            return
+        if not conv.get("assigned_to") and not owner_uid:
+            # Pool de verdade = thread E lead sem dono (ou lead meu). Thread
+            # orfa de lead alheio nao e pool (mesma regra do envio e do assume):
+            # em canal standard o also_lead levaria o Lead junto.
+            lead_owner = (contact or {}).get("assigned_to")
+            if not lead_owner or lead_owner == me:
+                return
+            raise HTTPException(status_code=403, detail="Acesso negado: lead de outro operador")
+        # Sem ramo de takeover: o handler e gravado pelo proprio /takeover, que
+        # um operador conseguia forjar em thread sem conflito (revisao 2026-10-28).
+        raise HTTPException(status_code=403, detail="Acesso negado: atendimento de outro operador")
+    if contact and not contact.get("is_backup") and (
+            contact.get("assigned_to") == me or not contact.get("assigned_to_uid")):
+        return
+    raise HTTPException(status_code=403, detail="Acesso negado: lead de outro operador")
 
 
 @app.get("/api/wa/conversations")
@@ -2398,7 +2445,11 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
         raise HTTPException(status_code=500, detail="Nao foi possivel ler os bytes do audio")
 
     mime = asset.get("mime_type") or msg.get("media_mime") or "audio/ogg"
-    transcript = transcribe_audio_bytes(
+    # Whisper e sincrono (ffmpeg + CTranslate2): fora do event loop e sob o
+    # mesmo semaforo do webhook (1 transcricao por instancia), senao o unico
+    # worker para por 5-45 s por audio (apuracao 2026-10-27).
+    from webhook import _transcribe_off_loop
+    transcript = await _transcribe_off_loop(
         audio_bytes,
         media_mime=mime,
         language_code=STT_LANGUAGE_CODE,
@@ -4327,6 +4378,16 @@ async def conversation_takeover(conversation_id: str, current_user: dict = Depen
     if not privileged:
         # RBAC: dono do numero coex assumindo a propria thread.
         ensure_permission(current_user, "assumir_coex_proprio")
+        # Sem conflito registrado ('pending' com handler = eu, ou numero meu)
+        # nao ha o que assumir: antes qualquer operador virava handler de
+        # qualquer thread sem conflito, silenciava o bot (mark_human_active)
+        # e forjava posse pro /transfer (revisao 2026-10-28).
+        from channel_service import get_channel as _takeover_channel
+        _ch = _takeover_channel(conv.get("channel_id")) if conv.get("channel_id") is not None else None
+        _owner = (_ch or {}).get("owner_user_id")
+        _me = str(current_user["id"])
+        if conv.get("takeover_status") != "pending" or (str(handler or "") != _me and str(_owner or "") != _me):
+            raise HTTPException(status_code=403, detail="Apenas o dono do numero pode assumir este atendimento")
     set_conversation_takeover_active(conversation_id, current_user["id"])
     # Lead self-service do bot CX: quem assume temporariamente tambem precisa
     # do resumo/temperatura do que a IA coletou. Idempotente por marcador
@@ -4354,6 +4415,12 @@ async def conversation_return(conversation_id: str, current_user: dict = Depends
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation nao encontrada")
     lead_owner = conv.get("lead_owner_user_id")
+    # Sem gate este endpoint encerrava o takeover de qualquer thread (2026-10-28).
+    # Comparacao por str: ids legados podem estar gravados como string.
+    _me = str(current_user.get("id"))
+    if not can_see_all_tenant(current_user) and _me not in {
+            str(v) for v in (lead_owner, conv.get("takeover_handler_user_id"), conv.get("assigned_to")) if v is not None}:
+        raise HTTPException(status_code=403, detail="Acesso negado: atendimento de outro operador")
     clear_conversation_takeover(conversation_id)
     contact_id = conv.get("contact_id")
     if contact_id is not None:
@@ -4723,11 +4790,15 @@ async def retry_pending_webhook_event(event_id: str, current_user: dict = Depend
     payload = event.get("payload") or {}
     if not payload:
         raise HTTPException(status_code=400, detail="Evento sem payload")
+    from webhook import HistoryChunkBusy as _HistoryChunkBusy
     try:
         await process_webhook_payload(payload, ws_notify_callback=broadcast_to_operators)
         mark_event_attempt(event_id, success=True)
         log_audit(current_user["id"], "PENDING_EVENT_RETRY", f"id={event_id} ok")
         return {"status": "ok", "id": event_id}
+    except _HistoryChunkBusy:
+        # Nao marca nada: o evento segue pendente para um novo retry.
+        raise HTTPException(status_code=409, detail="Bloco do historico em importacao por outra request; tente em alguns minutos")
     except Exception as exc:
         mark_event_attempt(event_id, success=False, error=f"{type(exc).__name__}: {exc}")
         log_audit(current_user["id"], "PENDING_EVENT_RETRY", f"id={event_id} err={type(exc).__name__}")
@@ -5067,7 +5138,7 @@ def _verify_cron_auth(request: Request) -> None:
 @app.post("/api/internal/cron/cleanup-impersonation")
 async def cron_cleanup_impersonation(request: Request):
     """Limpa somente contas temporarias registradas; funciona com flag off."""
-    _verify_cron_auth(request)
+    await run_in_threadpool(_verify_cron_auth, request)  # OIDC busca certificados por HTTP
     return await run_in_threadpool(cleanup_expired_sessions)
 
 
@@ -5082,7 +5153,7 @@ async def cron_health_check(request: Request):
       - X-Cron-Secret: <secret>             (header customizado, fallback
         pra dev/staging onde OIDC nao tem SA configurado)
     """
-    _verify_cron_auth(request)
+    await run_in_threadpool(_verify_cron_auth, request)  # OIDC busca certificados por HTTP
 
     from tenant_service import list_tenants
     from firestore_common import set_tenant_context, reset_tenant_context, document as fs_doc
@@ -5124,7 +5195,12 @@ async def cron_expire_takeovers(request: Request):
     OBS: enquanto o Cloud Scheduler de prod nao existir, este endpoint so roda
     se chamado manualmente (armado, mas dormente).
     """
-    _verify_cron_auth(request)
+    # Cron fora do event loop (2026-10-28): a verificacao OIDC busca os
+    # certificados do Google por HTTP e expire/close fazem centenas de
+    # leituras Firestore sincronas — rodavam no loop do unico worker e
+    # congelavam toda request por ~14 s a cada 30 min (apuracao 2026-10-27).
+    # run_in_threadpool copia os contextvars (tenant) pra thread.
+    await run_in_threadpool(_verify_cron_auth, request)
     from firestore_common import set_tenant_context, reset_tenant_context
     from tenant_service import list_tenants
 
@@ -5142,7 +5218,7 @@ async def cron_expire_takeovers(request: Request):
             continue
         token = set_tenant_context(tid)
         try:
-            expired = expire_stale_takeovers(TAKEOVER_TIMEOUT_HOURS)
+            expired = await run_in_threadpool(expire_stale_takeovers, TAKEOVER_TIMEOUT_HOURS)
             for e in expired:
                 contact_id = e.get("contact_id")
                 if contact_id is not None:
@@ -5160,7 +5236,8 @@ async def cron_expire_takeovers(request: Request):
             # Toggle por tenant (auto_close_enabled): desligado, so a valvula
             # de orfaos do Modo Recepcao fecha (PO 2026-09-01).
             from database import is_auto_close_enabled
-            closed = close_stale_attendances(
+            closed = await run_in_threadpool(
+                close_stale_attendances,
                 ATTENDANCE_AUTOCLOSE_HOURS, RECEPTION_UNATTENDED_RELEASE_DAYS,
                 inactivity_enabled=is_auto_close_enabled(),
             )
@@ -5296,7 +5373,7 @@ async def cron_pool_wait_notice(request: Request):
     elegibilidade em database_firestore.pool_wait_notice_eligible. Tenant com
     o toggle desligado ou expediente fechado nao le nenhuma thread.
     """
-    _verify_cron_auth(request)
+    await run_in_threadpool(_verify_cron_auth, request)  # OIDC busca certificados por HTTP
     from firestore_common import set_tenant_context, reset_tenant_context
     from tenant_service import list_tenants
     from channel_service import get_channel as _get_notice_channel
@@ -5331,7 +5408,10 @@ async def cron_pool_wait_notice(request: Request):
                 continue
             minutes = int(settings.get("pool_wait_notice_minutes") or 15)
             sent = failed = 0
-            for cand in find_pool_wait_notice_candidates(minutes, tid):
+            # Leituras Firestore sincronas fora do loop (ate 66 s em 2026-10-27).
+            candidates = await run_in_threadpool(
+                lambda: list(find_pool_wait_notice_candidates(minutes, tid)))
+            for cand in candidates:
                 if _monotonic() - started > 200:
                     break
                 conv = cand["conversation"]
@@ -5446,9 +5526,17 @@ async def wa_transfer(request: Request, current_user: dict = Depends(get_current
         raise HTTPException(status_code=400, detail="Resumo do atendimento e obrigatorio")
     _validate_transfer_department(to_department_id)
 
+    if not conversation_id:
+        # Ramo legado por contact_id: o gate vem ANTES do resolve, que faz
+        # upsert da thread (bump de recencia / thread orfa). Contato inexistente
+        # segue respondendo 404 pelo resolve.
+        _ctc_pre = get_wa_contact(contact_id)
+        if _ctc_pre:
+            _require_transfer_source_access(None, _ctc_pre, current_user)
     conv, contact, channel = _resolve_send_target(conversation_id, contact_id)
-    # Guard ANTES de qualquer write (depois do resolve: thread inexistente
-    # continua respondendo 404 primeiro).
+    # Guards ANTES de qualquer write (depois do resolve: thread inexistente
+    # continua respondendo 404 primeiro). Origem: so o que o operador atende.
+    _require_transfer_source_access(conv if conversation_id else None, contact, current_user)
     _require_target_user_with_uid(to_user_id)
 
     # Fase 2C: transferencia atua na conversation. Quando vier so contact_id

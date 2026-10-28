@@ -117,6 +117,28 @@ function LoginScreen() {
   );
 }
 
+// Aba normal ja autenticada no Firebase esperando a sessao do CRM
+// (/api/session + listas de apoio): backend lento/congelado ou nova tentativa
+// apos falha transitoria. Antes caia na tela "Entrar" com o usuario logado.
+const CONNECTING_LOGOUT_AFTER_S = 20;
+function ConnectingScreen() {
+  const { error, logout } = useCrm();
+  const [startedAt] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return (
+    <div className="screen"><div className="hero-card"><p className="eyebrow">Castro Intelligence</p><h1>Conectando ao CRM…</h1>
+      <p>Aguardando o servidor há {seconds} s.</p>
+      {error ? <div className="alert danger" role="alert">{error}</div> : null}
+      {seconds >= CONNECTING_LOGOUT_AFTER_S ? <button className="ghost" style={{ marginTop: "0.6rem" }} onClick={() => void logout()}>Sair e entrar de novo</button> : null}
+    </div></div>
+  );
+}
+
 function TopBar() {
   const { sessionUser, tenantName, monitorEnabled, config, theme, toggleTheme, showSettings, setShowSettings, toggleSettingsMenu, openSettingsPage, settingsMenuRef, logout, can } = useCrm();
   const [gcOpen, setGcOpen] = useState(false);
@@ -815,6 +837,7 @@ const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(
 const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["bot", "novos", "meus", "equipe"]);
 
 function ContactList() {
+  const { listsReady, unavailableContactIds } = useCrm();
   const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, equipeChannelFilter, setEquipeChannelFilter, equipeChannelOptions, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, userSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
   const tagOptions = buildTagOptions(systemSettings.tags_global, userSettings.tags);
   // Revisao B: registry esvaziado fazia o controle SUMIR com o filtro ainda
@@ -838,6 +861,15 @@ function ContactList() {
     return () => { disposed = true; };
   }, [countAllContacts, contactsCountNonce]);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? (poolReception ? "Recepção" : "Novos Leads") : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
+  // 15 s sem as listas chegarem: aviso extra sob o "Carregando conversas"
+  // (multiplas abas disputam o cache persistente do Firestore). Some quando
+  // os dados chegam.
+  const [listsSlow, setListsSlow] = useState(false);
+  useEffect(() => {
+    if (listsReady) { setListsSlow(false); return undefined; }
+    const id = window.setTimeout(() => setListsSlow(true), 15_000);
+    return () => window.clearTimeout(id);
+  }, [listsReady]);
 
   // Render incremental: com ~3k conversas, montar 1000+ itens no DOM trava a
   // coluna. Renderiza em paginas de 50 ("Carregar mais"); o contador do header
@@ -862,7 +894,9 @@ function ContactList() {
     }
     return 0;
   };
-  type RenderItem = { contact: Contact; conversation: Conversation };
+  // contact null = contato ainda nao chegou (snapshot ou hidratacao sob
+  // demanda em voo — ex.: lead de outro dono numa thread minha).
+  type RenderItem = { contact: Contact | null; conversation: Conversation };
   // Fase 3.D: cada item da sidebar e uma Conversation. O Contact e
   // resolvido via contactsById (join in-memory). Mesmo wa_id em 2 canais
   // = 2 entradas distintas, com badge proprio do canal.
@@ -877,8 +911,15 @@ function ContactList() {
       return toMillis(b.last_message_at) - toMillis(a.last_message_at);
     })
     .flatMap((conversation): RenderItem[] => {
-      const contact = contactsById.get(conversation.contact_id);
-      return contact ? [{ contact, conversation }] : [];
+      const contact = contactsById.get(conversation.contact_id) || null;
+      if (contact) return [{ contact, conversation }];
+      // Sem contato a linha vira placeholder (antes SUMIA ate a hidratacao).
+      // Continua escondida quando o backend negou/nao achou o contato
+      // (403/404, nao re-hidrata) ou quando ha filtro de qualificacao, que
+      // depende do contato (o "Nao lidas" e por thread e vale).
+      if (unavailableContactIds.has(conversation.contact_id)) return [];
+      if (qualificationFilter && !unreadMode) return [];
+      return [{ contact: null, conversation }];
     });
 
   const visibleTeamOperators = activeView === "equipe"
@@ -974,7 +1015,7 @@ function ContactList() {
           )}
         </div>
       )}
-      <div className="contact-list">
+      <div className="contact-list" aria-busy={!listsReady}>
         {renderItems.slice(0, visibleLimit).map(({ contact, conversation }) => {
           // Fase 3.D: assigned/department vem da Conversation (cutover Fase 2C);
           // qualification/notes/avatar continuam no Contact.
@@ -982,20 +1023,25 @@ function ContactList() {
             ? (operators.find((o) => o.id === conversation.assigned_to) || null)
             : null;
           const accent = assignedOperator ? operatorColor(assignedOperator.id) : null;
-          const lastMessageAt = conversation.last_message_at || contact.last_message_at;
+          const lastMessageAt = conversation.last_message_at || contact?.last_message_at;
           const unreadCount = conversation.unread_count ?? conversation.unread ?? 0;
           const channelLabel = conversation.channel_label || "";
-          const channelType = conversation.channel_type || conversation.source_channel_type || contact.source_channel_type || "";
+          const channelType = conversation.channel_type || conversation.source_channel_type || contact?.source_channel_type || "";
           const isActive = selectedThreadId === conversation.id;
-          const handleClick = () => setSelectedThreadId(conversation.id);
+          // Placeholder (contato ainda nao chegou): nome do proprio doc da
+          // thread quando houver, sem chip de qualificacao e sem clique — abrir
+          // sem o contato deixaria o painel sem nome/qualificacao.
+          const pending = !contact;
+          const displayName = contact ? contact.display_name : (conversation.display_name || conversation.phone_formatted || "Carregando contato…");
+          const handleClick = () => { if (contact) setSelectedThreadId(conversation.id); };
           return (
-            <button key={conversation.id} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
-              <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
+            <button key={conversation.id} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} disabled={pending} aria-busy={pending || undefined} title={pending ? "Carregando dados do contato" : undefined} style={pending ? { ...operatorAccentStyle(accent), opacity: 0.65, cursor: "progress" } : operatorAccentStyle(accent)}>
+              <div className="avatar" aria-hidden={pending || undefined}>{contact?.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{pending ? "…" : displayName.slice(0, 1).toUpperCase()}</span>}</div>
               <div className="contact-copy">
                 <div className="row">
-                  <strong>{contact.display_name}</strong>
+                  <strong>{displayName}</strong>
                   <div className="contact-meta">
-                    <LeadTemperatureDot temperature={conversation.lead_temperature || contact.lead_temperature} />
+                    <LeadTemperatureDot temperature={conversation.lead_temperature || contact?.lead_temperature} />
                     {assignedOperator ? (
                       <span
                         className="contact-operator-dot"
@@ -1009,9 +1055,10 @@ function ContactList() {
                     <span>{when(lastMessageAt)}</span>
                   </div>
                 </div>
-                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
+                <div className="sub">{contact ? (contact.phone_formatted || contact.wa_id) : (conversation.phone_formatted || conversation.wa_id)}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
                 <div className="row">
-                  <span className="chip">{contact.qualification || "novo"}</span>
+                  {/* span vazio no placeholder mantem o badge a direita (.row = space-between) */}
+                  {contact ? <span className="chip">{contact.qualification || "novo"}</span> : <span />}
                   {unreadCount ? <b className="badge">{unreadCount}</b> : null}
                 </div>
                 {channelLabel ? (
@@ -1029,7 +1076,15 @@ function ContactList() {
             </button>
           );
         })}
-        {!renderItems.length ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
+        {/* Listas ainda chegando (listener sem 1o snapshot): "carregando" no
+            lugar de "Nenhum ..."; apos 15 s, aviso sobre outras abas. */}
+        {!renderItems.length && !listsReady ? (
+          <div className="empty" role="status" aria-live="polite">
+            Carregando conversas…
+            {listsSlow ? <p className="sub" style={{ margin: "0.4rem 0 0" }}>Ainda conectando ao banco. Se houver outras abas do CRM abertas, feche-as e mantenha só esta.</p> : null}
+          </div>
+        ) : null}
+        {!renderItems.length && listsReady ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
         {(() => {
           // Dois papeis no mesmo botao: (1) REVELAR itens ja carregados alem dos
           // 100 mostrados ("Mostrar mais"); (2) BUSCAR no Firestore alem da
@@ -3822,7 +3877,8 @@ function CrmApp() {
   if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Configuracao invalida</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "O backend deve operar em modo Firebase."}</p></div></div>;
   if (!firebaseUser || !sessionUser) return impersonationTab
     ? <div className="screen"><div className="hero-card"><h1>Modo de visualização</h1><p>{impersonationEndMessage || error || (firebaseUser ? "Carregando o acesso..." : "A sessão foi encerrada ou expirou. Gere um novo acesso na aba do administrador.")}</p></div></div>
-    : <LoginScreen />;
+    // Firebase autenticado sem sessao do CRM ainda = conectando (nao e login).
+    : firebaseUser ? <ConnectingScreen /> : <LoginScreen />;
 
   return (
     <Fragment key={readOnly ? impersonationScopeGeneration : "normal"}>
