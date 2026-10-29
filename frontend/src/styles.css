@@ -1113,6 +1113,23 @@ textarea:focus {
   padding: 0.6rem;
 }
 
+.detail-panel > .panel-head {
+  flex-shrink: 0;
+}
+
+/* Evita cortar os cartoes antes de gerar overflow no painel. */
+.detail-panel .detail-scroll > * {
+  flex-shrink: 0;
+}
+
+.detail-panel .detail-scroll {
+  scrollbar-color: var(--muted) var(--panel-strong);
+}
+
+.detail-panel .detail-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--muted);
+}
+
 .detail-panel select,
 .detail-panel input,
 .detail-panel textarea,
@@ -1472,6 +1489,7 @@ textarea:focus {
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
+  .detail-panel .detail-scroll { flex-basis: auto; }
   .panel-head,
   .toolbar,
   .contact-banner { flex-direction: column; align-items: stretch; }
