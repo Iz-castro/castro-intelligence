@@ -1208,6 +1208,114 @@ textarea:focus {
   flex-shrink: 0;
 }
 
+.access-profiles-lightbox { padding: 1rem; }
+
+.access-profiles-modal {
+  width: min(960px, 100%);
+  max-height: 90vh;
+  padding: clamp(1rem, 3vw, 2rem);
+}
+
+.access-profiles-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  align-items: start;
+  gap: 1.5rem;
+}
+
+.access-profiles-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.access-profiles-editor { min-width: 0; }
+
+.access-profile-group { margin-bottom: 1.25rem; }
+
+.access-profile-group h3 {
+  margin: 0 0 0.4rem;
+  padding: 0 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.access-profile-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.access-profile-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  min-height: 48px;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.access-profile-option:last-child { border-bottom-color: transparent; }
+
+.access-profile-option:hover,
+.access-profile-option:focus-within { background: var(--panel-solid-soft); }
+
+.access-profile-option:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.access-profile-option[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+/* Checkbox nao deve herdar largura e padding dos campos de texto globais. */
+.access-profile-option input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  border-radius: 3px;
+  accent-color: var(--accent);
+  color-scheme: light;
+  box-shadow: none;
+  cursor: inherit;
+}
+
+:root.dark .access-profile-option input[type="checkbox"] { color-scheme: dark; }
+
+.access-profile-option-text { overflow-wrap: anywhere; }
+
+.access-profile-option-text small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.access-profile-option-lock { font-size: 0.75rem; }
+
+@media (max-width: 680px) {
+  .access-profiles-layout { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+  .access-profiles-list { flex-direction: row; flex-wrap: wrap; }
+  .access-profiles-list > * { flex: 1 1 140px; min-width: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .access-profile-option { transition: none; }
+}
+
 @keyframes pulse {
   0%, 100% { transform: scale(1); opacity: 1; }
   50% { transform: scale(1.08); opacity: 0.82; }

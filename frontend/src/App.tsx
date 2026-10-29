@@ -13,7 +13,7 @@ import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatP
 import { CommercialContactBanner, FollowupEntry } from "./components/followup/FollowupEntry";
 import { ApiError, getDownload, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PermissionKey, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 import { ImpersonateModal, ImpersonationLayout, READ_ONLY_TOOLTIP } from "./components/Impersonation";
 import { impersonationTab, isFirebaseSessionActive } from "./firebase";
@@ -2874,7 +2874,7 @@ function ReopenBatchModal() {
 // ---------------------------------------------------------------------------
 
 function PerfisAcessoModal() {
-  const { readOnly, config, followupEnabled } = useCrm();
+  const { readOnly, config, followupEnabled, sessionUser, can } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
@@ -2912,14 +2912,15 @@ function PerfisAcessoModal() {
     setCreating(false);
   }, [selectedId, perfis, catalogo]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Permissao de recurso desligado nao aparece (o rascunho mantem o valor
-  // salvo, entao salvar o perfil nao a altera).
+  // Permissao de recurso desligado nao aparece nem entra no PUT;
+  // o backend preserva o valor salvo ao mesclar apenas as chaves recebidas.
   const ocultas = new Set<string>([
     ...(config?.feature_impersonate ? [] : ["ver_como_usuario"]),
     ...(followupEnabled ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
       "registrar_recusa_comercial", "reativar_contato_comercial"]),
   ]);
-  const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
+  const catalogoVisivel = catalogo.filter((item) => !ocultas.has(item.chave));
+  const grupos = catalogoVisivel.reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
     (acc[item.grupo] = acc[item.grupo] || []).push(item);
     return acc;
   }, {});
@@ -2928,7 +2929,8 @@ function PerfisAcessoModal() {
     if (!bundle || !selected) return;
     setBusy(true);
     try {
-      await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles: draftToggles });
+      const toggles = Object.fromEntries(catalogoVisivel.map((item) => [item.chave, draftToggles[item.chave] === true]));
+      await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles });
       setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em ate 1 minuto.`);
       await load(selected.id);
     } catch (e: unknown) { setError(errorText(e)); }
@@ -2962,17 +2964,17 @@ function PerfisAcessoModal() {
   }
 
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Perfis de acesso" onClick={() => setShowSettings(false)}>
+    <div className="lightbox access-profiles-lightbox" role="dialog" aria-modal="true" aria-label="Perfis de acesso" onClick={() => setShowSettings(false)}>
       <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
-      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 860, maxHeight: "90vh", overflow: "auto" }}>
+      <div className="settings-modal access-profiles-modal" onClick={(e) => e.stopPropagation()}>
         <h2 style={{ margin: "0 0 0.3rem" }}>Perfis de acesso</h2>
         <p className="sub" style={{ margin: "0 0 0.9rem", fontSize: "0.82rem" }}>
           Cada usuario segue um perfil. Ajustes valem para todos os usuarios do perfil, sem deploy.
           O catalogo de permissoes e fixo da plataforma.
         </p>
-        <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div className="access-profiles-layout">
           {/* Mestre: lista de perfis */}
-          <div style={{ flex: "0 0 220px", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+          <div className="access-profiles-list">
             {perfis.map((p) => (
               <button key={p.id} type="button" className={p.id === selectedId ? "primary" : "ghost"} style={{ textAlign: "left", padding: "0.55rem 0.7rem" }} onClick={() => setSelectedId(p.id)}>
                 <strong style={{ display: "block", fontSize: "0.88rem" }}>{p.nome}</strong>
@@ -3001,7 +3003,7 @@ function PerfisAcessoModal() {
 
           {/* Detalhe: toggles do perfil selecionado */}
           {selected ? (
-            <div style={{ flex: "1 1 380px", minWidth: 300 }}>
+            <div className="access-profiles-editor">
               <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem", flexWrap: "wrap" }}>
                 <input value={draftNome} onChange={(e) => setDraftNome(e.target.value)} disabled={readOnly || (selected.is_system_locked)} style={{ flex: "1 1 180px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
                 <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
@@ -3010,25 +3012,37 @@ function PerfisAcessoModal() {
                 <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: todas as permissoes ficam sempre ligadas (e o teto do tenant — protecao contra auto-bloqueio). Para um perfil administrativo limitado, crie um perfil customizado com base Administrador.</p>
               ) : null}
               {Object.entries(grupos).map(([grupo, itens]) => (
-                <div key={grupo} style={{ marginBottom: "0.8rem" }}>
-                  <h3 style={{ margin: "0 0 0.35rem", fontSize: "0.82rem", textTransform: "uppercase", opacity: 0.7 }}>{grupo}</h3>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: "0.25rem 0.8rem" }}>
+                <section key={grupo} className="access-profile-group" aria-label={grupo}>
+                  <h3>{grupo}</h3>
+                  <div className="access-profile-options">
                     {itens.map((item) => {
                       const locked = !!selected.is_system_locked;
+                      // Como no backend, admin pode conceder tudo. Os demais podem
+                      // revogar chaves existentes, mas nao conceder as que nao possuem.
+                      const cannotEnable = sessionUser?.role !== "admin" && !can(item.chave as PermissionKey)
+                        && selected.toggles?.[item.chave] !== true;
+                      const disabled = readOnly || locked || cannotEnable || busy;
                       return (
-                        <label key={item.chave} style={{ display: "flex", alignItems: "center", gap: "0.45rem", fontSize: "0.82rem", opacity: locked ? 0.6 : 1, cursor: locked ? "not-allowed" : "pointer" }} title={locked ? "Travado no perfil de sistema" : item.chave}>
+                        <label key={item.chave} className="access-profile-option" aria-disabled={disabled}
+                          title={readOnly ? READ_ONLY_TOOLTIP : locked ? "Travado no perfil de sistema" : cannotEnable ? "Você não pode conceder uma permissão que não possui." : undefined}>
                           <input
                             type="checkbox"
                             checked={draftToggles[item.chave] === true}
-                            disabled={readOnly || (locked || busy)}
+                            disabled={disabled}
                             onChange={(e) => setDraftToggles((prev) => ({ ...prev, [item.chave]: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
                           />
-                          <span>{item.rotulo}{locked ? " 🔒" : ""}</span>
+                          <span className="access-profile-option-text">
+                            {item.rotulo}
+                            {item.chave === "ver_todos_leads" ? (
+                              <small>Só tem efeito para usuários com cargo de administrador ou supervisor.</small>
+                            ) : null}
+                          </span>
+                          {locked || cannotEnable ? <span className="access-profile-option-lock" aria-hidden="true">🔒</span> : null}
                         </label>
                       );
                     })}
                   </div>
-                </div>
+                </section>
               ))}
               <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.8rem" }}>
                 <button className="primary" disabled={readOnly || (busy || !draftNome.trim())} onClick={() => void savePerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "Salvando..." : "Salvar perfil"}</button>
