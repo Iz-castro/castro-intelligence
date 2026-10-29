@@ -1122,10 +1122,9 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-.detail-panel .detail-scroll {
-  scrollbar-color: var(--muted) var(--panel-strong);
-}
-
+/* Sem scrollbar-color aqui: no Chrome/Edge >= 121 ela desliga o
+   ::-webkit-scrollbar (barra fina global) neste painel e, por heranca, nos
+   scrollers internos (cartoes, textareas) — virava barra nativa de 15 px. */
 .detail-panel .detail-scroll::-webkit-scrollbar-thumb {
   background-color: var(--muted);
 }
@@ -1354,11 +1353,15 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-.access-profiles-lightbox { padding: 1rem; }
+/* Faixa de cima reservada para o botao "Fechar" (absoluto, top/right 1.2rem):
+   com 960 px o modal passava por baixo dele entre ~840 e ~1160 px de janela
+   e o topo da barra de rolagem fechava o modal sem salvar. */
+.access-profiles-lightbox { padding: 4.25rem 1rem 1rem; }
 
 .access-profiles-modal {
   width: min(960px, 100%);
-  max-height: 90vh;
+  max-height: calc(100vh - 5.5rem);
+  max-height: calc(100dvh - 5.5rem);
   padding: clamp(1rem, 3vw, 2rem);
 }
 
@@ -1413,8 +1416,10 @@ textarea:focus {
 
 .access-profile-option:last-child { border-bottom-color: transparent; }
 
+/* :focus-within deixava a linha clicada acesa depois que o ponteiro saia
+   (clique foca o checkbox); o destaque segue so o ponteiro e o foco de teclado. */
 .access-profile-option:hover,
-.access-profile-option:focus-within { background: var(--panel-solid-soft); }
+.access-profile-option:has(input:focus-visible) { background: var(--panel-solid-soft); }
 
 .access-profile-option:has(input:focus-visible) {
   outline: 2px solid var(--accent);

@@ -2995,7 +2995,16 @@ function PerfisAcessoModal() {
     if (!bundle || !selected) return;
     setBusy(true);
     try {
-      const toggles = Object.fromEntries(catalogoVisivel.map((item) => [item.chave, draftToggles[item.chave] === true]));
+      // So as chaves visiveis que MUDARAM em relacao a listagem. O backend
+      // mescla (update_perfil) e compara a concessao com o doc CRU: chave
+      // ausente no doc (preenchida pelo seed na listagem) contava como
+      // concessao nova e dava 403 a editor nao-admin que nao a possui, mesmo
+      // sem ele ter mexido nela (revisao dos PRs #4/#5, 2026-10-29).
+      const toggles = Object.fromEntries(
+        catalogoVisivel
+          .filter((item) => (draftToggles[item.chave] === true) !== (selected.toggles?.[item.chave] === true))
+          .map((item) => [item.chave, draftToggles[item.chave] === true]),
+      );
       await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles });
       setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em ate 1 minuto.`);
       await load(selected.id);
