@@ -245,7 +245,11 @@ def _select(tenant_id, args):
         skips[m] += 1
 
     q = collection("wa_contacts").where("qualification", "in", ["em_atendimento", "novo"])
-    for snap in q.stream():
+    # Materializa ANTES do laco: as checagens por candidato (conversa, link da
+    # Val) levam minutos e o stream aberto estourava o deadline do gRPC
+    # (504 Deadline Exceeded) no meio da iteracao (2026-10-28, com
+    # --incluir-sem-aceite o laco ficou ~3x mais longo).
+    for snap in list(q.stream()):
         c = snap.to_dict() or {}
         c.setdefault("id", int(snap.id) if str(snap.id).isdigit() else snap.id)
         wa_id = str(c.get("wa_id") or "")
@@ -257,7 +261,9 @@ def _select(tenant_id, args):
             skip("commercial_contact_blocked"); continue
         if c.get("lgpd_revoked"):
             skip("lgpd_revogado"); continue
-        if c.get("lgpd_consent") is not True:
+        if c.get("lgpd_consent") is False:
+            skip("lgpd_recusado"); continue
+        if c.get("lgpd_consent") is not True and not getattr(args, "incluir_sem_aceite", False):
             skip("consentimento_ausente"); continue
         if c.get("reopen_opt_out"):
             skip("opt_out"); continue
@@ -368,6 +374,10 @@ def main():
                    help="trecho do link de agendamento da Val; quem recebeu fica fora (vazio = desliga)")
     p.add_argument("--sleep", type=float, default=1.5)
     p.add_argument("--user-id", type=int, default=None, help="id do operador para auditoria (opcional)")
+    p.add_argument("--incluir-sem-aceite", action="store_true",
+                   help="inclui leads que NUNCA responderam ao aviso LGPD (lgpd_consent ausente). "
+                        "Recusa explicita (False) e revogacao continuam fora. Decisao do PO em 2026-10-28; "
+                        "quem clicar Continuar cai no aviso LGPD da Val antes de qualquer turno.")
     p.add_argument("--yes", action="store_true", help="ENVIA (default: dry-run)")
     args = p.parse_args()
 

@@ -250,6 +250,17 @@ def _set_bot_state(contact_id: int, state: dict):
     document("bot_states", contact_id).set(state, merge=True)
 
 
+def queue_cx_session_params(contact_id: int, params: dict) -> None:
+    """Parametros de sessao de UM turno do agente CX (ex.: origem=retomada_lote
+    no clique de Continuar — ADR 0013 item 4). Ficam em bot_states (qualquer
+    instancia consome), entram no proximo _process_cx_message do contato e
+    saem como None no turno seguinte, para nao ficarem presos na sessao do
+    agente (contrato em docs/CX_RETOMADA_LOTE_DEV_IA.md)."""
+    if not params:
+        return
+    _set_bot_state(contact_id, {"pending_session_params": dict(params)})
+
+
 def _clear_bot_state(contact_id: int):
     document("bot_states", contact_id).delete()
     document("bot_buffers", contact_id).delete()
@@ -964,6 +975,26 @@ async def _process_cx_message(
         # (nunca decide horario sozinho nem escreve hora no texto). Agente que
         # ainda nao usa os params simplesmente os ignora.
         session_params.update(cx_hours_params(get_tenant_context() or ""))
+        # Parametros de UM turno enfileirados em bot_states (queue_cx_session_
+        # params; ADR 0013 item 4: origem=retomada_lote no Continuar): entram
+        # neste turno e saem como None no seguinte. `state` e o doc lido no
+        # inicio do turno; a baixa e gravada ANTES do DetectIntent para o turno
+        # seguinte (em qualquer instancia) ja ver a limpeza pendente.
+        _pending_params = state.get("pending_session_params") if isinstance(state, dict) else None
+        _clear_params = state.get("clear_session_params") if isinstance(state, dict) else None
+        _state_updates = {}
+        if isinstance(_clear_params, list) and _clear_params:
+            session_params.update({str(k): None for k in _clear_params})
+            _state_updates["clear_session_params"] = []
+        if isinstance(_pending_params, dict) and _pending_params:
+            session_params.update(_pending_params)
+            _state_updates["pending_session_params"] = {}
+            _state_updates["clear_session_params"] = sorted(str(k) for k in _pending_params)
+        if _state_updates:
+            try:
+                _set_bot_state(contact_id, _state_updates)
+            except Exception as exc:
+                logger.warning("[BOT-CX] baixa dos params de um turno falhou | contato=%s: %s", contact_id, exc)
         # Param que o agente do tenant declara com outro tipo (o Hugo declara
         # retorno_previsto como BOOLEAN e o CRM manda texto) sai por
         # settings.ai.omit_session_params. user_id e lgpd_consent nunca saem.

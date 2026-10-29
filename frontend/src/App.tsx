@@ -4,6 +4,7 @@ import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, Vide
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
+import { ChatTabs, CHAT_TABPANEL_ID, chatTabDomId } from "./components/chat/ChatTabs";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
 import { MonitorModal } from "./components/monitor/MonitorModal";
 import { resolveMessageMedia } from "./utils/media";
@@ -1248,6 +1249,9 @@ function ChatPanel() {
   const confirmTakeover = async (withMessage: boolean) => { if (!selectedThreadId) return; setBusyTakeover(true); try { await takeoverConversation(selectedThreadId, withMessage ? greetDraft : undefined); setShowTakeoverPrompt(false); } finally { setBusyTakeover(false); } };
   const doReturn = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await returnConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
   const chatIsEmpty = selectedContact && visibleMessages.length === 0;
+  // Guias de conversa: o painel do chat e a regiao (tabpanel) da guia ativa.
+  const tabsShown = !readOnly && ctx.tabInfo.length > 0;
+  const activeTabId = ctx.tabInfo.find((tab) => tab.isActive)?.id ?? null;
   useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
 
   // Scroll management — must live here (not in CrmProvider) because messagesRef is attached to a DOM node inside this component
@@ -1343,8 +1347,14 @@ function ChatPanel() {
 
   return (
     <main className="panel chat-panel">
+      {/* Guias de conversa: no topo, inclusive sem conversa selecionada. */}
+      <ChatTabs />
       {error ? <div className="alert danger"><span>{error}</span><button type="button" className="alert-close" onClick={() => ctx.setError("")}>&#10005;</button></div> : null}
       {notice ? <div className="alert success"><span>{notice}</span><button type="button" className="alert-close" onClick={() => ctx.setNotice("")}>&#10005;</button></div> : null}
+      {/* Regiao controlada pelas guias (role so com a faixa visivel). */}
+      <div className="chat-tabpanel" id={CHAT_TABPANEL_ID} role={tabsShown ? "tabpanel" : undefined}
+        aria-labelledby={tabsShown && activeTabId ? chatTabDomId(activeTabId) : undefined}
+        aria-label={tabsShown && !activeTabId ? "Conversa" : undefined}>
       {selectedContact ? <>
         <div className="contact-banner">
           <div>
@@ -1573,6 +1583,7 @@ function ChatPanel() {
         </form>
         )}
       </> : <div className="empty large">Selecione um contato para abrir a conversa.</div>}
+      </div>
       {showTemplatePicker && selectedContact ? (
         <TemplatePickerModal
           contactId={selectedContact.id}

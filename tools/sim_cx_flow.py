@@ -1454,6 +1454,28 @@ finally:
     _AI_CFG.pop("lgpd_by_agent", None)
     CX_SCRIPT.clear()
 
+print("\n=== Continuar do lote (ADR 0013 item 4): origem=retomada_lote por UM turno ===")
+novo_contato(61, wa_id="5571999990061")
+STORE.setdefault("bot_states", {})["61"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+bot.queue_cx_session_params(61, {"origem": "retomada_lote"})
+check(STORE["bot_states"]["61"].get("pending_session_params") == {"origem": "retomada_lote"},
+      "queue_cx_session_params grava pending_session_params em bot_states")
+CX_SCRIPT.append(_cx_ok("Que bom te ver de novo! Como posso ajudar?"))
+envia(61, "Quero continuar o atendimento.")
+_p1 = CX_CALLS[-1]["params"]
+check(_p1.get("origem") == "retomada_lote", "1o turno apos o clique: origem=retomada_lote vai ao agente")
+check(STORE["bot_states"]["61"].get("pending_session_params") == {}
+      and STORE["bot_states"]["61"].get("clear_session_params") == ["origem"],
+      "baixa gravada antes do DetectIntent: pendente vazio + limpeza agendada")
+CX_SCRIPT.append(_cx_ok("Claro."))
+envia(61, "quero marcar")
+_p2 = CX_CALLS[-1]["params"]
+check("origem" in _p2 and _p2["origem"] is None, "turno seguinte: origem=None (nao fica preso na sessao)")
+check(STORE["bot_states"]["61"].get("clear_session_params") == [], "limpeza consumida")
+CX_SCRIPT.append(_cx_ok("Ok."))
+envia(61, "obrigado")
+check("origem" not in CX_CALLS[-1]["params"], "3o turno: sem a chave origem")
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")

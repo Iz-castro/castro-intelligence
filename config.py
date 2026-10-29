@@ -296,6 +296,10 @@ REOPEN_SCAN_MAX = max(1, _as_int(os.environ.get("REOPEN_SCAN_MAX"), 2000))
 # de agendamento da Val; quem o recebeu da Val no ciclo fica fora do publico
 # Bot. Vazio desliga a heuristica.
 REOPEN_DESFECHO_LINK = os.environ.get("REOPEN_DESFECHO_LINK", "marcaconsultas").strip().lower()
+# Publico BOT da reabertura (plano v2.2, D3 — 2026-10-29): lead em fase de bot
+# que clica Continuar/Retomar VOLTA PARA O AGENTE (turno com este texto
+# sintetico) em vez de ir para a equipe. Vazio = comportamento antigo (equipe).
+REOPEN_RESUME_BOT_TEXT = os.environ.get("REOPEN_RESUME_BOT_TEXT", "Quero continuar o atendimento.").strip()
 # Janela (horas) em que o clique de avaliacao ainda vale apos o pedido —
 # clique fora dela e ignorado (nunca vira nota nem chega ao bot).
 RATING_CAPTURE_HOURS = int(os.environ.get("RATING_CAPTURE_HOURS", "48"))

@@ -23,6 +23,7 @@ from config import (
     RATING_CAPTURE_HOURS,
     BOT_BUFFER_SECONDS, BOT_BUFFER_MAX_CHARS, CX_DETECT_TIMEOUT_SECONDS,
     WEBHOOK_RAW_DEBUG_CHANNELS, WEBHOOK_RAW_DEBUG_TTL_DAYS,
+    REOPEN_RESUME_BOT_TEXT,
 )
 from database import (
     upsert_wa_contact, save_wa_message, update_wa_message_status, log_audit, flag_conversation_takeover,
@@ -41,7 +42,7 @@ from database import (
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
-from bot_service import process_bot_message_async, lgpd_consent_resolved
+from bot_service import process_bot_message_async, lgpd_consent_resolved, queue_cx_session_params
 from bot_transport import extract_interactive_inbound
 from bot_sender import send_bot_reply
 from firestore_common import (
@@ -407,12 +408,38 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         logger.info("[REOPEN BTN] Cliente encerrou | conv=%s", conversation_id)
     else:  # retomar
         set_attendance_status(conversation_id, "aberto")
+        # Publico BOT (plano v2.2, D3 — 2026-10-29): lead em fase de bot que
+        # clica Continuar VOLTA PARA O AGENTE com um turno sintetico, em vez de
+        # ir para a equipe. Para quem nunca respondeu ao aviso LGPD, o gate do
+        # agente manda o aviso antes de qualquer turno (mesmo caminho de um
+        # texto do cliente). So tenant com motor CX ativo; falha do turno cai
+        # no caminho antigo (equipe), para o cliente nao ficar sem resposta.
+        in_bot_phase = bool(contact) and not contact.get("bot_completed") and not contact.get("assigned_to")
+        resumed_by_bot = False
+        if in_bot_phase and REOPEN_RESUME_BOT_TEXT and _tenant_bot_engine_is_cx():
+            try:
+                # ADR 0013 item 4: o agente recebe origem=retomada_lote neste
+                # turno (saudacao de retorno, sem apresentacao completa) e
+                # origem=None no seguinte.
+                queue_cx_session_params(contact_id, {"origem": "retomada_lote"})
+                await _run_bot_turn_and_send(
+                    contact_id, REOPEN_RESUME_BOT_TEXT, str(contact.get("display_name") or ""), wa_id,
+                    str((channel or {}).get("access_token") or WHATSAPP_TOKEN or "").strip(),
+                    str((channel or {}).get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID or "").strip(),
+                    channel_id=channel_id,
+                    channel_owner_user_id=(channel or {}).get("owner_user_id"),
+                )
+                resumed_by_bot = True
+                logger.info("[REOPEN BTN] Continuar devolvido ao agente | conv=%s", conversation_id)
+            except Exception as exc:
+                logger.warning("[REOPEN BTN] turno do agente no Continuar falhou conv=%s: %s",
+                               conversation_id, exc)
         # Revisao adversarial C2: lead devolvido ao bot (reception) que clica
         # Retomar/Continuar caia em zona morta — bot_completed falso esconde a
         # thread da aba Recepcao e clique de botao nao dispara turno de bot.
         # Mesmo carimbo de engajamento humano do envio manual pelo app
         # (main._check_conv_send_permission): a thread volta visivel pra equipe.
-        if contact and not contact.get("bot_completed"):
+        if contact and not contact.get("bot_completed") and not resumed_by_bot:
             try:
                 mark_contact_bot_done(contact_id)
             except Exception as exc:
@@ -831,6 +858,24 @@ def _tenant_bot_buffer_seconds() -> float:
         )
         return max(0.0, float(BOT_BUFFER_SECONDS))
     return seconds
+
+
+def _tenant_bot_engine_is_cx() -> bool:
+    """settings.ai do tenant atual = motor Dialogflow CX ativo (a mesma
+    resolucao de process_bot_message_async: engine 'dialogflow_cx' e status
+    'active'). Builtin/pausado/desconhecido = False."""
+    tid = get_tenant_context()
+    try:
+        tenant = get_tenant(tid) or {} if tid else {}
+    except Exception:
+        return False
+    settings = tenant.get("settings")
+    ai_cfg = settings.get("ai") if isinstance(settings, dict) else None
+    if not isinstance(ai_cfg, dict):
+        return False
+    engine = str(ai_cfg.get("bot_engine") or "").strip().lower()
+    status = str(ai_cfg.get("status") or "active").strip().lower()
+    return engine == "dialogflow_cx" and status == "active"
 
 
 def _tenant_lgpd_by_agent() -> bool:

@@ -1229,6 +1229,78 @@ def cenario_tags_lead():
         check(True, "registry: slug repetido (case-insensitive) -> ValueError")
 
 
+def cenario_continuar_devolve_ao_agente():
+    titulo("CENARIO 20b — Publico Bot: Continuar devolve ao agente (plano v2.2 D3, 2026-10-29)")
+    import webhook as wh
+    names = ("get_wa_message_by_wa_message_id", "get_wa_conversation_by_id", "get_wa_contact", "document",
+             "set_attendance_status", "get_current_protocol_id", "insert_transfer_system_message", "log_audit",
+             "mark_contact_bot_done", "_run_bot_turn_and_send", "_tenant_bot_engine_is_cx", "REOPEN_RESUME_BOT_TEXT",
+             "queue_cx_session_params")
+    saved = {n: getattr(wh, n) for n in names}
+    rec = {"turns": [], "marks": [], "status": [], "docs": [], "queued": []}
+
+    class _Doc:
+        def __init__(self, name, key):
+            self.name, self.key = name, key
+
+        def set(self, data, merge=False):
+            rec["docs"].append((self.name, self.key, dict(data)))
+
+    async def fake_turn(contact_id, text, contact_name, wa_id, token, phone_id, **kw):
+        rec["turns"].append((contact_id, text, token, phone_id, kw.get("channel_id")))
+        if rec.get("boom"):
+            raise RuntimeError("CX fora do ar")
+
+    wh.get_wa_message_by_wa_message_id = lambda wamid: None
+    wh.get_wa_conversation_by_id = lambda cid: {"id": cid, "contact_id": 1, "channel_id": 6}
+    wh.document = lambda name, key: _Doc(name, key)
+    wh.set_attendance_status = lambda cid, st: rec["status"].append((cid, st))
+    wh.get_current_protocol_id = lambda cid: None
+    wh.insert_transfer_system_message = lambda *a, **k: None
+    wh.log_audit = lambda *a, **k: None
+    wh.mark_contact_bot_done = lambda cid: rec["marks"].append(cid)
+    wh._run_bot_turn_and_send = fake_turn
+    wh.queue_cx_session_params = lambda cid, params: rec["queued"].append((cid, dict(params)))
+    channel = {"id": 6, "access_token": "tok-canal", "phone_number_id": "pnid-canal", "owner_user_id": None}
+
+    def click(contact, cx=True, text="Quero continuar o atendimento.", boom=False):
+        rec["turns"].clear(); rec["marks"].clear(); rec["status"].clear(); rec["queued"].clear(); rec["boom"] = boom
+        wh.get_wa_contact = lambda cid: contact
+        wh._tenant_bot_engine_is_cx = lambda: cx
+        wh.REOPEN_RESUME_BOT_TEXT = text
+        asyncio.run(wh._handle_reopen_button(
+            contact_id=1, wa_id="5531900000001", channel=channel, button={"text": "Continuar"},
+            context={"id": "wamid.template"}, db_id=10, content="Continuar", ts_iso="2026-10-29T13:00:00Z",
+            reply_fields=None, ws_notify_callback=None))
+
+    try:
+        bot_phase = {"id": 1, "display_name": "Paciente", "bot_completed": False, "assigned_to": None}
+        click(bot_phase)
+        check(rec["turns"] == [(1, "Quero continuar o atendimento.", "tok-canal", "pnid-canal", 6)],
+              "CX + fase de bot: turno do agente com o texto sintetico e credenciais do canal")
+        check(rec["marks"] == [], "CX + fase de bot: NAO marca bot_completed (lead segue com o agente)")
+        check(rec["queued"] == [(1, {"origem": "retomada_lote"})], "origem=retomada_lote enfileirado para o turno (ADR 0013 item 4)")
+        check(("6__5531900000001", "aberto") in rec["status"], "atendimento reaberto antes do turno")
+
+        click(dict(bot_phase, bot_completed=True))
+        check(rec["turns"] == [] and rec["marks"] == [], "lead ja fora do bot (Recepcao): sem turno e sem marcar")
+
+        click(bot_phase, cx=False)
+        check(rec["turns"] == [] and rec["marks"] == [1], "motor builtin/pausado: caminho antigo (equipe)")
+
+        click(bot_phase, boom=True)
+        check(len(rec["turns"]) == 1 and rec["marks"] == [1], "turno do agente falhou: cai no caminho antigo (equipe)")
+
+        click(bot_phase, text="")
+        check(rec["turns"] == [] and rec["marks"] == [1], "REOPEN_RESUME_BOT_TEXT vazio = desliga (equipe)")
+
+        click(dict(bot_phase, assigned_to=7))
+        check(rec["turns"] == [] and rec["marks"] == [1], "lead com dono nao e fase de bot: comportamento antigo")
+    finally:
+        for n, v in saved.items():
+            setattr(wh, n, v)
+
+
 def cenario_reabertura_travas():
     titulo("CENARIO 20 — Frente C1: matcher do botao + opt-out de retomada")
     import webhook as wh
@@ -2830,6 +2902,7 @@ def run():
     cenario_rating_botao()
     cenario_tags_lead()
     cenario_reabertura_travas()
+    cenario_continuar_devolve_ao_agente()
     cenario_scan_reabertura()
     cenario_worker_lote()
     cenario_reabertura_pontual_carimbo()

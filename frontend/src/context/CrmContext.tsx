@@ -19,6 +19,7 @@ import { applyTheme, themePref, transportPref } from "../utils/storage";
 import type { LightboxMedia } from "../utils/media";
 import { installAudioUnlock, playBeep } from "../utils/audio";
 import { useImpersonationPolling, type PollCycle } from "../hooks/useImpersonationPolling";
+import { useChatTabs, type ChatTabInfo } from "../hooks/useChatTabs";
 import { assertImpersonationRead, threadReadParams, type ImpersonationRead, type ImpersonationSnapshot, type ImpersonationPage, type ImpersonationThread, type RawDocument } from "../utils/impersonation";
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,14 @@ type CrmContextValue = {
   setSelectedThreadId: (id: string | null) => void;
   selectedContact: Contact | null;
   selectedConversation: Conversation | null;
+
+  // Guias de conversa (PO 2026-10-28): cada conversa aberta vira uma guia
+  // acima do chat (hooks/useChatTabs.ts). Vazias na aba de Ver como.
+  openTabs: string[];
+  tabInfo: ChatTabInfo[];
+  activateTab: (id: string) => void;
+  closeTab: (id: string) => void;
+  closeAllTabs: () => void;
 
   // Views
   activeView: ActiveView;
@@ -500,6 +509,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // com o top-50), evitando que o painel do operador seja derrubado. Mapa
   // conversation_id -> Conversation. Zerado no logout/troca de conta.
   const [extraConversations, setExtraConversations] = useState<Map<string, Conversation>>(new Map());
+  // Copia FIXADA de cada conversa aberta em GUIA (useChatTabs): mantem a
+  // thread no merge mesmo fora das janelas ao vivo e das camadas estaticas —
+  // removeExtraConversation (chamado em varios pontos) nao derruba guia. Cada
+  // guia tem listener proprio no doc, que mantem esta copia fresca.
+  const [tabPins, setTabPins] = useState<Map<string, Conversation>>(new Map());
   // Camada ESTATICA de paginacao do "Meus" (operador comum): getDocs do `mine`
   // com limite crescente. O listener AO VIVO continua em 50; estas sao paginas
   // antigas carregadas sob demanda ("Carregar mais"), sem snapshot. Uma conversa
@@ -578,18 +592,22 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   // Fonte de verdade unificada das conversas: snapshot AO VIVO (top-50) +
-  // FIXADAS (extraConversations). Dedup por id com a versao ao vivo sempre
-  // sobrescrevendo a estatica (o listener e mais fresco). Alimenta selecao,
-  // lazy-fetch de contatos e todas as views.
+  // GUIAS (tabPins) + FIXADAS (extraConversations) + paginadas. Dedup por id
+  // com a versao ao vivo sempre sobrescrevendo as demais (o listener e mais
+  // fresco). A pin da guia vem logo abaixo: tem listener proprio no doc, ao
+  // contrario das copias estaticas (picker / "Carregar mais"), que congelam
+  // quando a thread deixa de estar selecionada. Alimenta selecao, lazy-fetch
+  // de contatos e todas as views.
   const allConversations = useMemo(() => {
-    if (extraConversations.size === 0 && pagedConversations.size === 0) return conversations;
+    if (extraConversations.size === 0 && pagedConversations.size === 0 && tabPins.size === 0) return conversations;
     const map = new Map<string, Conversation>();
     extraConversations.forEach((c) => map.set(c.id, c));  // fixadas (otimista do picker)
     pagedConversations.forEach((c) => map.set(c.id, c));  // paginadas (getDocs, mais frescas)
+    tabPins.forEach((c) => map.set(c.id, c));             // guias (listener proprio por guia)
     conversations.forEach((c) => map.set(c.id, c));        // ao vivo sobrescreve tudo
     return Array.from(map.values())
       .sort((a, b) => (b.last_message_at || "").localeCompare(a.last_message_at || ""));
-  }, [conversations, extraConversations, pagedConversations]);
+  }, [conversations, extraConversations, pagedConversations, tabPins]);
   const selectedConversation = useMemo(
     () => (selectedThreadId ? allConversations.find((c) => c.id === selectedThreadId) || null : null),
     [allConversations, selectedThreadId],
@@ -746,7 +764,16 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const searchText = useDeferredValue(search.trim().toLowerCase());
 
   // -- Composer --
-  const [draft, setDraft] = useState("");
+  // Um composer so, com rascunho POR GUIA: o texto do composer pertence a uma
+  // thread e a troca de guia guarda/devolve (useChatTabs). Toda escrita passa
+  // pelo setDraft deste render, que leva junto a thread do render — um envio
+  // que termina depois da troca de guia limpa o rascunho da guia de origem,
+  // nao o texto da guia atual. Reset (logout/Ver como) usa setDraftState.
+  const [draft, setDraftState] = useState("");
+  const setDraft = (value: string) => chatTabs.writeDraft(selectedThreadId, value);
+  // Modo 1 (Sussurro): nota interna. Declarado aqui (antes das guias): o modo
+  // vai junto com o rascunho de cada guia.
+  const [internalMode, setInternalMode] = useState(false);
   const [replyTarget, setReplyTarget] = useState<MessageReplyReference | null>(null);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [quickSuggestions, setQuickSuggestions] = useState<QuickMessage[]>([]);
@@ -1277,6 +1304,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         };
         setPagedConversations(markRead);
         setExtraConversations(markRead);
+        // Pin da guia vem acima das estaticas no merge: sem zerar aqui o badge
+        // voltaria (e o mark-read repetiria) ate o listener da guia entregar.
+        setTabPins(markRead);
       } else {
         setContacts((prev) => prev.map((contact) => (
           contact.id === contactId ? { ...contact, unread: 0, unread_count: 0 } : contact
@@ -1509,7 +1539,10 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setOperators([]);
     setDepartments([]);
     setChannels([]);
-    setDraft("");
+    // Guias: zera memoria, pins e listeners (o localStorage por uid fica — as
+    // guias voltam no proximo login do mesmo usuario).
+    chatTabs.resetTabs();
+    setDraftState("");
     setReplyTarget(null);
     correctionTargetRef.current = null;
     setCorrectionTarget(null);
@@ -1914,6 +1947,37 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     discardRecording();
   }, [selectedThreadId]);
 
+  // Guias de conversa (PO 2026-10-28). Chamado DEPOIS do effect acima de
+  // proposito: a troca do composer pro rascunho da guia nova roda depois que
+  // a correcao em andamento limpou o texto da guia anterior (ver writeDraft).
+  // So com snapshot: em polling nao ha listener por guia e a pin congelaria.
+  const chatTabs = useChatTabs({
+    enabled: !readOnly && !!sessionUser && !!snapshotMode,
+    storageUid: uiPrefsUid,
+    auth: bundle?.auth ?? null,
+    db: bundle?.db ?? null,
+    conversationsPath: config?.firestore.collections.wa_conversations || "",
+    snapshotMode: !!snapshotMode,
+    sessionUser,
+    canSeeAll,
+    operators,
+    allConversations,
+    liveConversations: conversations,
+    contactsById,
+    unavailableContactIds,
+    selectedThreadId,
+    setSelectedThreadId,
+    holdEmptySelectionRef,
+    setTabPins,
+    setDraftState,
+    internalMode,
+    setInternalMode,
+    correctionTargetRef,
+    suggestionsOpen: quickSuggestions.length > 0,
+    setNotice,
+    scopeGenerationRef: impersonationScopeGenerationRef,
+  });
+
   // Reset detail state on contact change (so o que NAO deriva do contato; os
   // campos derivados — qualificacao/notas/destino — sao semeados no effect
   // seguinte, quando o contato estiver disponivel).
@@ -2063,7 +2127,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setAllConvPageLimit(ADMIN_CONV_WINDOW); setAllConvHasMore(true); setUnreadPageLimit(UNREAD_PAGE); setUnreadHasMore(false);
     setLoadingMoreConvs(false); setQualificationFilter(""); setTagFilter([]); setSearch(""); setChatSearch("");
     setEquipeOperatorFilter(""); setEquipeChannelFilter(""); setChannelFilter("");
-    setDraft(""); setReplyTarget(null); correctionTargetRef.current = null; setCorrectionTarget(null);
+    chatTabs.resetTabs(); setDraftState(""); setReplyTarget(null); correctionTargetRef.current = null; setCorrectionTarget(null);
     setQualification(""); setNotes(""); setToUserId(""); setToDepartmentId(""); setTransferReason(""); setTransferSummary("");
     setQuickSuggestions([]); setQuickSelectedIndex(-1);
     setShowSettings(false); setLightboxMedia(null); setShowAttachMenu(false); setShowDotsMenu(false);
@@ -2765,6 +2829,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
 
   async function logout() {
     if (bundle?.impersonationTab) return endImpersonation(true);
+    // Sair pelo botao (PC compartilhado): apaga os rascunhos salvos deste uid;
+    // a lista de guias fica. Queda de sessao/troca de token nao passa aqui.
+    chatTabs.clearSavedDrafts();
     if (bundle) await signOut(bundle.auth);
     return true;
   }
@@ -2779,7 +2846,6 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     return {};
   }
 
-  const [internalMode, setInternalMode] = useState(false);
   async function sendTextMessage() {
     if (readOnly) return;
     if (!bundle || !selectedContact || !draft.trim() || busySend || busyAudio || busyUpload) return;
@@ -3863,6 +3929,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // top-50), tira da camada estatica — senao ficaria fantasma em "Meus" com
       // dono defasado (o ao vivo nao reentrega thread fora do escopo).
       removeExtraConversation(selectedThreadId);
+      // A guia sai junto: o atendimento nao e mais deste usuario (sem isso o
+      // listener da guia fecharia depois com "assumido por outro operador").
+      chatTabs.discardTab(selectedThreadId);
       setSelectedThreadId(null);
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
@@ -4002,6 +4071,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,
     contacts, contactsById, unavailableContactIds, conversations, selectedContactId, selectedContact, selectedConversation,
     selectedThreadId, setSelectedThreadId,
+    openTabs: chatTabs.openTabs, tabInfo: chatTabs.tabInfo, activateTab: chatTabs.activateTab, closeTab: chatTabs.closeTab, closeAllTabs: chatTabs.closeAllTabs,
     activeView, setActiveView, novosConversations, meusConversations, nqConversations, equipeConversations, botConversations, backupConversations, novosUnread, meusUnread, nqUnread, equipeUnread, botUnread, backupUnread, equipeOperatorFilter, setEquipeOperatorFilter, equipeChannelFilter, setEquipeChannelFilter, equipeChannelOptions, equipeFiltered,
     messages, setMessages, visibleMessages, messageLimit, setMessageLimit, loadingMore, setLoadingMore, messagesRef, scrollIntentRef, prevMessageCountRef,
     transcribingMessageId, transcribeMessage,

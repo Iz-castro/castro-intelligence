@@ -44,3 +44,8 @@ pela Val (`desfecho_bot`: agendou, recebeu o link) fica fora do público Bot.
   nascia vazio e deixava o lead devolvido ao bot sem público.
 - Continuar no Bot abrir para a equipe: o lead estava com a Val; a equipe não tem contexto e a caixa de Recepção enche.
 - Opt-out permanente (ADR 0009 D2 original): cliente que escreve de novo demonstrou interesse.
+
+## Emendas
+
+- **2026-10-29 — item 4 implementado.** O clique em Continuar de lead em fase de bot (tenant com motor CX ativo) roda um turno do agente com `REOPEN_RESUME_BOT_TEXT` (env; default "Quero continuar o atendimento.", vazio desliga) e manda `origem=retomada_lote` por UM turno (`bot_service.queue_cx_session_params` → `bot_states.pending_session_params`; `origem=None` no turno seguinte). Falha do turno, motor builtin/pausado ou lead com dono caem no caminho antigo (equipe). Quem nunca respondeu ao aviso LGPD recebe o aviso antes do turno (gate local).
+- **2026-10-28/29 — item 3 flexibilizado pelo PO para a Varizemed:** o script one-off `scripts/reopen_bot_audience_once.py` ganhou `--incluir-sem-aceite` (lead que NUNCA respondeu ao aviso; recusa explícita e revogação continuam fora). A tela do lote segue com a regra do item 3.
