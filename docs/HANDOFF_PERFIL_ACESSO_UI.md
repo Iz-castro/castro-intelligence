@@ -34,8 +34,10 @@ difere do padrão do cargo e quem usa cada perfil.
    `ver_como_usuario` só com a flag do Ver como (`config.feature_impersonate`). Veja o `ocultas` no modal
    atual (~2975) e mantenha a lógica: chave oculta **não** entra no PUT (senão regrava o seed).
 4. **Chave ausente no doc = valor do seed do cargo** (`_fill_missing_toggles` já faz isso na listagem). Ao
-   salvar, mande o mapa completo que a UI mostra; não invente chaves fora do catálogo (`sanitize_toggles`
-   descarta).
+   salvar, mande **só as chaves visíveis que mudaram em relação à listagem** (revisão de 29/10): o backend
+   mescla (`update_perfil`), mas compara a concessão com o doc **cru** — chave ausente reenviada como `true`
+   conta como concessão nova e dá 403 a editor não-admin que não a possui, mesmo sem ele ter mexido nela.
+   Não invente chaves fora do catálogo (`sanitize_toggles` descarta).
 5. **Teto por cargo**: `ver_todos_leads` só tem efeito de dados para `admin`/`supervisor` (`can_see_all_tenant`).
    Um perfil de operador com essa chave ligada **não** amplia a visibilidade (rules do Firestore) — a UI deve
    avisar isso em vez de sugerir que funciona.
