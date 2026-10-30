@@ -1364,13 +1364,27 @@ async def list_perfis_acesso(current_user: dict = Depends(get_current_user)):
     if not (has_permission(current_user, "gerenciar_perfis_acesso")
             or has_permission(current_user, "gerenciar_usuarios")):
         raise HTTPException(status_code=403, detail="Permissao negada (gerenciar_perfis_acesso)")
-    from rbac import list_perfis
+    from rbac import SEED_PERFIS, list_perfis
+    # Bases de criacao com as chaves que o EDITOR nao possui — o mesmo guard
+    # do POST (toggles_beyond_user sobre o seed de CODIGO, nao sobre o doc do
+    # tenant). A UI desabilita a base bloqueada em vez de levar 403 no Criar
+    # (editor de cargo supervisor x base Operador, cujo seed liga
+    # assumir_coex_proprio). Admin: beyond sempre [].
+    bases = [
+        {
+            "id": pid,
+            "nome": str(SEED_PERFIS[pid].get("nome") or pid),
+            "beyond": toggles_beyond_user(SEED_PERFIS[pid].get("toggles") or {}, current_user),
+        }
+        for pid in SEED_PERFIL_IDS if pid in SEED_PERFIS
+    ]
     return {
         "perfis": list_perfis(str(current_user.get("tenant_id") or "") or "hubloc"),
         "catalogo": [
             {"grupo": grupo, "chave": chave, "rotulo": rotulo}
             for grupo, chave, rotulo in PERMISSION_CATALOG
         ],
+        "bases": bases,
     }
 
 

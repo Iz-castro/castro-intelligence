@@ -14,7 +14,7 @@ import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatP
 import { CommercialContactBanner, FollowupEntry } from "./components/followup/FollowupEntry";
 import { ApiError, getDownload, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PermissionKey, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilBaseItem, PerfilCatalogoItem, PermissionKey, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 import { ImpersonateModal, ImpersonationLayout, READ_ONLY_TOOLTIP } from "./components/Impersonation";
 import { impersonationTab, isFirebaseSessionActive } from "./firebase";
@@ -2939,6 +2939,15 @@ function ReopenBatchModal() {
 // Perfis de Acesso (RBAC dinamico M-B2) — master-detail de toggles
 // ---------------------------------------------------------------------------
 
+// Ordem fixa do select de base (menor privilegio primeiro) e fallback para
+// backend antigo que ainda nao devolve `bases` na listagem.
+const PERFIL_BASE_ORDER = ["perfil_operador", "perfil_supervisor", "perfil_admin"];
+const PERFIL_BASES_FALLBACK: PerfilBaseItem[] = [
+  { id: "perfil_operador", nome: "Operador", beyond: [] },
+  { id: "perfil_supervisor", nome: "Supervisor", beyond: [] },
+  { id: "perfil_admin", nome: "Administrador", beyond: [] },
+];
+
 function PerfisAcessoModal() {
   const { readOnly, config, followupEnabled, sessionUser, can } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
@@ -2952,20 +2961,39 @@ function PerfisAcessoModal() {
   const [creating, setCreating] = useState(false);
   const [newNome, setNewNome] = useState("");
   const [newBase, setNewBase] = useState("perfil_operador");
+  // Bases de criacao com as chaves que o EDITOR nao possui (mesmo guard do
+  // POST, calculado no backend sobre o seed de codigo). Base bloqueada fica
+  // desabilitada no select em vez de dar 403 no Criar (editor de cargo
+  // supervisor x base Operador, que liga assumir_coex_proprio).
+  const [bases, setBases] = useState<PerfilBaseItem[]>([]);
 
   const selected = perfis.find((p) => p.id === selectedId) || null;
+  const baseOptions = (bases.length ? bases : PERFIL_BASES_FALLBACK)
+    .slice()
+    .sort((a, b) => PERFIL_BASE_ORDER.indexOf(a.id) - PERFIL_BASE_ORDER.indexOf(b.id));
+  const newBaseBloqueada = baseOptions.find((b) => b.id === newBase)?.beyond || [];
 
   const load = useCallback(async (focusId?: string) => {
     if (!bundle) return;
     try {
-      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[] }>(bundle.auth, "/api/admin/perfis-acesso");
+      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[]; bases?: PerfilBaseItem[] }>(bundle.auth, "/api/admin/perfis-acesso");
       setPerfis(res.perfis);
       setCatalogo(res.catalogo);
+      setBases(Array.isArray(res.bases) ? res.bases : []);
       setSelectedId((prev) => focusId || prev || res.perfis[0]?.id || null);
     } catch (e: unknown) { setError(errorText(e)); }
   }, [bundle, setError]);
 
   useEffect(() => { void load(); }, [load]);
+  // Se a base pre-selecionada esta bloqueada para este editor, pula para a
+  // primeira liberada (na ordem do select) em vez de deixar o Criar travado.
+  useEffect(() => {
+    if (!bases.length) return;
+    const atual = bases.find((b) => b.id === newBase);
+    if (atual && atual.beyond.length === 0) return;
+    const livre = PERFIL_BASE_ORDER.map((id) => bases.find((b) => b.id === id)).find((b) => b && b.beyond.length === 0);
+    if (livre) setNewBase(livre.id);
+  }, [bases]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sincroniza o rascunho ao trocar de perfil selecionado.
   useEffect(() => {
@@ -3062,12 +3090,19 @@ function PerfisAcessoModal() {
               <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", border: "1px solid var(--border, #444)", borderRadius: 8, padding: "0.55rem" }}>
                 <input value={newNome} onChange={(e) => setNewNome(e.target.value)} placeholder="Nome do perfil" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 <select value={newBase} onChange={(e) => setNewBase(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
-                  <option value="perfil_operador">Base: Operador</option>
-                  <option value="perfil_supervisor">Base: Supervisor</option>
-                  <option value="perfil_admin">Base: Administrador</option>
+                  {baseOptions.map((b) => (
+                    <option key={b.id} value={b.id} disabled={b.beyond.length > 0}>
+                      {`Base: ${b.nome}`}{b.beyond.length > 0 ? " (indisponível para você)" : ""}
+                    </option>
+                  ))}
                 </select>
+                {newBaseBloqueada.length > 0 ? (
+                  <span className="sub" style={{ fontSize: "0.72rem", lineHeight: 1.3 }}>
+                    Esta base concede permissões que você não possui: {newBaseBloqueada.map((chave) => catalogo.find((item) => item.chave === chave)?.rotulo || chave).join(", ")}.
+                  </span>
+                ) : null}
                 <div style={{ display: "flex", gap: "0.35rem" }}>
-                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={readOnly || (busy || !newNome.trim())} onClick={() => void createPerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "..." : "Criar"}</button>
+                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={readOnly || (busy || !newNome.trim() || newBaseBloqueada.length > 0)} onClick={() => void createPerfil()} title={readOnly ? READ_ONLY_TOOLTIP : newBaseBloqueada.length > 0 ? "Escolha uma base que você possa conceder." : undefined}>{busy ? "..." : "Criar"}</button>
                   <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setCreating(false)}>✕</button>
                 </div>
               </div>

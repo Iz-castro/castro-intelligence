@@ -101,6 +101,10 @@ export type SessionPerfil = {
 // Item do catalogo de toggles retornado por GET /api/admin/perfis-acesso.
 export type PerfilCatalogoItem = { grupo: string; chave: string; rotulo: string };
 
+// Base seed para criar perfil (GET /api/admin/perfis-acesso `bases`): `beyond`
+// = chaves ligadas no seed que o EDITOR atual nao possui (base bloqueada).
+export type PerfilBaseItem = { id: string; nome: string; beyond: string[] };
+
 // Doc completo de tenants/{tid}/perfis_acesso/{id} (UI de gestao).
 export type PerfilAcesso = {
   id: string;
