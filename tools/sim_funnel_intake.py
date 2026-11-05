@@ -32,6 +32,11 @@ mesmos writes e leituras, so os crm_* a mais. Endpoints REAIS: texto,
 correcao, template manual e reabertura pontual movem; o lote de reabertura
 real nao. Sem contexto de tenant nada acontece (sem fallback 'hubloc') e uma
 sessao VALIDA de "Ver como" nao passa do middleware em nenhuma rota de envio.
+O [Continuar] do template de reabertura devolvido ao agente (develop): o
+clique entra por _process_messages (lead antigo vai para A classificar), o
+turno sintetico com handoff leva a Em atendimento com Activity, a reentrega
+do clique nao repete turno nem Activity e o turno falhando cai na equipe
+(mark_contact_bot_done) sem mexer em crm_*.
 
 NAO toca em producao: roda o codigo REAL de webhook.py (_process_messages,
 process_webhook_payload, eco, agenda e history), database_firestore.py
@@ -627,8 +632,9 @@ _CLINIC_STAGES = {s["key"]: s for s in fc.TEMPLATES["clinic_v1"]["stages"]}
 
 def auto_id(event, cid, from_version, tenant=TENANT):
     """Id esperado da Activity de automacao: deterministico por tenant,
-    evento, contato e versao de ORIGEM (reentrega cai no mesmo doc)."""
-    key = "\x1f".join((tenant, "auto", event, str(cid), str(from_version)))
+    contato e versao de ORIGEM (reentrega cai no mesmo doc; o evento NAO
+    entra: handoff e 1a resposta da mesma versao = 1 Activity)."""
+    key = "\x1f".join((tenant, "auto", str(cid), str(from_version)))
     return "stage_auto_" + hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
@@ -1559,8 +1565,15 @@ def cenario_16_handoff():
     check(act.get("contact_id") == cid and act.get("tenant_id") == TENANT and act.get("task_id") is None
           and act.get("conversation_id") is None and act.get("occurred_at") == c.get(fc.F_CHANGED_AT)
           and act.get("data") == {"stage_version": 2, "source": "rule:handoff", "rule": "handoff"}
-          and act.get("operation_id") == "auto:handoff:%s:1" % cid,
+          and act.get("operation_id") == "auto:%s:1" % cid,
           "Activity: contato/tenant certos, occurred_at = changed_at, data {stage_version, source, rule}")
+    _same = dict(c, id=cid, **{fc.F_STAGE: "new", fc.F_VERSION: 1})
+    _cat = fc.load_tenant_funnel(TENANT)
+    _h = fc.auto_transition(_same, NOW, _cat, fc.AUTO_HANDOFF, TENANT)
+    _r = fc.auto_transition(_same, NOW, _cat, fc.AUTO_HUMAN_REPLY, TENANT)
+    check(_h[1] and _r[1] and _h[1]["id"] == _r[1]["id"] == _h[0][fc.F_ACTIVITY] == _r[0][fc.F_ACTIVITY]
+          and _h[1]["data"]["rule"] == "handoff" and _r[1]["data"]["rule"] == "human_reply",
+          "handoff e 1a resposta humana da MESMA versao = mesmo id de Activity (1 movimento, nao 2)")
     pos = [i for i, w in enumerate(WRITES) if w[1] == "crm_activities"]
     check(pos == [idx + 1] and [k for (_t, coll, _d, k) in OPS if coll == "crm_activities"] == ["set"]
           and all(w[4] is False and w[0] == TENANT for w in WRITES if w[1] == "crm_activities"),
@@ -2066,7 +2079,7 @@ def cenario_17_resposta_humana():
         check(set(act) == ACTIVITY_KEYS and act.get("from_stage") == "new" and act.get("to_stage") == "in_service"
               and act.get("actor_type") == "system" and act.get("occurred_at") == t_reply
               and act.get("data") == {"stage_version": 2, "source": "rule:human_reply", "rule": "human_reply"}
-              and act.get("operation_id") == "auto:human_reply:1191:1",
+              and act.get("operation_id") == "auto:1191:1",
               "Activity da 1a resposta: system, new -> in_service, occurred_at = hora da mensagem")
         ci = [i for i, w in enumerate(WRITES) if w[1] == "wa_contacts"]
         ai = [i for i, w in enumerate(WRITES) if w[1] == "crm_activities"]
@@ -2671,6 +2684,107 @@ def cenario_20_ver_como():
           "controle: o mesmo middleware com token normal chega ao endpoint no tenant do usuario")
 
 
+def _reopen_click(wa, mid):
+    """Clique no botao [Continuar] do template de reabertura (quick-reply)."""
+    return {"from": wa, "id": mid, "type": "button", "timestamp": unix(NOW - timedelta(seconds=5)),
+            "button": {"payload": "Continuar", "text": "Continuar"}}
+
+
+def _seed_reopen_lead(cid, wa):
+    """Lead antigo em fase de bot (sem dono, bot_completed False, LGPD ja
+    aceita), sem etapa, com a thread fechada por inatividade que recebeu o
+    template de reabertura."""
+    seed_contact(cid, wa, qualification="novo", bot_completed=False, assigned_to=None,
+                 last_reopen_template_at=NOW - timedelta(hours=1))
+    conv_id = "4__%s" % wa
+    STORE.setdefault((TENANT, "wa_conversations"), {})[conv_id] = {
+        "id": conv_id, "contact_id": cid, "channel_id": 4, "wa_id": wa,
+        "attendance_status": "fechado_inatividade", "assigned_to": None, "assigned_to_uid": "",
+        "source_channel_type": "standard", "is_backup": False}
+    STORE.setdefault((TENANT, "bot_states"), {})[str(cid)] = {
+        "step": "cx", "lgpd_consent": True, "lgpd_status": "accepted"}
+    return conv_id
+
+
+def _continuar_run(cid, wa, feature=True, fail_turn=False, sent=None):
+    """Um clique [Continuar] pelo _process_messages REAL com o motor CX ativo
+    no tenant (settings.ai) e o despachante real do bot; so o envio da
+    resposta e trocado. fail_turn = o turno sintetico do agente levanta."""
+    reset(feature=feature)
+    TENANT_DOCS[TENANT]["settings"]["ai"] = copy.deepcopy(AI_CFG)
+    conv_id = _seed_reopen_lead(cid, wa)
+    if fail_turn:
+        async def _boom(*_a, **_k):
+            raise RuntimeError("motor CX fora (simulado)")
+        webhook.process_bot_message_async = _boom
+    else:
+        webhook.process_bot_message_async = bot_service.process_bot_message_async
+        CX_SCRIPT.append(copy.deepcopy(HANDOFF_REPLY))
+    if sent is not None:
+        sent.clear()
+    deliver([_reopen_click(wa, "w.21.%d" % cid)])
+    return conv_id
+
+
+def cenario_21_continuar_agente():
+    titulo("21. [Continuar] da reabertura devolvido ao agente (develop) com o funil ligado")
+    saved = {name: getattr(webhook, name) for name in ("process_bot_message_async", "_send_bot_reply")}
+    sent = []
+
+    async def _send(*args, **kwargs):
+        sent.append(args[1] if len(args) > 1 else kwargs.get("reply"))
+
+    webhook._send_bot_reply = _send
+    try:
+        wa = "5531911110301"
+        conv_id = _continuar_run(9101, wa, sent=sent)
+        c = contact(9101)
+        acts = activities_of(9101)
+        stage_writes = [d for d, _m in contact_writes(9101) if crm(d)]
+        check(in_tenant(webhook._tenant_bot_engine_is_cx) and STORE[(TENANT, "wa_conversations")][conv_id]
+              ["attendance_status"] == "aberto", "motor CX ativo no tenant e a thread reaberta pelo clique")
+        check(len(stage_writes) == 2 and stage_writes[0][fc.F_STAGE] == "unclassified"
+              and stage_writes[0][fc.F_SOURCE] == "intake" and stage_writes[0][fc.F_VERSION] == 1
+              and set(crm(stage_writes[0])) == set(fc.CONTACT_STAGE_FIELDS),
+              "o clique entra por _process_messages: lead antigo sem etapa vai para A classificar (intake)")
+        check(CX_CALLS == [config.REOPEN_RESUME_BOT_TEXT] and CX_PARAMS[0].get("origem") == "retomada_lote"
+              and sent == [HANDOFF_REPLY["reply_text"]],
+              "turno sintetico do agente (origem=retomada_lote) e a resposta enviada")
+        check(c[fc.F_STAGE] == "in_service" and c[fc.F_VERSION] == 2 and c[fc.F_SOURCE] == "rule:handoff"
+              and c.get("bot_completed") is True and c.get("qualification") == "novo",
+              "handoff no turno do Continuar: A classificar -> Em atendimento (qualification intocada)")
+        check(len(acts) == 1 and acts[0]["id"] == auto_id("handoff", 9101, 1) == c[fc.F_ACTIVITY]
+              and (acts[0]["from_stage"], acts[0]["to_stage"]) == ("unclassified", "in_service")
+              and acts[0]["data"].get("rule") == "handoff",
+              "1 Activity da automacao (handoff) apontada pelo contato")
+        before, calls, n_acts, n_msgs = copy.deepcopy(crm(c)), len(CX_CALLS), len(acts), len(messages_of(9101))
+        WRITES.clear()
+        deliver([_reopen_click(wa, "w.21.9101")])
+        check(crm(contact(9101)) == before and len(CX_CALLS) == calls and len(activities_of(9101)) == n_acts
+              and len(sent) == 1 and not [d for d, _m in contact_writes(9101) if crm(d)],
+              "reentrega do MESMO clique (was_dup): nenhum turno, Activity, envio ou crm_* a mais")
+        check(not writes_in("wa_conversations") and len(messages_of(9101)) == n_msgs,
+              "reentrega nao reprocessa o botao: thread nao regravada e nenhum aviso de sistema novo")
+        # Controle: funil desligado = o mesmo fluxo do develop, sem crm_* nem Activity.
+        _continuar_run(9102, "5531911110302", feature=False, sent=sent)
+        off = contact(9102)
+        check(not crm(off) and not activities_of(9102) and off.get("bot_completed") is True
+              and CX_CALLS == [config.REOPEN_RESUME_BOT_TEXT] and len(sent) == 1,
+              "funil desligado: mesmo Continuar (turno + handoff), sem crm_* e sem Activity")
+        # Turno do agente falhando: cai na equipe (mark_contact_bot_done) e a
+        # etapa da entrada fica; o carimbo nao escreve crm_*.
+        _continuar_run(9103, "5531911110303", fail_turn=True, sent=sent)
+        failed = contact(9103)
+        done = [d for d, m in contact_writes(9103) if m and d.get("bot_completed") is True]
+        check(failed[fc.F_STAGE] == "unclassified" and failed[fc.F_VERSION] == 1 and failed[fc.F_SOURCE] == "intake"
+              and failed.get("bot_completed") is True and not activities_of(9103) and not CX_CALLS and not sent,
+              "turno falhando: lead fica em A classificar, cai na equipe, sem Activity nem envio")
+        check(done == [{"bot_completed": True}], "mark_contact_bot_done grava so bot_completed (nada de crm_*)")
+    finally:
+        for name, value in saved.items():
+            setattr(webhook, name, value)
+
+
 _SENTINEL_MODULE = "google.cloud.firestore"
 _COHORT_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _INTAKE_SOURCES = {"intake", "graduation"}
@@ -2759,6 +2873,7 @@ def main():
     cenario_17i_templates()
     cenario_18_chamadas_de_envio()
     cenario_20_ver_como()
+    cenario_21_continuar_agente()
     cenario_19_tipos()  # por ultimo: varre os writes de TODOS os cenarios
     print("\n" + "=" * 70)
     if FAILS:

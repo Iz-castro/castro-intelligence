@@ -13,8 +13,8 @@ export { loadContactHistory, loadContactStage } from "./api";
 export { boardReducer, createBoardState, DEFAULT_FILTERS } from "./boardReducer";
 export type { BoardAction, BoardState } from "./boardReducer";
 export {
-  buildCloseFunnel, CLOSE_NOTE_MAX, closeChoiceProblem, closeExcluded, closeFormMode, closeGateApplies, closeKeepsStage, closeNoteAllowed, closeOpensModal, closeOutcomeStages,
-  contactMatchesFilter, contactStageLabel, contactStagePatch, effectiveCloseChoice, EMPTY_CLOSE_DRAFT, filterValueValid, findStage, freezeCloseDraft, initialCloseTarget,
+  buildCloseFunnel, CLOSE_GATE_KINDS, CLOSE_NOTE_MAX, closeChoiceProblem, closeExcluded, closeFormMode, closeGateApplies, closeKeepsStage, closeNoteAllowed, closeOpensModal, closeOutcomeStages,
+  contactMatchesFilter, contactStageLabel, contactStagePatch, contactWithStage, effectiveCloseChoice, EMPTY_CLOSE_DRAFT, filterValueValid, findStage, freezeCloseDraft, initialCloseTarget,
   LEGACY_OPEN_QUALIFICATIONS, moveTargets, patchCloseDraft, selectableReasons, STAGE_FILTER_PREFIX, stageFilterOptions, stageFromFilter, stageLegacyQualification, stageVisible,
 } from "./catalog";
 export type { CloseBase, CloseChoice, CloseDraft, CloseFormMode, FunnelUi, FunnelUiStatus, StageFilterOption } from "./catalog";
@@ -26,5 +26,5 @@ export { StageHistory } from "./StageHistory";
 export { useFunnelAccess } from "./useFunnelAccess";
 export { useFunnelCatalog } from "./useFunnelCatalog";
 export type { FunnelCatalogState } from "./useFunnelCatalog";
-export { funnelAvailable, invalidateFunnelConfig, useFunnelConfig } from "./useFunnelConfig";
+export { funnelAvailable, funnelCatalogAvailable, invalidateFunnelConfig, useFunnelConfig } from "./useFunnelConfig";
 export type { BoardFilters, CloseFunnelBody, FunnelCapabilities, FunnelCatalog, FunnelConfig, FunnelStage, HistoryItem, MoveStageResponse, StageState, StaleCurrent } from "./types";

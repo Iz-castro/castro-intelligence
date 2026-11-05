@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ApiError } from "../../api";
 import { useOperationId } from "../../features/followup/useOperation";
 import {
@@ -26,6 +26,8 @@ export type FunnelCloseForm = {
   prepare: (conversationId: string) => CloseFunnelBody | null;
   // Erro do encerramento: 409 stale_version vira o aviso de conflito (e a
   // nova base); erros com code do funil ficam no modal. true = tratado.
+  // Modal ja desmontado (ex.: a troca de conversa fechou durante o envio) =
+  // false: o erro vai ao alerta global do CrmContext.
   handleError: (error: unknown) => boolean;
 };
 
@@ -45,12 +47,20 @@ export function useFunnelCloseForm(contact: Contact, thread?: Conversation | nul
   const [conflict, setConflict] = useState<StaleCurrent | null>(null);
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);
+  // Montado? O envio pode terminar depois que o modal saiu da tela.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const mode = closeFormMode(funnel, contact, thread);
   const catalog = funnel.catalog;
   // Etapa atual com motivo (Não convertido): o motivo nao vem no contato
   // (pode ser dado de saude). 1 GET leve da etapa so neste caso, para
   // pre-selecionar o motivo registrado (manter = so sincroniza o legado).
-  const needsReason = mode === "funnel" && Boolean(base.stage) && Boolean(findStage(catalog, base.stage)?.requires_reason);
+  // A rota exige ver_funil: quem so fecha atendimento (catalogo sem
+  // ver_funil) escolhe o motivo sem a pre-selecao.
+  const needsReason = mode === "funnel" && access.available && Boolean(base.stage) && Boolean(findStage(catalog, base.stage)?.requires_reason);
   const auth = access.auth;
   useEffect(() => {
     if (!needsReason || !auth || !base.stage) return;
@@ -88,6 +98,8 @@ export function useFunnelCloseForm(contact: Contact, thread?: Conversation | nul
   }
 
   function handleError(cause: unknown): boolean {
+    // Ninguem veria o aviso num modal desmontado: o alerta global mostra.
+    if (!mounted.current) return false;
     const stale = staleCurrent(cause);
     if (stale) {
       // A escolha exibida (inclusive pre-selecao) fica fixa: a base nova nao

@@ -42,11 +42,11 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
   `tools\sim_followup_api.py` (56), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
-  Funil comercial (ADR 0015): `tools\sim_funnel_flow.py` (447, inclui gate estatico dos indices por matriz),
-  `tools\sim_funnel_api.py` (253, inclui o encerramento unificado pelo app real),
-  `tools\sim_funnel_intake.py` (340, entrada automatica e automacoes no caminho quente),
-  `tools\sim_funnel_migration.py` (351) e, na raiz, `node tools\sim_funnel_frontend.mjs` (672).
-  Guias de conversa (limite por uso, rascunho+modo por guia, storage por uid + restauracao sem abrir, auto-fechamento so com dado do servidor, Ctrl+Alt+Seta, Sair apaga rascunho, Ver como/polling sem guias): na raiz, `node tools\sim_chat_tabs.mjs` (174).
+  Funil comercial (ADR 0015): `tools\sim_funnel_flow.py` (472, inclui gate estatico dos indices por matriz),
+  `tools\sim_funnel_api.py` (294, inclui o encerramento unificado pelo app real),
+  `tools\sim_funnel_intake.py` (351, entrada automatica e automacoes no caminho quente),
+  `tools\sim_funnel_migration.py` (351) e, na raiz, `node tools\sim_funnel_frontend.mjs` (714).
+  Guias de conversa (limite por uso, rascunho+modo por guia, storage por uid + restauracao sem abrir, auto-fechamento so com dado do servidor, Ctrl+Alt+Seta sem camada modal aberta, Sair apaga rascunho, Ver como/polling sem guias): na raiz, `node tools\sim_chat_tabs.mjs` (180).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -207,7 +207,9 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   mudança MANUAL de etapa (quadro, cartão ou modal de encerrar) grava também o desfecho legado equivalente
   em `qualification` (`stage.legacy_qualification`); intake, automações e migração NUNCA escrevem
   `qualification` (o handoff gravar em_atendimento tiraria o lead da caixa da recepção). A etapa nunca
-  escreve bot/dono/LGPD/opt-out/tags. `/api/funnel` fica fora das allowlists do Ver como;
+  escreve bot/dono/LGPD/opt-out/tags. Só `GET /api/funnel/config` abre também para
+  `fechar_atendimento_manual` (quem fecha escolhe a etapa sem `ver_funil`); tarefas no card seguem
+  `tenant_followup_enabled`. `/api/funnel` fica fora das allowlists do Ver como;
   `FollowupService.list_activities` descarta `crm_stage_*`. 12 índices novos: publicar READY antes de ligar.
 - **Event loop único (`--workers 1`): trabalho síncrono pesado roda em `run_in_threadpool`** (2026-10-28).
   O cliente Firestore é síncrono; uma chamada longa dentro de `async def` congela TODAS as requests da

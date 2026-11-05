@@ -3,7 +3,7 @@ import { useCrm } from "../../context/CrmContext";
 import type { Contact } from "../../types";
 import {
   closeOutcomeStages, daysInStageText, elapsedDays, formatDateTime, funnelErrorMessage, InfoButton, isAccessLost, loadContactHistory, MoveStageDialog, StageHistory,
-  useFunnelAccess, useFunnelConfig, type FunnelCatalog, type HistoryItem, type MoveStageResponse,
+  stageLegacyQualification, useFunnelAccess, useFunnelConfig, type FunnelCatalog, type HistoryItem, type MoveStageResponse,
 } from "../../features/funnel";
 
 // Etapa vinda do POST/409 desta tela. Vale sobre a do contato ao vivo so
@@ -29,12 +29,16 @@ function historyError(reason: unknown): string {
 // (ao vivo) + o catalogo de useFunnelConfig (1 GET por sessao, em cache);
 // historico so ao expandir; "Mover para…"/"Incluir no funil" sempre pelo
 // dialogo confirmado. Nada aqui assume, abre conversa, pega tarefa ou manda
-// mensagem. Indisponivel (Ver como, flag, tenant, permissao) = nada
-// renderizado e nenhuma requisicao.
+// mensagem. Indisponivel (Ver como, flag, tenant, sem ver_funil) = nada
+// renderizado e nenhuma requisicao propria: o /config e o MESMO cache do
+// catalogo (quem so fecha atendimento le o catalogo, mas nao ve o cartao).
+// A etapa gravada aqui (POST ou 409) tambem vai para a copia do contato no
+// CrmContext (contato do picker/Equipe nao tem listener): chip e
+// encerramento seguem a versao nova.
 export function FunnelStageCard({ contact }: { contact: Contact }) {
-  const { sessionUser } = useCrm();
+  const { sessionUser, patchContactStage } = useCrm();
   const access = useFunnelAccess();
-  const { config, error: configError, accessLost, loading, reload } = useFunnelConfig(access.auth, access.available, access.accessKey);
+  const { config, error: configError, accessLost, loading, reload } = useFunnelConfig(access.auth, access.catalogAvailable, access.accessKey);
   const auth = access.auth;
   const id = useId();
   const contactId = contact.id;
@@ -120,6 +124,8 @@ export function FunnelStageCard({ contact }: { contact: Contact }) {
     const stage = response.stage;
     if (stage && Number.isInteger(stage.version)) {
       setLocal({ contactId, key: stage.key, version: stage.version, changedAt: stage.changed_at || null, reason: stage.reason || null });
+      // Mudanca MANUAL: o backend gravou junto o legado equivalente.
+      patchContactStage(contactId, stage, stageLegacyQualification(catalog, stage.key));
     }
     const label = stage?.label || stageLabel(catalog, stage?.key) || "a nova etapa";
     setNotice({ contactId, tone: "success", version: stage?.version, text: `Etapa alterada para ${label}. Nenhuma mensagem foi enviada.` });
@@ -175,8 +181,10 @@ export function FunnelStageCard({ contact }: { contact: Contact }) {
       onMoved={moved}
       onConflict={(current) => {
         // Etapa atual do servidor (quem mudou primeiro): o cartao acompanha
-        // mesmo sem listener para este contato.
+        // mesmo sem listener para este contato. O legado fica: a mudanca de
+        // outra pessoa pode ter sido automatica (nao grava qualification).
         setLocal({ contactId, key: current.stage, version: current.version, changedAt: current.changed_at, reason: null });
+        if (current.stage) patchContactStage(contactId, { key: current.stage, version: current.version, changed_at: current.changed_at });
       }}
       onAccessLost={(error) => {
         setDialog(null);

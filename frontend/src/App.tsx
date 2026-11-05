@@ -10,6 +10,7 @@ import { MonitorModal } from "./components/monitor/MonitorModal";
 import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
+import { useBusyLock } from "./hooks/useBusyLock";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { CommercialContactBanner, FollowupEntry } from "./components/followup/FollowupEntry";
 import { FunnelEntry } from "./components/funnel/FunnelEntry";
@@ -1648,21 +1649,29 @@ function CloseAttendanceModal({ contact, threadId, thread, onClose }: { contact:
   // 28/10) — inclusive para perfil sem ver_funil, que cai no select legado.
   const offerQualified = !(config?.feature_funnel && funnelEnabled);
   const canSubmit = funnelMode ? funnelForm.mode === "funnel" && !funnelForm.problem : Boolean(outcome);
+  // Envio em andamento: fechar pelo fundo, "Fechar" ou "Cancelar" fica
+  // travado. Fechar no meio desmontava o modal e o 409/422/403 do
+  // encerramento sumia sem ninguem ver (o fechamento pela troca de conversa
+  // continua; ai o erro vai ao alerta global). Sucesso fecha pelo onClose cru.
+  const sending = useBusyLock();
+  const closeManually = sending.guard(onClose);
   async function submit() {
-    if (busyTransfer) return;
-    if (funnelMode) {
-      const funnel = funnelForm.prepare(threadId);
-      if (!funnel) return;
-      const ok = await setAttendance(threadId, "fechado_manual", { notes, tags, tag_labels: tagLabels, funnel, legacyQualification: funnelForm.legacyQualification }, { onError: funnelForm.handleError });
+    if (busyTransfer || sending.isBusy()) return;
+    await sending.run(async () => {
+      if (funnelMode) {
+        const funnel = funnelForm.prepare(threadId);
+        if (!funnel) return;
+        const ok = await setAttendance(threadId, "fechado_manual", { notes, tags, tag_labels: tagLabels, funnel, legacyQualification: funnelForm.legacyQualification }, { onError: funnelForm.handleError });
+        if (ok) onClose();
+        return;
+      }
+      const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels });
       if (ok) onClose();
-      return;
-    }
-    const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels });
-    if (ok) onClose();
+    });
   }
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Encerrar atendimento" onClick={onClose}>
-      <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Encerrar atendimento" onClick={closeManually}>
+      <button type="button" className="lightbox-close" onClick={closeManually} disabled={sending.busy} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: funnelMode ? 560 : 440 }}>
         <h2 style={{ margin: "0 0 0.6rem" }}>Encerrar atendimento</h2>
         {error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{error}</span></div> : null}
@@ -1687,7 +1696,7 @@ function CloseAttendanceModal({ contact, threadId, thread, onClose }: { contact:
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Notas de atendimento</label>
         <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={4} style={{ width: "100%" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end", marginTop: "1rem" }}>
-          <button type="button" className="ghost" onClick={onClose} disabled={busyTransfer}>Cancelar</button>
+          <button type="button" className="ghost" onClick={closeManually} disabled={busyTransfer || sending.busy}>Cancelar</button>
           <button
             type="button"
             className="primary"

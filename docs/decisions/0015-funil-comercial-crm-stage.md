@@ -90,6 +90,20 @@ existe como `lead_temperature`.
 6. **RBAC:** sai `confirmar_conversao_funil`; entra `ver_contatos_agente_funil` (coluna Novo contato),
    desligada para operadoras.
 
+## Ajustes de 05/11/2026 (revisão depois da integração com o `develop`)
+
+1. **Paciente que volta:** o encerramento volta a exigir o desfecho também quando a etapa atual é
+   aberta ou perdida (Aguardando retorno, Não convertido), coberto pela permissão de fechar; ganho e
+   Não qualificado seguem fechando direto (trocar exige `mover_etapa_funil`).
+2. **Desfechos para quem fecha:** `GET /api/funnel/config` aceita `ver_funil` OU
+   `fechar_atendimento_manual`; as demais rotas seguem exigindo `ver_funil`. Sem isso, perfil que
+   fecha sem ver o funil gravava só o legado.
+3. **Corrida automação × mudança manual** (merge sem precondição no caminho quente): aceita como
+   resíduo documentado (plano, seção 9). A Activity de automação passa a ter id por contato + versão
+   de origem (sem o evento): handoff e 1ª resposta simultâneos contam 1 movimento.
+4. As tarefas no card seguem o follow-up ligado **por tenant** (`tenant_followup_enabled`, do
+   `develop`).
+
 ## Consequências
 
 - 12 índices compostos novos (publicar READY antes de ligar).

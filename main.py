@@ -6092,8 +6092,10 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
             # Desfecho como etapa (funnel_service, mesmo caminho do quadro:
             # versao, recibo, Activity, legado equivalente). Roda ANTES de
             # qualquer escrita deste fechamento. O toggle de fechar (acima)
-            # cobre o lead ainda sem desfecho; trocar desfecho ja registrado
-            # exige mover_etapa_funil (checado la).
+            # cobre o lead ainda sem desfecho e o paciente que volta de um
+            # desfecho aberto/perdido (close_gate); trocar um desfecho de
+            # ganho/excluido exige mover_etapa_funil (checado la). Thread de
+            # backup de contato vivo tambem passa pelo funil.
             from funnel_service import close_attendance_outcome
             _funnel = close_attendance_outcome(current_user, conv, contact, _funnel_body)
             if _funnel["applied"]:
@@ -6102,8 +6104,8 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
                     # So as notas: qualification vazia nao sobrescreve.
                     update_wa_contact_qualification(contact_id, "", notes)
             else:
-                # Contato fora do funil (backup/arquivado): o desfecho vale so
-                # no legado, como o modal antigo (gate e toggles abaixo).
+                # CONTATO fora do funil (contato backup/arquivado): o desfecho
+                # vale so no legado, como o modal antigo (gate e toggles abaixo).
                 qualification = _funnel["qualification"] or ""
         if _gate and not qualification and not (_funnel and _funnel["applied"]):
             raise HTTPException(

@@ -23,7 +23,7 @@ import { useChatTabs, type ChatTabInfo } from "../hooks/useChatTabs";
 import { assertImpersonationRead, threadReadParams, type ImpersonationRead, type ImpersonationSnapshot, type ImpersonationPage, type ImpersonationThread, type RawDocument } from "../utils/impersonation";
 // Modulo-folha do funil (so tipos + funcoes puras): sem ciclo com as telas
 // do funil, que importam este contexto.
-import { contactMatchesFilter, contactStagePatch } from "../features/funnel/catalog";
+import { contactMatchesFilter, contactStagePatch, contactWithStage } from "../features/funnel/catalog";
 import type { CloseFunnelBody, StageState } from "../features/funnel/types";
 
 // ---------------------------------------------------------------------------
@@ -212,6 +212,11 @@ type CrmContextValue = {
   // de qualification. `options.onError` devolve true quando o chamador
   // tratou o erro (ex.: 409 stale_version no modal), sem o alerta global.
   setAttendance: (conversationId: string, status: "fechado_manual" | "aberto", outcome?: AttendanceOutcome, options?: { onError?: (error: unknown) => boolean }) => Promise<boolean>;
+  // Etapa do funil gravada por uma tela do funil ("Mover para…" do cartao
+  // ou do quadro, 409 com a etapa atual) aplicada na copia local do contato
+  // (extraContacts e lista local). So avanca a versao. `legacyQualification`
+  // = legado que a mudanca MANUAL gravou junto (null = nao toca).
+  patchContactStage: (contactId: number, stage: Partial<StageState> | null | undefined, legacyQualification?: string | null) => void;
   // Fase 5A: busca por protocolo (admin/sup).
   loadProtocol: (protocolId: string) => Promise<ProtocolSearchResult | null>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
@@ -4030,6 +4035,37 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     finally { setBusyTransfer(false); }
   }
 
+  // Etapa do funil gravada fora do setAttendance ("Mover para…" do cartao ou
+  // do quadro, 409 stale_version com a etapa atual). Contato aberto pelo
+  // picker/Equipe vive em extraContacts (fetch unico, sem listener): sem este
+  // patch o chip seguia na etapa velha e o "Encerrar atendimento" mandava a
+  // versao antiga (409 "outra pessoa mudou" com o nome da propria pessoa). A
+  // lista local (polling) tambem recebe; no snapshot o listener a substitui.
+  // So avanca (versao maior): nunca regride o que o listener ja entregou.
+  const patchContactStage = useCallback((contactId: number, stage: Partial<StageState> | null | undefined, legacyQualification?: string | null) => {
+    if (contactStagePatch(stage).crm_stage_version === undefined) return;
+    const apply = (contact: Contact): Contact => contactWithStage(contact, stage, legacyQualification);
+    setExtraContacts((prev) => {
+      const cur = prev.get(contactId);
+      if (!cur) return prev;
+      const updated = apply(cur);
+      if (updated === cur) return prev;
+      const next = new Map(prev);
+      next.set(contactId, updated);
+      return next;
+    });
+    setContacts((prev) => {
+      let changed = false;
+      const next = prev.map((contact) => {
+        if (contact.id !== contactId) return contact;
+        const updated = apply(contact);
+        if (updated !== contact) changed = true;
+        return updated;
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
   // Fase 4: fecha (fechado_manual) ou reabre (aberto) um atendimento.
   // `outcome` (reforma 2026-09): qualificacao final + notas + tags do gate
   // de desfecho, no MESMO request — o backend recusa fechar lead novo/
@@ -4176,7 +4212,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     loadAllContacts, pickerPage, pickerSearch, pickerByTag, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, focusExistingConversation, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
-    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, returnContactToPool, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,
+    busySave, busyTransfer, busyAssume, saveQualification, assumeContact, returnContactToPool, transferContact, reassignLead, supervisorTakeover, setAttendance, patchContactStage, loadProtocol,
     editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole,
     coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex,
     takeoverConversation, returnConversation,

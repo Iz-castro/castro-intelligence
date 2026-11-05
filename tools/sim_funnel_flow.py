@@ -9,7 +9,12 @@ ver_contatos_agente_funil, desfecho legado gravado junto da mudanca manual
 ("uma classificacao so"), os nomes/textos que a clinica edita (tela
 "Etapas") e o desfecho do "Encerrar atendimento" pela funcao compartilhada
 funnel_service.close_attendance_outcome (o endpoint main.wa_set_attendance
-inteiro, com notas, tags e mensagens, roda no sim_funnel_api pelo main.app).
+inteiro, com notas, tags e mensagens, roda no sim_funnel_api pelo main.app):
+gate por kind (paciente que volta de desfecho aberto/perdido encerra sem
+mover_etapa_funil; ganho/excluido exige), recheck na transacao, thread de
+backup de contato vivo no funil e a linha do usuario relida por cima do
+cache de auth. Textos da clinica: cache de 30 s com geracao por tenant
+(leitura em voo durante o PUT nao grava o doc velho).
 O fake (deste simulador e do sim_funnel_api) imita as restricoes do
 Firestore que importam aqui: tipos
 distintos nao se igualam (0 != False), campo ausente nao casa filtro nem
@@ -1755,6 +1760,42 @@ def scenario_settings():
     finally:
         FunnelRepository.overrides = original
     check(fc.stage_label(service_module.load_catalog(TENANT), "scheduled") == "Agendou", "a falha nao fica em cache")
+    # Corrida: leitura do cache em voo (doc VELHO ja lido), o PUT desta
+    # instancia grava e reseta o cache, a leitura termina. Ela serve o doc
+    # que leu so para a propria request; o cache nao fica com o velho.
+    original = FunnelRepository.overrides
+    reads = []
+
+    def in_flight(reset):
+        def read(self):
+            stale = original(self)
+            reads.append(stale.get("version"))
+            if len(reads) == 1:
+                reset()
+            return stale
+        return read
+
+    for label, reset, expected in (
+            ("PUT (reset do tenant)", lambda: svc(ADMIN).save_settings(
+                {"version": 5, "stage_labels": {"scheduled": "Consulta confirmada"}}), "Consulta confirmada"),
+            ("reset total", lambda: (put("system_settings", "funnel", dict(doc("system_settings", "funnel"), version=7,
+                                                                           stage_labels={"scheduled": "Marcou"})),
+                                     service_module.reset_overrides_cache()), "Marcou")):
+        service_module.reset_overrides_cache()
+        old = fc.stage_label(service_module.load_catalog(TENANT), "scheduled")
+        service_module.reset_overrides_cache()
+        reads.clear()
+        FunnelRepository.overrides = in_flight(reset)
+        try:
+            raced = service_module.load_catalog(TENANT)
+            after = service_module.load_catalog(TENANT)
+            cached = service_module.load_catalog(TENANT)
+        finally:
+            FunnelRepository.overrides = original
+        check(fc.stage_label(raced, "scheduled") == old and fc.stage_label(after, "scheduled") == expected
+              and fc.stage_label(cached, "scheduled") == expected and len(reads) == 2,
+              "corrida no cache dos textos (%s): leitura em voo serve o doc velho so a ela; logo depois o rotulo"
+              " novo (sem esperar o TTL) e o cache volta a valer" % label)
     check(all(write["key"] == (TENANT, "system_settings", "funnel") or write["key"][1] in ("wa_contacts", "crm_activities")
               for write in WRITES), "textos: nenhuma escrita fora de system_settings/funnel (alem da mudanca de etapa)")
 
@@ -1841,14 +1882,21 @@ def scenario_close():
           "sync do legado auditado")
     again = close(BOB, 14, close_body("non_converted", 2, "op-close-0006", reason="price"))
     check(again["activity_id"] is None and len(WRITES) == writes + 1, "mesmo motivo informado: mesma etapa, nada a gravar")
-    expect(403, "permission_denied", lambda: close(BOB, 14, close_body("non_converted", 2, "op-close-0007", reason="distance")),
-           "fora do gate: corrigir o motivo tambem exige mover_etapa_funil")
+    # Decisao do PO: Nao convertido (kind perdido) com legado terminal segue
+    # no gate (paciente que volta): o toggle de fechar cobre ate o motivo.
+    check(doc("wa_contacts", 14)["qualification"] == "nao_convertido", "14 em Nao convertido com o legado terminal")
+    redo = close(BOB, 14, close_body("non_converted", 2, "op-close-0007", reason="distance"))
+    redo_doc = doc("crm_activities", redo["activity_id"])
+    check(redo_doc["event_type"] == fc.EVENT_REASON_CHANGED and redo_doc["data"]["via"] == "close"
+          and redo["stage"]["reason"]["key"] == "distance" and redo["stage"]["version"] == 3
+          and doc("wa_contacts", 14)["qualification"] == "nao_convertido",
+          "Nao convertido (perdido) no gate: Bob corrige o motivo no encerramento sem mover_etapa_funil")
     bump("wa_contacts", 14, qualification="em_atendimento")                   # legado reaberto: gate
-    fix = close(BOB, 14, close_body("non_converted", 2, "op-close-0008", reason="distance"))
+    fix = close(BOB, 14, close_body("non_converted", 3, "op-close-0008", reason="price"))
     fix_doc = doc("crm_activities", fix["activity_id"])
     check(fix_doc["event_type"] == fc.EVENT_REASON_CHANGED and fix_doc["data"]["via"] == "close"
-          and fix["stage"]["reason"]["key"] == "distance" and doc("wa_contacts", 14)["qualification"] == "nao_convertido",
-          "gate pelo legado aberto: correcao de motivo no encerramento sem mover_etapa_funil")
+          and fix["stage"]["reason"]["key"] == "price" and doc("wa_contacts", 14)["qualification"] == "nao_convertido",
+          "gate pelo legado aberto: correcao de motivo no encerramento sem mover_etapa_funil, legado ressincronizado")
     react = close(BOB, 24, close_body("scheduled", 1, "op-close-0009"))
     check(doc("crm_activities", react["activity_id"])["entry_kind"] == "reactivation"
           and doc("wa_contacts", 24)["qualification"] == "convertido",
@@ -1859,6 +1907,52 @@ def scenario_close():
           and c17["qualification"] == "nao_convertido"
           and doc("crm_activities", entry["activity_id"])["entry_kind"] == "triage",
           "contato fora do funil: o desfecho inclui no funil (triagem) com o legado equivalente")
+    # Decisao do PO: paciente ja classificado que volta. Desfecho de kind
+    # aberto ou perdido (com o legado terminal equivalente) segue no gate;
+    # ganho e excluido nao. Generico por kind, sem chave fixa.
+    for stage in fc.close_outcomes(CATALOG):
+        terminal = {"qualification": fc.legacy_qualification_for(CATALOG, stage["key"]), fc.F_STAGE: stage["key"]}
+        check(service_module.close_gate(CATALOG, terminal) is (stage["kind"] in (fc.KIND_OPEN, fc.KIND_LOST))
+              and service_module.close_gate(CATALOG, dict(terminal, qualification="em_atendimento")) is True,
+              "close_gate por kind: %s (%s) com legado terminal = %s" % (
+                  stage["key"], stage["kind"], stage["kind"] in (fc.KIND_OPEN, fc.KIND_LOST)))
+    check(service_module.close_gate(CATALOG, {}) and service_module.close_gate(CATALOG, {fc.F_STAGE: "in_service",
+                                                                                      "qualification": "convertido"}),
+          "close_gate: sem etapa ou etapa que nao e desfecho = gate (como antes)")
+    contact(64, "awaiting_followup", qualification="nao_convertido", assigned_to=2, assigned_to_uid="bob")
+    contact(65, "non_converted", qualification="nao_convertido", assigned_to=2, assigned_to_uid="bob")
+    for cid, label in ((64, "Aguardando retorno"), (65, "Nao convertido")):
+        AUDIT.clear()
+        back = close(BOB, cid, close_body("scheduled", 1, "op-close-back%d" % cid, appointment_kind="consultation"))
+        row = doc("wa_contacts", cid)
+        event = doc("crm_activities", back["activity_id"])
+        check(back["applied"] and back["stage"]["key"] == "scheduled" and back["stage"]["version"] == 2
+              and row[fc.F_STAGE] == "scheduled" and row["qualification"] == "convertido"
+              and row["converted_by_user_id"] == 2 and event["data"]["via"] == "close"
+              and event["from_stage"] == ("awaiting_followup" if cid == 64 else "non_converted")
+              and AUDIT == [(TENANT, 2, "CONTACT_QUALIFY", "Contato %d: convertido (no encerramento, via funil)" % cid)],
+              "paciente que volta de %s (legado terminal): Bob sem mover_etapa_funil encerra como Cliente Agendado" % label)
+    contact(66, "loyal", qualification="convertido", assigned_to=2, assigned_to_uid="bob")
+    bump("wa_contacts", 63, qualification="nao_qualificado")
+    writes = len(WRITES)
+    for cid, stage_key, target in ((64, "scheduled", "non_converted"), (66, "loyal", "scheduled"),
+                                   (63, "disqualified", "scheduled")):
+        row = doc("wa_contacts", cid)
+        check(row[fc.F_STAGE] == stage_key and not service_module.close_gate(CATALOG, row),
+              "%s com legado terminal fora do gate" % stage_key)
+        extra = {"reason": "price"} if target == "non_converted" else {}
+        expect(403, "permission_denied",
+               lambda c=cid, t=target, v=repository_module.stage_version(row), e=extra: close(
+                   BOB, c, close_body(t, v, "op-close-out%d" % c, **e)),
+               "%s com legado terminal: trocar para %s sem mover_etapa_funil = 403" % (stage_key, target))
+    check(len(WRITES) == writes, "ganho/excluido fora do gate: 403 nao grava nada")
+    # Recheck NA transacao com a regra nova: o legado vira terminal entre a
+    # leitura do endpoint e a transacao, mas Nao convertido (perdido) segue
+    # no gate: quem nao pode mover encerra mesmo assim.
+    BEFORE_TRANSACTION.append(lambda: bump("wa_contacts", 25, qualification="nao_convertido"))
+    inner = close(BOB, 25, close_body("scheduled", 1, "op-close-inner25"))
+    check(inner["stage"]["key"] == "scheduled" and doc("wa_contacts", 25)["qualification"] == "convertido",
+          "recheck na transacao: legado terminal em Nao convertido continua no gate (sem 409)")
     # Corrida: gate calculado com o doc do endpoint; o legado vira terminal
     # (outro request no /qualify) antes da transacao, sem bump de versao.
     BEFORE_TRANSACTION.append(lambda: bump("wa_contacts", 61, qualification="nao_qualificado"))
@@ -1869,10 +1963,12 @@ def scenario_close():
     BEFORE_TRANSACTION.append(lambda: bump("wa_contacts", 62, qualification="nao_qualificado"))
     raced = close(MANAGER, 62, close_body("non_converted", 1, "op-close-0012", reason="price"))
     check(raced["stage"]["key"] == "non_converted", "mesma corrida com mover_etapa_funil: segue")
-    # Backup e arquivado: fora do funil, o legado vale como no modal antigo.
+    # CONTATO backup ou arquivado: fora do funil, o legado vale como no modal
+    # antigo (inclusive pela thread de backup dele).
     writes = len(WRITES)
     for cid, thread, label in ((15, None, "contato backup"), (16, None, "contato arquivado"),
-                               (13, {"id": "4__13", "contact_id": 13, "is_backup": True}, "thread de backup")):
+                               (15, {"id": "4__15", "contact_id": 15, "is_backup": True},
+                                "thread de backup de contato backup")):
         out = close(BOB, cid, close_body("scheduled", 1, "op-close-1%03d" % cid), conversation=thread)
         check(out == {"applied": False, "stage": None, "qualification": "convertido", "replayed": False,
                       "activity_id": None}, "%s: applied=False com o legado equivalente" % label)
@@ -1880,6 +1976,20 @@ def scenario_close():
            "backup: desfecho ainda validado (motivo obrigatorio)")
     check(len(WRITES) == writes and doc("wa_contacts", 15) == start[(TENANT, "wa_contacts", "15")],
           "backup/arquivado: o funil nao grava nada")
+    # Thread de backup (is_backup na conversa) de contato VIVO: o contato
+    # segue no funil; etapa + legado pela transacao, como qualquer thread.
+    check(not doc("wa_contacts", 19).get("is_backup") and not doc("wa_contacts", 19).get("is_archived"),
+          "19 e contato vivo (nem backup nem arquivado)")
+    AUDIT.clear()
+    live = close(BOB, 19, close_body("scheduled", 1, "op-close-bkp19"),
+                 conversation={"id": "4__19bkp", "contact_id": 19, "is_backup": True})
+    c19 = doc("wa_contacts", 19)
+    check(live["applied"] and live["stage"]["key"] == "scheduled" and live["qualification"] == "convertido"
+          and c19[fc.F_STAGE] == "scheduled" and c19[fc.F_VERSION] == 2 and c19["qualification"] == "convertido"
+          and doc("crm_activities", live["activity_id"])["data"]["via"] == "close"
+          and AUDIT == [(TENANT, 2, "CONTACT_QUALIFY", "Contato 19: convertido (no encerramento, via funil)")],
+          "thread de backup de contato vivo: applied=True, etapa + legado pela transacao do funil")
+    writes = len(WRITES)
     for target in ("in_service", "new", "unclassified", "bogus"):
         expect(422, "stage_not_allowed", lambda t=target: close(BOB, 13, close_body(t, 1, "op-close-2%s" % t[:3])),
                "%s nao e desfecho de encerramento" % target)
@@ -1918,7 +2028,25 @@ def scenario_close():
     expect(403, "user_inactive", lambda: close(BOB, 13, close_body("scheduled", 1, "op-close-4006")),
            "usuario desativado relido")
     bump("users", 2, is_active=1)
+    bump("users", 2, firebase_uid="outro-uid")
+    expect(403, "user_inactive", lambda: close(BOB, 13, close_body("scheduled", 1, "op-close-4007")),
+           "linha relida com outro uid = 403")
+    bump("users", 2, firebase_uid="bob")
     check(len(WRITES) == writes, "nenhum 409/403/422 grava")
+    # current_user do cache de auth (ate ~45 s) com role/perfil velhos: o
+    # encerramento rele a linha e usa a nova (sem 403 user_inactive).
+    bump("users", 2, role="supervisor")
+    fresh = close(BOB, 13, close_body("scheduled", 1, "op-close-4008"))
+    check(fresh["applied"] and fresh["stage"]["key"] == "scheduled"
+          and doc("crm_activities", fresh["activity_id"])["actor_user_id"] == 2,
+          "role mudou depois do cache de auth: fecha com a linha relida")
+    bump("users", 2, role="operador", perfil_acesso_id="op_move")
+    check(not rbac.has_permission(BOB, "mover_etapa_funil") and not service_module.close_gate(
+        CATALOG, doc("wa_contacts", 13)), "sessao cacheada sem mover; 13 agora fora do gate")
+    moved = close(BOB, 13, close_body("non_converted", 2, "op-close-4009", reason="price"))
+    check(moved["stage"]["key"] == "non_converted" and doc("wa_contacts", 13)["qualification"] == "nao_convertido",
+          "perfil novo (com mover) vale na hora: troca fora do gate com a linha relida")
+    put("users", 2, {**BOB, "is_active": 1})
     check_writes_whitelist(start, "encerramento")
 
 

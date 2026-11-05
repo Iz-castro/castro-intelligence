@@ -241,8 +241,8 @@ function boot({ uid = "uid-op", userId = 5, canSeeAll = false, enabled = true, s
   };
 }
 const range = (from, to) => Array.from({ length: to - from + 1 }, (_, index) => from + index);
-function press(key, { ctrl = true, alt = true, tag = "TEXTAREA", handled = false } = {}) {
-  const event = { key, altKey: alt, ctrlKey: ctrl, metaKey: false, shiftKey: false, isComposing: false, target: { tagName: tag }, defaultPrevented: handled, preventDefault() { this.defaultPrevented = true; } };
+function press(key, { ctrl = true, alt = true, tag = "TEXTAREA", handled = false, target = null } = {}) {
+  const event = { key, altKey: alt, ctrlKey: ctrl, metaKey: false, shiftKey: false, isComposing: false, target: target || { tagName: tag }, defaultPrevented: handled, preventDefault() { this.defaultPrevented = true; } };
   for (const handler of [...fakeWindow.keydown]) handler(event);
   return event;
 }
@@ -672,6 +672,24 @@ async function keyboard() {
     s.h.out.setSelectedThreadId(null); s.h.flush();
     press("ArrowDown"); s.h.flush();
     check(s.h.out.selectedThreadId === tid(1), "Sem guia ativa, Ctrl+Alt+ArrowDown abre a primeira");
+    // Camada modal aberta (painel/drawer/"Mover para…" do funil, lightbox,
+    // modais com aria-modal): o atalho nao troca a conversa por baixo (nem
+    // dispara o POST de lido). `closest` simula o elemento dentro da camada.
+    const insideOf = (layer) => ({ tagName: "BUTTON", closest: (query) => (query.split(", ").includes(layer) ? {} : null) });
+    for (const layer of ['[aria-modal="true"]', ".fn-layer", ".lightbox"]) {
+      event = press("ArrowDown", { target: insideOf(layer) }); s.h.flush();
+      check(s.h.out.selectedThreadId === tid(1) && !event.defaultPrevented, `Tecla dentro de camada modal (${layer}) nao troca de guia`);
+    }
+    fakeWindow.document = { activeElement: insideOf(".fn-layer"), querySelector: () => null };
+    event = press("ArrowDown", { tag: "BODY" }); s.h.flush();
+    check(s.h.out.selectedThreadId === tid(1) && !event.defaultPrevented, "Foco dentro do painel do funil (activeElement) nao troca de guia");
+    fakeWindow.document = { activeElement: { tagName: "BUTTON", closest: () => null }, querySelector: (query) => (query.split(", ").includes(".lightbox") ? {} : null) };
+    event = press("ArrowDown", { tag: "BUTTON" }); s.h.flush();
+    check(s.h.out.selectedThreadId === tid(1) && !event.defaultPrevented, "Lightbox aberto com o foco fora dele nao troca de guia");
+    fakeWindow.document = { activeElement: { tagName: "BUTTON", closest: () => null }, querySelector: () => null };
+    event = press("ArrowDown", { target: { tagName: "BUTTON", closest: () => null } }); s.h.flush();
+    check(s.h.out.selectedThreadId === tid(2) && event.defaultPrevented, "Camada fechada: o atalho volta a trocar de guia");
+    delete fakeWindow.document;
   } finally { s.h.unmount(); }
   check(fakeWindow.keydown.size === 0, "Desmontar remove o atalho de teclado");
 }

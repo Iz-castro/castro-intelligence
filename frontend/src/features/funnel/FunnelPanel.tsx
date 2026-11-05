@@ -3,6 +3,7 @@ import { useCrm } from "../../context/CrmContext";
 import { useLayer } from "./a11y";
 import { loadBoard, loadStageCards } from "./api";
 import { findCard, nextBoardRequestId, sameFilters, type BoardAction, type BoardState } from "./boardReducer";
+import { stageLegacyQualification } from "./catalog";
 import { ContactDrawer } from "./ContactDrawer";
 import { funnelErrorCode, funnelErrorMessage, isAccessLost } from "./errors";
 import { FunnelBoard } from "./FunnelBoard";
@@ -55,9 +56,9 @@ const BOARD_MAX_AGE_MS = 5 * 60_000;
 const REFRESH_LOCK_MS = 10_000;
 
 export function FunnelPanel({ board, dispatch, filters, onFiltersChange, tab, onTabChange, onClose, returnFocus }: FunnelPanelProps) {
-  const { operators, systemSettings, settingsLoaded, focusExistingConversation } = useCrm();
+  const { operators, systemSettings, settingsLoaded, focusExistingConversation, patchContactStage } = useCrm();
   const access = useFunnelAccess();
-  const { config, error: configError, accessLost: configLost, reload: reloadConfig } = useFunnelConfig(access.auth, access.available, access.accessKey);
+  const { config, error: configError, accessLost: configLost, reload: reloadConfig } = useFunnelConfig(access.auth, access.catalogAvailable, access.accessKey);
   const auth = access.auth;
   const id = useId();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -142,11 +143,16 @@ export function FunnelPanel({ board, dispatch, filters, onFiltersChange, tab, on
   const cardElement = useCallback((contactId: number, selector: string) => panelRef.current?.querySelector<HTMLElement>(`[data-fn-card="${contactId}"] ${selector}`) || null, []);
   const columnHeading = (stage?: string | null) => (stage ? document.getElementById(`${columnDomId(stage)}-title`) : null);
 
+  // A etapa nova (POST ou 409) tambem vai para a copia do contato no
+  // CrmContext: sem isso o chip do chat e o "Encerrar atendimento" seguiam
+  // na versao velha (409 enganoso) para contato sem listener (picker/Equipe).
   const applyMoved = useCallback((contactId: number, response: MoveStageResponse, name?: string) => {
     movedTo.current = response.stage?.key || null;
     dispatch({ type: "card_moved", contactId, result: response.stage, target: stages.get(response.stage?.key), now: Date.now() });
+    // Mudanca MANUAL: o backend gravou junto o legado equivalente.
+    patchContactStage(contactId, response.stage, stageLegacyQualification(catalog, response.stage?.key));
     setNotice({ tone: "success", text: `${name || "O contato"} agora está em ${response.stage?.label || stages.get(response.stage?.key)?.label || "outra etapa"}. Nenhuma mensagem foi enviada.` });
-  }, [dispatch, stages]);
+  }, [dispatch, stages, catalog, patchContactStage]);
 
   const applyConflict = useCallback((contactId: number, current: StaleCurrent) => {
     if (!current.stage) { dispatch({ type: "card_removed", contactId }); return; }
@@ -156,7 +162,8 @@ export function FunnelPanel({ board, dispatch, filters, onFiltersChange, tab, on
       changed_at: current.changed_at || "", source: "user", entered_at: null, reason: null, reason_note: null, appointment_kind: null,
     };
     dispatch({ type: "card_moved", contactId, result: stage, target, now: Date.now() });
-  }, [dispatch, stages]);
+    patchContactStage(contactId, stage);
+  }, [dispatch, stages, patchContactStage]);
 
   const stageSeen = useCallback((contactId: number, stage: StageState | null) => {
     const card = findCard(boardRef.current, contactId);

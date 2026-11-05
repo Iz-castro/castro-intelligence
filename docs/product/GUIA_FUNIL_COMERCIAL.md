@@ -41,6 +41,13 @@ convertido ou Não qualificado). O CRM atualiza o funil e a classificação anti
 juntos; não é preciso classificar duas vezes. A opção "Qualificado" deixou de
 existir: quem marcou consulta é **Cliente Agendado**.
 
+Se o paciente estava em **Aguardando retorno** ou **Não convertido** e voltou a
+conversar, o encerramento pergunta o desfecho de novo (já vem marcado o atual;
+basta confirmar ou trocar, por exemplo para Cliente Agendado). Em Cliente
+Agendado, Paciente em acompanhamento e Não qualificado o atendimento fecha
+direto; para corrigir esses, peça à supervisão ou use **Mover para…** (se o seu
+perfil tiver a permissão).
+
 ## Usar o quadro
 
 - O botão **Funil**, no topo, abre o quadro com uma coluna por etapa. Cada

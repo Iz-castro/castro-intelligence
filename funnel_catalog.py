@@ -36,6 +36,7 @@ import copy
 import hashlib
 import logging
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -118,6 +119,14 @@ CONTACT_STAGE_FIELDS = (F_STAGE, F_VERSION, F_CHANGED_AT, F_SOURCE, F_ACTIVITY,
 
 _KEY = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# Texto que vai para a tela: alem dos controles ASCII, recusa os controles
+# C1 (Cc), os invisiveis/bidi (Cf: zero-width, RLO, BOM) e os separadores de
+# linha/paragrafo Unicode (Zl/Zp): nome "vazio" ou texto invertido na UI.
+_HIDDEN_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp"))
+
+
+def _has_control(text):
+    return bool(_CONTROL.search(text)) or any(unicodedata.category(ch) in _HIDDEN_CATEGORIES for ch in text)
 
 
 class FunnelRuleError(Exception):
@@ -211,7 +220,7 @@ def _clean_label(value, fallback):
     if not isinstance(value, str):
         return fallback
     value = value.strip()
-    if not value or len(value) > LABEL_MAX or _CONTROL.search(value):
+    if not value or len(value) > LABEL_MAX or _has_control(value):
         return fallback
     return value
 
@@ -296,7 +305,7 @@ def _clean_description(value, fallback):
     if not isinstance(value, str):
         return fallback
     value = value.strip()
-    if not value or len(value) > DESCRIPTION_MAX or _CONTROL.search(value):
+    if not value or len(value) > DESCRIPTION_MAX or _has_control(value):
         return fallback
     return value
 
@@ -327,7 +336,7 @@ def validate_overrides(template_name, payload):
             if not isinstance(value, str):
                 raise FunnelRuleError("overrides_invalid", "%s inválido." % label)
             text = value.strip()
-            if len(text) > maximum or _CONTROL.search(text):
+            if len(text) > maximum or _has_control(text):
                 raise FunnelRuleError("overrides_invalid", "%s: use até %d caracteres, sem quebra de linha." % (label, maximum))
             clean[field][key] = text
     return clean
@@ -551,7 +560,7 @@ def validate_change(catalog, *, current_stage, current_reason, to_stage, reason=
             if not isinstance(note, str):
                 raise FunnelRuleError("note_invalid", "Texto do motivo inválido.")
             clean_note = note.strip()
-            if len(clean_note) > NOTE_MAX or _CONTROL.search(clean_note):
+            if len(clean_note) > NOTE_MAX or _has_control(clean_note):
                 raise FunnelRuleError("note_invalid", "Use até %d caracteres, sem quebra de linha." % NOTE_MAX)
             clean_note = clean_note or None
     elif reason not in (None, "") or note not in (None, ""):
@@ -721,7 +730,10 @@ def auto_transition(contact, at, catalog, event, tenant_id):
             version = int(current.get(F_VERSION) or 0)
         except (TypeError, ValueError):
             version = 0
-        key = "\x1f".join((str(tenant_id), "auto", event, str(contact_id), str(version)))
+        # Sem o evento na chave: a versao de ORIGEM ja identifica a transicao
+        # (o contato sai da versao v uma vez so). Handoff e 1a resposta humana
+        # simultaneos a partir da mesma versao caem no MESMO doc: 1 movimento.
+        key = "\x1f".join((str(tenant_id), "auto", str(contact_id), str(version)))
         activity_id = "stage_auto_" + hashlib.sha256(key.encode("utf-8")).hexdigest()
         source = SOURCE_RULE_PREFIX + event
         fields = {
@@ -743,7 +755,7 @@ def auto_transition(contact, at, catalog, event, tenant_id):
             "event_type": EVENT_CHANGED, "actor_type": "system",
             "actor_user_id": None, "actor_uid": "",
             "occurred_at": moment, "recorded_at": datetime.now(timezone.utc),
-            "operation_id": "auto:%s:%s:%s" % (event, contact_id, version),
+            "operation_id": "auto:%s:%s" % (contact_id, version),
             "from_stage": from_key, "to_stage": to_key,
             "stage_reason": None, "from_reason": None,
             # Automacao e fato do periodo (paciente antigo voltou e foi atendido

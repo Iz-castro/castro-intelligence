@@ -103,12 +103,21 @@ export function closeFormMode(funnel: FunnelUi, contact: Pick<Contact, "is_backu
   return closeOutcomeStages(funnel.catalog).length > 0 ? "funnel" : "legacy";
 }
 
-// Espelha o gate do backend: etapa atual que nao e desfecho de
-// encerramento (inclusive sem etapa) OU legado ainda novo/em_atendimento.
+// Tipos de etapa que continuam pedindo o desfecho no fechamento (decisao do
+// PO): em andamento (Aguardando retorno) e perdida (Nao convertido) abrem o
+// modal mesmo sendo desfechos; ganha (Cliente Agendado, Paciente em
+// acompanhamento) e excluida (Nao qualificado) fecham direto.
+export const CLOSE_GATE_KINDS: readonly string[] = ["open", "lost"];
+
+// Espelha o gate do backend (funnel_service.close_gate): etapa atual que nao
+// e desfecho de encerramento (inclusive sem etapa), etapa de tipo em
+// CLOSE_GATE_KINDS OU legado ainda novo/em_atendimento.
 export function closeGateApplies(catalog: FunnelCatalog | null | undefined, contact: Pick<Contact, "crm_stage" | "qualification"> | null | undefined): boolean {
   const current = contact?.crm_stage || null;
   const isOutcome = Boolean(current) && closeOutcomeStages(catalog).some((stage) => stage.key === current);
-  return !isOutcome || LEGACY_OPEN_QUALIFICATIONS.includes(contact?.qualification || "novo");
+  const kind = findStage(catalog, current)?.kind;
+  return !isOutcome || (typeof kind === "string" && CLOSE_GATE_KINDS.includes(kind))
+    || LEGACY_OPEN_QUALIFICATIONS.includes(contact?.qualification || "novo");
 }
 
 // Menu "Fechar atendimento": abre o modal (desfecho obrigatorio) ou fecha
@@ -236,4 +245,14 @@ export function contactStagePatch(stage: Partial<StageState> | null | undefined)
     ...(typeof stage.changed_at === "string" && stage.changed_at ? { crm_stage_changed_at: stage.changed_at } : {}),
     ...(typeof stage.source === "string" && stage.source ? { crm_stage_source: stage.source } : {}),
   };
+}
+
+// Copia local do contato com a etapa gravada por uma tela do funil ("Mover
+// para…", 409 com a etapa atual). So avanca a versao (nunca regride o que o
+// listener ja entregou); `legacyQualification` = legado que a mudanca MANUAL
+// gravou junto. Nada a aplicar = o MESMO objeto (sem re-render).
+export function contactWithStage<T extends Pick<Contact, "crm_stage_version" | "qualification">>(contact: T, stage: Partial<StageState> | null | undefined, legacyQualification?: string | null): T {
+  const patch = contactStagePatch(stage);
+  if (patch.crm_stage_version === undefined || (contact.crm_stage_version ?? 0) >= patch.crm_stage_version) return contact;
+  return { ...contact, ...patch, ...(legacyQualification ? { qualification: legacyQualification } : {}) };
 }

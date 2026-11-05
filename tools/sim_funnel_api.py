@@ -7,9 +7,14 @@ verdade para o que so existe la: no-store por prefixo (inclusive em erro),
 client-config, /api/session, a trava do "Ver como" no middleware e o
 "Encerrar atendimento" com o desfecho do funil (POST
 /api/wa/conversation/{id}/set-attendance com `funnel`, decisao do PO de
-28/10): gate sem mover_etapa_funil, fora do gate exige, 409/422/403 abortam
-sem fechar nem gravar, legado gravado, Hub Loc/front antigo intactos e
-nenhuma mensagem alem das que o fechamento ja manda.
+28/10): gate sem mover_etapa_funil (inclusive o paciente que volta de
+desfecho aberto/perdido), fora do gate (ganho/excluido) exige, 409/422/403
+abortam sem fechar nem gravar, legado gravado, thread de backup de contato
+vivo no funil e contato backup no legado, linha do usuario relida (role
+mudada no cache de auth fecha; inativa = 403), Hub Loc/front antigo
+intactos e nenhuma mensagem alem das que o fechamento ja manda. O /config
+abre tambem para quem so tem fechar_atendimento_manual (desfechos do modal);
+o resto do funil segue exigindo ver_funil.
 
 Rodar na raiz do worktree:
     C:\\Rafael\\castro-intelligence\\.venv\\Scripts\\python.exe tools\\sim_funnel_api.py
@@ -51,6 +56,9 @@ FUNNEL_ONLY = {"id": 7, "firebase_uid": "funnel-only", "tenant_id": TENANT, "rol
                "perfil_acesso_id": "p_funnel_only", "display_name": "So funil"}
 FOLLOWUP_ONLY = {"id": 8, "firebase_uid": "followup-only", "tenant_id": TENANT, "role": "operador",
                  "perfil_acesso_id": "p_followup_only", "display_name": "So follow-up"}
+# Encerra atendimento sem ver o funil (decisao do PO: so o /config abre).
+CLOSE_ONLY = {"id": 11, "firebase_uid": "close-only", "tenant_id": TENANT, "role": "operador",
+              "perfil_acesso_id": "p_close_only", "display_name": "So encerra"}
 OTHER_ADMIN = {"id": 1, "firebase_uid": "other-admin", "tenant_id": fake.OTHER_TENANT, "role": "admin",
                "display_name": "Admin de outro tenant"}
 SECRET = "SEGREDO-CLINICO-" + "y" * 200
@@ -120,8 +128,11 @@ def session(user=None, context=None):
 def seed():
     fake.seed()
     fake.PROFILES[(TENANT, "p_funnel_only")] = {"toggles": {"ver_funil": True, "gerenciar_followup": False}}
-    fake.PROFILES[(TENANT, "p_followup_only")] = {"toggles": {"ver_funil": False, "gerenciar_followup": True}}
-    for user in (FUNNEL_ONLY, FOLLOWUP_ONLY):
+    fake.PROFILES[(TENANT, "p_followup_only")] = {"toggles": {"ver_funil": False, "gerenciar_followup": True,
+                                                              "fechar_atendimento_manual": False}}
+    fake.PROFILES[(TENANT, "p_close_only")] = {"toggles": {"ver_funil": False, "fechar_atendimento_manual": True,
+                                                           "gerenciar_followup": False}}
+    for user in (FUNNEL_ONLY, FOLLOWUP_ONLY, CLOSE_ONLY):
         fake.put("users", user["id"], {**user, "is_active": 1})
     fake.put("users", OTHER_ADMIN["id"], {**OTHER_ADMIN, "is_active": 1}, tenant=fake.OTHER_TENANT)
     rbac.invalidate_perfil_cache()
@@ -167,8 +178,25 @@ def scenario_gates(client):
     call(client, "GET", "/config", 403, "user_inactive", label="doc do usuario de outro tenant")
     fake.bump("users", 1, tenant_id=TENANT)
     session(FOLLOWUP_ONLY)
-    response = call(client, "GET", "/config", 403, label="sem ver_funil = 403 do RBAC")
+    response = call(client, "GET", "/config", 403, label="sem ver_funil nem fechar_atendimento_manual = 403 do RBAC")
     check("ver_funil" in response.text, "403 do RBAC cita a permissao")
+    # Decisao do PO: quem encerra atendimento le os desfechos (/config) sem
+    # ver o funil; o resto do funil continua exigindo ver_funil.
+    session(CLOSE_ONLY)
+    check(not rbac.has_permission(CLOSE_ONLY, "ver_funil")
+          and rbac.has_permission(CLOSE_ONLY, "fechar_atendimento_manual"), "perfil so-encerra: fecha, nao ve o funil")
+    data = call(client, "GET", "/config", label="so fechar_atendimento_manual: /config 200").json()
+    outcomes = [s["key"] for s in data["catalog"]["stages"] if s["close_outcome"]]
+    check(outcomes == [s["key"] for s in fake.fc.close_outcomes(fake.CATALOG)]
+          and data["capabilities"] == {"can_move": False, "can_dashboard": False, "privileged": False,
+                                       "followup": False, "can_configure": False, "can_see_agent_contacts": False},
+          "/config do so-encerra: desfechos do modal e capacidades reais (nada liberado)")
+    for method, path in (("GET", "/board"), ("GET", "/stages/in_service/cards"), ("GET", "/contacts/10"),
+                         ("GET", "/contacts/10/stage"), ("GET", "/contacts/10/history"), ("GET", "/dashboard"),
+                         ("GET", "/settings"), ("POST", "/contacts/10/stage")):
+        response = call(client, method, path, 403, label="so-encerra: %s %s = 403" % (method, path),
+                        body=stage_body("in_service", 1, "op-close-only-1") if method == "POST" else None)
+        check("ver_funil" in response.text, "so-encerra: %s %s nega por ver_funil" % (method, path))
     writes = len(fake.WRITES)
     for user, label in (({**fake.ALICE, "impersonation": IMPERSONATION}, "Ver como (user['impersonation'] real)"),
                         ({**fake.ALICE, "read_only": True}, "read_only"),
@@ -776,15 +804,89 @@ def scenario_set_attendance():
             before, counts = copy.deepcopy(fake.DATA), counters()
             post(client, "4__19", {"status": "fechado_manual"}, 400, label="sem funnel e sem desfecho: 400 legado")
             aborted(before, counts, "4__19", "400 legado")
-            # Thread de backup: fora do funil, o desfecho vale so no legado (como o modal antigo).
+            # Thread de backup de contato VIVO: o contato segue no funil (etapa
+            # + legado pela transacao), como qualquer thread.
+            check(not fake.doc("wa_contacts", 21).get("is_backup"), "21 e contato vivo (a thread 4__21 e de backup)")
+            audit_before = len(MAIN_AUDIT)
             backup = post(client, "4__21", {"status": "fechado_manual", "notes": "backup",
                                             "funnel": funnel("scheduled", 1, "op-att-0008")},
-                          label="thread de backup com funnel").json()
+                          label="thread de backup de contato vivo com funnel").json()
             c21 = fake.doc("wa_contacts", 21)
-            check(backup["funnel"] == {"stage": None} and c21["qualification"] == "convertido"
-                  and c21[fake.fc.F_STAGE] == "new" and c21[fake.fc.F_VERSION] == 1
-                  and MAIN_AUDIT[-2] == (2, "CONTACT_QUALIFY", "Contato 21: convertido (no encerramento)"),
-                  "backup: legado gravado pelo caminho antigo; etapa intocada")
+            check(backup["funnel"]["stage"]["key"] == "scheduled" and backup["funnel"]["stage"]["version"] == 2
+                  and c21["qualification"] == "convertido" and c21[fake.fc.F_STAGE] == "scheduled"
+                  and c21[fake.fc.F_VERSION] == 2 and c21["notes"] == "backup"
+                  and attendance("4__21") == "fechado_manual"
+                  and [entry[1] for entry in MAIN_AUDIT[audit_before:]] == ["ATTENDANCE_SET_STATUS"]
+                  and fake.AUDIT[-1] == (TENANT, 2, "CONTACT_QUALIFY", "Contato 21: convertido (no encerramento, via funil)"),
+                  "thread de backup de contato vivo: etapa + legado pela transacao do funil (nada pelo caminho antigo)")
+            # CONTATO backup: fora do funil, o desfecho vale so no legado (como o modal antigo).
+            thread("4__15", 15, fake.BOB, is_backup=True)
+            stage15 = {key: value for key, value in fake.doc("wa_contacts", 15).items() if key.startswith("crm_")}
+            legacy_backup = post(client, "4__15", {"status": "fechado_manual",
+                                                   "funnel": funnel("scheduled", 1, "op-att-0015")},
+                                 label="contato backup com funnel").json()
+            c15 = fake.doc("wa_contacts", 15)
+            check(legacy_backup["funnel"] == {"stage": None} and c15["qualification"] == "convertido"
+                  and {key: value for key, value in c15.items() if key.startswith("crm_")} == stage15
+                  and MAIN_AUDIT[-2] == (2, "CONTACT_QUALIFY", "Contato 15: convertido (no encerramento)"),
+                  "contato backup: legado gravado pelo caminho antigo; etapa intocada")
+            # Decisao do PO: paciente ja classificado que volta (desfecho de kind
+            # aberto/perdido com o legado terminal): o toggle de fechar cobre.
+            for cid, stage_key in ((80, "awaiting_followup"), (81, "non_converted")):
+                fake.contact(cid, stage_key, qualification="nao_convertido", assigned_to=2, assigned_to_uid="bob")
+                thread("4__%d" % cid, cid, fake.BOB)
+                result = post(client, "4__%d" % cid, {"status": "fechado_manual", "funnel": funnel(
+                    "scheduled", 1, "op-att-back%d" % cid, appointment_kind="consultation")},
+                    label="%s com legado terminal: Bob (sem mover) encerra como Cliente Agendado" % stage_key).json()
+                row = fake.doc("wa_contacts", cid)
+                check(result["funnel"]["stage"]["key"] == "scheduled" and row[fake.fc.F_STAGE] == "scheduled"
+                      and row["qualification"] == "convertido" and row["converted_by_user_id"] == 2
+                      and attendance("4__%d" % cid) == "fechado_manual",
+                      "paciente que volta de %s: 200, etapa Cliente Agendado e legado convertido" % stage_key)
+            fake.contact(82, "loyal", qualification="convertido", assigned_to=2, assigned_to_uid="bob")
+            fake.contact(83, "disqualified", qualification="nao_qualificado", assigned_to=2, assigned_to_uid="bob")
+            for conv_id, stage_key, target in (("4__14", "scheduled", "loyal"), ("4__82", "loyal", "scheduled"),
+                                               ("4__83", "disqualified", "scheduled")):
+                if conv_id != "4__14":
+                    thread(conv_id, int(conv_id[3:]), fake.BOB)
+                row = fake.doc("wa_contacts", int(conv_id[3:]))
+                check(row[fake.fc.F_STAGE] == stage_key and row["qualification"] in ("convertido", "nao_qualificado"),
+                      "%s com legado terminal" % stage_key)
+                before, counts = copy.deepcopy(fake.DATA), counters()
+                post(client, conv_id, {"status": "fechado_manual", "funnel": funnel(
+                    target, fake.repository_module.stage_version(row), "op-att-out%s" % conv_id[3:])},
+                     403, "permission_denied", label="%s: trocar para %s sem mover_etapa_funil = 403" % (stage_key, target))
+                aborted(before, counts, conv_id, "403 %s" % stage_key)
+            # Decisao do PO: quem so encerra (sem ver_funil) fecha com o desfecho.
+            session(CLOSE_ONLY)
+            fake.contact(84, "in_service", assigned_to=11, assigned_to_uid="close-only")
+            thread("4__84", 84, CLOSE_ONLY)
+            closer = post(client, "4__84", {"status": "fechado_manual", "funnel": funnel("scheduled", 1, "op-att-0084")},
+                          label="so-encerra (sem ver_funil) no caso do gate: fecha com o desfecho").json()
+            c84 = fake.doc("wa_contacts", 84)
+            check(closer["funnel"]["stage"]["key"] == "scheduled" and c84[fake.fc.F_STAGE] == "scheduled"
+                  and c84["qualification"] == "convertido" and c84["converted_by_user_id"] == 11
+                  and attendance("4__84") == "fechado_manual",
+                  "so-encerra: etapa + legado gravados pela transacao do funil")
+            # current_user do cache de auth (ate ~45 s) com a role velha: o
+            # encerramento rele a linha do usuario (sem 403 user_inactive).
+            session(fake.BOB)
+            fake.bump("users", 2, role="supervisor")
+            fake.contact(85, "in_service", assigned_to=2, assigned_to_uid="bob")
+            thread("4__85", 85, fake.BOB)
+            post(client, "4__85", {"status": "fechado_manual", "funnel": funnel("scheduled", 1, "op-att-0085")},
+                 label="role mudou depois do cache de auth: fecha")
+            check(fake.doc("wa_contacts", 85)[fake.fc.F_STAGE] == "scheduled" and attendance("4__85") == "fechado_manual",
+                  "role nova: etapa gravada e atendimento fechado")
+            fake.bump("users", 2, role="operador", is_active=0)
+            fake.contact(86, "in_service", assigned_to=2, assigned_to_uid="bob")
+            thread("4__86", 86, fake.BOB)
+            before, counts = copy.deepcopy(fake.DATA), counters()
+            post(client, "4__86", {"status": "fechado_manual", "notes": "nao gravar",
+                                   "funnel": funnel("scheduled", 1, "op-att-0086")},
+                 403, "user_inactive", label="linha do usuario inativa = 403")
+            aborted(before, counts, "4__86", "403 user_inactive")
+            fake.bump("users", 2, is_active=1)
             # Operadora com mover (Alice): Nao convertido com motivo Outro e nota.
             session(fake.ALICE)
             lost = post(client, "4__11", {"status": "fechado_manual", "funnel": funnel(
@@ -825,8 +927,8 @@ def scenario_set_attendance():
             check(fake.DATA == before and counters() == counts
                   and attendance("4__98", tenant=fake.OTHER_TENANT) == "aberto",
                   "409 funnel_disabled: nao fecha e nao grava")
-            check(not HTTP_CALLS and len(SYSTEM_MESSAGES) == len(PROTOCOL_SENDS) == 6,
-                  "6 fechamentos = 6 avisos internos + 6 protocolos (os de hoje); nenhum envio externo extra")
+            check(not HTTP_CALLS and len(SYSTEM_MESSAGES) == len(PROTOCOL_SENDS) == 11,
+                  "11 fechamentos = 11 avisos internos + 11 protocolos (os de hoje); nenhum envio externo extra")
     finally:
         for name, value in saved.items():
             setattr(main, name, value)

@@ -87,6 +87,11 @@ OVERRIDES_TTL_SECONDS = 30.0
 OVERRIDE_FIELDS = ("stage_labels", "stage_descriptions", "reason_labels")
 # Legado "em andamento": o fechamento manual exige desfecho (gate de main.py).
 LEGACY_OPEN = ("novo", "em_atendimento")
+# Desfecho de encerramento que continua no gate (decisao do PO: paciente ja
+# classificado que volta e encerrado de novo pela recepcao): kind aberto
+# (Aguardando retorno) ou perdido (Nao convertido). Ganho e excluido ficam
+# fora: trocar exige mover_etapa_funil.
+CLOSE_GATE_KINDS = (fc.KIND_OPEN, fc.KIND_LOST)
 
 _RATE_LOCK = threading.Lock()
 _RATE_HITS = {}
@@ -94,6 +99,12 @@ _DASHBOARD_LOCK = threading.Lock()
 _DASHBOARD_CACHE = {}
 _OVERRIDES_LOCK = threading.Lock()
 _OVERRIDES_CACHE = {}
+# Geracao dos textos por tenant (e do reset total): a leitura so grava no
+# cache se nenhum reset aconteceu enquanto ela estava em voo. Sem isto, uma
+# leitura que comecou antes do PUT gravava o doc VELHO depois do reset e o
+# rotulo antigo ficava ate 30 s nesta instancia.
+_OVERRIDES_GENERATION = {}
+_OVERRIDES_EPOCH = [0]
 
 
 def reset_rate_limits():
@@ -110,16 +121,27 @@ def reset_overrides_cache(tenant_id=None):
     with _OVERRIDES_LOCK:
         if tenant_id is None:
             _OVERRIDES_CACHE.clear()
+            _OVERRIDES_EPOCH[0] += 1
         else:
-            _OVERRIDES_CACHE.pop(str(tenant_id), None)
+            tenant_id = str(tenant_id)
+            _OVERRIDES_CACHE.pop(tenant_id, None)
+            _OVERRIDES_GENERATION[tenant_id] = _OVERRIDES_GENERATION.get(tenant_id, 0) + 1
+
+
+def _overrides_generation(tenant_id):
+    # Chamar com _OVERRIDES_LOCK.
+    return _OVERRIDES_EPOCH[0], _OVERRIDES_GENERATION.get(tenant_id, 0)
 
 
 def _cached_overrides(tenant_id):
     """Doc system_settings/funnel do tenant ({} sem doc), cache de 30 s.
-    Leitura falha = rotulos padrao nesta request, sem cachear a falha."""
+    Leitura falha = rotulos padrao nesta request, sem cachear a falha.
+    Reset (PUT) durante a leitura: o doc lido serve so esta request e nao
+    entra no cache (a proxima leitura busca o doc novo)."""
     now = time.monotonic()
     with _OVERRIDES_LOCK:
         entry = _OVERRIDES_CACHE.get(tenant_id)
+        generation = _overrides_generation(tenant_id)
     if entry and entry[0] > now:
         return entry[1]
     try:
@@ -128,7 +150,8 @@ def _cached_overrides(tenant_id):
         logger.warning("textos do funil ilegiveis (tenant=%s): %s", tenant_id, type(exc).__name__)
         return {}
     with _OVERRIDES_LOCK:
-        _OVERRIDES_CACHE[tenant_id] = (now + OVERRIDES_TTL_SECONDS, doc)
+        if _overrides_generation(tenant_id) == generation:
+            _OVERRIDES_CACHE[tenant_id] = (now + OVERRIDES_TTL_SECONDS, doc)
     return doc
 
 
@@ -267,6 +290,25 @@ def _default_tenant_loader(tenant_id):
     # Import tardio: cache de 60 s do tenant_service (mesmo doc do settings.ai).
     import tenant_service
     return tenant_service.get_tenant(tenant_id)
+
+
+def session_user(current_user, tenant_id, row):
+    """Usuario do funil nesta request: a linha RELIDA do doc do usuario por
+    cima do current_user (cache de auth de ate ~45 s), para role/perfil
+    trocados valerem na hora e o _actor (que compara com a linha) nao negar
+    a sessao ate o cache vencer. Linha ausente, inativa, de outro uid ou de
+    outro tenant = 403 user_inactive. As flags de sessao somente leitura /
+    Ver como vem sempre da sessao (o documento nao as apaga). Usado pelo
+    require_user das rotas e pelo encerramento (close_attendance_outcome)."""
+    current_user = current_user or {}
+    if (not row or row.get("is_active", 1) not in (1, True)
+            or str(row.get("firebase_uid") or "") != str(current_user.get("firebase_uid") or "")
+            or row.get("tenant_id") not in (None, "", tenant_id)):
+        _fail(403, "user_inactive", "Usuário inativo ou identidade alterada.")
+    user = {**current_user, **row, "tenant_id": tenant_id}
+    for flag in ("read_only", "impersonating", "impersonation"):
+        user[flag] = bool(current_user.get(flag))
+    return user
 
 
 class FunnelService:
@@ -1247,12 +1289,15 @@ class FunnelService:
         gestao da thread; o toggle de fechar ja foi checado la).
 
         Gate (close_gate): o contato ainda nao tem desfecho (etapa que nao e
-        desfecho de encerramento ou legado novo/em_atendimento): o
-        fechamento exige o desfecho e o toggle de FECHAR cobre a mudanca.
-        Fora do gate, trocar um desfecho registrado por outro (ou corrigir o
-        motivo) exige mover_etapa_funil. O gate e recalculado sobre o doc
-        lido NA transacao: o legado muda sem versao da etapa (/qualify), e
-        quem nao pode mover nao passa por um gate que deixou de valer.
+        desfecho de encerramento ou legado novo/em_atendimento) OU esta num
+        desfecho de kind aberto/perdido (paciente ja classificado que volta:
+        Aguardando retorno, Nao convertido): o toggle de FECHAR cobre a
+        mudanca (inclusive a correcao do motivo). Fora do gate (ganho ou
+        excluido: Cliente Agendado, Paciente em acompanhamento, Nao
+        qualificado, com legado terminal), trocar o desfecho exige
+        mover_etapa_funil. O gate e recalculado sobre o doc lido NA
+        transacao: o legado muda sem versao da etapa (/qualify), e quem nao
+        pode mover nao passa por um gate que deixou de valer.
         Desfecho igual a etapa atual (sem pedir motivo novo): sem Activity,
         so sincroniza o legado se divergente (mesma versao/etapa na
         transacao). Reenvio do mesmo operation_id = replay (o fechamento
@@ -1582,13 +1627,22 @@ class FunnelService:
 
 
 def close_gate(catalog, contact):
-    """O fechamento manual EXIGE o desfecho agora (espelha o gate de
-    main.wa_set_attendance e do front)? Contato fora de etapa de desfecho de
-    encerramento (inclusive sem etapa) ou com o legado novo/em_atendimento."""
+    """O toggle de FECHAR cobre o desfecho do encerramento, sem
+    mover_etapa_funil? Sim quando o contato:
+    - esta fora de etapa de desfecho de encerramento (inclusive sem etapa);
+    - tem o legado novo/em_atendimento (o fechamento exige o desfecho); ou
+    - esta num desfecho de kind aberto ou perdido (CLOSE_GATE_KINDS; decisao
+      do PO: paciente ja classificado que volta e encerrado de novo; no
+      clinic_v1, Aguardando retorno e Nao convertido).
+    Ganho e excluido (Cliente Agendado, Paciente em acompanhamento, Nao
+    qualificado) com legado terminal ficam fora: trocar exige mover. Por kind,
+    sem chave fixa de etapa. Usado antes e DENTRO da transacao (recheck)."""
     contact = contact or {}
-    outcomes = {stage["key"] for stage in fc.close_outcomes(catalog)}
-    return (str(contact.get("qualification") or "novo") in LEGACY_OPEN
-            or (contact.get(fc.F_STAGE) or None) not in outcomes)
+    if str(contact.get("qualification") or "novo") in LEGACY_OPEN:
+        return True
+    outcomes = {stage["key"]: stage for stage in fc.close_outcomes(catalog)}
+    stage = outcomes.get(contact.get(fc.F_STAGE) or None)
+    return stage is None or stage.get("kind") in CLOSE_GATE_KINDS
 
 
 def close_attendance_outcome(user, conversation, contact, payload, **service_options):
@@ -1598,12 +1652,20 @@ def close_attendance_outcome(user, conversation, contact, payload, **service_opt
     escrita do fechamento; HTTPException (409/422/403, detail {code,
     message}) aborta o fechamento.
 
+    O usuario do servico = a linha RELIDA do usuario por cima do
+    `user` (session_user, como o require_user das rotas): o current_user do
+    cache de auth (ate ~45 s) com role/perfil velhos nao vira 403
+    user_inactive temporario, e a permissao vale a da linha nova.
+
     Devolve {"applied", "stage", "qualification", "replayed", "activity_id"}:
     - applied=True: etapa (ou so o legado, se o desfecho = etapa atual)
-      gravada pela transacao do funil; o chamador grava so notas e tags;
-    - applied=False: contato fora do funil (backup ou arquivado): nada foi
-      gravado e `qualification` = legado equivalente, para o chamador gravar
-      como o modal antigo (mesmo gate, toggles e auditoria dele)."""
+      gravada pela transacao do funil; o chamador grava so notas e tags.
+      Inclui a thread de backup (is_backup na conversa) de contato vivo: o
+      contato continua no funil;
+    - applied=False: so o CONTATO fora do funil (contato backup ou
+      arquivado): nada foi gravado e `qualification` = legado equivalente,
+      para o chamador gravar como o modal antigo (mesmo gate, toggles e
+      auditoria dele)."""
     # Import tardio: funnel_routes importa este modulo.
     from funnel_routes import parse_stage_body
     tenant_id = str((user or {}).get("tenant_id") or "")
@@ -1618,7 +1680,9 @@ def close_attendance_outcome(user, conversation, contact, payload, **service_opt
     if body["to_stage"] not in outcomes:
         _fail(422, "stage_not_allowed", "Este desfecho não pode ser usado no encerramento.")
     contact = dict(contact or {})
-    if (conversation or {}).get("is_backup") or contact.get("is_backup") or contact.get("is_archived"):
+    # So o CONTATO decide: thread de backup (conversation.is_backup) de
+    # contato vivo segue o funil (etapa + legado pela transacao).
+    if contact.get("is_backup") or contact.get("is_archived"):
         try:
             fc.validate_change(catalog, current_stage=None, current_reason=None, to_stage=body["to_stage"],
                                reason=body.get("reason"), note=body.get("reason_note"),
@@ -1627,7 +1691,11 @@ def close_attendance_outcome(user, conversation, contact, payload, **service_opt
             _fail(422, exc.code, exc.message)
         return {"applied": False, "stage": None, "replayed": False, "activity_id": None,
                 "qualification": fc.legacy_qualification_for(catalog, body["to_stage"])}
-    service = FunnelService(FunnelRepository(tenant_id), user, None, catalog, **service_options)
+    repository = FunnelRepository(tenant_id)
+    user_id = _int_or_none((user or {}).get("id"))
+    row = repository.user(user_id) if user_id is not None and user_id >= 1 else None
+    session = session_user(user, tenant_id, row)
+    service = FunnelService(repository, session, None, catalog, actor_row=row, **service_options)
     result = service.close_stage(contact.get("id"), contact, body)
     return {"applied": True, "stage": result["stage"], "qualification": result["qualification"],
             "replayed": result["replayed"], "activity_id": result["activity_id"]}

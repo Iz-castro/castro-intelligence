@@ -1,7 +1,7 @@
 # Funil comercial no Castro Intelligence CRM — proposta e entrega (Varizemed)
 
-**Revisão:** 25/10/2026, atualizada em 28/10 com as decisões do PO (seção 10 e emenda do ADR 0015).
-**Frente:** `feature/funil`, worktree próprio, a partir de `develop` (1ff4005).
+**Revisão:** 25/10/2026, atualizada em 28/10 e 05/11 com as decisões do PO (seção 10 e ADR 0015).
+**Frente:** `feature/funil`, worktree próprio, a partir de `develop` (1ff4005), integrada com o `develop` de 30/10.
 **Status:** proposta revisada (5 revisões adversariais) e implementação **local** atrás de
 `FEATURE_FUNNEL=false` + habilitação por tenant. Sem push, deploy, índice publicado ou escrita em
 produção. Entrega, testes e cobertura dos 24 critérios na seção 14. Decisão registrada no
@@ -203,7 +203,7 @@ middleware (inclusive nos erros); limite de taxa por usuário nos GETs do quadro
 
 | Rota | Função |
 |---|---|
-| `GET /config` | Catálogo resolvido com os textos da clínica (todas as etapas, com `visibility_permission`/`visible`) + capacidades (`can_move`, `can_dashboard`, `can_configure`, `can_see_agent_contacts`, `privileged`, `followup`) |
+| `GET /config` | Catálogo resolvido com os textos da clínica (todas as etapas, com `visibility_permission`/`visible`) + capacidades (`can_move`, `can_dashboard`, `can_configure`, `can_see_agent_contacts`, `privileged`, `followup`). Única rota aberta também a quem só tem `fechar_atendimento_manual` (decisão de 05/11: o encerramento usa a etapa mesmo sem `ver_funil`) |
 | `GET /board?order=&owner_id=&mine=` | Colunas: total (`count()`), parados, 1ª página (20 cards) e cursor; etapa invisível ao usuário fica de fora, sem nenhuma consulta |
 | `GET /stages/{stage}/cards?cursor=…` | Próximas páginas (cursor HMAC por valores, TTL 1 h); etapa invisível → 404 `unknown_stage` |
 | `GET /contacts/{id}` | Drawer só-leitura: resumo, etapa, motivo, histórico, próximas tarefas, sugestões |
@@ -237,9 +237,10 @@ na transação; a Activity registra `data.legacy_qualification` e a auditoria `C
 `stage_not_allowed`). A mudança passa pelo mesmo código do quadro (versão, recibo, Activity com
 `data.via=close`, legado) ANTES de qualquer escrita do fechamento: 403/409/422 abortam sem fechar,
 sem escrever e sem mensagem. Desfecho igual à etapa atual só sincroniza o legado. Se o contato ainda
-não tem desfecho (etapa fora dos desfechos ou legado novo/em_atendimento), o toggle de fechar basta;
-trocar um desfecho já registrado exige `mover_etapa_funil`, e o gate é rechecado dentro da transação
-(409 `context_changed` se mudou). Backup ou arquivado: só o legado, pelo caminho antigo. Funil
+não tem desfecho (etapa fora dos desfechos ou legado novo/em_atendimento) ou está numa etapa aberta ou
+perdida (Aguardando retorno, Não convertido: paciente que volta, decisão de 05/11), o toggle de fechar
+basta; trocar um desfecho de ganho ou Não qualificado exige `mover_etapa_funil`, e o gate é rechecado dentro da transação
+(409 `context_changed` se mudou). Contato backup ou arquivado: só o legado, pelo caminho antigo (thread de backup de contato vivo usa a etapa). Funil
 desligado depois de a tela carregar → 409 `funnel_disabled` (não fecha). Sem `funnel` no corpo (Hub
 Loc, front antigo) o fechamento legado fica intacto; a resposta ganha `funnel.stage`.
 
@@ -264,8 +265,10 @@ Loc, front antigo) o fechamento legado fica intacto; a resposta ganha `funnel.st
   e edita os textos explicativos (≤200 caracteres), com "restaurar padrão"; não cria nem remove etapas.
 - **Encerrar atendimento (uma classificação só):** o "Desfecho" passa a ser a etapa do funil
   (Aguardando retorno, Cliente Agendado, Paciente em acompanhamento, Não convertido com motivo, Não
-  qualificado); o CRM move o funil e grava o desfecho legado equivalente. Sem catálogo (Hub Loc), o
-  modal antigo continua.
+  qualificado); o CRM move o funil e grava o desfecho legado equivalente. O modal abre quando o contato
+  ainda não tem desfecho e também em Aguardando retorno ou Não convertido (o paciente pode ter voltado);
+  em Cliente Agendado, Paciente em acompanhamento e Não qualificado fecha direto. Quem fecha recebe os
+  desfechos mesmo sem `ver_funil`. Sem catálogo (Hub Loc), o modal antigo continua.
 - **Painel do contato (chat):** cartão "Etapa do funil" ao lado da "Próxima ação" do follow-up
   ("Fora do funil" com "Incluir no funil" quando não há etapa). Na Varizemed, o antigo cartão
   "Qualificação" sai, o chip do cabeçalho mostra a etapa e o filtro da barra lateral usa as etapas.
@@ -345,7 +348,7 @@ relatório com o PO → `--yes` no `varizemed-test` e depois na `varizemed` → 
 | Etapas manuais desatualizadas | Novo contato e Em atendimento automáticos por evento; o encerramento já classifica; selos derivados; sugestão de um clique (Val agendou) |
 | Agendamento pelo link da Val não chega ao CRM | Selo "Val: enviou o link" + sugestão; a equipe confirma na chegada; integração com a agenda online fica para depois |
 | Desfecho legado espelhado diverge da etapa (escrita parcial) | A etapa e o legado gravam no mesmo commit; automações e migração não tocam o legado; Hub Loc segue só com o legado |
-| Corrida rara: o intake ou uma automação (handoff, 1ª resposta humana) grava (merge sem precondição) a partir de leitura feita dezenas de ms antes de uma mudança manual ou da migração no mesmo contato | Aceito. Só ocorre no mesmo instante da mudança (intake: 1º inbound após a habilitação; automação: só a partir de Novo contato/A classificar). Efeitos: a etapa volta a A classificar/Novo, `crm_max_reached_order` e a coorte são regravados e a versão continua 1 (o 409 não detecta); a Activity da mudança fica no histórico e uma nova mudança corrige. A migração em massa roda antes de habilitar o tenant e, em transação, nunca sobrescreve |
+| Corrida rara: o intake ou uma automação (handoff, 1ª resposta humana) grava (merge sem precondição) a partir de leitura feita dezenas de ms antes de uma mudança manual ou da migração no mesmo contato | **Aceito pelo PO em 05/11** (resíduo documentado; corrigir exigiria leitura + escrita condicional no caminho do webhook). Janela: ~0,1–0,6 s no handoff CX, ~50–100 ms na 1ª resposta. Na automação, uma mudança manual feita nessa janela (ex.: Não qualificado, Cliente Agendado) volta a Em atendimento com o legado manual mantido e `crm_max_reached_order` regravado; a supervisão corrige movendo de novo. Só ocorre no mesmo instante da mudança (intake: 1º inbound após a habilitação; automação: só a partir de Novo contato/A classificar). Efeitos: a etapa volta a A classificar/Novo, `crm_max_reached_order` e a coorte são regravados e a versão continua 1 (o 409 não detecta); a Activity da mudança fica no histórico e uma nova mudança corrige. A migração em massa roda antes de habilitar o tenant e, em transação, nunca sobrescreve |
 | Índice não publicado → `FAILED_PRECONDITION` | Publicar READY antes; gate estático de índices; sem fallback para full-scan |
 | Custo de leitura | Sem polling; `count()`; páginas de 20; tarefas em lote; cache curto do painel; limite de taxa |
 | Scripts legados (`_dedupe_contacts`, export/import de anotações) não conhecem `crm_*` | Registrado no ADR; revisar antes de qualquer uso |
@@ -368,6 +371,12 @@ relatório com o PO → `--yes` no `varizemed-test` e depois na `varizemed` → 
 6. Motivos com "Não aceitou a proposta", "Convênio não aceito" e "Não compareceu"; tags continuam
    como anotação livre.
 7. Abertura do chat (`request_welcome`) conta como entrada em Novo contato.
+
+**Tomadas em 05/11/2026** (revisão adversarial depois da integração com o `develop`):
+1. Paciente que volta: ao encerrar, Aguardando retorno e Não convertido pedem o desfecho de novo
+   (pré-selecionado); a permissão de fechar cobre a troca.
+2. Quem pode fechar atendimento recebe os desfechos do funil (`GET /config`) mesmo sem `ver_funil`.
+3. A corrida rara entre automação e mudança manual fica documentada como resíduo (seção 9).
 
 **Ainda em aberto (não bloqueiam a liberação):**
 - Regra opt-in `reopen_opt_out` da migração (decidir depois de ver a simulação).
@@ -409,34 +418,42 @@ carregamento de conversas antigas, "Pegar tarefa abre o chat". O "CRM de novos e
 Ver [processo de privacidade do funil](compliance/FUNIL_PRIVACIDADE.md): o que é gravado, quem lê,
 portabilidade/eliminação e o que nunca entra no histórico.
 
-## 14. Entrega local — 26/10/2026
+## 14. Entrega local — 05/11/2026
 
-Código desta branch, sem commit, push, deploy, índice publicado ou acesso a produção.
+Branch `feature/funil`, commits locais (sem push, deploy, índice publicado ou acesso a produção),
+já integrada com o `develop` de 30/10 (abas de conversa, editor de perfis, follow-up por tenant).
 
-**Backend:** `funnel_catalog.py` (puro: templates, regras, entrada automática, sinais),
-`funnel_repository.py`, `funnel_service.py`, `funnel_routes.py`; entrada automática em
-`webhook.py` e `database_firestore.py` (mesmo write); `FEATURE_FUNNEL` em `config.py`; 4 toggles em
-`rbac.py`; em `main.py`, o router, `no-store` por prefixo, `feature_funnel` no client-config,
-`funnel.enabled` no `/api/session` e o 422 com `code` no funil. No follow-up: autorizador com
-permissão parametrizada e helper de visibilidade de thread, contexto/mensagens em helpers
-compartilhados, "Ver como" negado também no serviço e `list_activities` sem eventos do funil.
+**Backend:** `funnel_catalog.py` (puro: template `clinic_v1`, regras, entrada automática,
+automações, sinais, validação dos textos da clínica), `funnel_repository.py`, `funnel_service.py`
+(quadro, drawer, mudança de etapa com legado, encerramento unificado `close_attendance_outcome`,
+textos da clínica, painel), `funnel_routes.py` (inclui `GET/PUT /settings`); entrada automática em
+`webhook.py`/`database_firestore.py` e automações de handoff (`bot_service.py`) e 1ª resposta humana
+(`save_wa_message(funnel_human_reply=True)` nos envios REST de `main.py`), no mesmo write;
+`FEATURE_FUNNEL` em `config.py`; 4 toggles em `rbac.py`; em `main.py`, o router, `no-store` por prefixo,
+`feature_funnel` no client-config, `funnel.enabled` no `/api/session`, o 422 com `code` no funil e o
+`funnel` no `set-attendance`. No follow-up: autorizador com permissão parametrizada e helpers de
+contexto/mensagens compartilhados (pulam 503 como o `develop`), "Ver como" negado no serviço e
+`list_activities` sem eventos do funil.
 **Índices:** 12 novos em `firestore.indexes.json` (nenhum removido).
-**Frontend:** `features/funnel/` (quadro, coluna, card, drawer, diálogo de mover, histórico, busca,
-painel gerencial, reducer, camadas de acessibilidade), `components/funnel/FunnelEntry.tsx` e
-`FunnelStageCard.tsx` (com o aviso no modal de encerramento), `components/LeadTemperatureDot.tsx`
-extraído; `api.ts` (erro estruturado), `normalization.ts`/`types.ts` (campos `crm_*`) e
-`CrmContext.tsx` (`funnelEnabled`, `focusExistingConversation`). Painel carregado sob demanda.
-**Scripts:** `scripts/set_tenant_funnel.py` e `scripts/classify_funnel_stage.py`.
+**Frontend:** `features/funnel/` (quadro, coluna com ⓘ, card, drawer, "Mover para…", histórico, busca,
+painel gerencial, aba Etapas, catálogo/gate puros, reducer, acessibilidade),
+`components/funnel/` (entrada da barra, cartão da etapa, campos do encerramento),
+`components/LeadTemperatureDot.tsx`, `hooks/useBusyLock.ts`; `App.tsx` (modal de encerrar com a etapa,
+cartão Qualificação escondido, chip e filtro por etapa, editor de perfis), `CrmContext.tsx`
+(`funnelEnabled`, `setAttendance` com `funnel`, `patchContactStage`, `focusExistingConversation`) e o
+atalho das abas desligado sob camadas modais (`useChatTabs.ts`).
+**Scripts:** `scripts/set_tenant_funnel.py` e `scripts/classify_funnel_stage.py` (ruleset 2026-10-28).
 
-**Gates executados em 26/10 (todos verdes):** `py_compile`; `sim_bot_flow` 76, `sim_cx_flow` 229,
-`sim_reception_flow` 301, `sim_buffer_flow` 61, `sim_history_recency` 45, `sim_pool_wait_notice` 48,
-`sim_monitor_flow` 73, `sim_followup_flow` 81, `sim_followup_api` 53,
+**Gates executados em 05/11, sobre o código integrado (todos verdes):** `py_compile`; `sim_bot_flow` 76,
+`sim_cx_flow` 235, `sim_reception_flow` 333, `sim_buffer_flow` 61, `sim_history_recency` 62,
+`sim_pool_wait_notice` 48, `sim_monitor_flow` 73, `sim_followup_flow` 81, `sim_followup_api` 56,
 `sim_commercial_contact_policy` 55, `sim_followup_send_guards`, `sim_impersonate` 306,
-`sim_impersonate_views` 92, `sim_picker_v21` 93 (com `PYTHONIOENCODING=utf-8`; sem isso o console
-cp1252 não imprime "✓" — preexistente), `sim_message_correction` 25; novos: `sim_funnel_flow` 312,
-`sim_funnel_api` 167, `sim_funnel_intake` 163, `sim_funnel_migration` 230; frontend: `npm run build`,
-`check_wa_format` 32, `sim_funnel_frontend` 352, `sim_followup_frontend` 19, `sim_followup_lifecycle` 25.
-As correções da revisão foram provadas por mutação (cada teste novo falha sem a correção).
+`sim_impersonate_views` 92, `sim_picker_v21` 93 (com `PYTHONIOENCODING=utf-8`),
+`sim_message_correction` 25; do funil: `sim_funnel_flow` 472, `sim_funnel_api` 294,
+`sim_funnel_intake` 351, `sim_funnel_migration` 351; frontend: `npm run build`, `check_wa_format` 32,
+`sim_funnel_frontend` 714, `sim_chat_tabs` 180, `sim_followup_frontend` 19, `sim_followup_lifecycle` 25.
+Revisões adversariais em 26/10 (v1) e 05/11 (v2 integrado: backend, caminho quente, frontend; nenhum
+achado crítico ou alto); as correções foram provadas por mutação (cada teste novo falha sem a correção).
 
 **Não verificado:** UI em navegador autenticado (layout, foco real, tema escuro), regras no emulador
 do Firestore, índices reais publicados, e qualquer dado de produção (a migração só rodou contra
@@ -445,12 +462,12 @@ Firestore em memória).
 | # | Critério do PO | Como é garantido | Prova |
 |---|---|---|---|
 | 1 | Contato existente recebe etapa | Migração (resto em A classificar); entrada de quem volta a escrever; "Incluir no funil" | `sim_funnel_migration`; `sim_funnel_intake`; `sim_funnel_flow` |
-| 2 | Não interfere em qualification | Só campos `crm_*` são escritos | `sim_funnel_flow` (qualification/bot/dono/LGPD/tags intocados) |
-| 3 | Não interfere em atendimento/bot | Nenhum outro doc muda; intake só acrescenta campos ao write existente | `sim_funnel_flow`; `sim_funnel_intake` (mesmas escritas com flag on/off); sims do bot/CX/recepção |
+| 2 | Não interfere em qualification | **Mudou por decisão do PO (28/10, "uma classificação só"):** mudança manual de etapa grava o desfecho legado equivalente no mesmo commit; entrada automática, automações e migração nunca escrevem `qualification`; bot/dono/LGPD/tags intocados | `sim_funnel_flow` (lista branca de escrita), `sim_funnel_intake`, `sim_funnel_migration` |
+| 3 | Não interfere em atendimento/bot | Nenhum outro doc muda; intake e automações só acrescentam `crm_*` ao write existente (+ Activity best-effort) | `sim_funnel_flow`; `sim_funnel_intake` (mesmas escritas com flag on/off); sims do bot/CX/recepção |
 | 4 | Kanban lista por etapa | `/board` + `/stages/{s}/cards` paginados | `sim_funnel_flow` |
 | 5 | Clicar card abre contexto | Drawer só-leitura | `sim_funnel_flow`, `sim_funnel_frontend` |
 | 6 | Abrir card não assume | GETs não gravam; UI nunca chama `/conversation/open` | `sim_funnel_flow`, `sim_funnel_frontend` (guardas) |
-| 7 | Mover altera só a etapa | 2 escritas: contato (`crm_*`) + Activity | `sim_funnel_flow` |
+| 7 | Mover altera só a etapa | 2 escritas: contato (`crm_*` + desfecho legado equivalente) + Activity | `sim_funnel_flow` |
 | 8 | Movimento gera Activity | `crm_stage_changed` com origem, destino, ator, data, motivo, `operation_id` | `sim_funnel_flow` |
 | 9 | Conflito concorrente controlado | `crm_stage_version` + 409 com quem moveu; recibo idempotente | `sim_funnel_flow`, `sim_funnel_frontend` |
 | 10 | Não convertido exige motivo | Catálogo + validação | `sim_funnel_flow`, `sim_funnel_api` |
@@ -465,7 +482,7 @@ Firestore em memória).
 | 19 | Contagem respeita tenant/permissão | Escopo do operador; painel só com visão do tenant | `sim_funnel_flow`, `sim_funnel_api` |
 | 20 | Sem etapa não some | Entrada automática, migração, colunas inativas com contatos, "Fora do funil" | `sim_funnel_intake`, `sim_funnel_migration`, `sim_funnel_flow`, `sim_funnel_frontend` |
 | 21 | Sem dado clínico na Activity | Evento com lista branca; nota curta só em Outro; motivo fora do contato | `sim_funnel_flow` |
-| 22 | Mover não envia WhatsApp | Nenhuma escrita além de `crm_*` + Activity | `sim_funnel_flow` |
+| 22 | Mover não envia WhatsApp | Nenhuma escrita além de `crm_*`, o legado e a Activity; o encerramento manda só o aviso e o protocolo que já mandava | `sim_funnel_flow`, `sim_funnel_api` |
 | 23 | Mover não assume conversa | Threads intocadas | `sim_funnel_flow` |
 | 24 | Nenhuma operação concede acesso | IDOR, escopo, thread-só não move, Ver como bloqueado | `sim_funnel_flow`, `sim_funnel_api` |
 

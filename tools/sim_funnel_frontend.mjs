@@ -7,9 +7,12 @@
 // normalizeContact (campos crm_*, origem "rule:"), ApiError com detail
 // objeto, mapa de erros x codes do backend (inclusive os do encerramento),
 // boardReducer (so as colunas devolvidas), sinais derivados, funnelAvailable
-// + cache de 1 GET do /config e textos recem-salvos, operation_id estavel,
+// e funnelCatalogAvailable (quem so fecha atendimento recebe o catalogo) +
+// cache de 1 GET do /config, textos recem-salvos e recuperacao apos erro sem
+// GET novo, operation_id estavel, trava de envio do Encerrar,
 // catalogo puro (desfechos do encerramento, pre-selecao, congelamento no 409,
-// nota so em Outro, Mover para…, filtro "stage:"), formulario da aba Etapas
+// nota so em Outro, Mover para…, filtro "stage:", matriz do gate do menu
+// Fechar por tipo de etapa, copia local da etapa), formulario da aba Etapas
 // (limites, PUT com version, restaurar padrao, rebase no 409), guardas
 // estaticas (sem polling, sem /conversation/open, sem qualification no
 // quadro, sem conversao restrita), cartao da etapa, desfecho do Encerrar
@@ -184,6 +187,7 @@ export * as settings from "./src/features/funnel/settingsForm.ts";
 const hooked = await load(`
 export * as config from "./src/features/funnel/useFunnelConfig.ts";
 export * as operation from "./src/features/followup/useOperation.ts";
+export * as lock from "./src/hooks/useBusyLock.ts";
 export { ApiError } from "./src/api.ts";
 `, { react: true, funnelApi: true });
 
@@ -457,6 +461,16 @@ for (const [change, why] of [[{ readOnly: true }, "Ver como"], [{ featureFunnel:
   [{ featureFunnel: null }, "flag nula"], [{ funnelEnabled: false }, "tenant sem funil"], [{ canView: false }, "perfil sem ver_funil"]]) {
   check(!funnelAvailable({ ...ok, ...change }), `indisponivel: ${why}`);
 }
+// Catalogo do /config (encerramento, gate do menu, chip, filtro): ver_funil
+// OU fechar_atendimento_manual (decisao do PO); o resto do gate e o mesmo e
+// o quadro/cartao seguem so com ver_funil.
+const { funnelCatalogAvailable } = m.config;
+const closerOnly = { ...ok, canView: false, canClose: true };
+check(funnelCatalogAvailable(closerOnly) && !funnelAvailable(closerOnly), "catalogo: so fechar_atendimento_manual basta; o quadro segue exigindo ver_funil");
+check(funnelCatalogAvailable({ ...ok, canClose: false }) && !funnelCatalogAvailable({ ...ok, canView: false, canClose: false }), "catalogo: ver_funil sozinho basta; sem nenhum dos dois = indisponivel");
+for (const [change, why] of [[{ readOnly: true }, "Ver como"], [{ featureFunnel: false }, "flag global desligada"], [{ featureFunnel: null }, "flag nula"], [{ funnelEnabled: false }, "tenant sem funil"]]) {
+  check(!funnelCatalogAvailable({ ...closerOnly, ...change }), `catalogo indisponivel: ${why}`);
+}
 
 function hookHarness() {
   const slots = [];
@@ -580,6 +594,37 @@ await flush();
 view = consumer.render(() => useFunnelConfig(auth, true, "k2"));
 check(view.config === fresh, "/config alcancou a versao salva: overlay sai, vale o servidor");
 
+// Recuperacao sem recarregar a pagina: o GET do boot falhou (503) e os
+// consumidores montados (barra lateral, cabecalho, menu) ficaram em erro; o
+// proximo GET que da certo (ex.: cartao remontado) entrega o valor a TODOS
+// da mesma chave, sem GET novo. Consumidor de outra chave nao e acordado.
+const otherKey = hookHarness();
+otherKey.render(() => useFunnelConfig(auth, true, "k9"));
+configCalls[configCalls.length - 1].reject(new hooked.ApiError("Servico indisponivel", 503));
+await flush();
+check(otherKey.render(() => useFunnelConfig(auth, true, "k9")).error !== "", "outra chave: consumidor em erro");
+const bootCalls = configCalls.length;
+const bootSidebar = hookHarness();
+const bootHeader = hookHarness();
+bootSidebar.render(() => useFunnelConfig(auth, true, "k3"));
+bootHeader.render(() => useFunnelConfig(auth, true, "k3"));
+check(configCalls.length === bootCalls + 1, "boot: 1 GET para os consumidores montados");
+configCalls[bootCalls].reject(new hooked.ApiError("Servico indisponivel", 503));
+await flush();
+view = bootSidebar.render(() => useFunnelConfig(auth, true, "k3"));
+check(view.config === null && view.error !== "" && !view.loading && !view.accessLost, "503 no boot: consumidor em erro (tela no modo legado)");
+const remountedCard = hookHarness();
+remountedCard.render(() => useFunnelConfig(auth, true, "k3"));
+check(configCalls.length === bootCalls + 2, "montagem nova tenta de novo (erro nao fica em cache)");
+configCalls[bootCalls + 1].resolve(catalogPayload);
+await flush();
+check(remountedCard.render(() => useFunnelConfig(auth, true, "k3")).config === catalogPayload, "montagem nova recebe o config");
+view = bootSidebar.render(() => useFunnelConfig(auth, true, "k3"));
+check(view.config === catalogPayload && view.error === "" && !view.loading, "consumidor que ficou em erro pega o valor sem recarregar a pagina");
+check(bootHeader.render(() => useFunnelConfig(auth, true, "k3")).config === catalogPayload && configCalls.length === bootCalls + 2, "todos da mesma chave recuperados com o MESMO GET (nenhum GET novo)");
+otherKey.render(() => useFunnelConfig(auth, true, "k9"));
+check(configCalls.length === bootCalls + 2, "aviso do GET bem-sucedido nao faz consumidor de outra chave buscar");
+
 // operation_id estavel por payload (inclui contact_id): reenvio apos falha
 // de rede vira replay no backend; outro contato/corpo = id novo.
 const { useOperationId } = hooked.operation;
@@ -591,6 +636,28 @@ check(operation({ contact_id: 7, attempt: 0, ...body }) === first, "mesmo payloa
 const otherContact = operation({ contact_id: 8, attempt: 0, ...body });
 check(otherContact !== first, "outro contato = outro operation_id");
 check(operation({ contact_id: 8, attempt: 1, ...body }) !== otherContact, "operation_reused (attempt+1) = id novo");
+
+// Trava de envio do modal "Encerrar atendimento" (useBusyLock): fechar pelo
+// fundo, "Fechar" ou "Cancelar" durante o envio e ignorado (o erro do
+// encerramento precisa do modal montado); terminado o envio, volta.
+const { useBusyLock } = hooked.lock;
+const lockHarness = hookHarness();
+let lock = lockHarness.render(() => useBusyLock());
+const manualCloses = [];
+const closeGuarded = lock.guard(() => manualCloses.push("close"));
+let finishSend;
+const sendDone = lock.run(() => new Promise((resolve) => { finishSend = resolve; }));
+closeGuarded();
+lock = lockHarness.render(() => useBusyLock());
+check(manualCloses.length === 0 && lock.isBusy() && lock.busy === true, "envio em andamento: fechar manualmente e ignorado e o estado desabilita os botoes");
+check(await lock.run(async () => "segundo") === undefined, "segundo envio durante o primeiro e ignorado");
+finishSend("ok");
+check(await sendDone === "ok", "a acao devolve o resultado");
+lock = lockHarness.render(() => useBusyLock());
+lock.guard(() => manualCloses.push("close"))();
+check(manualCloses.length === 1 && !lock.isBusy() && lock.busy === false, "terminado o envio, fechar volta a funcionar");
+await lock.run(async () => { throw new Error("rede"); }).catch(() => {});
+check(!lock.isBusy(), "falha no envio libera a trava");
 
 // ---------------------------------------------------------------------------
 // 7. Pilha de camadas (Esc fecha so o topo), selos e busca
@@ -687,9 +754,26 @@ same([c.closeFormMode({ status: "off", catalog: null }, {}), c.closeFormMode({ s
   ["legacy", "loading", "funnel", "legacy"], "modo do modal: sem funil, carregando, funil, template sem sync");
 same([c.closeFormMode(ready, { is_backup: true }), c.closeFormMode(ready, { is_archived: 1 }), c.closeFormMode(ready, {}, { is_backup: true }), c.closeFormMode(ready, null)],
   ["legacy", "legacy", "legacy", "legacy"], "backup/arquivado (contato ou thread) seguem o legado");
-check(c.closeGateApplies(clinic, { crm_stage: undefined, qualification: "convertido" }) && c.closeGateApplies(clinic, { crm_stage: "in_service", qualification: "em_atendimento" }) && c.closeGateApplies(clinic, { crm_stage: "new", qualification: "convertido" }), "gate: sem etapa ou etapa que nao e desfecho");
-check(c.closeGateApplies(clinic, { crm_stage: "scheduled", qualification: "em_atendimento" }) && c.closeGateApplies(clinic, { crm_stage: "scheduled", qualification: "" }), "gate: desfecho no funil mas legado novo/em_atendimento");
-check(!c.closeGateApplies(clinic, { crm_stage: "scheduled", qualification: "convertido" }) && !c.closeGateApplies(clinic, { crm_stage: "non_converted", qualification: "nao_convertido" }), "sem gate: etapa ja e desfecho e o legado tambem");
+// Matriz do gate do menu "Fechar atendimento" (espelho do
+// funnel_service.close_gate; decisao do PO): pede o desfecho sem etapa, fora
+// dos desfechos, em etapa de tipo open/lost (Aguardando retorno, Nao
+// convertido) ou com o legado novo/em_atendimento; fecha direto SO em
+// won/excluded (Cliente Agendado, Paciente em acompanhamento, Nao
+// qualificado) com o legado terminal.
+const pyGateKinds = (/^CLOSE_GATE_KINDS = \(([^)]*)\)/m.exec(pyService)?.[1] || "").split(",").map((name) => pyConstants[name.trim().replace(/^fc\./, "")]).filter(Boolean);
+same([...c.CLOSE_GATE_KINDS], pyGateKinds, "gate por tipo igual ao CLOSE_GATE_KINDS do funnel_service.py");
+same([...c.CLOSE_GATE_KINDS], [pyConstants.KIND_OPEN, pyConstants.KIND_LOST], "gate por tipo: open e lost (decisao do PO)");
+same(["awaiting_followup", "non_converted", "scheduled", "loyal", "disqualified"].map((key) => stageDefs[key].kind), ["open", "lost", "won", "won", "excluded"], "tipos dos desfechos no clinic_v1");
+const gateLegacy = ["", "novo", "em_atendimento", "qualificado", "convertido", "nao_convertido", "nao_qualificado"];
+const closesDirect = ["scheduled", "loyal", "disqualified"];
+const gateCells = [undefined, ...templateStages.map((stage) => stage.key), "gone"].flatMap((stage) => gateLegacy.map((qualification) => ({ stage, qualification })));
+same(gateCells.map((cell) => [cell.stage, cell.qualification, c.closeGateApplies(clinic, { crm_stage: cell.stage, qualification: cell.qualification })]),
+  gateCells.map((cell) => [cell.stage, cell.qualification, !(closesDirect.includes(cell.stage) && !["", "novo", "em_atendimento"].includes(cell.qualification))]),
+  `matriz do gate: ${gateCells.length} combinacoes etapa x legado (fecha direto so em won/excluded com legado terminal)`);
+same(gateCells.map((cell) => c.closeGateApplies(clinicOperator, { crm_stage: cell.stage, qualification: cell.qualification })), gateCells.map((cell) => c.closeGateApplies(clinic, { crm_stage: cell.stage, qualification: cell.qualification })), "gate igual para o operador (nao depende da visibilidade no quadro)");
+const withKind = (key, kind) => ({ ...clinic, stages: clinic.stages.map((stage) => (stage.key === key ? { ...stage, kind } : stage)) });
+check(!c.closeGateApplies(withKind("awaiting_followup", "won"), { crm_stage: "awaiting_followup", qualification: "nao_convertido" }) && c.closeGateApplies(withKind("scheduled", "lost"), { crm_stage: "scheduled", qualification: "convertido" }) && c.closeGateApplies(withKind("disqualified", "open"), { crm_stage: "disqualified", qualification: "nao_qualificado" }), "gate generico pelo tipo da etapa (nao pela chave)");
+check(c.closeOpensModal(ready, { crm_stage: "non_converted", qualification: "nao_convertido" }) && c.closeOpensModal(ready, { crm_stage: "awaiting_followup", qualification: "nao_convertido" }) && !c.closeOpensModal(ready, { crm_stage: "disqualified", qualification: "nao_qualificado" }), "menu Fechar: Nao convertido e Aguardando retorno abrem o modal; Nao qualificado fecha direto");
 check(c.closeOpensModal({ status: "loading", catalog: null }, { qualification: "convertido" }), "menu Fechar: catalogo carregando = modal");
 check(c.closeOpensModal(ready, { crm_stage: "in_service", qualification: "em_atendimento" }) && !c.closeOpensModal(ready, { crm_stage: "loyal", qualification: "convertido" }), "menu Fechar com funil espelha o gate");
 check(c.closeOpensModal({ status: "off", catalog: null }, { qualification: "" }) && !c.closeOpensModal({ status: "off", catalog: null }, { qualification: "convertido" }), "menu Fechar sem funil: gate legado (novo/em_atendimento)");
@@ -772,6 +856,14 @@ same([c.stageLegacyQualification(clinic, "scheduled"), c.stageLegacyQualificatio
 same(c.contactStagePatch({ key: "scheduled", version: 6, changed_at: "2026-10-26T12:00:00+00:00", source: "user", label: "Cliente Agendado" }), { crm_stage: "scheduled", crm_stage_version: 6, crm_stage_changed_at: "2026-10-26T12:00:00+00:00", crm_stage_source: "user" }, "patch da etapa a partir da resposta do encerramento");
 same(c.contactStagePatch({ key: "loyal", version: 2, changed_at: null, source: "" }), { crm_stage: "loyal", crm_stage_version: 2 }, "patch sem data/origem: so etapa e versao");
 same([c.contactStagePatch(null), c.contactStagePatch({ key: "Bad", version: 1 }), c.contactStagePatch({ key: "loyal", version: -1 }), c.contactStagePatch({ key: "loyal", version: 1.5 }), c.contactStagePatch({ key: "loyal" })], [{}, {}, {}, {}, {}], "payload incompleto = nada a aplicar");
+// Copia local do contato (CrmContext.patchContactStage) apos o "Mover para…"
+// ou o 409: so avanca a versao; o legado so quando a mudanca manual gravou.
+const liveCopy = { id: 7, crm_stage: "in_service", crm_stage_version: 3, crm_stage_changed_at: "2026-10-20T12:00:00+00:00", qualification: "em_atendimento" };
+same(c.contactWithStage(liveCopy, { key: "scheduled", version: 4, changed_at: "2026-11-05T12:00:00+00:00", source: "user" }, "convertido"),
+  { id: 7, crm_stage: "scheduled", crm_stage_version: 4, crm_stage_changed_at: "2026-11-05T12:00:00+00:00", crm_stage_source: "user", qualification: "convertido" }, "Mover para…: copia local avanca etapa, versao e o legado gravado junto");
+same(c.contactWithStage(liveCopy, { key: "loyal", version: 9, changed_at: null }), { ...liveCopy, crm_stage: "loyal", crm_stage_version: 9 }, "409: etapa e versao do servidor, sem tocar o legado");
+check([c.contactWithStage(liveCopy, { key: "new", version: 3 }, "x"), c.contactWithStage(liveCopy, { key: "new", version: 2 }), c.contactWithStage(liveCopy, null, "convertido"), c.contactWithStage(liveCopy, { key: "Bad", version: 8 })].every((value) => value === liveCopy), "versao igual/menor ou payload incompleto = o MESMO objeto (nunca regride o listener)");
+check(c.contactWithStage({ id: 8, qualification: "novo" }, { key: "in_service", version: 1 }).crm_stage === "in_service", "contato fora do funil (sem versao) entra na etapa");
 
 // ---------------------------------------------------------------------------
 // 10. Formulario da aba "Etapas" (settingsForm.ts)
@@ -893,6 +985,14 @@ check((app.match(/contactStageLabel\(funnelUi\.catalog, /g) || []).length >= 2, 
 check(/const UNREAD_FILTER = "nao_lidos";/.test(crmSource) && /: contactMatchesFilter\(qualificationFilter, c\)\);/.test(crmSource), "CrmContext: filtro por contactMatchesFilter (stage: ou legado)");
 check(/if \(outcome\.funnel\) body\.funnel = outcome\.funnel;\s*else body\.qualification = outcome\.qualification \?\? "";/.test(crmSource), "CrmContext: setAttendance repassa `funnel` no lugar da qualification");
 check(/const stagePatch = contactStagePatch\(stage\);/.test(crmSource) && /if \(options\.onError\?\.\(e\)\) return false;/.test(crmSource), "CrmContext: patch da etapa da resposta e erro estruturado devolvido ao modal");
+check(/const patchContactStage = useCallback\(\(contactId: number, stage: Partial<StageState> \| null \| undefined, legacyQualification\?: string \| null\) => \{/.test(crmSource)
+  && /const apply = \(contact: Contact\): Contact => contactWithStage\(contact, stage, legacyQualification\);\s*setExtraContacts\(\(prev\) => \{\s*const cur = prev\.get\(contactId\);\s*if \(!cur\) return prev;\s*const updated = apply\(cur\);/.test(crmSource)
+  && /setContacts\(\(prev\) => \{\s*let changed = false;\s*const next = prev\.map\(\(contact\) => \{\s*if \(contact\.id !== contactId\) return contact;\s*const updated = apply\(contact\);/.test(crmSource)
+  && /setAttendance, patchContactStage, loadProtocol,/.test(crmSource), "CrmContext: patchContactStage (extraContacts + lista local) exposto no contexto");
+check(/patchContactStage\(contactId, response\.stage, stageLegacyQualification\(catalog, response\.stage\?\.key\)\);/.test(panelSource) && /patchContactStage\(contactId, stage\);\s*\}, \[dispatch, stages, patchContactStage\]\);/.test(panelSource), "quadro/drawer: Mover para… e 409 tambem atualizam a copia do contato no CrmContext");
+check(/const sending = useBusyLock\(\);\s*const closeManually = sending\.guard\(onClose\);/.test(app) && /aria-label="Encerrar atendimento" onClick=\{closeManually\}>/.test(app)
+  && /className="lightbox-close" onClick=\{closeManually\} disabled=\{sending\.busy\}/.test(app) && /onClick=\{closeManually\} disabled=\{busyTransfer \|\| sending\.busy\}>Cancelar/.test(app)
+  && /await sending\.run\(async \(\) => \{/.test(app) && !/aria-label="Encerrar atendimento" onClick=\{onClose\}/.test(app), "App: Encerrar atendimento trava fundo, Fechar e Cancelar durante o envio");
 check(!/const LEAD_TEMPERATURE_META/.test(app) && /from "\.\/components\/LeadTemperatureDot"/.test(app), "App: usa o LeadTemperatureDot extraido");
 const rbacKeys = [...read("../rbac.py").matchAll(/\("Funil", "([a-z_]+)"/g)].map((match) => match[1]);
 const typesSource = read("../frontend/src/types.ts");
@@ -907,7 +1007,7 @@ const ui = await load(`
 export { FunnelStageCard } from "./src/components/funnel/FunnelStageCard.tsx";
 export { FunnelCloseFields, useFunnelCloseForm } from "./src/components/funnel/FunnelCloseFields.tsx";
 export { FunnelEntry } from "./src/components/funnel/FunnelEntry.tsx";
-export { InfoButton, MoveStageDialog, StageHistory, FUNNEL_CLOSE_ERROR_MESSAGES } from "./src/features/funnel/index.ts";
+export { InfoButton, MoveStageDialog, StageHistory, FUNNEL_CLOSE_ERROR_MESSAGES, useFunnelCatalog } from "./src/features/funnel/index.ts";
 export { resetFunnelConfigCache } from "./src/features/funnel/useFunnelConfig.ts";
 export { normalizeContact } from "./src/utils/normalization.ts";
 export { apiErrorFromPayload } from "./src/api.ts";
@@ -940,11 +1040,14 @@ function textOf(node) {
 const elements = (tree, type) => { const found = []; walk(tree, (node) => { if (node.type === type) found.push(node); }); return found; };
 const buttonNamed = (tree, label) => elements(tree, "button").find((node) => textOf(node.props.children).trim() === label) || null;
 const simAuth = { currentUser: null };
+// Patches de etapa pedidos ao CrmContext (copia local do contato).
+const stagePatches = [];
 function crm({ readOnly = false, feature = true, enabled = true, toggles = {}, user = { id: 5, firebase_uid: "uid-5", role: "operador" } } = {}) {
   const permissions = { ver_funil: true, mover_etapa_funil: true, ...toggles };
   return {
     bundle: { auth: simAuth }, config: { feature_funnel: feature, feature_followup: false }, readOnly, funnelEnabled: enabled,
     can: (key) => permissions[key] === true, canSeeAll: false, sessionUser: user,
+    patchContactStage: (...args) => { stagePatches.push(args); },
   };
 }
 const configBody = (privileged = false, extra = {}) => ({ catalog: privileged ? clinicCatalog() : clinicCatalog(operatorHas), capabilities: capabilities({ privileged, can_see_agent_contacts: privileged, ...extra }) });
@@ -961,7 +1064,7 @@ function closeHarness(contactValue, thread = null) {
     const form = ui.useFunnelCloseForm(contactValue, thread);
     return { form, tree: ui.FunnelCloseFields({ form, disabled: false, onReapply: () => reapplied.push(form.choice.target) }) };
   });
-  return { render, reapplied };
+  return { render, reapplied, unmount: () => harness.unmount() };
 }
 const radio = (tree, group, value) => elements(tree, "input").find((node) => node.props.type === "radio" && String(node.props.name).endsWith(`-${group}`) && node.props.value === value) || null;
 const radios = (tree, group) => elements(tree, "input").filter((node) => node.props.type === "radio" && String(node.props.name).endsWith(`-${group}`)).map((node) => node.props.value);
@@ -977,6 +1080,31 @@ for (const [options, why] of [[{ readOnly: true }, "Ver como"], [{ feature: fals
 }
 await settle();
 check(fetchCalls.length === 0, "funil indisponivel: zero requisicoes");
+
+// So fecha atendimento (fechar_atendimento_manual sem ver_funil, decisao do
+// PO): o catalogo vem (desfechos do Encerrar, gate do menu, chip, filtro);
+// cartao, quadro e rotas que exigem ver_funil (GET leve da etapa) nao. Mesmo
+// cache: o cartao remontado (troca de contato) nao descarta o /config.
+ui.resetFunnelConfigCache();
+globalThis.__simCrm = crm({ toggles: { ver_funil: false, fechar_atendimento_manual: true } });
+const closerStart = fetchCalls.length;
+const closerLost = () => asContact({ crm_stage: "non_converted", crm_stage_version: 4, qualification: "nao_convertido" });
+check(renderCard(hookHarness(), closerLost()) === null, "so fecha: cartao da etapa some (exige ver_funil)");
+check(hookHarness().render(() => ui.FunnelEntry()) === null, "so fecha: sem o botao do quadro");
+const closerCatalog = hookHarness();
+check(closerCatalog.render(() => ui.useFunnelCatalog()).status === "loading", "so fecha: catalogo carregando");
+await settle();
+check(closerCatalog.render(() => ui.useFunnelCatalog()).status === "ready", "so fecha: catalogo pronto (chip, filtro e gate do menu pelo funil)");
+check(renderCard(hookHarness(), closerLost()) === null, "so fecha: cartao remontado continua sem nada");
+const closerClose = closeHarness(closerLost());
+closerClose.render();
+await settle();
+const closerForm = closerClose.render();
+same(radios(closerForm.tree, "outcome"), outcomeKeys, "so fecha: Encerrar com os desfechos do funil");
+check(closerForm.form.mode === "funnel" && closerForm.form.choice.target === "non_converted" && closerForm.form.choice.reason === "" && closerForm.form.problem === "Informe o motivo.", "so fecha: sem o GET leve (exige ver_funil), a pessoa escolhe o motivo");
+same(fetchCalls.slice(closerStart).map((call) => `${call.method} ${call.path}`), ["GET /api/funnel/config"], "so fecha: 1 GET /config compartilhado e nada que exija ver_funil");
+// Os cenarios abaixo contam as requisicoes desde o inicio do espiao.
+fetchCalls.length = 0;
 
 // Disponivel, contato sem etapa e sem dono: 1 GET /config, "Fora do funil",
 // "Incluir no funil" (expected_version 0) e historico so ao expandir.
@@ -997,7 +1125,9 @@ buttonNamed(tree, "Incluir no funil").props.onClick({ currentTarget: {} });
 tree = renderCard(cardHarness, unstaged);
 let dialogs = elements(tree, ui.MoveStageDialog);
 check(dialogs.length === 1 && dialogs[0].props.expectedVersion === 0 && dialogs[0].props.currentStage === null && dialogs[0].props.contactId === 7, "Incluir no funil abre o dialogo com expected_version 0");
+stagePatches.length = 0;
 dialogs[0].props.onMoved({ contact_id: 7, replayed: false, activity_id: "stage_x", stage: { key: "in_service", label: "Em atendimento", kind: "open", version: 1, changed_at: at(NOW), source: "user", entered_at: at(NOW), reason: null, reason_note: null, appointment_kind: null } });
+check(stagePatches.length === 1 && stagePatches[0][0] === 7 && stagePatches[0][1].key === "in_service" && stagePatches[0][1].version === 1 && stagePatches[0][2] === "em_atendimento", "Mover para…: a etapa nova (e o legado gravado junto) vai para a copia do contato no CrmContext");
 dialogs[0].props.onClose();
 tree = renderCard(cardHarness, unstaged);
 check(elements(tree, ui.MoveStageDialog).length === 0 && textOf(tree).includes("Em atendimento") && buttonNamed(tree, "Mover para…"), "resposta do POST vale ate o contato ao vivo alcancar a versao");
@@ -1021,9 +1151,11 @@ buttonNamed(tree, "Mover para…").props.onClick({ currentTarget: {} });
 tree = renderCard(cardHarness, asContact({ crm_stage: "awaiting_followup", crm_stage_version: 2 }));
 dialogs = elements(tree, ui.MoveStageDialog);
 check(dialogs[0].props.expectedVersion === 2 && dialogs[0].props.currentStage === "awaiting_followup" && dialogs[0].props.catalog.stages.find((stage) => stage.key === "new").visible === false, "Mover para… parte da versao exibida, com o catalogo do usuario");
+stagePatches.length = 0;
 dialogs[0].props.onConflict({ stage: "scheduled", version: 9, changed_at: at(NOW), changed_by_user_id: 3, changed_by_name: "Ana" });
 tree = renderCard(cardHarness, asContact({ crm_stage: "awaiting_followup", crm_stage_version: 2 }));
 check(textOf(tree).includes("Cliente Agendado"), "409 stale_version: o cartao passa a mostrar a etapa atual do servidor");
+same(stagePatches, [[7, { key: "scheduled", version: 9, changed_at: at(NOW) }]], "409: etapa e versao do servidor na copia do contato (sem legado: pode ter sido automatica)");
 // Etapa invisivel no QUADRO continua visivel no cartao (acesso do CRM).
 const agentCard = renderCard(hookHarness(), asContact({ crm_stage: "new", crm_stage_version: 1 }));
 check(textOf(agentCard).includes("Novo contato"), "cartao mostra Novo contato mesmo para quem nao o ve no quadro");
@@ -1142,6 +1274,18 @@ check(keepScheduled.reapplied.join() === "scheduled", "Reaplicar envia a escolha
 same({ ...closing.form.prepare("conv-9"), operation_id: "x" }, { to_stage: "scheduled", expected_version: 9, reason: null, reason_note: null, appointment_kind: null, operation_id: "x" }, "Reaplicar: payload a partir da versao do servidor");
 closing = keepScheduled.render();
 check(!textOf(closing.tree).includes("Outra pessoa mudou a etapa"), "envio novo limpa o aviso de conflito");
+
+// Modal desmontado durante o envio (ex.: a troca de conversa fecha o modal
+// pelo efeito do App): ninguem veria o aviso no modal, o erro vai ao alerta
+// global (handleError devolve false).
+const leaving = closeHarness(asContact({ crm_stage: "in_service", crm_stage_version: 3, qualification: "em_atendimento" }));
+leaving.render();
+await settle();
+const leavingForm = leaving.render().form;
+check(leavingForm.handleError(ui.apiErrorFromPayload({ detail: { code: "permission_denied", message: "x" } }, 403)) === true, "montado: erro do funil fica no modal");
+leaving.unmount();
+check(leavingForm.handleError(staleError) === false && leavingForm.handleError(ui.apiErrorFromPayload({ detail: { code: "reason_required", message: "x" } }, 422)) === false
+  && leavingForm.handleError(ui.apiErrorFromPayload({ detail: { code: "permission_denied", message: "x" } }, 403)) === false, "desmontado: 409/422/403 vao ao alerta global do CrmContext");
 
 // Manter Nao convertido: o motivo registrado vem do GET leve da etapa.
 mark = fetchCalls.length;

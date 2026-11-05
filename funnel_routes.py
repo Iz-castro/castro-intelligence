@@ -21,7 +21,7 @@ from firestore_common import get_tenant_context, tenant_context
 from followup_access import build_authorizer
 from funnel_repository import FunnelRepository
 from funnel_service import FunnelService
-from rbac import ensure_permission
+from rbac import ensure_permission, has_permission
 
 
 class StageChangeRequest(BaseModel):
@@ -84,7 +84,8 @@ def parse_settings_body(payload):
 def create_funnel_router(get_current_user, require_contact_access):
     router = APIRouter(prefix="/api/funnel", tags=["funnel"])
 
-    def require_user(current_user=Depends(get_current_user)):
+    def load_context(current_user):
+        """(usuario relido, catalogo, linha) sem checar o toggle da rota."""
         if not getattr(config, "FEATURE_FUNNEL", False):
             raise _error(404, "funnel_disabled", "Funil indisponível neste ambiente.")
         tenant_id = str(current_user.get("tenant_id") or "")
@@ -96,20 +97,27 @@ def create_funnel_router(get_current_user, require_contact_access):
             raise _error(403, "read_only_session", "Sessão somente de leitura não acessa o funil.")
         with tenant_context(tenant_id):
             row = get_user_raw_by_id(current_user.get("id"))
-        if (not row or row.get("is_active", 1) not in (1, True)
-                or str(row.get("firebase_uid") or "") != str(current_user.get("firebase_uid") or "")
-                or row.get("tenant_id") not in (None, "", tenant_id)):
-            raise _error(403, "user_inactive", "Usuário inativo ou identidade alterada.")
-        user = {**current_user, **row, "tenant_id": tenant_id}
-        # Flags de sessao nao podem ser apagadas pelo documento.
-        for flag in ("read_only", "impersonating", "impersonation"):
-            user[flag] = bool(current_user.get(flag))
+        # Linha relida por cima da sessao (mesma regra do encerramento).
+        user = funnel_service.session_user(current_user, tenant_id, row)
         # Catalogo das telas: config do tenant + nomes/textos da clinica.
         catalog = funnel_service.load_catalog(tenant_id)
         if not catalog:
             raise _error(404, "funnel_disabled", "Funil não habilitado para este tenant.")
-        ensure_permission(user, "ver_funil")
         return user, catalog, row
+
+    def require_user(current_user=Depends(get_current_user)):
+        context = load_context(current_user)
+        ensure_permission(context[0], "ver_funil")
+        return context
+
+    def require_config_user(current_user=Depends(get_current_user)):
+        # So o /config (decisao do PO): quem encerra atendimento precisa dos
+        # desfechos do modal "Encerrar atendimento" mesmo sem ver o funil.
+        # Sem nenhum dos dois = o mesmo 403 do RBAC de sempre (ver_funil).
+        context = load_context(current_user)
+        if not has_permission(context[0], "fechar_atendimento_manual"):
+            ensure_permission(context[0], "ver_funil")
+        return context
 
     def service(context):
         user, catalog, row = context
@@ -121,7 +129,9 @@ def create_funnel_router(get_current_user, require_contact_access):
         )
 
     @router.get("/config")
-    def funnel_config(context=Depends(require_user)):
+    def funnel_config(context=Depends(require_config_user)):
+        # Catalogo + capacidades reais (can_move etc.); o quadro e as demais
+        # rotas continuam exigindo ver_funil.
         return service(context).get_config()
 
     @router.get("/settings")

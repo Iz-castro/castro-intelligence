@@ -7,8 +7,19 @@ import type { FunnelConfig, FunnelSettings } from "./types";
 
 // Disponibilidade do funil na UI. PURA: nada do funil faz request quando
 // e falso (Ver como, flag global, tenant sem funil, perfil sem ver_funil).
+// Vale para o quadro, o cartao da etapa, o drawer e as rotas que exigem
+// ver_funil.
 export function funnelAvailable(input: { readOnly: boolean; featureFunnel?: boolean | null; funnelEnabled: boolean; canView: boolean }): boolean {
   return !input.readOnly && input.featureFunnel === true && input.funnelEnabled === true && input.canView === true;
+}
+
+// Disponibilidade do CATALOGO (GET /config): desfechos do "Encerrar
+// atendimento" e o que depende dele (gate do menu, chip e filtro com
+// etapas, cartao Qualificacao escondido). Decisao do PO: quem fecha
+// atendimento recebe o catalogo mesmo sem ver_funil (o backend aceita o
+// /config com ver_funil OU fechar_atendimento_manual). PURA, como acima.
+export function funnelCatalogAvailable(input: { readOnly: boolean; featureFunnel?: boolean | null; funnelEnabled: boolean; canView: boolean; canClose: boolean }): boolean {
+  return funnelAvailable({ ...input, canView: input.canView === true || input.canClose === true });
 }
 
 // 1 GET /config por sessao: cache de UM slot, chaveado pela identidade e
@@ -19,8 +30,15 @@ type Slot = { key: string; promise: Promise<FunnelConfig>; value: FunnelConfig |
 let slot: Slot | null = null;
 // Consumidores montados (cartao, quadro, barra lateral, encerramento): a
 // invalidacao (textos salvos na aba "Etapas", "Tentar novamente") faz TODOS
-// buscarem de novo, com um GET so (mesma chave = mesmo slot novo).
-const listeners = new Set<() => void>();
+// buscarem de novo, com um GET so (mesma chave = mesmo slot novo). Um GET
+// que da certo tambem avisa quem usa a MESMA chave: consumidor que ficou em
+// erro (ex.: 503 no boot) pega o valor do cache, sem GET novo e sem
+// recarregar a pagina. `key` undefined = todos (invalidacao).
+const listeners = new Set<(key?: string) => void>();
+
+function notifyListeners(key?: string): void {
+  for (const listener of [...listeners]) listener(key);
+}
 // Textos que ESTA sessao acabou de salvar na aba "Etapas" (resposta do PUT),
 // valendo sobre o /config enquanto ele vier com overrides_version menor (o
 // backend tem cache de 30 s por instancia). Some quando o /config alcanca a
@@ -38,7 +56,7 @@ export function resetFunnelConfigCache(): void {
 export function invalidateFunnelConfig(saved?: FunnelSettings | null): void {
   if (saved && slot) savedTexts = { key: slot.key, settings: saved };
   slot = null;
-  for (const listener of [...listeners]) listener();
+  notifyListeners();
 }
 
 function overrideVersion(config: FunnelConfig): number {
@@ -64,9 +82,12 @@ function cachedConfig(auth: Auth, key: string): Slot {
   const entry: Slot = { key, promise: loadFunnelConfig(auth), value: null };
   slot = entry;
   entry.promise.then((value) => {
-    if (slot === entry) entry.value = value;
     // O servidor alcancou os textos salvos: o overlay nao e mais preciso.
     if (savedTexts && savedTexts.key === key && overrideVersion(value) >= savedTexts.settings.version) savedTexts = null;
+    if (slot !== entry) return;
+    entry.value = value;
+    // Recupera quem ficou em erro com esta chave (o slot agora tem valor).
+    notifyListeners(key);
   }, () => { if (slot === entry) slot = null; });
   return entry;
 }
@@ -79,13 +100,18 @@ export function useFunnelConfig(auth: Auth | null | undefined, available: boolea
   const reload = useCallback(() => invalidateFunnelConfig(), []);
 
   useEffect(() => {
-    const listener = () => setNonce((value) => value + 1);
+    const listener = (key?: string) => { if (key === undefined || key === accessKey) setNonce((value) => value + 1); };
     listeners.add(listener);
     return () => { listeners.delete(listener); };
-  }, []);
+  }, [accessKey]);
 
+  // Ficar indisponivel (Ver como, flag, tenant, perfil) descarta o cache.
+  // Efeito proprio: o aviso de um GET bem-sucedido (nonce) nunca descarta.
   useEffect(() => {
     if (!available) { slot = null; savedTexts = null; }
+  }, [available]);
+
+  useEffect(() => {
     if (!auth || !available) { setState({ key: "", config: null, error: "", accessLost: false }); return; }
     const entry = cachedConfig(auth, accessKey);
     if (entry.value) { setState({ key: accessKey, config: entry.value, error: "", accessLost: false }); return; }
