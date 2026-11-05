@@ -42,10 +42,10 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
   `tools\sim_followup_api.py` (56), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
-  Funil comercial (ADR 0015): `tools\sim_funnel_flow.py` (446, inclui gate estatico dos indices por matriz),
+  Funil comercial (ADR 0015): `tools\sim_funnel_flow.py` (447, inclui gate estatico dos indices por matriz),
   `tools\sim_funnel_api.py` (253, inclui o encerramento unificado pelo app real),
   `tools\sim_funnel_intake.py` (340, entrada automatica e automacoes no caminho quente),
-  `tools\sim_funnel_migration.py` (351) e, na raiz, `node tools\sim_funnel_frontend.mjs` (352).
+  `tools\sim_funnel_migration.py` (351) e, na raiz, `node tools\sim_funnel_frontend.mjs` (672).
   Guias de conversa (limite por uso, rascunho+modo por guia, storage por uid + restauracao sem abrir, auto-fechamento so com dado do servidor, Ctrl+Alt+Seta, Sair apaga rascunho, Ver como/polling sem guias): na raiz, `node tools\sim_chat_tabs.mjs` (174).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
