@@ -898,6 +898,120 @@ def cenario_transfer_rbac():
         reset_rbac()
 
 
+def cenario_transfer_origem():
+    titulo("CENARIO 7b — Transfer so do que o operador ATENDE (IDOR 2026-10-28)")
+    reset_rbac()
+    real_resolve = main._resolve_send_target
+    real_validate = main._validate_transfer_department
+    real_target = main._require_target_user_with_uid
+    real_get_conv = main.get_wa_conversation_by_id
+    real_clear = main.clear_conversation_takeover
+    real_get_ctc = main.get_wa_contact
+    real_set_active = main.set_conversation_takeover_active
+    import channel_service as _chs
+    real_get_channel = _chs.get_channel
+    target = {"conv": None, "contact": None, "channel": None}
+    channel = {"id": 8, "channel_type": "coexistence", "owner_user_id": 99}
+
+    def _after_gate(*a, **k):
+        # Sentinela DEPOIS do gate de origem: 404 = passou, 403 = barrado.
+        raise HTTPException(status_code=404, detail="passou-gate")
+    main._resolve_send_target = lambda cid, ctc: (target["conv"], target["contact"], channel)
+    main._validate_transfer_department = lambda d: None
+    main._require_target_user_with_uid = _after_gate
+    main.get_wa_conversation_by_id = lambda conv_id: target["conv"]
+    main.clear_conversation_takeover = _after_gate
+    main.get_wa_contact = lambda cid: target["contact"]
+    main.set_conversation_takeover_active = _after_gate
+    _chs.get_channel = lambda cid: target["channel"] if target["channel"] is not None else channel
+    try:
+        contact = {"id": 50, "wa_id": "5531999990050", "assigned_to": 99, "assigned_to_uid": "uid99"}
+        pool_contact = dict(contact, assigned_to=None, assigned_to_uid="")
+        base = {"id": "8__5531999990050", "contact_id": 50, "channel_id": 8}
+        req = _FakeRequest({"conversation_id": base["id"], "to_user_id": 99, "summary": "s"})
+        cases = [
+            (dict(base, assigned_to=99, assigned_to_uid="uid99"), contact, OPERADOR, 403, "thread de OUTRO operador -> 403"),
+            (dict(base, assigned_to=7, assigned_to_uid="uid7"), contact, OPERADOR, 404, "thread PROPRIA passa o gate"),
+            (dict(base, assigned_to=None, assigned_to_uid=""), pool_contact, OPERADOR, 404, "thread da POOL (lead sem dono) passa o gate"),
+            (dict(base, assigned_to=None, assigned_to_uid=""), dict(contact, assigned_to=7, assigned_to_uid="uid7"),
+             OPERADOR, 404, "thread orfa de lead MEU passa o gate"),
+            (dict(base, assigned_to=None, assigned_to_uid=""), contact, OPERADOR, 403,
+             "thread orfa de lead ALHEIO nao e pool -> 403 (fura o 409 do assume)"),
+            # Takeover nao libera transferencia: o handler e gravado pelo proprio
+            # /takeover (forjavel em thread sem conflito, revisao 2026-10-28).
+            (dict(base, assigned_to=99, assigned_to_uid="uid99", takeover_status="active", takeover_handler_user_id=7),
+             contact, OPERADOR, 403, "takeover ACTIVE do handler NAO libera transfer -> 403"),
+            (dict(base, assigned_to=99, assigned_to_uid="uid99", takeover_status="pending", takeover_handler_user_id=7),
+             contact, OPERADOR, 403, "takeover so 'pending' NAO libera -> 403"),
+            (dict(base, assigned_to=None, assigned_to_uid="__backup__", is_backup=True), contact, OPERADOR, 403,
+             "thread de BACKUP -> 403 para operador"),
+            (dict(base, assigned_to=99, assigned_to_uid="uid99"), contact, SUPERVISOR, 404, "supervisor transfere thread alheia"),
+        ]
+        for conv, ctc, user, status, label in cases:
+            target["conv"], target["contact"] = conv, ctc
+            expect_http(lambda: asyncio.run(main.wa_transfer(req, current_user=dict(user))), status, label)
+
+        # Ramo legado por contact_id: so lead proprio ou da pool, e o gate vem
+        # ANTES do resolve (que faz upsert da thread): o resolve e sentinela.
+        req_ctc = _FakeRequest({"contact_id": 50, "to_user_id": 99, "summary": "s"})
+        target["conv"] = dict(base, assigned_to=7, assigned_to_uid="uid7")  # irrelevante neste ramo
+        main._resolve_send_target = _after_gate
+        for ctc, user, status, label in [
+            (dict(contact, assigned_to=99, assigned_to_uid="uid99"), OPERADOR, 403, "contact_id: lead de OUTRO -> 403 ANTES do resolve"),
+            (dict(contact, assigned_to=7, assigned_to_uid="uid7"), OPERADOR, 404, "contact_id: lead PROPRIO passa ate o resolve"),
+            (pool_contact, OPERADOR, 404, "contact_id: lead da POOL passa ate o resolve"),
+            (dict(contact, assigned_to=None, assigned_to_uid="__backup__", is_backup=True), OPERADOR, 403,
+             "contact_id: contato de BACKUP -> 403"),
+        ]:
+            target["contact"] = ctc
+            expect_http(lambda: asyncio.run(main.wa_transfer(req_ctc, current_user=dict(user))), status, label)
+        main._resolve_send_target = lambda cid, ctc: (target["conv"], target["contact"], channel)
+
+        # /takeover: so com conflito registrado ('pending' e handler = eu ou
+        # numero meu). Antes qualquer operador virava handler de thread sem
+        # conflito, silenciava o bot e forjava posse para o /transfer.
+        target["contact"] = contact
+        for conv, ch, user, status, label in [
+            (dict(base, assigned_to=99, takeover_status="pending", takeover_handler_user_id=7), channel, OPERADOR, 404,
+             "/takeover pending com handler = eu passa"),
+            (dict(base, assigned_to=99, takeover_status="pending"), dict(channel, owner_user_id=7), OPERADOR, 404,
+             "/takeover pending sem handler, numero MEU, passa"),
+            (dict(base, assigned_to=99, takeover_status="pending"), channel, OPERADOR, 403,
+             "/takeover pending sem handler em numero ALHEIO -> 403"),
+            (dict(base, assigned_to=99, takeover_status="none", takeover_handler_user_id=7), channel, OPERADOR, 403,
+             "/takeover sem conflito ('none') -> 403 mesmo sendo handler antigo"),
+            (dict(base, assigned_to=99), channel, OPERADOR, 403, "/takeover em thread sem conflito -> 403 (forja fechada)"),
+            (dict(base, assigned_to=99), channel, SUPERVISOR, 404, "/takeover pela supervisao (assumir_supervisor) passa"),
+        ]:
+            target["conv"], target["channel"] = conv, ch
+            expect_http(lambda: asyncio.run(main.conversation_takeover(base["id"], current_user=dict(user))), status, label)
+        target["channel"] = None
+
+        # /return: so dono do lead, handler do takeover, dono da thread ou gestao.
+        for conv, user, status, label in [
+            (dict(base, assigned_to=99, lead_owner_user_id=5, takeover_handler_user_id=6), OPERADOR, 403,
+             "/return de thread alheia -> 403"),
+            (dict(base, assigned_to=99, lead_owner_user_id=5, takeover_handler_user_id=7), OPERADOR, 404,
+             "/return pelo HANDLER passa o gate"),
+            (dict(base, assigned_to=99, lead_owner_user_id=7, takeover_handler_user_id=6), OPERADOR, 404,
+             "/return pelo DONO DO LEAD passa o gate"),
+            (dict(base, assigned_to=99, lead_owner_user_id=5, takeover_handler_user_id=6), SUPERVISOR, 404,
+             "/return pela gestao passa o gate"),
+        ]:
+            target["conv"] = conv
+            expect_http(lambda: asyncio.run(main.conversation_return(base["id"], current_user=dict(user))), status, label)
+    finally:
+        main._resolve_send_target = real_resolve
+        main._validate_transfer_department = real_validate
+        main._require_target_user_with_uid = real_target
+        main.get_wa_conversation_by_id = real_get_conv
+        main.clear_conversation_takeover = real_clear
+        main.get_wa_contact = real_get_ctc
+        main.set_conversation_takeover_active = real_set_active
+        _chs.get_channel = real_get_channel
+        reset_rbac()
+
+
 def cenario_perfis_merge():
     titulo("CENARIO 8 — list_perfis completa chave nova com default do seed (fix revisao)")
     import firestore_common
@@ -1113,6 +1227,78 @@ def cenario_tags_lead():
         check(False, "slug repetido deveria levantar ValueError")
     except ValueError:
         check(True, "registry: slug repetido (case-insensitive) -> ValueError")
+
+
+def cenario_continuar_devolve_ao_agente():
+    titulo("CENARIO 20b — Publico Bot: Continuar devolve ao agente (plano v2.2 D3, 2026-10-29)")
+    import webhook as wh
+    names = ("get_wa_message_by_wa_message_id", "get_wa_conversation_by_id", "get_wa_contact", "document",
+             "set_attendance_status", "get_current_protocol_id", "insert_transfer_system_message", "log_audit",
+             "mark_contact_bot_done", "_run_bot_turn_and_send", "_tenant_bot_engine_is_cx", "REOPEN_RESUME_BOT_TEXT",
+             "queue_cx_session_params")
+    saved = {n: getattr(wh, n) for n in names}
+    rec = {"turns": [], "marks": [], "status": [], "docs": [], "queued": []}
+
+    class _Doc:
+        def __init__(self, name, key):
+            self.name, self.key = name, key
+
+        def set(self, data, merge=False):
+            rec["docs"].append((self.name, self.key, dict(data)))
+
+    async def fake_turn(contact_id, text, contact_name, wa_id, token, phone_id, **kw):
+        rec["turns"].append((contact_id, text, token, phone_id, kw.get("channel_id")))
+        if rec.get("boom"):
+            raise RuntimeError("CX fora do ar")
+
+    wh.get_wa_message_by_wa_message_id = lambda wamid: None
+    wh.get_wa_conversation_by_id = lambda cid: {"id": cid, "contact_id": 1, "channel_id": 6}
+    wh.document = lambda name, key: _Doc(name, key)
+    wh.set_attendance_status = lambda cid, st: rec["status"].append((cid, st))
+    wh.get_current_protocol_id = lambda cid: None
+    wh.insert_transfer_system_message = lambda *a, **k: None
+    wh.log_audit = lambda *a, **k: None
+    wh.mark_contact_bot_done = lambda cid: rec["marks"].append(cid)
+    wh._run_bot_turn_and_send = fake_turn
+    wh.queue_cx_session_params = lambda cid, params: rec["queued"].append((cid, dict(params)))
+    channel = {"id": 6, "access_token": "tok-canal", "phone_number_id": "pnid-canal", "owner_user_id": None}
+
+    def click(contact, cx=True, text="Quero continuar o atendimento.", boom=False):
+        rec["turns"].clear(); rec["marks"].clear(); rec["status"].clear(); rec["queued"].clear(); rec["boom"] = boom
+        wh.get_wa_contact = lambda cid: contact
+        wh._tenant_bot_engine_is_cx = lambda: cx
+        wh.REOPEN_RESUME_BOT_TEXT = text
+        asyncio.run(wh._handle_reopen_button(
+            contact_id=1, wa_id="5531900000001", channel=channel, button={"text": "Continuar"},
+            context={"id": "wamid.template"}, db_id=10, content="Continuar", ts_iso="2026-10-29T13:00:00Z",
+            reply_fields=None, ws_notify_callback=None))
+
+    try:
+        bot_phase = {"id": 1, "display_name": "Paciente", "bot_completed": False, "assigned_to": None}
+        click(bot_phase)
+        check(rec["turns"] == [(1, "Quero continuar o atendimento.", "tok-canal", "pnid-canal", 6)],
+              "CX + fase de bot: turno do agente com o texto sintetico e credenciais do canal")
+        check(rec["marks"] == [], "CX + fase de bot: NAO marca bot_completed (lead segue com o agente)")
+        check(rec["queued"] == [(1, {"origem": "retomada_lote"})], "origem=retomada_lote enfileirado para o turno (ADR 0013 item 4)")
+        check(("6__5531900000001", "aberto") in rec["status"], "atendimento reaberto antes do turno")
+
+        click(dict(bot_phase, bot_completed=True))
+        check(rec["turns"] == [] and rec["marks"] == [], "lead ja fora do bot (Recepcao): sem turno e sem marcar")
+
+        click(bot_phase, cx=False)
+        check(rec["turns"] == [] and rec["marks"] == [1], "motor builtin/pausado: caminho antigo (equipe)")
+
+        click(bot_phase, boom=True)
+        check(len(rec["turns"]) == 1 and rec["marks"] == [1], "turno do agente falhou: cai no caminho antigo (equipe)")
+
+        click(bot_phase, text="")
+        check(rec["turns"] == [] and rec["marks"] == [1], "REOPEN_RESUME_BOT_TEXT vazio = desliga (equipe)")
+
+        click(dict(bot_phase, assigned_to=7))
+        check(rec["turns"] == [] and rec["marks"] == [1], "lead com dono nao e fase de bot: comportamento antigo")
+    finally:
+        for n, v in saved.items():
+            setattr(wh, n, v)
 
 
 def cenario_reabertura_travas():
@@ -2709,12 +2895,14 @@ def run():
     cenario_auto_close_toggle()
     cenario_fechar_orfa()
     cenario_transfer_rbac()
+    cenario_transfer_origem()
     cenario_perfis_merge()
     cenario_set_attendance_orfa()
     cenario_gate_desfecho()
     cenario_rating_botao()
     cenario_tags_lead()
     cenario_reabertura_travas()
+    cenario_continuar_devolve_ao_agente()
     cenario_scan_reabertura()
     cenario_worker_lote()
     cenario_reabertura_pontual_carimbo()

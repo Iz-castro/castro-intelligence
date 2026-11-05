@@ -90,10 +90,13 @@ function snapshotError(auth: Auth, onError: ((error: FirestoreError) => void) | 
   onError?.(error);
 }
 
-export function watchSessionQuery<T>(auth: Auth, reference: Query<T>, onNext: (snapshot: QuerySnapshot<T>) => void, onError?: (error: FirestoreError) => void) {
+export function watchSessionQuery<T>(auth: Auth, reference: Query<T>, onNext: (snapshot: QuerySnapshot<T>) => void, onError?: (error: FirestoreError) => void, options?: { includeMetadataChanges?: boolean }) {
   if (impersonationTab) throw new Error("A visualização usa somente leituras pelo servidor.");
   if (!isFirebaseSessionActive(auth)) return () => {};
-  return trackListener(auth, onSnapshot(reference, (snapshot) => {
+  // options.includeMetadataChanges: o caller que distingue cache x servidor
+  // (gate de "carregando") precisa ouvir a confirmacao do servidor mesmo quando
+  // os docs nao mudam — sem isso um resultado vazio do cache nunca "amadurece".
+  return trackListener(auth, onSnapshot(reference, options ?? {}, (snapshot) => {
     if (isFirebaseSessionActive(auth)) onNext(snapshot);
   }, (error) => snapshotError(auth, onError, error)));
 }

@@ -411,6 +411,113 @@ def cenario_i_thread_fechada_nao_reabre():
     check(same(c.get("last_inbound_at"), last_live), "last_inbound_at nao recua")
 
 
+def cenario_j_idempotencia_por_bloco():
+    titulo("J. Idempotencia por BLOCO (reentrega da Meta nao reprocessa)")
+    patch_store()
+    cust = "5531911110009"
+    t1 = NOW - timedelta(days=30)
+    payload = hist_payload(cust, [("inbound", t1, "w.j1"), ("outbound", t1 + timedelta(minutes=1), "w.j2"),
+                                  ("inbound", t1 + timedelta(minutes=2), "w.j3")])
+    saves = {"n": 0}
+    real_save = webhook.save_wa_message
+
+    def counting_save(*a, **k):
+        saves["n"] += 1
+        return real_save(*a, **k)
+    webhook.save_wa_message = counting_save
+    try:
+        run(webhook._process_history(payload, channel=COEX_CH))
+        check(saves["n"] == 3, "1a entrega grava as 3 mensagens")
+        marks = STORE.get("history_chunks", {})
+        check(len(marks) == 1, "1 marcador de bloco criado")
+        key, mark = next(iter(marks.items()))
+        check(key.startswith("PNID8__c8__1__1__"), f"chave = numero__canal__fase__ordem__hash ({key})")
+        check(mark.get("status") == "done" and mark.get("msgs") == 3 and mark.get("attempts") == 1,
+              "marcador done com msgs=3 e attempts=1")
+        check(mark.get("lease_until") is None, "lease liberado no done")
+
+        # Reentrega identica (envelope pode mudar; ids das msgs nao): nada grava.
+        saves["n"] = 0
+        payload2 = hist_payload(cust, [("inbound", t1, "w.j1"), ("outbound", t1 + timedelta(minutes=1), "w.j2"),
+                                       ("inbound", t1 + timedelta(minutes=2), "w.j3")])
+        payload2["metadata"]["display_phone_number"] = "+" + BUSINESS  # envelope diferente
+        run(webhook._process_history(payload2, channel=COEX_CH))
+        check(saves["n"] == 0, "reentrega do mesmo bloco: 0 gravacoes (200 em ms)")
+        check(len(STORE.get("history_chunks", {})) == 1, "reentrega nao cria marcador novo")
+
+        # Outra copia em processamento com lease valido: NAO e sucesso — levanta
+        # HistoryChunkBusy (o HTTP responde 503 e a Meta reentrega). Um 200 aqui
+        # perderia o bloco se o dono do lease morresse (revisao 2026-10-28).
+        STORE["history_chunks"][key].update({"status": "processing", "lease_until": NOW + timedelta(minutes=10)})
+        try:
+            run(webhook._process_history(payload, channel=COEX_CH))
+            check(False, "copia concorrente deveria levantar HistoryChunkBusy")
+        except webhook.HistoryChunkBusy:
+            check(True, "copia concorrente com lease valido: HistoryChunkBusy (503, Meta reentrega)")
+        check(saves["n"] == 0 and STORE["history_chunks"][key]["status"] == "processing",
+              "copia concorrente: 0 gravacoes e marcador intacto")
+
+        # Lease vencido (request anterior morreu): reprocessa e fecha.
+        STORE["history_chunks"][key].update({"status": "processing", "lease_until": NOW - timedelta(minutes=1)})
+        run(webhook._process_history(payload, channel=COEX_CH))
+        check(saves["n"] == 3 and STORE["history_chunks"][key]["status"] == "done"
+              and STORE["history_chunks"][key]["attempts"] == 2,
+              "lease vencido: reprocessa (idempotente) e marca done com attempts=2")
+
+        # Falha no meio: marcador 'failed' (lease liberado) e excecao propaga.
+        saves["n"] = 0
+        STORE["history_chunks"].clear()
+        real_threads = webhook._process_history_threads
+
+        async def boom(*a, **k):
+            raise RuntimeError("firestore caiu")
+        webhook._process_history_threads = boom
+        try:
+            try:
+                run(webhook._process_history(payload, channel=COEX_CH))
+                check(False, "excecao deveria propagar (fila de pendentes reentrega)")
+            except RuntimeError:
+                check(True, "excecao propaga para o enqueue de pendentes")
+        finally:
+            webhook._process_history_threads = real_threads
+        mark = next(iter(STORE["history_chunks"].values()))
+        check(mark.get("status") == "failed" and mark.get("lease_until") is None, "falha -> marcador failed sem lease")
+        run(webhook._process_history(payload, channel=COEX_CH))
+        check(saves["n"] == 3 and next(iter(STORE["history_chunks"].values())).get("status") == "done",
+              "apos falha, a reentrega reprocessa e fecha done")
+
+        # Bloco DIFERENTE (mais uma mensagem) = chave nova: processa normalmente.
+        saves["n"] = 0
+        payload3 = hist_payload(cust, [("inbound", t1, "w.j1"), ("inbound", t1 + timedelta(minutes=5), "w.j4")])
+        run(webhook._process_history(payload3, channel=COEX_CH))
+        check(saves["n"] == 2 and len(STORE["history_chunks"]) == 2, "bloco com ids diferentes = chave nova, processa")
+        check(len(STORE.get("wa_messages", {})) == 4, "mensagens no banco: 4 distintas (w.j1 nao duplicou)")
+
+        # Midia inline que falha no download: 'done' congelaria a midia perdida.
+        # Marcador 'failed' + excecao (payload vai para a fila de pendentes).
+        real_dl = webhook.download_media
+
+        async def no_media(*a, **k):
+            return None
+        webhook.download_media = no_media
+        try:
+            payload4 = hist_payload(cust, [("inbound", t1 + timedelta(minutes=9), "w.j9")])
+            payload4["history"][0]["threads"][0]["messages"][0].update(
+                {"type": "image", "image": {"id": "MID9", "mime_type": "image/jpeg"}})
+            try:
+                run(webhook._process_history(payload4, channel=COEX_CH))
+                check(False, "midia sem download deveria levantar HistoryChunkIncomplete")
+            except webhook.HistoryChunkIncomplete:
+                check(True, "midia sem download: HistoryChunkIncomplete (fila de pendentes)")
+            marks4 = [m for m in STORE["history_chunks"].values() if m.get("media_failures")]
+            check(len(marks4) == 1 and marks4[0]["status"] == "failed",
+                  "marcador 'failed' com media_failures=1 (reentrega re-baixa so o que faltou)")
+        finally:
+            webhook.download_media = real_dl
+    finally:
+        webhook.save_wa_message = real_save
+
+
 def cenario_f_eco():
     titulo("F. Eco do celular (outbound) nao abre a janela de 24h")
     patch_store()
@@ -497,6 +604,7 @@ def main():
     cenario_f_eco()
     cenario_g_inbound_ao_vivo()
     cenario_h_bump_monotonico()
+    cenario_j_idempotencia_por_bloco()
     print("\n" + "=" * 70)
     if FAILS:
         print(f"FALHOU: {len(FAILS)} de {CHECKS} asserts")

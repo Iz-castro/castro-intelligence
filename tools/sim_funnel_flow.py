@@ -49,6 +49,7 @@ from google.api_core import exceptions as google_exceptions  # noqa: E402
 import config  # noqa: E402
 import firestore_common as common  # noqa: E402
 import followup_access as access  # noqa: E402
+import followup_routes  # noqa: E402  (chave do follow-up por tenant)
 import funnel_catalog as fc  # noqa: E402
 import funnel_repository as repository_module  # noqa: E402
 import funnel_service as service_module  # noqa: E402
@@ -101,7 +102,7 @@ ADMIN = {"id": 9, "firebase_uid": "admin", "tenant_id": TENANT, "role": "admin",
          "display_name": "Admin Sintetica"}
 USERS = (ALICE, BOB, MANAGER, EVE, CAROL, NODASH, SUPNOAGENT, ADMIN)
 TENANT_DOC = {"id": TENANT, "settings": {"funnel": {"enabled": True, "template": "clinic_v1", "version": 3},
-                                         "ai": {}}}
+                                         "ai": {}, "followup_enabled": True}}
 CATALOG = fc.funnel_for_tenant(TENANT_DOC)
 CARD_KEYS = {"contact_id", "display_name", "lead_temperature", "lead_temperature_at", "stage", "stage_version",
              "stage_changed_at", "stage_source", "owner", "last_inbound_at", "last_activity_at", "signals",
@@ -468,7 +469,13 @@ def install():
     service_module._default_audit = lambda tenant, user_id, action, detail: AUDIT.append(
         (tenant, user_id, action, detail))
     config.FEATURE_FUNNEL = True
-    config.FEATURE_FOLLOWUP = True
+    set_followup(True)
+
+
+def set_followup(enabled):
+    """Chave geral do follow-up nos dois nomes lidos em runtime."""
+    config.FEATURE_FOLLOWUP = enabled
+    followup_routes.FEATURE_FOLLOWUP = enabled
 
 
 install()
@@ -546,7 +553,7 @@ def seed():
     service_module.reset_overrides_cache()
     AUDIT.clear()
     config.FEATURE_FUNNEL = True
-    config.FEATURE_FOLLOWUP = True
+    set_followup(True)
     PROFILES.clear()
     PROFILES[(TENANT, "op_move")] = {"toggles": {"ver_funil": True, "mover_etapa_funil": True,
                                                  "gerenciar_followup": True}}
@@ -1041,7 +1048,7 @@ def scenario_tasks():
     check(sum(1 for q in QUERY_LOG if q["kind"] == "get_all" and q["collection"] == "wa_conversations") == 1
           and sum(1 for q in QUERY_LOG if q["kind"] == "channel") == 1,
           "threads em lote e tipo do canal em cache por request")
-    config.FEATURE_FOLLOWUP = False
+    set_followup(False)
     QUERY_LOG.clear()
     off = {card["contact_id"]: card for card in all_cards(svc(MANAGER).board())}
     check(not [q for q in QUERY_LOG if q["collection"] == "crm_tasks"]
@@ -1049,7 +1056,15 @@ def scenario_tasks():
           and not off[13]["signals"]["no_next_action"] and not off[11]["signals"]["task_overdue"],
           "FEATURE_FOLLOWUP=false: nenhuma tarefa, consulta ou selo de tarefa")
     check(not svc(MANAGER).get_config()["capabilities"]["followup"], "capability followup desligada")
-    config.FEATURE_FOLLOWUP = True
+    set_followup(True)
+    TENANTS[TENANT]["settings"]["followup_enabled"] = False
+    QUERY_LOG.clear()
+    tenant_off = {card["contact_id"]: card for card in all_cards(svc(MANAGER).board())}
+    check(not [q for q in QUERY_LOG if q["collection"] == "crm_tasks"]
+          and all(card["next_task"] is None and not card["tasks_visible"] for card in tenant_off.values())
+          and not svc(MANAGER).get_config()["capabilities"]["followup"],
+          "follow-up desligado so no tenant (settings.followup_enabled): nenhuma tarefa nem selo")
+    TENANTS[TENANT]["settings"]["followup_enabled"] = True
     carol = {card["contact_id"]: card for card in all_cards(svc(CAROL).board())}
     check(all(card["next_task"] is None and not card["tasks_visible"] for card in carol.values()),
           "sem gerenciar_followup: nenhuma tarefa nem selo")

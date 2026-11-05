@@ -4,6 +4,7 @@ import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, Vide
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
+import { ChatTabs, CHAT_TABPANEL_ID, chatTabDomId } from "./components/chat/ChatTabs";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
 import { MonitorModal } from "./components/monitor/MonitorModal";
 import { resolveMessageMedia } from "./utils/media";
@@ -18,7 +19,7 @@ import { closeOpensModal, contactStageLabel, filterValueValid, stageFilterOption
 import { LeadTemperatureDot } from "./components/LeadTemperatureDot";
 import { ApiError, getDownload, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PermissionKey, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilBaseItem, PerfilCatalogoItem, PermissionKey, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 import { ImpersonateModal, ImpersonationLayout, READ_ONLY_TOOLTIP } from "./components/Impersonation";
 import { impersonationTab, isFirebaseSessionActive } from "./firebase";
@@ -118,6 +119,28 @@ function LoginScreen() {
       )}
       {error ? <div className="alert danger">{error}</div> : null}
       {notice ? <div className="alert success">{notice}</div> : null}
+    </div></div>
+  );
+}
+
+// Aba normal ja autenticada no Firebase esperando a sessao do CRM
+// (/api/session + listas de apoio): backend lento/congelado ou nova tentativa
+// apos falha transitoria. Antes caia na tela "Entrar" com o usuario logado.
+const CONNECTING_LOGOUT_AFTER_S = 20;
+function ConnectingScreen() {
+  const { error, logout } = useCrm();
+  const [startedAt] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return (
+    <div className="screen"><div className="hero-card"><p className="eyebrow">Castro Intelligence</p><h1>Conectando ao CRM…</h1>
+      <p>Aguardando o servidor há {seconds} s.</p>
+      {error ? <div className="alert danger" role="alert">{error}</div> : null}
+      {seconds >= CONNECTING_LOGOUT_AFTER_S ? <button className="ghost" style={{ marginTop: "0.6rem" }} onClick={() => void logout()}>Sair e entrar de novo</button> : null}
     </div></div>
   );
 }
@@ -802,6 +825,7 @@ const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(
 const QUALIFICATION_FILTER_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>(["bot", "novos", "meus", "equipe"]);
 
 function ContactList() {
+  const { listsReady, unavailableContactIds } = useCrm();
   const { activeView, filteredConversations, contactsById, selectedThreadId, setSelectedThreadId, search, setSearch, qualificationFilter, setQualificationFilter, tagFilter, setTagFilter, channelFilter, setChannelFilter, myChannelOptions, equipeOperatorFilter, setEquipeOperatorFilter, equipeChannelFilter, setEquipeChannelFilter, equipeChannelOptions, operators, sessionUser, countAllContacts, contactsCountNonce, loadMoreMyConversations, canLoadMoreMine, loadMorePoolConversations, canLoadMorePool, loadMoreAllConversations, canLoadMoreAll, loadingMoreConvs, systemSettings, userSettings, loadUnreadConversations, canLoadMoreUnread, unreadMode, peekMode, setPeekMode, canPeek } = useCrm();
   const tagOptions = buildTagOptions(systemSettings.tags_global, userSettings.tags);
   // Revisao B: registry esvaziado fazia o controle SUMIR com o filtro ainda
@@ -838,6 +862,15 @@ function ContactList() {
     return () => { disposed = true; };
   }, [countAllContacts, contactsCountNonce]);
   const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? (poolReception ? "Recepção" : "Novos Leads") : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
+  // 15 s sem as listas chegarem: aviso extra sob o "Carregando conversas"
+  // (multiplas abas disputam o cache persistente do Firestore). Some quando
+  // os dados chegam.
+  const [listsSlow, setListsSlow] = useState(false);
+  useEffect(() => {
+    if (listsReady) { setListsSlow(false); return undefined; }
+    const id = window.setTimeout(() => setListsSlow(true), 15_000);
+    return () => window.clearTimeout(id);
+  }, [listsReady]);
 
   // Render incremental: com ~3k conversas, montar 1000+ itens no DOM trava a
   // coluna. Renderiza em paginas de 50 ("Carregar mais"); o contador do header
@@ -862,7 +895,9 @@ function ContactList() {
     }
     return 0;
   };
-  type RenderItem = { contact: Contact; conversation: Conversation };
+  // contact null = contato ainda nao chegou (snapshot ou hidratacao sob
+  // demanda em voo — ex.: lead de outro dono numa thread minha).
+  type RenderItem = { contact: Contact | null; conversation: Conversation };
   // Fase 3.D: cada item da sidebar e uma Conversation. O Contact e
   // resolvido via contactsById (join in-memory). Mesmo wa_id em 2 canais
   // = 2 entradas distintas, com badge proprio do canal.
@@ -877,8 +912,15 @@ function ContactList() {
       return toMillis(b.last_message_at) - toMillis(a.last_message_at);
     })
     .flatMap((conversation): RenderItem[] => {
-      const contact = contactsById.get(conversation.contact_id);
-      return contact ? [{ contact, conversation }] : [];
+      const contact = contactsById.get(conversation.contact_id) || null;
+      if (contact) return [{ contact, conversation }];
+      // Sem contato a linha vira placeholder (antes SUMIA ate a hidratacao).
+      // Continua escondida quando o backend negou/nao achou o contato
+      // (403/404, nao re-hidrata) ou quando ha filtro de qualificacao, que
+      // depende do contato (o "Nao lidas" e por thread e vale).
+      if (unavailableContactIds.has(conversation.contact_id)) return [];
+      if (qualificationFilter && !unreadMode) return [];
+      return [{ contact: null, conversation }];
     });
 
   const visibleTeamOperators = activeView === "equipe"
@@ -981,7 +1023,7 @@ function ContactList() {
           )}
         </div>
       )}
-      <div className="contact-list">
+      <div className="contact-list" aria-busy={!listsReady}>
         {renderItems.slice(0, visibleLimit).map(({ contact, conversation }) => {
           // Fase 3.D: assigned/department vem da Conversation (cutover Fase 2C);
           // qualification/notes/avatar continuam no Contact.
@@ -989,20 +1031,25 @@ function ContactList() {
             ? (operators.find((o) => o.id === conversation.assigned_to) || null)
             : null;
           const accent = assignedOperator ? operatorColor(assignedOperator.id) : null;
-          const lastMessageAt = conversation.last_message_at || contact.last_message_at;
+          const lastMessageAt = conversation.last_message_at || contact?.last_message_at;
           const unreadCount = conversation.unread_count ?? conversation.unread ?? 0;
           const channelLabel = conversation.channel_label || "";
-          const channelType = conversation.channel_type || conversation.source_channel_type || contact.source_channel_type || "";
+          const channelType = conversation.channel_type || conversation.source_channel_type || contact?.source_channel_type || "";
           const isActive = selectedThreadId === conversation.id;
-          const handleClick = () => setSelectedThreadId(conversation.id);
+          // Placeholder (contato ainda nao chegou): nome do proprio doc da
+          // thread quando houver, sem chip de qualificacao e sem clique — abrir
+          // sem o contato deixaria o painel sem nome/qualificacao.
+          const pending = !contact;
+          const displayName = contact ? contact.display_name : (conversation.display_name || conversation.phone_formatted || "Carregando contato…");
+          const handleClick = () => { if (contact) setSelectedThreadId(conversation.id); };
           return (
-            <button key={conversation.id} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} style={operatorAccentStyle(accent)}>
-              <div className="avatar">{contact.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{contact.display_name.slice(0, 1).toUpperCase()}</span>}</div>
+            <button key={conversation.id} className={`contact ${isActive ? "active" : ""} ${accent ? "contact--team-accent" : ""}`} onClick={handleClick} disabled={pending} aria-busy={pending || undefined} title={pending ? "Carregando dados do contato" : undefined} style={pending ? { ...operatorAccentStyle(accent), opacity: 0.65, cursor: "progress" } : operatorAccentStyle(accent)}>
+              <div className="avatar" aria-hidden={pending || undefined}>{contact?.contact_avatar_path ? <img src={contact.contact_avatar_path} alt={contact.display_name} /> : <span>{pending ? "…" : displayName.slice(0, 1).toUpperCase()}</span>}</div>
               <div className="contact-copy">
                 <div className="row">
-                  <strong>{contact.display_name}</strong>
+                  <strong>{displayName}</strong>
                   <div className="contact-meta">
-                    <LeadTemperatureDot temperature={conversation.lead_temperature || contact.lead_temperature} />
+                    <LeadTemperatureDot temperature={conversation.lead_temperature || contact?.lead_temperature} />
                     {assignedOperator ? (
                       <span
                         className="contact-operator-dot"
@@ -1016,9 +1063,10 @@ function ContactList() {
                     <span>{when(lastMessageAt)}</span>
                   </div>
                 </div>
-                <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
+                <div className="sub">{contact ? (contact.phone_formatted || contact.wa_id) : (conversation.phone_formatted || conversation.wa_id)}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
                 <div className="row">
-                  <span className="chip">{funnelReady ? contactStageLabel(funnelUi.catalog, contact.crm_stage) : (contact.qualification || "novo")}</span>
+                  {/* span vazio no placeholder mantem o badge a direita (.row = space-between) */}
+                  {contact ? <span className="chip">{funnelReady ? contactStageLabel(funnelUi.catalog, contact.crm_stage) : (contact.qualification || "novo")}</span> : <span />}
                   {unreadCount ? <b className="badge">{unreadCount}</b> : null}
                 </div>
                 {channelLabel ? (
@@ -1036,7 +1084,15 @@ function ContactList() {
             </button>
           );
         })}
-        {!renderItems.length ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
+        {/* Listas ainda chegando (listener sem 1o snapshot): "carregando" no
+            lugar de "Nenhum ..."; apos 15 s, aviso sobre outras abas. */}
+        {!renderItems.length && !listsReady ? (
+          <div className="empty" role="status" aria-live="polite">
+            Carregando conversas…
+            {listsSlow ? <p className="sub" style={{ margin: "0.4rem 0 0" }}>Ainda conectando ao banco. Se houver outras abas do CRM abertas, feche-as e mantenha só esta.</p> : null}
+          </div>
+        ) : null}
+        {!renderItems.length && listsReady ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
         {(() => {
           // Dois papeis no mesmo botao: (1) REVELAR itens ja carregados alem dos
           // 100 mostrados ("Mostrar mais"); (2) BUSCAR no Firestore alem da
@@ -1203,6 +1259,9 @@ function ChatPanel() {
   const confirmTakeover = async (withMessage: boolean) => { if (!selectedThreadId) return; setBusyTakeover(true); try { await takeoverConversation(selectedThreadId, withMessage ? greetDraft : undefined); setShowTakeoverPrompt(false); } finally { setBusyTakeover(false); } };
   const doReturn = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await returnConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
   const chatIsEmpty = selectedContact && visibleMessages.length === 0;
+  // Guias de conversa: o painel do chat e a regiao (tabpanel) da guia ativa.
+  const tabsShown = !readOnly && ctx.tabInfo.length > 0;
+  const activeTabId = ctx.tabInfo.find((tab) => tab.isActive)?.id ?? null;
   useClickOutside(activeMessageMenuRef, openMessageMenuId !== null, () => setOpenMessageMenuId(null));
 
   // Scroll management — must live here (not in CrmProvider) because messagesRef is attached to a DOM node inside this component
@@ -1298,8 +1357,14 @@ function ChatPanel() {
 
   return (
     <main className="panel chat-panel">
+      {/* Guias de conversa: no topo, inclusive sem conversa selecionada. */}
+      <ChatTabs />
       {error ? <div className="alert danger"><span>{error}</span><button type="button" className="alert-close" onClick={() => ctx.setError("")}>&#10005;</button></div> : null}
       {notice ? <div className="alert success"><span>{notice}</span><button type="button" className="alert-close" onClick={() => ctx.setNotice("")}>&#10005;</button></div> : null}
+      {/* Regiao controlada pelas guias (role so com a faixa visivel). */}
+      <div className="chat-tabpanel" id={CHAT_TABPANEL_ID} role={tabsShown ? "tabpanel" : undefined}
+        aria-labelledby={tabsShown && activeTabId ? chatTabDomId(activeTabId) : undefined}
+        aria-label={tabsShown && !activeTabId ? "Conversa" : undefined}>
       {selectedContact ? <>
         <div className="contact-banner">
           <div>
@@ -1528,6 +1593,7 @@ function ChatPanel() {
         </form>
         )}
       </> : <div className="empty large">Selecione um contato para abrir a conversa.</div>}
+      </div>
       {showTemplatePicker && selectedContact ? (
         <TemplatePickerModal
           contactId={selectedContact.id}
@@ -1814,7 +1880,7 @@ function ContactTagsCard({ contact }: { contact: Contact }) {
 }
 
 function TemplatePickerModal({ contactId, channelId, conversation, contact, onClose }: { contactId: number; channelId: number | null; conversation?: Conversation | null; contact?: Contact | null; onClose: () => void }) {
-  const { readOnly, config } = useCrm();
+  const { readOnly, config, followupEnabled } = useCrm();
   const { fetchTemplates, sendTemplate, reopenConversation, busyTemplate } = useCrm();
   const [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
@@ -1959,7 +2025,7 @@ function TemplatePickerModal({ contactId, channelId, conversation, contact, onCl
               {selected ? (
                 <>
                   {/* Finalidade so existe com o follow-up ligado; desligado, o envio segue comercial como antes. */}
-                  {config?.feature_followup ? <label htmlFor="template-contact-purpose" style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginBottom: "1rem", fontSize: "0.85rem" }}>
+                  {followupEnabled ? <label htmlFor="template-contact-purpose" style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginBottom: "1rem", fontSize: "0.85rem" }}>
                     <span>Finalidade deste contato</span>
                     <select id="template-contact-purpose" value={isReopen ? "commercial" : contactPurpose} disabled={isReopen || busyTemplate} onChange={(event) => setContactPurpose(event.target.value as "commercial" | "service")}>
                       <option value="commercial">Retomada comercial</option>
@@ -2932,8 +2998,17 @@ function ReopenBatchModal() {
 // Perfis de Acesso (RBAC dinamico M-B2) — master-detail de toggles
 // ---------------------------------------------------------------------------
 
+// Ordem fixa do select de base (menor privilegio primeiro) e fallback para
+// backend antigo que ainda nao devolve `bases` na listagem.
+const PERFIL_BASE_ORDER = ["perfil_operador", "perfil_supervisor", "perfil_admin"];
+const PERFIL_BASES_FALLBACK: PerfilBaseItem[] = [
+  { id: "perfil_operador", nome: "Operador", beyond: [] },
+  { id: "perfil_supervisor", nome: "Supervisor", beyond: [] },
+  { id: "perfil_admin", nome: "Administrador", beyond: [] },
+];
+
 function PerfisAcessoModal() {
-  const { readOnly, config, funnelEnabled } = useCrm();
+  const { readOnly, config, funnelEnabled, followupEnabled, sessionUser, can } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
@@ -2945,20 +3020,39 @@ function PerfisAcessoModal() {
   const [creating, setCreating] = useState(false);
   const [newNome, setNewNome] = useState("");
   const [newBase, setNewBase] = useState("perfil_operador");
+  // Bases de criacao com as chaves que o EDITOR nao possui (mesmo guard do
+  // POST, calculado no backend sobre o seed de codigo). Base bloqueada fica
+  // desabilitada no select em vez de dar 403 no Criar (editor de cargo
+  // supervisor x base Operador, que liga assumir_coex_proprio).
+  const [bases, setBases] = useState<PerfilBaseItem[]>([]);
 
   const selected = perfis.find((p) => p.id === selectedId) || null;
+  const baseOptions = (bases.length ? bases : PERFIL_BASES_FALLBACK)
+    .slice()
+    .sort((a, b) => PERFIL_BASE_ORDER.indexOf(a.id) - PERFIL_BASE_ORDER.indexOf(b.id));
+  const newBaseBloqueada = baseOptions.find((b) => b.id === newBase)?.beyond || [];
 
   const load = useCallback(async (focusId?: string) => {
     if (!bundle) return;
     try {
-      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[] }>(bundle.auth, "/api/admin/perfis-acesso");
+      const res = await getJson<{ perfis: PerfilAcesso[]; catalogo: PerfilCatalogoItem[]; bases?: PerfilBaseItem[] }>(bundle.auth, "/api/admin/perfis-acesso");
       setPerfis(res.perfis);
       setCatalogo(res.catalogo);
+      setBases(Array.isArray(res.bases) ? res.bases : []);
       setSelectedId((prev) => focusId || prev || res.perfis[0]?.id || null);
     } catch (e: unknown) { setError(errorText(e)); }
   }, [bundle, setError]);
 
   useEffect(() => { void load(); }, [load]);
+  // Se a base pre-selecionada esta bloqueada para este editor, pula para a
+  // primeira liberada (na ordem do select) em vez de deixar o Criar travado.
+  useEffect(() => {
+    if (!bases.length) return;
+    const atual = bases.find((b) => b.id === newBase);
+    if (atual && atual.beyond.length === 0) return;
+    const livre = PERFIL_BASE_ORDER.map((id) => bases.find((b) => b.id === id)).find((b) => b && b.beyond.length === 0);
+    if (livre) setNewBase(livre.id);
+  }, [bases]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sincroniza o rascunho ao trocar de perfil selecionado.
   useEffect(() => {
@@ -2971,16 +3065,17 @@ function PerfisAcessoModal() {
     setCreating(false);
   }, [selectedId, perfis, catalogo]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Permissao de recurso desligado nao aparece (o rascunho mantem o valor
-  // salvo, entao salvar o perfil nao a altera).
+  // Permissao de recurso desligado nao aparece nem entra no PUT;
+  // o backend preserva o valor salvo ao mesclar apenas as chaves recebidas.
   const ocultas = new Set<string>([
     ...(config?.feature_impersonate ? [] : ["ver_como_usuario"]),
-    ...(config?.feature_followup ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
+    ...(followupEnabled ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
       "registrar_recusa_comercial", "reativar_contato_comercial"]),
     // Funil: flag global E funil habilitado no tenant (/api/session.funnel).
     ...(config?.feature_funnel && funnelEnabled ? [] : ["ver_funil", "mover_etapa_funil", "ver_contatos_agente_funil", "ver_dashboard_funil"]),
   ]);
-  const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
+  const catalogoVisivel = catalogo.filter((item) => !ocultas.has(item.chave));
+  const grupos = catalogoVisivel.reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
     (acc[item.grupo] = acc[item.grupo] || []).push(item);
     return acc;
   }, {});
@@ -2989,7 +3084,17 @@ function PerfisAcessoModal() {
     if (!bundle || !selected) return;
     setBusy(true);
     try {
-      await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles: draftToggles });
+      // So as chaves visiveis que MUDARAM em relacao a listagem. O backend
+      // mescla (update_perfil) e compara a concessao com o doc CRU: chave
+      // ausente no doc (preenchida pelo seed na listagem) contava como
+      // concessao nova e dava 403 a editor nao-admin que nao a possui, mesmo
+      // sem ele ter mexido nela (revisao dos PRs #4/#5, 2026-10-29).
+      const toggles = Object.fromEntries(
+        catalogoVisivel
+          .filter((item) => (draftToggles[item.chave] === true) !== (selected.toggles?.[item.chave] === true))
+          .map((item) => [item.chave, draftToggles[item.chave] === true]),
+      );
+      await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles });
       setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em ate 1 minuto.`);
       await load(selected.id);
     } catch (e: unknown) { setError(errorText(e)); }
@@ -3023,17 +3128,17 @@ function PerfisAcessoModal() {
   }
 
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Perfis de acesso" onClick={() => setShowSettings(false)}>
+    <div className="lightbox access-profiles-lightbox" role="dialog" aria-modal="true" aria-label="Perfis de acesso" onClick={() => setShowSettings(false)}>
       <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
-      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 860, maxHeight: "90vh", overflow: "auto" }}>
+      <div className="settings-modal access-profiles-modal" onClick={(e) => e.stopPropagation()}>
         <h2 style={{ margin: "0 0 0.3rem" }}>Perfis de acesso</h2>
         <p className="sub" style={{ margin: "0 0 0.9rem", fontSize: "0.82rem" }}>
           Cada usuario segue um perfil. Ajustes valem para todos os usuarios do perfil, sem deploy.
           O catalogo de permissoes e fixo da plataforma.
         </p>
-        <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div className="access-profiles-layout">
           {/* Mestre: lista de perfis */}
-          <div style={{ flex: "0 0 220px", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+          <div className="access-profiles-list">
             {perfis.map((p) => (
               <button key={p.id} type="button" className={p.id === selectedId ? "primary" : "ghost"} style={{ textAlign: "left", padding: "0.55rem 0.7rem" }} onClick={() => setSelectedId(p.id)}>
                 <strong style={{ display: "block", fontSize: "0.88rem" }}>{p.nome}</strong>
@@ -3046,12 +3151,19 @@ function PerfisAcessoModal() {
               <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", border: "1px solid var(--border, #444)", borderRadius: 8, padding: "0.55rem" }}>
                 <input value={newNome} onChange={(e) => setNewNome(e.target.value)} placeholder="Nome do perfil" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 <select value={newBase} onChange={(e) => setNewBase(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
-                  <option value="perfil_operador">Base: Operador</option>
-                  <option value="perfil_supervisor">Base: Supervisor</option>
-                  <option value="perfil_admin">Base: Administrador</option>
+                  {baseOptions.map((b) => (
+                    <option key={b.id} value={b.id} disabled={b.beyond.length > 0}>
+                      {`Base: ${b.nome}`}{b.beyond.length > 0 ? " (indisponível para você)" : ""}
+                    </option>
+                  ))}
                 </select>
+                {newBaseBloqueada.length > 0 ? (
+                  <span className="sub" style={{ fontSize: "0.72rem", lineHeight: 1.3 }}>
+                    Esta base concede permissões que você não possui: {newBaseBloqueada.map((chave) => catalogo.find((item) => item.chave === chave)?.rotulo || chave).join(", ")}.
+                  </span>
+                ) : null}
                 <div style={{ display: "flex", gap: "0.35rem" }}>
-                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={readOnly || (busy || !newNome.trim())} onClick={() => void createPerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "..." : "Criar"}</button>
+                  <button className="primary" style={{ flex: 1, padding: "0.4rem" }} disabled={readOnly || (busy || !newNome.trim() || newBaseBloqueada.length > 0)} onClick={() => void createPerfil()} title={readOnly ? READ_ONLY_TOOLTIP : newBaseBloqueada.length > 0 ? "Escolha uma base que você possa conceder." : undefined}>{busy ? "..." : "Criar"}</button>
                   <button className="ghost" style={{ padding: "0.4rem 0.6rem" }} onClick={() => setCreating(false)}>✕</button>
                 </div>
               </div>
@@ -3062,7 +3174,7 @@ function PerfisAcessoModal() {
 
           {/* Detalhe: toggles do perfil selecionado */}
           {selected ? (
-            <div style={{ flex: "1 1 380px", minWidth: 300 }}>
+            <div className="access-profiles-editor">
               <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem", flexWrap: "wrap" }}>
                 <input value={draftNome} onChange={(e) => setDraftNome(e.target.value)} disabled={readOnly || (selected.is_system_locked)} style={{ flex: "1 1 180px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
                 <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
@@ -3071,25 +3183,37 @@ function PerfisAcessoModal() {
                 <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: todas as permissoes ficam sempre ligadas (e o teto do tenant — protecao contra auto-bloqueio). Para um perfil administrativo limitado, crie um perfil customizado com base Administrador.</p>
               ) : null}
               {Object.entries(grupos).map(([grupo, itens]) => (
-                <div key={grupo} style={{ marginBottom: "0.8rem" }}>
-                  <h3 style={{ margin: "0 0 0.35rem", fontSize: "0.82rem", textTransform: "uppercase", opacity: 0.7 }}>{grupo}</h3>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: "0.25rem 0.8rem" }}>
+                <section key={grupo} className="access-profile-group" aria-label={grupo}>
+                  <h3>{grupo}</h3>
+                  <div className="access-profile-options">
                     {itens.map((item) => {
                       const locked = !!selected.is_system_locked;
+                      // Como no backend, admin pode conceder tudo. Os demais podem
+                      // revogar chaves existentes, mas nao conceder as que nao possuem.
+                      const cannotEnable = sessionUser?.role !== "admin" && !can(item.chave as PermissionKey)
+                        && selected.toggles?.[item.chave] !== true;
+                      const disabled = readOnly || locked || cannotEnable || busy;
                       return (
-                        <label key={item.chave} style={{ display: "flex", alignItems: "center", gap: "0.45rem", fontSize: "0.82rem", opacity: locked ? 0.6 : 1, cursor: locked ? "not-allowed" : "pointer" }} title={locked ? "Travado no perfil de sistema" : item.chave}>
+                        <label key={item.chave} className="access-profile-option" aria-disabled={disabled}
+                          title={readOnly ? READ_ONLY_TOOLTIP : locked ? "Travado no perfil de sistema" : cannotEnable ? "Você não pode conceder uma permissão que não possui." : undefined}>
                           <input
                             type="checkbox"
                             checked={draftToggles[item.chave] === true}
-                            disabled={readOnly || (locked || busy)}
+                            disabled={disabled}
                             onChange={(e) => setDraftToggles((prev) => ({ ...prev, [item.chave]: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
                           />
-                          <span>{item.rotulo}{locked ? " 🔒" : ""}</span>
+                          <span className="access-profile-option-text">
+                            {item.rotulo}
+                            {item.chave === "ver_todos_leads" ? (
+                              <small>Só tem efeito para usuários com cargo de administrador ou supervisor.</small>
+                            ) : null}
+                          </span>
+                          {locked || cannotEnable ? <span className="access-profile-option-lock" aria-hidden="true">🔒</span> : null}
                         </label>
                       );
                     })}
                   </div>
-                </div>
+                </section>
               ))}
               <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.8rem" }}>
                 <button className="primary" disabled={readOnly || (busy || !draftNome.trim())} onClick={() => void savePerfil()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "Salvando..." : "Salvar perfil"}</button>
@@ -3883,7 +4007,8 @@ function CrmApp() {
   if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Configuracao invalida</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "O backend deve operar em modo Firebase."}</p></div></div>;
   if (!firebaseUser || !sessionUser) return impersonationTab
     ? <div className="screen"><div className="hero-card"><h1>Modo de visualização</h1><p>{impersonationEndMessage || error || (firebaseUser ? "Carregando o acesso..." : "A sessão foi encerrada ou expirou. Gere um novo acesso na aba do administrador.")}</p></div></div>
-    : <LoginScreen />;
+    // Firebase autenticado sem sessao do CRM ainda = conectando (nao e login).
+    : firebaseUser ? <ConnectingScreen /> : <LoginScreen />;
 
   return (
     <Fragment key={readOnly ? impersonationScopeGeneration : "normal"}>

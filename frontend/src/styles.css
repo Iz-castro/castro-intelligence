@@ -28,6 +28,9 @@
   --panel-solid-bg: #faf6ef;
   --panel-solid-strong: #fffdf9;
   --panel-solid-soft: #f3ede3;
+  /* Guias de conversa: fundo da ativa e pico do piscar (nao lida). */
+  --tab-active-bg: rgba(15, 118, 110, 0.12);
+  --tab-blink-bg: rgba(15, 118, 110, 0.26);
   --hero-bg: linear-gradient(180deg, rgba(255, 251, 244, 0.96), rgba(255, 248, 238, 0.82));
   --page-bg:
     radial-gradient(circle at top left, rgba(154, 89, 39, 0.18), transparent 30%),
@@ -66,6 +69,8 @@
   --panel-solid-bg: #18202a;
   --panel-solid-strong: #1b232d;
   --panel-solid-soft: #222c37;
+  --tab-active-bg: rgba(20, 184, 166, 0.16);
+  --tab-blink-bg: rgba(20, 184, 166, 0.34);
   --hero-bg: linear-gradient(180deg, rgba(22, 27, 34, 0.98), rgba(18, 22, 30, 0.96));
   --page-bg: linear-gradient(145deg, #0f1117, #131820);
 }
@@ -473,6 +478,130 @@ textarea:focus {
 
 .contact-banner { padding: 1rem; align-items: flex-start; }
 .banner-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 0.3rem; flex-shrink: 0; }
+
+/* Guias de conversa (PO 2026-10-28): faixa acima do chat, como as guias do
+   navegador. As guias encolhem ate um minimo (nome com reticencias); o que nao
+   cabe rola, com indicador nas pontas (e quantas escondidas tem nao lidas).
+   Guia nao ativa com nao lidas pisca devagar (so visual); com movimento
+   reduzido vira borda tracejada, mais discreta que a ativa. */
+.chat-tabs-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 0.3rem; min-width: 0; }
+.chat-tabs {
+  /* largura 0 + flex: nao empurra o painel (no celular a coluna crescia com as guias) */
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.3rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+.chat-tabs::-webkit-scrollbar { height: 6px; }
+.chat-tab {
+  /* Como no navegador: todas com a mesma largura, encolhendo juntas ate o
+     minimo; container pra esconder o chip do canal quando estreita. */
+  flex: 1 1 14rem;
+  display: inline-flex;
+  align-items: center;
+  min-width: 7.5rem;
+  max-width: 14rem;
+  container-type: inline-size;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-card);
+  color: var(--text);
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.chat-tab:hover { border-color: var(--accent); }
+.chat-tab.active { border-color: var(--accent); background: var(--tab-active-bg); box-shadow: inset 0 -2px 0 var(--accent); }
+.chat-tab__main {
+  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  padding: 0.35rem 0.1rem 0.35rem 0.55rem;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 0.8rem;
+}
+.chat-tab__name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.chat-tab.active .chat-tab__name { font-weight: 700; color: var(--accent); }
+.chat-tab__channel {
+  flex-shrink: 0;
+  padding: 0.05rem 0.3rem;
+  border-radius: 999px;
+  background: rgba(154, 89, 39, 0.12);
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.6rem;
+}
+.chat-tab__badge { flex-shrink: 0; min-width: 1.3rem; padding: 0.05rem 0.35rem; font-size: 0.65rem; }
+/* Guia estreita: o nome vale mais que o chip (canal segue no title/aria-label). */
+@container (max-width: 10.5rem) { .chat-tab__channel { display: none; } }
+.chat-tab__close {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  margin-right: 0.2rem;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.chat-tab__close:hover { background: var(--danger-bg); color: var(--danger); }
+.chat-tab__main:focus-visible,
+.chat-tab__close:focus-visible,
+.chat-tabs__more:focus-visible,
+.chat-tabs__close-all:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@keyframes chat-tab-blink {
+  0%, 100% { background-color: var(--panel-card); }
+  50% { background-color: var(--tab-blink-bg); }
+}
+.chat-tab.unread { border-color: var(--accent); animation: chat-tab-blink 1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .chat-tab.unread { animation: none; border-style: dashed; } }
+/* Pontas da faixa: ha guias fora da area (clique rola); "+N" = com nao lidas. */
+.chat-tabs__more {
+  /* largura fixa: o "+N" nao pode mudar a largura da faixa (cortaria a ativa) */
+  flex: 0 0 2.6rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.15rem;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1;
+}
+.chat-tabs__more b { font-family: "IBM Plex Mono", monospace; font-size: 0.65rem; }
+.chat-tabs__more:disabled { opacity: 0.35; cursor: default; }
+.chat-tabs__more.unread { border-color: var(--accent); color: var(--accent); animation: chat-tab-blink 1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .chat-tabs__more.unread { animation: none; border-style: dashed; } }
+.chat-tabs__close-all {
+  flex-shrink: 0;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+.chat-tabs__close-all:hover { border-color: var(--danger); color: var(--danger); }
+/* Regiao do chat controlada pelas guias (tabpanel): mesma coluna do painel. */
+.chat-tabpanel { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 0.5rem; }
 
 .audio-container {
   display: flex;
@@ -984,6 +1113,22 @@ textarea:focus {
   padding: 0.6rem;
 }
 
+.detail-panel > .panel-head {
+  flex-shrink: 0;
+}
+
+/* Evita cortar os cartoes antes de gerar overflow no painel. */
+.detail-panel .detail-scroll > * {
+  flex-shrink: 0;
+}
+
+/* Sem scrollbar-color aqui: no Chrome/Edge >= 121 ela desliga o
+   ::-webkit-scrollbar (barra fina global) neste painel e, por heranca, nos
+   scrollers internos (cartoes, textareas) — virava barra nativa de 15 px. */
+.detail-panel .detail-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--muted);
+}
+
 .detail-panel select,
 .detail-panel input,
 .detail-panel textarea,
@@ -1208,6 +1353,120 @@ textarea:focus {
   flex-shrink: 0;
 }
 
+/* Faixa de cima reservada para o botao "Fechar" (absoluto, top/right 1.2rem):
+   com 960 px o modal passava por baixo dele entre ~840 e ~1160 px de janela
+   e o topo da barra de rolagem fechava o modal sem salvar. */
+.access-profiles-lightbox { padding: 4.25rem 1rem 1rem; }
+
+.access-profiles-modal {
+  width: min(960px, 100%);
+  max-height: calc(100vh - 5.5rem);
+  max-height: calc(100dvh - 5.5rem);
+  padding: clamp(1rem, 3vw, 2rem);
+}
+
+.access-profiles-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  align-items: start;
+  gap: 1.5rem;
+}
+
+.access-profiles-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.access-profiles-editor { min-width: 0; }
+
+.access-profile-group { margin-bottom: 1.25rem; }
+
+.access-profile-group h3 {
+  margin: 0 0 0.4rem;
+  padding: 0 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.access-profile-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.access-profile-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  min-height: 48px;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.access-profile-option:last-child { border-bottom-color: transparent; }
+
+/* :focus-within deixava a linha clicada acesa depois que o ponteiro saia
+   (clique foca o checkbox); o destaque segue so o ponteiro e o foco de teclado. */
+.access-profile-option:hover,
+.access-profile-option:has(input:focus-visible) { background: var(--panel-solid-soft); }
+
+.access-profile-option:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.access-profile-option[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+/* Checkbox nao deve herdar largura e padding dos campos de texto globais. */
+.access-profile-option input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  border-radius: 3px;
+  accent-color: var(--accent);
+  color-scheme: light;
+  box-shadow: none;
+  cursor: inherit;
+}
+
+:root.dark .access-profile-option input[type="checkbox"] { color-scheme: dark; }
+
+.access-profile-option-text { overflow-wrap: anywhere; }
+
+.access-profile-option-text small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.access-profile-option-lock { font-size: 0.75rem; }
+
+@media (max-width: 680px) {
+  .access-profiles-layout { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+  .access-profiles-list { flex-direction: row; flex-wrap: wrap; }
+  .access-profiles-list > * { flex: 1 1 140px; min-width: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .access-profile-option { transition: none; }
+}
+
 @keyframes pulse {
   0%, 100% { transform: scale(1); opacity: 1; }
   50% { transform: scale(1.08); opacity: 0.82; }
@@ -1235,6 +1494,7 @@ textarea:focus {
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
+  .detail-panel .detail-scroll { flex-basis: auto; }
   .panel-head,
   .toolbar,
   .contact-banner { flex-direction: column; align-items: stretch; }

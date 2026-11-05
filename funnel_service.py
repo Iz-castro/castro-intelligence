@@ -313,7 +313,13 @@ class FunnelService:
 
     @property
     def tasks_visible(self):
-        return bool(getattr(config, "FEATURE_FOLLOWUP", False)) and self.can("gerenciar_followup")
+        # Follow-up ligado PARA O TENANT (chave geral + settings.followup_enabled,
+        # cache do tenant_service); sem ele o card nao mostra tarefa nem "sem
+        # proxima acao". Import tardio: followup_routes importa o follow-up todo.
+        if not self.can("gerenciar_followup"):
+            return False
+        from followup_routes import tenant_followup_enabled
+        return tenant_followup_enabled(self.repo.tenant_id)
 
     def _actor(self):
         if self.user.get("read_only") or self.user.get("impersonating") or self.user.get("impersonation"):

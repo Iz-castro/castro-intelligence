@@ -112,7 +112,7 @@ def list_authorized_conversations(tenant_id, authorize, contact_id, user, limit=
         try:
             row = authorize(contact_id, snap.id, user)["conversation"]
         except HTTPException as exc:
-            if exc.status_code in (403, 404):
+            if exc.status_code in (403, 404, 503):  # 503 = checagem indisponivel: pula o candidato
                 continue
             raise
         rows.append(row)

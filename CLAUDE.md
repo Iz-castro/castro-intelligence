@@ -29,23 +29,24 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py funnel_catalog.py funnel_repository.py funnel_service.py funnel_routes.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (229).
-  Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
+  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (235).
+  Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente: `tools\sim_reception_flow.py` (333).
   Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (61).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
-  History sync/eco do coex (recência real, janela de 24h, dono da thread): `tools\sim_history_recency.py` (45).
+  History sync/eco do coex (recência real, janela de 24h, dono da thread, idempotência por bloco): `tools\sim_history_recency.py` (62).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
   `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
   `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
   (rules combinadas com o follow-up: 861 verificacoes em 2026-10-18).
   Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
-  `tools\sim_followup_api.py` (53), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
+  `tools\sim_followup_api.py` (56), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   Funil comercial (ADR 0015): `tools\sim_funnel_flow.py` (446, inclui gate estatico dos indices por matriz),
   `tools\sim_funnel_api.py` (253, inclui o encerramento unificado pelo app real),
   `tools\sim_funnel_intake.py` (340, entrada automatica e automacoes no caminho quente),
   `tools\sim_funnel_migration.py` (351) e, na raiz, `node tools\sim_funnel_frontend.mjs` (352).
+  Guias de conversa (limite por uso, rascunho+modo por guia, storage por uid + restauracao sem abrir, auto-fechamento so com dado do servidor, Ctrl+Alt+Seta, Sair apaga rascunho, Ver como/polling sem guias): na raiz, `node tools\sim_chat_tabs.mjs` (174).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -178,8 +179,12 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   **reentrega o payload ~23s sem ACK**. O guard `was_dup` em `webhook.py` (texto **e áudio**) é o que impede bot e
   transcrição de rodarem 2x — tirar áudio dali = Val responde em dobro e Whisper re-transcreve o
   mesmo áudio por dias (incidente 2026-08-14/18).
-- **Follow-up (PR #2, 2026-10-18):** `FEATURE_FOLLOWUP` (default false) e GLOBAL — antes de ligar,
-  criar gate por tenant (ou desligar as 5 chaves de Follow-up nos perfis dos outros tenants). A recusa
+- **Follow-up (PR #2, 2026-10-18):** liga POR TENANT (2026-10-26): `FEATURE_FOLLOWUP` (env, chave
+  geral) **E** `tenants/{id}.settings.followup_enabled is True` (`tenant_followup_enabled`, em
+  `followup_routes.py`); sem as duas, a API `/api/followup` da 404 e a sessao manda
+  `followup.enabled=false` (tela, Finalidade do template e chaves de perfil somem). Template comercial
+  e reabertura pontual checam `_require_contact_access` ANTES do 409 da recusa (senao o 409 revela a
+  recusa de lead alheio — LGPD); o gate de envio, que silencia a Val na Recepcao, segue depois. A recusa
   comercial (`wa_contacts.commercial_contact_block`) barra template comercial, reabertura pontual, o scan
   v2 do lote (`scan_reopen_audiences`), o worker (pulo contado em `pulados_recusa_comercial`) e o script
   one-off; **se desfaz quando o paciente manda mensagem nova** (decisao do PO, mesmo D4 do Encerrar),
@@ -204,6 +209,24 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   `qualification` (o handoff gravar em_atendimento tiraria o lead da caixa da recepção). A etapa nunca
   escreve bot/dono/LGPD/opt-out/tags. `/api/funnel` fica fora das allowlists do Ver como;
   `FollowupService.list_activities` descarta `crm_stage_*`. 12 índices novos: publicar READY antes de ligar.
+- **Event loop único (`--workers 1`): trabalho síncrono pesado roda em `run_in_threadpool`** (2026-10-28).
+  O cliente Firestore é síncrono; uma chamada longa dentro de `async def` congela TODAS as requests da
+  instância. Já estão fora do loop: Whisper (`_transcribe_off_loop`, semáforo de 1), os crons
+  (`_verify_cron_auth` + `expire_stale_takeovers`/`close_stale_attendances`/pool-wait) e o `smb_app_state_sync`.
+  `close_stale_attendances` retorna cedo em tenant legacy com auto_close OFF (lia 2.351 threads por execução).
+  **History do coex é idempotente por BLOCO** (`history_chunks/{numero__c<canal>__fase__ordem__hash}`,
+  `claim_history_chunk`/`finish_history_chunk`, `claim_id` por tentativa): a Meta reenviava o mesmo bloco ~1x/h
+  por ~6 dias e cada reentrega travava o loop 43–63 s (apuração 2026-10-27: 75/75 congelamentos vistos pelas
+  operadoras). `done` só depois de persistir tudo; `failed` libera o lease (mídia inline sem download também é
+  `failed` + fila de pendentes). **Reentrega durante a importação (`busy`) responde 503** — única resposta não-2xx
+  do `/webhook` — para a Meta reentregar até cair em `done`; um 200 sem cópia durável perderia o bloco se o dono do
+  lease morresse. Ainda inline no loop: a PRIMEIRA entrega de cada bloco (194–210 s) — não conectar número coex
+  novo em horário de pico até levar `_process_history_threads` para thread.
+- **Transfer/return/takeover exigem posse da origem** (`_require_transfer_source_access`, 2026-10-28): operador
+  comum só transfere thread própria ou da pool **com lead sem dono (ou seu)** — órfã de lead alheio não é pool;
+  por `contact_id`, só lead próprio/pool, e o gate roda ANTES do `_resolve_send_target` (que faz upsert). Sem ramo
+  de takeover: o handler é gravado pelo próprio `/takeover`, que agora só aceita `pending` com handler = eu ou número
+  meu (antes qualquer operador virava handler de thread sem conflito, silenciava o bot e forjava posse).
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar
