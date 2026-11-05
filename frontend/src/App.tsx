@@ -11,9 +11,14 @@ import { playBeep } from "./utils/audio";
 import { useClickOutside } from "./hooks/useClickOutside";
 import { InternalChatPanel, GcBadgeIcon } from "./components/gchat/InternalChatPanel";
 import { CommercialContactBanner, FollowupEntry } from "./components/followup/FollowupEntry";
+import { FunnelEntry } from "./components/funnel/FunnelEntry";
+import { FunnelStageCard } from "./components/funnel/FunnelStageCard";
+import { FunnelCloseFields, useFunnelCloseForm } from "./components/funnel/FunnelCloseFields";
+import { closeOpensModal, contactStageLabel, filterValueValid, stageFilterOptions, useFunnelCatalog } from "./features/funnel";
+import { LeadTemperatureDot } from "./components/LeadTemperatureDot";
 import { ApiError, getDownload, getJson, sendJson, putJson, deleteJson, sendForm } from "./api";
 import { errorText } from "./utils/errors";
-import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
+import type { ActiveView, Channel, ChatMessage, ConflictLead, Contact, Conversation, Department, Operator, PerfilAcesso, PerfilCatalogoItem, PermissionKey, PickerRow, ProtocolSearchResult, TagDef, TemplateComponent, TemplateSendComponent, WhatsAppTemplate } from "./types";
 import sussurroIcon from "./assets/sussurro-icon.png";
 import { ImpersonateModal, ImpersonationLayout, READ_ONLY_TOOLTIP } from "./components/Impersonation";
 import { impersonationTab, isFirebaseSessionActive } from "./firebase";
@@ -134,6 +139,7 @@ function TopBar() {
       </div>
       <div className="topbar-actions">
         <FollowupEntry />
+        <FunnelEntry />
         <button className="composer-icon" onClick={toggleTheme} title={theme === "dark" ? "Tema claro" : "Tema escuro"} aria-label="Alternar tema">
           {theme === "dark" ? <SunIcon /> : <MoonIcon />}
         </button>
@@ -786,27 +792,8 @@ function ConflictsPanel() {
   );
 }
 
-// Temperatura do lead (tenants com motor CX): bolinha vermelha/amarela/branca.
-// Data-driven: sem campo no doc (tenants sem IA) -> null, nenhum plumbing de
-// plano/modulo necessario. Gravada pelo backend UMA vez, no handoff do bot.
-const LEAD_TEMPERATURE_META: Record<string, { bg: string; border: string; label: string }> = {
-  quente: { bg: "#dc2626", border: "#dc2626", label: "Lead quente — alta intencao (priorize este atendimento)" },
-  morno: { bg: "#f59e0b", border: "#f59e0b", label: "Lead morno — exploratorio" },
-  frio: { bg: "#ffffff", border: "#94a3b8", label: "Lead frio — suporte generico / curiosidade" },
-};
-function LeadTemperatureDot({ temperature }: { temperature?: string }) {
-  if (!temperature) return null;
-  // Valor fora do vocabulario (override futuro de tenant): bolinha NEUTRA
-  // cinza — o dot nunca some enquanto o chip do header mostra o texto.
-  const meta = LEAD_TEMPERATURE_META[temperature] || { bg: "#e2e8f0", border: "#94a3b8", label: `Temperatura do lead: ${temperature}` };
-  return (
-    <span
-      title={meta.label}
-      aria-label={meta.label}
-      style={{ width: 10, height: 10, borderRadius: "50%", display: "inline-block", flexShrink: 0, background: meta.bg, border: `1.5px solid ${meta.border}` }}
-    />
-  );
-}
+// Temperatura do lead: LeadTemperatureDot (components/LeadTemperatureDot.tsx),
+// extraido para o funil reusar no card e no drawer.
 const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 // Caixas que exibem o seletor de qualificacao na toolbar da sidebar. O filtro
@@ -820,6 +807,19 @@ function ContactList() {
   // Revisao B: registry esvaziado fazia o controle SUMIR com o filtro ainda
   // aplicado (lista vazia sem controle visivel). Sem opcoes, limpa.
   useEffect(() => { if (tagFilter.length > 0 && tagOptions.length === 0) setTagFilter([]); }, [tagFilter, tagOptions.length, setTagFilter]);
+  // Funil (decisao do PO de 28/10, "uma classificação só"): com catalogo, o
+  // select oferece as etapas visiveis ao usuario (+ "Não lidas") e o chip do
+  // item mostra a etapa; sem catalogo (Hub Loc), a qualificacao como antes.
+  const { can } = useCrm();
+  const funnelUi = useFunnelCatalog();
+  const funnelReady = funnelUi.status === "ready";
+  const stageOptions = funnelReady ? stageFilterOptions(funnelUi.catalog, (permission) => can(permission as PermissionKey)) : null;
+  const stageOptionsKey = stageOptions ? stageOptions.map((option) => option.value).join("|") : null;
+  // Valor que nao existe mais nas opcoes (catalogo chegou/saiu, etapa ficou
+  // invisivel): limpa, senao o filtro esconderia tudo sem opcao no select.
+  useEffect(() => {
+    if (!filterValueValid(qualificationFilter, stageOptions, "nao_lidos")) setQualificationFilter("");
+  }, [qualificationFilter, stageOptionsKey, setQualificationFilter]); // eslint-disable-line react-hooks/exhaustive-deps
   const poolReception = systemSettings.pool_mode === "reception";
   const [showNewContact, setShowNewContact] = useState(false);
   // Total de contatos do tenant (inclui agenda telefonica do state_sync,
@@ -927,8 +927,15 @@ function ContactList() {
         {/* Filtro por qualificacao: Bot, Novos/Recepcao, Meus e Equipe. A caixa
             N/Q ja e um filtro por qualificacao (so nao_qualificado) e o Backup e
             historico importado — sem seletor nelas. O match em si
-            (filteredConversations) e client-side sobre o que esta carregado. */}
-        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option><option value="nao_lidos">Não lidas</option></select>}
+            (filteredConversations) e client-side sobre o que esta carregado.
+            Com o funil, as opcoes sao as etapas ("stage:<chave>"). */}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title={stageOptions ? "Filtrar conversas (etapa do funil ou nao lidas)" : "Filtrar conversas (qualificacao ou nao lidas)"} aria-label="Filtrar conversas">
+          <option value="">Todos</option>
+          {stageOptions
+            ? stageOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)
+            : <><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></>}
+          <option value="nao_lidos">Não lidas</option>
+        </select>}
         {/* "So espiar" (admin/supervisor): abrir conversa sem marcar como lida
             — badge e alarme continuam ate alguem tratar. Lembrado por navegador. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && canPeek && (
@@ -1011,7 +1018,7 @@ function ContactList() {
                 </div>
                 <div className="sub">{contact.phone_formatted || contact.wa_id}{activeView === "equipe" && assignedOperator ? ` · ${assignedOperator.display_name}` : ""}</div>
                 <div className="row">
-                  <span className="chip">{contact.qualification || "novo"}</span>
+                  <span className="chip">{funnelReady ? contactStageLabel(funnelUi.catalog, contact.crm_stage) : (contact.qualification || "novo")}</span>
                   {unreadCount ? <b className="badge">{unreadCount}</b> : null}
                 </div>
                 {channelLabel ? (
@@ -1127,8 +1134,11 @@ function ChatPanel() {
   const [openMessageMenuDirection, setOpenMessageMenuDirection] = useState<"down" | "up">("down");
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
   // Gate de desfecho (reforma 2026-09): fechar lead ainda novo/em_atendimento
-  // abre o modal de qualificacao em vez de fechar direto.
+  // abre o modal de qualificacao em vez de fechar direto. Com o funil
+  // (contrato v2): abre quando a etapa atual nao e desfecho de encerramento
+  // (espelha o gate do backend); o chip do cabecalho mostra a etapa.
   const [showCloseModal, setShowCloseModal] = useState(false);
+  const funnelUi = useFunnelCatalog();
   const [busyTakeover, setBusyTakeover] = useState(false);
   const [showTakeoverPrompt, setShowTakeoverPrompt] = useState(false);
   const [greetDraft, setGreetDraft] = useState("");
@@ -1318,7 +1328,7 @@ function ChatPanel() {
           <div className="banner-actions">
             <div className="chips">
               <span className="chip">{selectedContact.department_name || "Sem setor"}</span>
-              <span className="chip">{selectedContact.qualification || "sem classificacao"}</span>
+              <span className="chip" title={funnelUi.status === "ready" ? "Etapa do funil comercial" : undefined}>{funnelUi.status === "ready" ? contactStageLabel(funnelUi.catalog, selectedContact.crm_stage) : (selectedContact.qualification || "sem classificacao")}</span>
               {(selectedThread?.lead_temperature || selectedContact.lead_temperature) ? (
                 <span className="chip" style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem" }}>
                   <LeadTemperatureDot temperature={selectedThread?.lead_temperature || selectedContact.lead_temperature} />
@@ -1341,7 +1351,7 @@ function ChatPanel() {
                     <button type="button" className="attach-option" onClick={() => { setNicknameInput(selectedContact.declared_name || ""); setEditingNickname(true); closeDotsMenu(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>✏️</span><span>Editar apelido</span></button>
                     {selectedThreadId ? <button type="button" className="attach-option" onClick={() => {
                       if (attendanceClosed) { void setAttendance(selectedThreadId, "aberto"); }
-                      else if (["novo", "em_atendimento"].includes(selectedContact.qualification || "novo")) { setShowCloseModal(true); }
+                      else if (closeOpensModal(funnelUi, selectedContact, selectedThread)) { setShowCloseModal(true); }
                       else { void setAttendance(selectedThreadId, "fechado_manual"); }
                       closeDotsMenu();
                     }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>{attendanceClosed ? "🔓" : "🔒"}</span><span>{attendanceClosed ? "Reabrir atendimento" : "Fechar atendimento"}</span></button> : null}
@@ -1531,6 +1541,7 @@ function ChatPanel() {
         <CloseAttendanceModal
           contact={selectedContact}
           threadId={selectedThreadId}
+          thread={selectedThread}
           onClose={() => setShowCloseModal(false)}
         />
       ) : null}
@@ -1542,11 +1553,21 @@ function ChatPanel() {
 // "em_atendimento" exige a qualificacao final. So oferece DESFECHOS —
 // novo/em_atendimento sao estados de passagem e ficam fora do select.
 // A trava real e o 400 do backend (set-attendance); aqui e UX.
-function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact; threadId: string; onClose: () => void }) {
-  const { readOnly } = useCrm();
+// Com o catalogo do funil (decisao do PO de 28/10, "uma classificação só"):
+// o desfecho E a etapa (Aguardando retorno, Cliente Agendado, ...), com o
+// texto explicativo; vai `funnel` no lugar de qualification e o backend
+// grava o legado equivalente. Sem catalogo (Hub Loc), o select legado.
+const LEGACY_QUALIFICATION_LABELS: Record<string, string> = {
+  novo: "Novo", em_atendimento: "Em atendimento", qualificado: "Qualificado", nao_qualificado: "Nao qualificado", convertido: "Convertido", nao_convertido: "Nao convertido",
+};
+
+function CloseAttendanceModal({ contact, threadId, thread, onClose }: { contact: Contact; threadId: string; thread?: Conversation | null; onClose: () => void }) {
+  const { readOnly, config, funnelEnabled } = useCrm();
   // `error` renderizado DENTRO do modal: o alert global fica atras do
   // overlay do lightbox — um 400/403 do encerramento ficava invisivel.
   const { setAttendance, busyTransfer, error, systemSettings, userSettings } = useCrm();
+  const funnelForm = useFunnelCloseForm(contact, thread);
+  const funnelMode = funnelForm.mode !== "legacy";
   const [outcome, setOutcome] = useState("");
   // Tags no encerramento (Frente B): "fechou com o paciente -> convertido +
   // tags pra busca futura", num passo so.
@@ -1556,22 +1577,45 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
   // Nota PRE-CARREGADA com a atual: modal em branco ja apagou notas no
   // passado (bug do form do painel) — nunca nasce vazio se o lead tem nota.
   const [notes, setNotes] = useState(contact.notes || "");
-  const currentLabel = (contact.qualification || "novo") === "em_atendimento" ? "Em atendimento" : "Novo";
+  const currentLabel = LEGACY_QUALIFICATION_LABELS[contact.qualification || "novo"] || "Novo";
+  // "Qualificado" deixa de ser oferecido em tenant com funil (decisao do PO,
+  // 28/10) — inclusive para perfil sem ver_funil, que cai no select legado.
+  const offerQualified = !(config?.feature_funnel && funnelEnabled);
+  const canSubmit = funnelMode ? funnelForm.mode === "funnel" && !funnelForm.problem : Boolean(outcome);
+  async function submit() {
+    if (busyTransfer) return;
+    if (funnelMode) {
+      const funnel = funnelForm.prepare(threadId);
+      if (!funnel) return;
+      const ok = await setAttendance(threadId, "fechado_manual", { notes, tags, tag_labels: tagLabels, funnel, legacyQualification: funnelForm.legacyQualification }, { onError: funnelForm.handleError });
+      if (ok) onClose();
+      return;
+    }
+    const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels });
+    if (ok) onClose();
+  }
   return (
     <div className="lightbox" role="dialog" aria-modal="true" aria-label="Encerrar atendimento" onClick={onClose}>
       <button type="button" className="lightbox-close" onClick={onClose} aria-label="Fechar">Fechar</button>
-      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: funnelMode ? 560 : 440 }}>
         <h2 style={{ margin: "0 0 0.6rem" }}>Encerrar atendimento</h2>
         {error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{error}</span></div> : null}
-        <p className="sub" style={{ marginBottom: "0.8rem" }}>Este lead ainda esta como <strong>{currentLabel}</strong>. Qualifique o desfecho antes de encerrar.</p>
-        <label className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Desfecho *</label>
-        <select value={outcome} onChange={(e) => setOutcome(e.target.value)} style={{ width: "100%" }} autoFocus title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
-          <option value="">Selecione...</option>
-          <option value="convertido">Convertido</option>
-          <option value="nao_convertido">Nao convertido</option>
-          <option value="qualificado">Qualificado</option>
-          <option value="nao_qualificado">Nao qualificado</option>
-        </select>
+        {/* Funil saiu do ar no meio do encerramento (409 funnel_disabled): o
+            modal voltou ao desfecho legado e o aviso continua visivel. */}
+        {!funnelMode && funnelForm.error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{funnelForm.error}</span></div> : null}
+        {funnelMode ? <FunnelCloseFields form={funnelForm} disabled={readOnly || busyTransfer} onReapply={() => void submit()} /> : <>
+          {["novo", "em_atendimento"].includes(contact.qualification || "novo")
+            ? <p className="sub" style={{ marginBottom: "0.8rem" }}>Este lead ainda esta como <strong>{currentLabel}</strong>. Qualifique o desfecho antes de encerrar.</p>
+            : <p className="sub" style={{ marginBottom: "0.8rem" }}>Desfecho atual: <strong>{currentLabel}</strong>. Escolha o desfecho para encerrar.</p>}
+          <label className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Desfecho *</label>
+          <select value={outcome} onChange={(e) => setOutcome(e.target.value)} style={{ width: "100%" }} autoFocus title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
+            <option value="">Selecione...</option>
+            <option value="convertido">Convertido</option>
+            <option value="nao_convertido">Nao convertido</option>
+            {offerQualified ? <option value="qualificado">Qualificado</option> : null}
+            <option value="nao_qualificado">Nao qualificado</option>
+          </select>
+        </>}
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Tags</label>
         <TagDraftEditor draft={tags} onChange={setTags} meta={tagMeta} listId="tag-suggestions-close" onNewLabel={(slug, label) => setTagLabels((prev) => ({ ...prev, [slug]: label }))} />
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Notas de atendimento</label>
@@ -1581,8 +1625,8 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
           <button
             type="button"
             className="primary"
-            disabled={readOnly || (!outcome || busyTransfer)}
-            onClick={() => { void (async () => { const ok = await setAttendance(threadId, "fechado_manual", { qualification: outcome, notes, tags, tag_labels: tagLabels }); if (ok) onClose(); })(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
+            disabled={readOnly || !canSubmit || busyTransfer}
+            onClick={() => { void submit(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
           >
             {busyTransfer ? "Encerrando..." : "Salvar e encerrar"}
           </button>
@@ -2001,7 +2045,12 @@ function CollapsibleCard({ title, defaultOpen = true, children }: { title: strin
 }
 
 function DetailPanel() {
-  const { config, readOnly } = useCrm();
+  const { config, readOnly, funnelEnabled } = useCrm();
+  // Funil (decisao do PO de 28/10): com catalogo, a classificacao do contato
+  // e a etapa (cartao "Etapa do funil" + encerramento); o cartao
+  // "Qualificação" vira so "Notas do atendimento".
+  const funnelUi = useFunnelCatalog();
+  const tenantFunnel = Boolean(config?.feature_funnel && funnelEnabled);
   const [impersonateTarget, setImpersonateTarget] = useState<Operator | null>(null);
   const { bundle, selectedContact, selectedThreadId, selectedConversation, sessionUser, can, canSeeAll, operators, departments, channels, qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary, busySave, busyTransfer, saveQualification, transferContact, editingUserId, setEditingUserId, editRole, setEditRole, editPerfilId, setEditPerfilId, editDeptId, setEditDeptId, busyRoleUpdate, startEditUser, saveUserRole, coexEditingUserId, coexPhoneInput, setCoexPhoneInput, busyCoexUpdate, startEditCoex, cancelEditCoex, saveCoex, revokeCoex, setError, setNotice, refreshPollingViews } = useCrm();
   const [busyReturnBot, setBusyReturnBot] = useState(false);
@@ -2075,6 +2124,7 @@ function DetailPanel() {
         {selectedContact ? <>
           <CommercialContactBanner contact={selectedContact} />
           <FollowupEntry contactId={selectedContact.id} variant="contact" />
+          <FunnelStageCard key={selectedContact.id} contact={selectedContact} />
           {/* Info do canal */}
           {contactChannel ? (
             <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", opacity: 0.7, display: "flex", gap: "0.3rem", alignItems: "center" }}>
@@ -2096,14 +2146,23 @@ function DetailPanel() {
             </div>
           ) : null}
 
-          <CollapsibleCard title="Qualificacao">
-            <select value={qualification} onChange={(e) => setQualification(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></select>
+          {funnelUi.status === "ready" ? <CollapsibleCard title="Notas do atendimento">
+            <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>A classificação do contato é a etapa do funil (cartão acima e encerramento do atendimento).</span>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <button className="primary" onClick={() => void saveQualification({ notesOnly: true })} disabled={readOnly || (busySave)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySave ? "Salvando..." : "Salvar notas"}</button>
+            {can("editar_dono_lead") && selectedContact.assigned_to ? (
+              <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={readOnly || (busyReturnBot)} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
+            ) : null}
+          </CollapsibleCard> : <CollapsibleCard title="Qualificacao">
+            {/* Tenant com funil (perfil sem ver_funil cai aqui): "Qualificado"
+                deixa de ser oferecido (PO, 28/10); so aparece se ja for o valor. */}
+            <select value={qualification} onChange={(e) => setQualification(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option>{!tenantFunnel || qualification === "qualificado" ? <option value="qualificado">Qualificado</option> : null}<option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></select>
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <button className="primary" onClick={() => void saveQualification()} disabled={readOnly || (busySave)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySave ? "Salvando..." : "Salvar"}</button>
             {can("editar_dono_lead") && selectedContact.assigned_to ? (
               <button className="ghost" style={{ marginTop: "0.5rem", fontSize: "0.8rem", color: "var(--danger)" }} disabled={readOnly || (busyReturnBot)} onClick={() => { if (confirm("Devolver este contato para a fila do bot?")) void returnToBot(selectedContact.id); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyReturnBot ? "Devolvendo..." : "Devolver ao bot"}</button>
             ) : null}
-          </CollapsibleCard>
+          </CollapsibleCard>}
           <ContactTagsCard contact={selectedContact} />
           {can("transferir_atendimento") ? <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move so este atendimento (thread). O Dono do Lead nao muda.</span>
@@ -2874,7 +2933,7 @@ function ReopenBatchModal() {
 // ---------------------------------------------------------------------------
 
 function PerfisAcessoModal() {
-  const { readOnly, config } = useCrm();
+  const { readOnly, config, funnelEnabled } = useCrm();
   const { bundle, setShowSettings, setError, setNotice } = useCrm();
   const [perfis, setPerfis] = useState<PerfilAcesso[]>([]);
   const [catalogo, setCatalogo] = useState<PerfilCatalogoItem[]>([]);
@@ -2918,6 +2977,8 @@ function PerfisAcessoModal() {
     ...(config?.feature_impersonate ? [] : ["ver_como_usuario"]),
     ...(config?.feature_followup ? [] : ["gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
       "registrar_recusa_comercial", "reativar_contato_comercial"]),
+    // Funil: flag global E funil habilitado no tenant (/api/session.funnel).
+    ...(config?.feature_funnel && funnelEnabled ? [] : ["ver_funil", "mover_etapa_funil", "ver_contatos_agente_funil", "ver_dashboard_funil"]),
   ]);
   const grupos = catalogo.filter((item) => !ocultas.has(item.chave)).reduce<Record<string, PerfilCatalogoItem[]>>((acc, item) => {
     (acc[item.grupo] = acc[item.grupo] || []).push(item);

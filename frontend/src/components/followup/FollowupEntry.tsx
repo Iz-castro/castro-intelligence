@@ -14,14 +14,16 @@ export function CommercialContactBanner({ contact }: { contact: Contact }) {
 }
 
 export function FollowupEntry({ contactId, variant = "topbar" }: { contactId?: number; variant?: "topbar" | "contact" }) {
-  const { bundle, config, can, canSeeAll } = useCrm();
+  const { bundle, config, can, canSeeAll, readOnly } = useCrm();
   const [open, setOpen] = useState(false);
   const [next, setNext] = useState<FollowupTask | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [refresh, setRefresh] = useState(0);
-  const enabled = Boolean(config?.feature_followup && can("gerenciar_followup"));
+  // Ver como: as rotas do follow-up negam a sessao temporaria; sem o gate a
+  // entrada apareceria e cada consulta viraria 403.
+  const enabled = Boolean(!readOnly && config?.feature_followup && can("gerenciar_followup"));
   const trigger = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {

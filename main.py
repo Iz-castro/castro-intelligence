@@ -286,8 +286,9 @@ async def add_security_headers(request: Request, call_next):
     # consulta sobre dado potencialmente sensivel) nunca podem parar no
     # cache de disco de maquina compartilhada. Carimbado AQUI porque o
     # header setado dentro da rota nao sobrevive a HTTPException/422 — os
-    # caminhos de ERRO saiam sem no-store.
-    if (request.url.path.startswith(("/api/wa/contacts/picker", "/api/followup"))
+    # caminhos de ERRO saiam sem no-store. O funil (quadro, drawer, painel)
+    # entra pelo mesmo prefixo, inclusive nos 4xx.
+    if (request.url.path.startswith(("/api/wa/contacts/picker", "/api/followup", "/api/funnel"))
             or request.url.path.rstrip("/") in ("/api/admin/impersonate", "/api/impersonation/end")
             or is_impersonation_token(getattr(request.state, "firebase_decoded", {}))):
         response.headers["Cache-Control"] = "private, no-store"
@@ -756,8 +757,13 @@ async def session_info(current_user: dict = Depends(get_current_user)):
     # frontend, ao vivo pelo snapshot do perfil) estao ligados — conceder o
     # toggle a outro perfil vale sem relogin.
     from monitor_service import monitor_config
+    # Funil comercial: flag global (lida em runtime) E habilitacao do tenant
+    # no doc ja lido acima; o toggle ver_funil decide no frontend/backend.
+    import config as _runtime_config
+    from funnel_catalog import funnel_for_tenant
     return {
         "monitor": {"enabled": bool(monitor_config(tenant_id))},
+        "funnel": {"enabled": bool(_runtime_config.FEATURE_FUNNEL and funnel_for_tenant(tenant_doc))},
         "user": current_user,
         "auth_mode": AUTH_MODE,
         "tenant_id": tenant_id,
@@ -777,6 +783,7 @@ async def session_info(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/client-config")
 async def client_config():
+    import config as _runtime_config
     return {
         "auth_mode": AUTH_MODE,
         "chat_delivery_mode": CHAT_DELIVERY_MODE,
@@ -799,6 +806,7 @@ async def client_config():
         "impersonation_polling_interval_ms": IMPERSONATE_POLLING_INTERVAL_MS,
         "feature_google_chat": FEATURE_GOOGLE_CHAT,
         "feature_followup": FEATURE_FOLLOWUP,
+        "feature_funnel": bool(_runtime_config.FEATURE_FUNNEL),
         "firestore": {
             "collections": {
                 "departments": collection_name("departments"),
@@ -2691,6 +2699,7 @@ async def wa_send_location(body: WaSendLocationRequest, current_user: dict = Dep
             sender_user_id=current_user["id"],
             sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
+            funnel_human_reply=True,  # funil: 1a resposta humana -> Em atendimento
             **reply_fields,
         )
         log_audit(current_user["id"], "WA_SEND_LOCATION", f"Para {wa_id}: {body.latitude},{body.longitude}")
@@ -2749,6 +2758,9 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
             sender_user_id=current_user["id"],
             sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
+            # Funil comercial: a 1a resposta humana pelo CRM move Novo contato /
+            # A classificar -> Em atendimento (so endpoints de envio humano).
+            funnel_human_reply=True,
             **reply_fields,
         )
         _maybe_credit_assume_counter(contact, current_user["id"])
@@ -2814,6 +2826,7 @@ async def wa_send_media(
         sent_by_name=str(current_user.get("display_name") or ""),
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         media_size_bytes=len(file_content),
+        funnel_human_reply=True,  # funil: 1a resposta humana -> Em atendimento
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -2885,6 +2898,7 @@ async def wa_send_audio(
         sent_by_name=str(current_user.get("display_name") or ""),
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         media_size_bytes=len(converted),
+        funnel_human_reply=True,  # funil: 1a resposta humana -> Em atendimento
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
@@ -3112,6 +3126,7 @@ async def wa_send_template(
             sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
             template_category=effective_template_category,
+            funnel_human_reply=True,  # funil: template manual = resposta humana
         )
         log_audit(current_user["id"], "WA_SEND_TEMPLATE", f"Para {contact['wa_id']} template={effective_template_name} lang={effective_language}")
         return {"status": "sent", "wa_message_id": wa_msg_id, "template_name": effective_template_name}
@@ -4021,6 +4036,7 @@ async def correct_message(body: CorrectMessageRequest, current_user: dict = Depe
         reply_to_message_id=body.message_id,
         reply_to_preview=original_preview,
         reply_to_sender_name=original_sender.strip()[:80] or "Equipe",
+        funnel_human_reply=True,  # funil: correcao tambem e envio humano
     )
 
     # Marcar original como corrigida
@@ -4087,6 +4103,12 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
     from database import is_reception_mode
     _auto_assume = (has_permission(current_user, "assumir_atendimento")
                     and not is_reception_mode())
+    # Funil comercial (ADR 0015): tenant EXPLICITO do operador, e so quando
+    # coincide com o contexto da request (sem fallback implicito).
+    from firestore_common import get_tenant_context as _ctx_tenant
+    from funnel_catalog import load_tenant_funnel
+    _user_tid = str(current_user.get("tenant_id") or "")
+    _funnel = load_tenant_funnel(_user_tid) if _user_tid and _user_tid == _ctx_tenant() else None
     contact_id, error = create_manual_wa_contact(
         declared_name=body.declared_name,
         wa_id=wa_id,
@@ -4094,6 +4116,7 @@ async def create_contact_manual(body: ManualContactRequest, current_user: dict =
         user_id=current_user["id"],
         allow_admin_override=allow_override,
         auto_assume=_auto_assume,
+        funnel_intake=_funnel,
     )
     if error:
         raise HTTPException(status_code=409, detail=error)
@@ -5882,7 +5905,15 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
     "novo"/"em_atendimento" EXIGE a qualificacao final no mesmo request
     (convertido | nao_convertido | qualificado | nao_qualificado) — o modal
     do frontend coleta, esta trava e a camada real. Cron e fechamento pelo
-    proprio cliente (fechado_cliente) nao passam por aqui; backup fora."""
+    proprio cliente (fechado_cliente) nao passam por aqui; backup fora.
+
+    Funil comercial (decisao do PO de 28/10, "uma classificacao so"): com o
+    funil do tenant, o modal manda o desfecho como ETAPA em
+    `funnel = {to_stage, expected_version, reason, reason_note,
+    appointment_kind, operation_id}`; a transacao do funil grava etapa +
+    legado equivalente ANTES de qualquer outra escrita daqui (409/422/403
+    abortam sem fechar) e a resposta ganha `funnel.stage`. Sem `funnel`
+    (Hub Loc, front antigo) o comportamento legado fica intacto."""
     body = await request.json()
     status = (body.get("status") or "").strip()
     if status not in ("fechado_manual", "aberto"):
@@ -5915,6 +5946,14 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
     contact = get_wa_contact(contact_id) if contact_id is not None else None
     qualification = str(body.get("qualification") or "").strip()
     notes = body.get("notes")
+    _funnel_body = body.get("funnel")
+    _funnel = None
+    if _funnel_body is not None:
+        if status != "fechado_manual":
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_payload", "message": "Desfecho do funil só no encerramento."})
+        # Com o funil, o desfecho legado vem da etapa, nunca do corpo.
+        qualification = ""
     if status == "fechado_manual":
         _terminais = ("qualificado", "nao_qualificado", "convertido", "nao_convertido")
         if qualification and qualification not in _terminais:
@@ -5936,7 +5975,24 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
         _gate = (contact is not None and not conv.get("is_backup")
                  and not contact.get("is_backup")
                  and _cur_q in ("novo", "em_atendimento"))
-        if _gate and not qualification:
+        if _funnel_body is not None and contact is not None:
+            # Desfecho como etapa (funnel_service, mesmo caminho do quadro:
+            # versao, recibo, Activity, legado equivalente). Roda ANTES de
+            # qualquer escrita deste fechamento. O toggle de fechar (acima)
+            # cobre o lead ainda sem desfecho; trocar desfecho ja registrado
+            # exige mover_etapa_funil (checado la).
+            from funnel_service import close_attendance_outcome
+            _funnel = close_attendance_outcome(current_user, conv, contact, _funnel_body)
+            if _funnel["applied"]:
+                contact = dict(contact, qualification=_funnel["qualification"])
+                if notes is not None:
+                    # So as notas: qualification vazia nao sobrescreve.
+                    update_wa_contact_qualification(contact_id, "", notes)
+            else:
+                # Contato fora do funil (backup/arquivado): o desfecho vale so
+                # no legado, como o modal antigo (gate e toggles abaixo).
+                qualification = _funnel["qualification"] or ""
+        if _gate and not qualification and not (_funnel and _funnel["applied"]):
             raise HTTPException(
                 status_code=400,
                 detail="Qualifique o desfecho antes de encerrar (convertido, nao_convertido, qualificado ou nao_qualificado).",
@@ -5997,7 +6053,10 @@ async def wa_set_attendance(conversation_id: str, request: Request, current_user
             except Exception as exc:
                 logger.warning("reopen daily attendance pid=%s falhou: %s", pid, exc)
     log_audit(current_user["id"], "ATTENDANCE_SET_STATUS", f"conv={conversation_id} -> {status}")
-    return {"status": "ok", "attendance_status": status}
+    _result = {"status": "ok", "attendance_status": status}
+    if _funnel is not None:
+        _result["funnel"] = {"stage": _funnel["stage"]}
+    return _result
 
 
 @app.post("/api/wa/assume/{contact_id}")
@@ -7227,8 +7286,28 @@ async def embedded_signup_exchange(
 
 
 from followup_routes import create_followup_router
+from funnel_routes import create_funnel_router
 
 app.include_router(create_followup_router(get_current_user, _require_contact_access))
+# Funil comercial (ADR 0015): fora das allowlists do Ver como de proposito.
+app.include_router(create_funnel_router(get_current_user, _require_contact_access))
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler as _default_validation_handler
+
+_FUNNEL_API_PREFIX = "/api/funnel"
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError):
+    """422 de validacao de query/path/corpo. No funil (ADR 0015) o erro segue
+    o contrato {code, message} e NAO ecoa o input (o padrao do FastAPI
+    devolve loc/input/ctx); as demais rotas ficam com o 422 padrao."""
+    path = request.url.path
+    if path == _FUNNEL_API_PREFIX or path.startswith(_FUNNEL_API_PREFIX + "/"):
+        return JSONResponse(status_code=422, content={"detail": {
+            "code": "invalid_request", "message": "Parâmetros inválidos."}})
+    return await _default_validation_handler(request, exc)
 
 # -- Execucao --
 

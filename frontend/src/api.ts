@@ -6,12 +6,36 @@ type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
 export class ApiError extends Error {
   status: number;
+  // `code`/`detail` vem do detail OBJETO ({code, message, ...}) das rotas
+  // novas (funil). Erros antigos (detail string) seguem so com message.
+  code?: string;
+  detail?: unknown;
 
-  constructor(message: string, status = 500) {
+  constructor(message: string, status = 500, extra: { code?: string; detail?: unknown } = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    if (extra.code) this.code = extra.code;
+    if (extra.detail !== undefined) this.detail = extra.detail;
   }
+}
+
+// detail do FastAPI: string (padrao), ARRAY (422 de validacao) ou objeto
+// {code, message, ...}. Retrocompativel e nunca "[object Object]".
+export function apiErrorFromPayload(payload: Record<string, unknown>, status: number): ApiError {
+  const fallback = `Erro HTTP ${status}`;
+  const detail = payload.detail || payload.error || payload.message;
+  if (Array.isArray(detail)) {
+    const message = detail.map((d: { msg?: string } | null) => d?.msg || "Valor invalido").join("; ");
+    return new ApiError(message || fallback, status, { detail });
+  }
+  if (detail && typeof detail === "object") {
+    const item = detail as Record<string, unknown>;
+    const code = typeof item.code === "string" && item.code ? item.code : undefined;
+    const message = typeof item.message === "string" && item.message.trim() ? item.message : fallback;
+    return new ApiError(message, status, { code, detail });
+  }
+  return new ApiError(detail ? String(detail) : fallback, status, detail ? { detail } : {});
 }
 
 async function buildHeaders(auth: Auth | null, initHeaders?: HeadersInit, isFormData = false) {
@@ -82,14 +106,7 @@ async function performRequest<T>(auth: Auth | null, path: string, init: RequestI
     let payload: Record<string, unknown> = {};
     try { payload = raw ? JSON.parse(raw) : {}; }
     catch { if (response.ok) throw new ApiError("Resposta inválida do servidor.", response.status); }
-    if (!response.ok) {
-      const detail = payload.detail || payload.error || payload.message || `Erro HTTP ${response.status}`;
-      // 422 do FastAPI manda detail como ARRAY de erros de validacao.
-      const message = Array.isArray(detail)
-        ? detail.map((d: { msg?: string }) => d?.msg || "Valor invalido").join("; ")
-        : detail;
-      throw new ApiError(String(message), response.status);
-    }
+    if (!response.ok) throw apiErrorFromPayload(payload, response.status);
     return payload as T;
   } finally {
     if (controller) impersonationControllers.delete(controller);

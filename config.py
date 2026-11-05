@@ -148,6 +148,12 @@ IMPERSONATE_POLLING_INTERVAL_MS = 15000
 # /api/followup respondem 404 e a UI do follow-up some (inclusive o campo de
 # finalidade do template e as permissoes no editor de perfis).
 FEATURE_FOLLOWUP = _bool_env("FEATURE_FOLLOWUP", "false")
+# Funil comercial (crm_stage no contato + historico em crm_activities; ver
+# docs/funil_crm_varizemed.md e ADR 0015). Kill-switch GLOBAL: desligado, as
+# rotas /api/funnel respondem 404, a UI some e a entrada automatica no funil
+# nao grava nada. Ligado, o funil ainda exige habilitacao POR TENANT em
+# tenants/{tid}.settings.funnel (scripts/set_tenant_funnel.py, dry-run default).
+FEATURE_FUNNEL = _bool_env("FEATURE_FUNNEL", "false")
 
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
 # CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em

@@ -364,6 +364,125 @@
         {"fieldPath": "conversation_id", "order": "ASCENDING"},
         {"fieldPath": "timestamp_wa", "order": "DESCENDING"}
       ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage_changed_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage_changed_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "assigned_to_uid", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage_changed_at", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "assigned_to_uid", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage_changed_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "last_inbound_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "assigned_to_uid", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "last_inbound_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "crm_cohort_month", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_max_reached_order", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "crm_cohort_month", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_max_reached_order", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "wa_contacts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "is_archived", "order": "ASCENDING"},
+        {"fieldPath": "is_backup", "order": "ASCENDING"},
+        {"fieldPath": "crm_stage", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "crm_activities",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "event_type", "order": "ASCENDING"},
+        {"fieldPath": "entry_kind", "order": "ASCENDING"},
+        {"fieldPath": "to_stage", "order": "ASCENDING"},
+        {"fieldPath": "occurred_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "crm_activities",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "event_type", "order": "ASCENDING"},
+        {"fieldPath": "entry_kind", "order": "ASCENDING"},
+        {"fieldPath": "occurred_at", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "crm_activities",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "contact_id", "order": "ASCENDING"},
+        {"fieldPath": "event_type", "order": "ASCENDING"},
+        {"fieldPath": "occurred_at", "order": "DESCENDING"}
+      ]
     }
   ],
   "fieldOverrides": []

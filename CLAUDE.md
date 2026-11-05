@@ -27,7 +27,7 @@ lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente 
 
 Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os gates são:
 
-- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
+- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py funnel_catalog.py funnel_repository.py funnel_service.py funnel_routes.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (229).
   Modo Recepção (pool compartilhada) + reabertura em lote por público: `tools\sim_reception_flow.py` (301).
@@ -42,6 +42,10 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
   `tools\sim_followup_api.py` (53), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
+  Funil comercial (ADR 0015): `tools\sim_funnel_flow.py` (446, inclui gate estatico dos indices por matriz),
+  `tools\sim_funnel_api.py` (253, inclui o encerramento unificado pelo app real),
+  `tools\sim_funnel_intake.py` (340, entrada automatica e automacoes no caminho quente),
+  `tools\sim_funnel_migration.py` (351) e, na raiz, `node tools\sim_funnel_frontend.mjs` (352).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
@@ -182,6 +186,24 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   no `save_wa_message`, so para inbound recebido posterior ao registro (clique, reacao e historico nao
   contam). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
   250/dia). Tarefas e historico (`crm_tasks`, `crm_activities`) sao so do backend nas rules.
+- **Funil comercial (ADR 0015):** `FEATURE_FUNNEL` (default false) + habilitação POR TENANT em
+  `tenants/{tid}.settings.funnel` (template de `funnel_catalog.py`; `scripts/set_tenant_funnel.py`, dry-run
+  default). Etapa em campos PLANOS `crm_*` de `wa_contacts`, escritos SÓ por `funnel_service` (quadro,
+  cartão e o desfecho do "Encerrar atendimento" via `close_attendance_outcome` no `wa_set_attendance`, ANTES
+  de qualquer escrita do fechamento; transação com `crm_stage_version` + recibo `stage_*`), pelo intake e
+  pelas automações no caminho quente e pelo `scripts/classify_funnel_stage.py`;
+  histórico append-only `crm_stage_*` em `crm_activities` (`task_id=None`). O **motivo não vai para o
+  contato** (categoria pode ser dado de saúde e o doc é lido via SDK pela pool). Intake: catálogo decidido
+  1x por payload em `_process_messages` → `upsert_wa_contact(funnel_intake=...)`, só inbound ao vivo do
+  cliente em canal standard, no MESMO write (zero escrita extra; nunca SERVER_TIMESTAMP/Increment; nunca em
+  `save_wa_message`); quem já conversava entra em `unclassified`. Automações SÓ por evento explícito
+  (handoff da Val e 1ª resposta humana pelo CRM → Em atendimento, só a partir de Novo/A classificar, no
+  mesmo write + Activity best-effort). **Exceção ao isolamento (emenda 28/10, "uma classificação só"):**
+  mudança MANUAL de etapa (quadro, cartão ou modal de encerrar) grava também o desfecho legado equivalente
+  em `qualification` (`stage.legacy_qualification`); intake, automações e migração NUNCA escrevem
+  `qualification` (o handoff gravar em_atendimento tiraria o lead da caixa da recepção). A etapa nunca
+  escreve bot/dono/LGPD/opt-out/tags. `/api/funnel` fica fora das allowlists do Ver como;
+  `FollowupService.list_activities` descarta `crm_stage_*`. 12 índices novos: publicar READY antes de ligar.
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar
@@ -208,6 +230,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 | Envio de resposta automática WhatsApp | `bot_sender.py` |
 | Horário comercial por tenant (aviso builtin + params CX) | `business_hours.py` |
 | Follow-up (tarefas, filas, calendario, preferencia comercial) | `followup_service.py`, `followup_routes.py`, `followup_access.py`, `followup_repository.py`, `commercial_contact_policy.py`, `frontend/src/features/followup/` — ver `docs/followup_crm_varizemed.md` (secao 16) |
+| Funil comercial (etapa, Kanban, painel gerencial, migração) | `funnel_catalog.py` (puro), `funnel_repository.py`, `funnel_service.py`, `funnel_routes.py`, `frontend/src/features/funnel/`, `frontend/src/components/funnel/`, `scripts/set_tenant_funnel.py`, `scripts/classify_funnel_stage.py` — ver `docs/funil_crm_varizemed.md` |
 | Monitor de atendimento (porte do painel do Izael; so-leitura, so admin por default) | `monitor_service.py`, `frontend/src/components/monitor/MonitorModal.tsx` — ver `docs/MONITOR_ATENDIMENTO.md` |
 | Redação de PII em logs | `pii_redaction.py` |
 | Frontend (estado central + listeners) | `frontend/src/context/CrmContext.tsx`, `App.tsx` |

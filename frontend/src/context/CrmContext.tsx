@@ -20,6 +20,10 @@ import type { LightboxMedia } from "../utils/media";
 import { installAudioUnlock, playBeep } from "../utils/audio";
 import { useImpersonationPolling, type PollCycle } from "../hooks/useImpersonationPolling";
 import { assertImpersonationRead, threadReadParams, type ImpersonationRead, type ImpersonationSnapshot, type ImpersonationPage, type ImpersonationThread, type RawDocument } from "../utils/impersonation";
+// Modulo-folha do funil (so tipos + funcoes puras): sem ciclo com as telas
+// do funil, que importam este contexto.
+import { contactMatchesFilter, contactStagePatch } from "../features/funnel/catalog";
+import type { CloseFunnelBody, StageState } from "../features/funnel/types";
 
 // ---------------------------------------------------------------------------
 // Context value shape
@@ -28,6 +32,20 @@ import { assertImpersonationRead, threadReadParams, type ImpersonationRead, type
 // Opcao do filtro por canal do "Meus": um canal distinto entre as conversas
 // do operador. label pronto pra UI ("Standard - <numero>" / "Coex - <numero>").
 export type ChannelFilterOption = { id: string; type: "standard" | "coexistence"; label: string };
+
+// Desfecho do "Encerrar atendimento". Legado (Hub Loc / sem catalogo):
+// `qualification`. Com o funil (contrato v2, "uma classificação só"):
+// `funnel` = a etapa escolhida e NAO vai qualification no corpo (o backend
+// grava o legado equivalente); `legacyQualification` so corrige o contato
+// local (camada estatica) quando o catalogo informa o equivalente.
+export type AttendanceOutcome = {
+  qualification?: string;
+  notes: string;
+  tags?: string[];
+  tag_labels?: Record<string, string>;
+  funnel?: CloseFunnelBody;
+  legacyQualification?: string | null;
+};
 
 function perfilFingerprint(perfil: SessionPerfil | null) {
   return JSON.stringify([perfil?.id || "", Object.entries(perfil?.toggles || {}).sort(([a], [b]) => a.localeCompare(b))]);
@@ -54,6 +72,9 @@ type CrmContextValue = {
   // toggle ver_monitor_atendimento (can(), ao vivo) o item "Dashboard" do
   // menu vira "Monitor".
   monitorEnabled: boolean;
+  // Funil comercial: o TENANT tem funil habilitado (/api/session.funnel).
+  // Disponibilidade real = flag global + isto + ver_funil, fora do Ver como.
+  funnelEnabled: boolean;
   operators: Operator[];
   departments: Department[];
   channels: Channel[];
@@ -166,8 +187,11 @@ type CrmContextValue = {
   reassignLead: (toUserId: number, toDeptId: number | null, reason: string, summary: string) => Promise<void>;
   // Modo 3: supervisor assume a thread (vira Dono do Atendimento).
   supervisorTakeover: (conversationId: string) => Promise<void>;
-  // Fase 4: fecha/reabre um atendimento manualmente.
-  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string; tags?: string[]; tag_labels?: Record<string, string> }) => Promise<boolean>;
+  // Fase 4: fecha/reabre um atendimento manualmente. `outcome.funnel`
+  // (catalogo do funil, contrato v2): o desfecho E a etapa — vai no lugar
+  // de qualification. `options.onError` devolve true quando o chamador
+  // tratou o erro (ex.: 409 stale_version no modal), sem o alerta global.
+  setAttendance: (conversationId: string, status: "fechado_manual" | "aberto", outcome?: AttendanceOutcome, options?: { onError?: (error: unknown) => boolean }) => Promise<boolean>;
   // Fase 5A: busca por protocolo (admin/sup).
   loadProtocol: (protocolId: string) => Promise<ProtocolSearchResult | null>;
   composerInputRef: React.MutableRefObject<HTMLTextAreaElement | null>;
@@ -235,6 +259,9 @@ type CrmContextValue = {
   contactsCountNonce: number;
   refreshAllContacts: () => Promise<void>;
   openConversationForContact: (contact_id: number, channel_id?: number) => Promise<string | null>;
+  // Funil: foca no chat uma thread JA EXISTENTE e ja autorizada pelo backend
+  // (linha do GET de contexto do funil). Nenhum POST; nunca /conversation/open.
+  focusExistingConversation: (row: Record<string, unknown>) => string | null;
   loadConflicts: () => Promise<ConflictLead[]>;
 
   // Message correction
@@ -275,7 +302,9 @@ type CrmContextValue = {
   busySave: boolean;
   busyTransfer: boolean;
   busyAssume: boolean;
-  saveQualification: () => Promise<void>;
+  // notesOnly: salva so as notas (qualification "" no /qualify) — painel do
+  // contato com funil, onde a classificacao e a etapa.
+  saveQualification: (options?: { notesOnly?: boolean }) => Promise<void>;
   assumeContact: (contactId: number) => Promise<void>;
   returnContactToPool: (contactId: number) => Promise<void>;
   transferContact: () => Promise<void>;
@@ -464,6 +493,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   const endingImpersonationPromiseRef = useRef<Promise<boolean> | null>(null);
   const [tenantName, setTenantName] = useState("");
   const [monitorEnabled, setMonitorEnabled] = useState(false);
+  const [funnelEnabled, setFunnelEnabled] = useState(false);
   // Perfil RBAC efetivo da sessao (M-B2). Nasce do /api/session (toggles ja
   // resolvidos com fallback de role) e e atualizado ao vivo pelo snapshot do
   // doc perfis_acesso/{id} do tenant.
@@ -1044,6 +1074,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     : activeView === "backup" ? backupConversations
     : nqConversations;
   // Search e qualification filter operam no contato (denormalizado pra UX).
+  // Com o catalogo do funil, o select da barra lateral oferece as ETAPAS
+  // ("stage:<chave>", nunca colide com os valores legados) e filtra por
+  // contact.crm_stage (contactMatchesFilter, puro e testado no sim do funil).
   const filteredConversations = viewConversations.filter((conv) => {
     const c = contactsById.get(conv.contact_id);
     const matchesSearch = !searchText || [
@@ -1061,7 +1094,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const matchesQual = !qualificationFilter
       || (qualificationFilter === UNREAD_FILTER
         ? ((conv.unread_count ?? conv.unread ?? 0) > 0 || conv.id === selectedThreadId)
-        : (c?.qualification || "novo") === qualificationFilter);
+        : contactMatchesFilter(qualificationFilter, c));
     const matchesChannel = activeView === "meus"
       ? (!channelFilter || convChannelKey(conv) === channelFilter)
       : activeView === "equipe"
@@ -1352,6 +1385,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     setUserSettings(DEFAULT_USER_SETTINGS);
     setTenantName("");
     setMonitorEnabled(false);
+    setFunnelEnabled(false);
     setContacts([]);
     setConversations([]);
     setExtraConversations(new Map());
@@ -1470,6 +1504,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
           tenant_id?: string;
           tenant?: { id: string; name?: string; plan?: string; modules?: string[] };
           monitor?: { enabled?: boolean };
+          funnel?: { enabled?: boolean };
           firestore_collections?: Record<string, string>;
           perfil?: SessionPerfil;
         }>(bundle.auth, "/api/session");
@@ -1499,6 +1534,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // titulo do topbar. Fallback = tenant_id (o backend ja faz isso).
         setTenantName(session.tenant?.name || "");
         setMonitorEnabled(!!session.monitor?.enabled);
+        setFunnelEnabled(session.funnel?.enabled === true);
         if (readOnly) {
           const fingerprint = perfilFingerprint(session.perfil ?? null);
           const wide = session.perfil?.toggles.ver_todos_leads === true && ["admin", "supervisor"].includes(session.user.role);
@@ -2813,20 +2849,25 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     void startRecording();
   }
 
-  async function saveQualification() {
+  async function saveQualification(options: { notesOnly?: boolean } = {}) {
     if (readOnly) return;
     if (!bundle || !selectedContact) return;
     const contactId = selectedContact.id;
     try {
       setBusySave(true); setError(""); setNotice("");
-      const r = await putJson(bundle.auth, `/api/wa/contact/${contactId}/qualify`, { qualification, notes }) as { qualification_effective?: string };
+      // notesOnly (painel com funil): qualification "" = o backend nao toca
+      // na qualificacao (update_wa_contact_qualification) e devolve a atual.
+      const sent = options.notesOnly ? "" : qualification;
+      const r = await putJson(bundle.auth, `/api/wa/contact/${contactId}/qualify`, { qualification: sent, notes }) as { qualification_effective?: string };
       // Verdade do servidor: "novo" em lead ja promovido e ignorado pelo
       // backend (reforma 2026-09) — patchar com o valor efetivo, senao a UI
       // mostraria "novo" salvo e o listener reverteria sem explicacao.
       const effective = r?.qualification_effective || qualification;
-      setNotice(effective !== qualification && qualification === "novo"
-        ? "Notas salvas. Lead ja em atendimento nao volta a Novo."
-        : "Qualificacao atualizada.");
+      setNotice(options.notesOnly
+        ? "Notas salvas."
+        : effective !== qualification && qualification === "novo"
+          ? "Notas salvas. Lead ja em atendimento nao volta a Novo."
+          : "Qualificacao atualizada.");
       // Contato hidratado sob demanda (extraContacts, fora do top-50 ao vivo)
       // e um fetch unico — sem este patch o chip e o filtro por qualificacao
       // da sidebar ficariam com o valor antigo ate recarregar a pagina. Quem
@@ -3570,6 +3611,28 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // Funil (drawer "Abrir conversa no chat"): a thread veio do GET de contexto
+  // do funil, que ja autorizou o acesso por thread. Diferente do picker, NAO
+  // chama /api/wa/conversation/open (que materializa thread, grava recencia,
+  // pode auto-atribuir e cala a Val): so fixa a copia em extraConversations
+  // (o guard de selecao orfa nao derruba thread fora do top-50) e seleciona.
+  // Marcar como lida segue sendo o efeito normal do chat aberto.
+  function focusExistingConversation(row: Record<string, unknown>): string | null {
+    if (readOnly || !row) return null;
+    const cid = String(row.id || "");
+    if (!cid) return null;
+    const thread = normalizeConversation(row, cid);
+    if (!thread.contact_id) return null;
+    holdEmptySelectionRef.current = false;
+    if (!conversations.some((c) => c.id === cid)) {
+      setExtraConversations((prev) => new Map(prev).set(cid, thread));
+    }
+    setSelectedThreadId(cid);
+    const mine = thread.assigned_to === sessionUser?.id || (!!thread.assigned_to_uid && thread.assigned_to_uid === sessionUser?.firebase_uid);
+    if (mine) setActiveView("meus");
+    return cid;
+  }
+
   async function updateDeclaredName(contact_id: number, declared_name: string) {
     if (readOnly) return;
     if (!bundle) return;
@@ -3658,16 +3721,27 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // Fase 4: fecha (fechado_manual) ou reabre (aberto) um atendimento.
   // `outcome` (reforma 2026-09): qualificacao final + notas + tags do gate
   // de desfecho, no MESMO request — o backend recusa fechar lead novo/
-  // em_atendimento sem desfecho. Retorna sucesso pro modal so fechar se salvou.
-  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto", outcome?: { qualification: string; notes: string; tags?: string[]; tag_labels?: Record<string, string> }): Promise<boolean> {
+  // em_atendimento sem desfecho. Com o funil (contrato v2), `outcome.funnel`
+  // vai no lugar da qualification: o desfecho E a etapa e o backend grava o
+  // legado equivalente na mesma operacao (409/422/403 abortam o fechamento).
+  // Retorna sucesso pro modal so fechar se salvou.
+  async function setAttendance(conversationId: string, status: "fechado_manual" | "aberto", outcome?: AttendanceOutcome, options: { onError?: (error: unknown) => boolean } = {}): Promise<boolean> {
     if (readOnly) return false;
     if (!bundle) return false;
     try {
       setBusyTransfer(true); setError(""); setNotice("");
       const body: Record<string, unknown> = { status };
-      if (outcome) { body.qualification = outcome.qualification; body.notes = outcome.notes; if (outcome.tags) { body.tags = outcome.tags; body.tag_labels = outcome.tag_labels || {}; } }
-      await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/set-attendance`, body);
-      setNotice(status === "fechado_manual" ? "Atendimento fechado." : "Atendimento reaberto.");
+      if (outcome) {
+        if (outcome.funnel) body.funnel = outcome.funnel;
+        else body.qualification = outcome.qualification ?? "";
+        body.notes = outcome.notes;
+        if (outcome.tags) { body.tags = outcome.tags; body.tag_labels = outcome.tag_labels || {}; }
+      }
+      const response = await sendJson<{ funnel?: { stage?: Partial<StageState> | null } | null }>(bundle.auth, `/api/wa/conversation/${conversationId}/set-attendance`, body);
+      // Etapa que o backend gravou (resposta de hoje + funnel.stage).
+      const stage = outcome?.funnel ? response?.funnel?.stage || null : null;
+      const stageLabel = typeof stage?.label === "string" ? stage.label.trim() : "";
+      setNotice(status === "fechado_manual" ? (stageLabel ? `Atendimento fechado. Etapa do funil: ${stageLabel}.` : "Atendimento fechado.") : "Atendimento reaberto.");
       if (outcome && selectedContact) {
         // Mesmo patch do saveQualification: camada estatica + seed do form,
         // senao chip/filtro da sidebar e painel ficam com o valor antigo.
@@ -3678,22 +3752,33 @@ export function CrmProvider({ children }: { children: ReactNode }) {
         // antigo (revisao adversarial 2026-09-01). detailSeedRef acompanha a
         // selecao (efeito de seed), entao id divergente = usuario trocou.
         const contactId = selectedContact.id;
+        // Com o funil: qualification so quando o catalogo diz o equivalente
+        // (senao o listener/recarga traz); a etapa vem da resposta.
+        const qualificationNow = outcome.funnel ? (outcome.legacyQualification || "") : (outcome.qualification ?? "");
+        const stagePatch = contactStagePatch(stage);
         setExtraContacts((prev) => {
           const cur = prev.get(contactId);
           if (!cur) return prev;
           const next = new Map(prev);
-          next.set(contactId, { ...cur, qualification: outcome.qualification, notes: outcome.notes, ...(outcome.tags ? { tags: outcome.tags } : {}) });
+          next.set(contactId, { ...cur, ...(qualificationNow ? { qualification: qualificationNow } : {}), notes: outcome.notes, ...(outcome.tags ? { tags: outcome.tags } : {}), ...stagePatch });
           return next;
         });
         if (detailSeedRef.current?.id === contactId) {
-          detailSeedRef.current = { id: contactId, qualification: outcome.qualification, notes: outcome.notes };
-          setQualification(outcome.qualification);
+          const seeded = qualificationNow || detailSeedRef.current.qualification;
+          detailSeedRef.current = { id: contactId, qualification: seeded, notes: outcome.notes };
+          setQualification(seeded);
           setNotes(outcome.notes);
         }
       }
       if (!snapshotMode) await refreshPollingViews();
       return true;
-    } catch (e) { setError(errorText(e)); return false; }
+    } catch (e) {
+      // Erro estruturado tratado pelo chamador (conflito de versao do funil,
+      // regra do desfecho): fica no modal, sem o alerta global.
+      if (options.onError?.(e)) return false;
+      setError(errorText(e));
+      return false;
+    }
     finally { setBusyTransfer(false); }
   }
 
@@ -3753,7 +3838,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   // =========================================================================
 
   const value: CrmContextValue = {
-    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
+    config, bundle, firebaseUser, sessionUser, readOnly, impersonationEndMessage, impersonationLastUpdated, impersonationStale, impersonationRefreshing, impersonationPollIntervalMs, impersonationRefreshNonce, impersonationScopeGeneration, reportImpersonationRead, tenantName, monitorEnabled, funnelEnabled, operators, departments, channels, booting, busyLogin, snapshotMode,
     perfil, can, canSeeAll,
     theme, toggleTheme,
     loginWithGoogle, loginWithEmail, resetPassword, logout, mfaPending, resolveMfaCode, cancelMfa,
@@ -3775,7 +3860,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     lightboxMedia, openLightbox, closeLightbox,
     qualification, setQualification, notes, setNotes, toUserId, setToUserId, toDepartmentId, setToDepartmentId, transferReason, setTransferReason, transferSummary, setTransferSummary,
     createManualContact, updateDeclaredName, busyCreateContact,
-    loadAllContacts, pickerPage, pickerSearch, pickerByTag, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, loadConflicts,
+    loadAllContacts, pickerPage, pickerSearch, pickerByTag, countAllContacts, contactsCountNonce, refreshAllContacts, openConversationForContact, focusExistingConversation, loadConflicts,
     correctMessage, correctionTarget, startCorrection, cancelCorrection,
     fetchTemplates, sendTemplate, reopenConversation, busyTemplate, fetchBillingStatus,
     busySave, busyTransfer, busyAssume, saveQualification, assumeContact, returnContactToPool, transferContact, reassignLead, supervisorTakeover, setAttendance, loadProtocol,

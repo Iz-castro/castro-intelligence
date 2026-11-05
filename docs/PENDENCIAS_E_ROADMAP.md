@@ -182,6 +182,12 @@ Batch: a modularização já mexe no `App.tsx` (monolito 2581 linhas) — aprove
 Uma linha por frente, pra não perder o fio quando o dia a dia interromper.
 **Legenda:** ✅ em prod · 🟡 parcial · ⛔ parado/pendente.
 
+- 🟡 **Funil comercial (Varizemed)** — [ADR 0015](decisions/0015-funil-comercial-crm-stage.md),
+  [plano](funil_crm_varizemed.md) (2026-10-25, branch `feature/funil`): implementação local atrás de
+  `FEATURE_FUNNEL=false` + `tenants/{tid}.settings.funnel`. ⛔ Antes de ligar: decisões do PO (§10 do
+  plano), publicar os 12 índices (READY), revisar perfis RBAC, dry-run da migração
+  (`scripts/classify_funnel_stage.py`) com o PO, RoPA (`compliance/FUNIL_PRIVACIDADE.md`).
+
 - ✅ **Modo Recepção / pool compartilhada** — [ADR 0010](decisions/0010-pool-mode-recepcao.md),
   em prod na `varizemed` desde 2026-08-05 (varizemed real com `pool_mode=reception` desde 2026-08-06). Hubloc segue `legacy` ("assumir pra falar",
   [ADR 0008](decisions/0008-lead-gruda-na-vendedora.md)). Kill-switch sem deploy:

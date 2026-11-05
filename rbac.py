@@ -70,6 +70,16 @@ PERMISSION_CATALOG = [
     ("Follow-up", "gerenciar_horarios_followup", "Configurar filas e horarios de follow-up"),
     ("Follow-up", "registrar_recusa_comercial", "Registrar pedido para parar contatos comerciais"),
     ("Follow-up", "reativar_contato_comercial", "Reativar contato comercial a pedido do paciente"),
+    # Funil comercial (funnel_routes.py, ADR 0015 + emenda de 28/10): ver =
+    # quadro e etapa do proprio escopo; ver_contatos_agente_funil = coluna
+    # Novo contato (lead ainda com o agente de IA), so supervisao no seed;
+    # mover e painel comecam so na supervisao (PO decide liberar
+    # mover_etapa_funil ao perfil Operador). Editar nomes e textos das etapas
+    # usa gerenciar_config_sistema (sem chave propria).
+    ("Funil", "ver_funil", "Ver o funil comercial (quadro e etapa dos contatos do proprio escopo)"),
+    ("Funil", "ver_contatos_agente_funil", "Ver no funil os contatos que ainda estao com o agente de IA (Novo contato)"),
+    ("Funil", "mover_etapa_funil", "Mover contatos entre etapas do funil"),
+    ("Funil", "ver_dashboard_funil", "Ver painel gerencial do funil (empresa inteira)"),
     ("Lead", "editar_declared_name", "Editar nome declarado"),
     ("Lead", "arquivar_lead", "Arquivar lead"),
     ("Lead", "adicionar_contato_manual", "Adicionar contato manual"),
@@ -154,6 +164,9 @@ SEED_PERFIS = {
             "gerenciar_tags_globais", "reabrir_em_lote",
             "gerenciar_followup", "redistribuir_followup", "gerenciar_horarios_followup",
             "registrar_recusa_comercial", "reativar_contato_comercial",
+            # Funil comercial: supervisao ve (inclusive a coluna do agente de
+            # IA), move e le o painel.
+            "ver_funil", "ver_contatos_agente_funil", "mover_etapa_funil", "ver_dashboard_funil",
             # F5: filtrar a agenda por tag agrega dado potencialmente
             # sensivel (art. 11) — seed ON so supervisao; operador comum
             # ganha por decisao explicita do admin no perfil.
@@ -180,6 +193,9 @@ SEED_PERFIS = {
             "qualificar_lead", "editar_declared_name", "arquivar_lead",
             "adicionar_contato_manual",
             "gerenciar_followup", "registrar_recusa_comercial",
+            # Funil: operador so VE o quadro do proprio escopo, sem a coluna
+            # Novo contato (lead com o agente de IA); mover = decisao do PO.
+            "ver_funil",
         }),
     },
 }

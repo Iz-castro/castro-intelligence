@@ -42,6 +42,7 @@ from lgpd_bot import (
 )
 from lead_temperature import classify_lead_temperature, signal_keys
 from business_hours import builtin_expediente_notice, cx_hours_params
+import funnel_catalog
 
 logger = logging.getLogger("castro_crm.bot")
 
@@ -476,7 +477,7 @@ def process_bot_message(
             _record_lgpd_consent(contact_id, policy_version=lgpd_cfg["version"])
             # Sem menu de setores: o aceite ja finaliza o bot e poe o lead,
             # sem dono, na fila do Comercial (pool "Novos Leads").
-            _finalize_bot(contact_id, state, SETOR_COMERCIAL)
+            _finalize_bot(contact_id, state, SETOR_COMERCIAL, contact=contact)
             return _msg_pos_aceite(lgpd_response)
 
         if not step:
@@ -495,7 +496,7 @@ def process_bot_message(
     # apagava o estado, nao respondia e repetia a LGPD na mensagem seguinte.
 
     if not step or step in ("lgpd", "cx"):
-        _finalize_bot(contact_id, state, SETOR_COMERCIAL)
+        _finalize_bot(contact_id, state, SETOR_COMERCIAL, contact=contact)
         return _msg_pos_aceite("Olá!")
 
     # -- Legado: contatos que receberam o menu de setores (pre 2026-07-24) --
@@ -503,9 +504,9 @@ def process_bot_message(
     if step == "ask_sector":
         setor = _classificar_setor(text.strip())
         if setor is None:
-            _finalize_bot(contact_id, state, SETOR_COMERCIAL)
+            _finalize_bot(contact_id, state, SETOR_COMERCIAL, contact=contact)
             return _msg_pos_aceite("Certo!")
-        _finalize_bot(contact_id, state, setor)
+        _finalize_bot(contact_id, state, setor, contact=contact)
         return None
 
     # Estado desconhecido: resetar (observabilidade — sem PII, so step/contato)
@@ -517,8 +518,61 @@ def process_bot_message(
     return None
 
 
-def _finalize_bot(contact_id: int, state: dict, setor: int):
-    """Finaliza o bot: atribui o contato ao departamento correto."""
+def _funnel_handoff(contact_id: int, contact: Optional[dict] = None):
+    """Funil comercial no handoff (ADR 0015, emenda de 28/10/2026): entregar
+    o lead a recepcao e o evento explicito AUTO_HANDOFF (Novo contato / A
+    classificar -> Em atendimento; as demais etapas nunca regridem). Devolve
+    (campos, activity, tenant_id): os campos entram no MESMO write do contato
+    que o handoff ja faz; a Activity e gravada depois (_record_funnel_handoff).
+    Sem funil (FEATURE_FUNNEL desligada, tenant sem settings.funnel) =
+    ({}, None, "") sem leitura nenhuma; o contato so e lido (1x) quando o
+    catalogo existe e o chamador nao o trouxe. Nunca escreve qualification
+    (em_atendimento tiraria o lead da caixa da recepcao) e nunca levanta: o
+    handoff roda no webhook, antes do ACK da Meta."""
+    try:
+        from firestore_common import get_tenant_context
+        tenant_id = str(get_tenant_context() or "")
+        catalog = funnel_catalog.load_tenant_funnel(tenant_id) if tenant_id else None
+        if not catalog:
+            return {}, None, ""
+        if not isinstance(contact, dict) or not contact:
+            contact = get_wa_contact(contact_id) or {}
+        fields, activity = funnel_catalog.auto_transition(
+            dict(contact, id=contact_id), utcnow(), catalog,
+            funnel_catalog.AUTO_HANDOFF, tenant_id,
+        )
+        if not fields or not activity:
+            return {}, None, ""
+        return fields, activity, tenant_id
+    except Exception as exc:
+        logger.warning(
+            "[BOT] funil: automacao do handoff ignorada | contato=%s | erro=%s",
+            contact_id, type(exc).__name__,
+        )
+        return {}, None, ""
+
+
+def _record_funnel_handoff(tenant_id: str, activity: Optional[dict]):
+    """Activity do handoff no funil, DEPOIS do write do contato. Best-effort
+    (id deterministico + set: reentrega regrava o mesmo doc); falha aqui
+    nunca quebra o handoff."""
+    if not activity:
+        return
+    try:
+        from database import record_funnel_auto_activity
+        record_funnel_auto_activity(tenant_id, activity)
+    except Exception as exc:
+        logger.warning(
+            "[BOT] funil: activity do handoff nao gravada | contato=%s | erro=%s",
+            activity.get("contact_id"), type(exc).__name__,
+        )
+
+
+def _finalize_bot(contact_id: int, state: dict, setor: int, contact: Optional[dict] = None):
+    """Finaliza o bot: atribui o contato ao departamento correto.
+
+    `contact` = doc lido no turno (com os crm_*): o funil comercial muda no
+    MESMO write do contato (_funnel_handoff), sem leitura extra."""
     dept_map = _get_dept_map()
     dept_id = dept_map.get(setor)
     setor_nome = _SETOR_NOMES.get(setor, "Desconhecido")
@@ -533,8 +587,11 @@ def _finalize_bot(contact_id: int, state: dict, setor: int):
     }
     if dept_id:
         updates["department_id"] = dept_id
+    funnel_fields, funnel_activity, funnel_tenant = _funnel_handoff(contact_id, contact)
+    updates.update(funnel_fields)
 
     document("wa_contacts", contact_id).set(updates, merge=True)
+    _record_funnel_handoff(funnel_tenant, funnel_activity)
 
     # Propaga o setor para as threads do contato: a pool ("novos") do frontend
     # segmenta por department_id da CONVERSATION, nao do contato. Mantem
@@ -1545,14 +1602,18 @@ def _finalize_cx_handoff(
         advance_recency=False,
     )
 
+    # Funil comercial: Em atendimento no MESMO write do contato (o
+    # commit-point abaixo); a Activity so depois que ele gravou.
+    funnel_fields, funnel_activity, funnel_tenant = _funnel_handoff(contact_id, contact)
     _persist_lead_temperature(
         contact_id, temperature, contact,
-        contact_extra={"bot_completed": True, "bot_notes": notes},
+        contact_extra={"bot_completed": True, "bot_notes": notes, **funnel_fields},
         dept_id=dept_id,
         # Abre o ciclo de espera da pool: enquanto nenhum operador responder,
         # o auto-close nao devolve este lead ao agente de IA.
         handoff_at=utcnow(),
     )
+    _record_funnel_handoff(funnel_tenant, funnel_activity)
 
     _clear_bot_state(contact_id)
     logger.info(

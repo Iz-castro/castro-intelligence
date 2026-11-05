@@ -22,6 +22,7 @@ from firestore_common import (
 )
 from lgpd_bot import aceite_cobre_data, hoje_br, validar_config_lgpd
 from rbac import default_perfil_for_role
+import funnel_catalog
 from impersonation_identity import require_real_uid
 
 logger = logging.getLogger("castro_crm.database")
@@ -1304,6 +1305,70 @@ def _graduate_backup_messages(conversation_id, owner_uid=""):
     return total
 
 
+def _funnel_graduation_fields(contact):
+    """Backup graduado (vira lead vivo): entra no funil comercial em A
+    classificar, no MESMO write da graduacao, se o tenant tem funil e o
+    contato ainda nao tem etapa (ADR 0015). Paciente antigo, nunca Novo
+    contato. Caminho administrativo (REST), nao o webhook."""
+    if not contact or contact.get(funnel_catalog.F_STAGE):
+        return {}
+    catalog = funnel_catalog.load_tenant_funnel(get_tenant_context())
+    return funnel_catalog.intake_fields(dict(contact, is_backup=False), utcnow(), catalog,
+                                        origin="graduation")
+
+
+def funnel_auto_transition(contact, event, at=None):
+    """Automacao do funil comercial por evento EXPLICITO (ADR 0015, emenda de
+    28/10/2026): `event` = funnel_catalog.AUTO_HANDOFF (a Val entregou o lead
+    a recepcao) ou AUTO_HUMAN_REPLY (1a resposta de uma pessoa da equipe pelo
+    CRM). Devolve (campos, activity, tenant_id): os campos vao no MESMO write
+    do contato que o chamador ja faz; a Activity e gravada DEPOIS dele, com
+    record_funnel_auto_activity. ({}, None, "") quando nao se aplica:
+    FEATURE_FUNNEL desligada ou tenant sem funil (nenhuma leitura alem do
+    cache do tenant), contato fora das etapas de origem do template (nunca
+    regride Cliente Agendado, Paciente em acompanhamento, Nao convertido...),
+    backup, contexto sem tenant (sem fallback implicito) ou qualquer erro.
+    `contact` = doc atual do contato, com os crm_* e o id. Nunca escreve
+    qualification (em_atendimento tiraria o lead da caixa da recepcao) e
+    nunca levanta: roda no caminho quente."""
+    try:
+        tenant_id = str(get_tenant_context() or "")
+        if not tenant_id or not isinstance(contact, dict):
+            return {}, None, ""
+        catalog = funnel_catalog.load_tenant_funnel(tenant_id)
+        if not catalog:
+            return {}, None, ""
+        fields, activity = funnel_catalog.auto_transition(
+            contact, at or utcnow(), catalog, event, tenant_id)
+        if not fields or not activity:
+            return {}, None, ""
+        return fields, activity, tenant_id
+    except Exception as exc:
+        logger.warning("funil: automacao %s ignorada: %s", event, type(exc).__name__)
+        return {}, None, ""
+
+
+def record_funnel_auto_activity(tenant_id, activity):
+    """Grava a Activity de uma automacao do funil DEPOIS do write do contato
+    que ja levou a etapa: tenants/{tid}/crm_activities/{id}, com tenant
+    EXPLICITO e id deterministico (tenant + evento + contato + versao de
+    origem) via set; reentrega ou retry do mesmo evento regrava o mesmo doc,
+    nunca duplica. Best-effort: a falha so deixa um aviso sem PII (o contato
+    fica na etapa certa e o historico sem este item). True se gravou; nunca
+    levanta."""
+    try:
+        if not tenant_id or not isinstance(activity, dict) or not activity.get("id"):
+            return False
+        from firestore_common import tenant_document
+        tenant_document(tenant_id, "crm_activities", activity["id"]).set(activity)
+        return True
+    except Exception as exc:
+        logger.warning("funil: activity da automacao nao gravada | contato=%s: %s",
+                       activity.get("contact_id") if isinstance(activity, dict) else None,
+                       type(exc).__name__)
+        return False
+
+
 def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transferred_by, reason="", summary="", also_lead=False):
     """Transfere uma conversation (thread). Atualiza a conversation; o
     contato (Dono do Lead) so e movido junto quando also_lead=True.
@@ -1343,12 +1408,29 @@ def assign_wa_conversation(conversation_id, to_user_id, to_department_id, transf
     }, merge=True)
     # Espelho no contato (Dono do Lead) — opt-in pos-Fase 3B.
     if also_lead and contact_id is not None:
-        document("wa_contacts", contact_id).set({
+        contact_fields = {
             "assigned_to": to_user_id,
             "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
             "department_id": to_department_id,
             "is_backup": False,
-        }, merge=True)
+        }
+        # Funil comercial (ADR 0015): este write gradua o CONTATO quando a
+        # thread era backup ou quando o contato ainda e backup (thread VIVA:
+        # o paciente do backup voltou a escrever), e ele entra em A
+        # classificar. Best-effort: so le o contato com o funil ligado no
+        # tenant (funil desligado = zero leitura; 1 leitura REST e nenhuma
+        # escrita extra quando ligado) e falha na leitura/calculo = sem etapa
+        # (o script recupera depois). A thread ja foi gravada acima: o funil
+        # nunca pode deixar a graduacao pela metade.
+        if funnel_catalog.load_tenant_funnel(get_tenant_context()):
+            try:
+                _lead = _get_doc("wa_contacts", contact_id)
+                if was_backup or (_lead or {}).get("is_backup"):
+                    contact_fields.update(_funnel_graduation_fields(_lead))
+            except Exception as exc:
+                logger.warning("assign_wa_conversation: entrada no funil ignorada contact_id=%s: %s",
+                               contact_id, type(exc).__name__)
+        document("wa_contacts", contact_id).set(contact_fields, merge=True)
     # Graduacao de backup: a 1a atribuicao define a dona de origem (sale_owner),
     # igual a um assume. Handoff normal (nao-backup) NAO mexe no sale_owner.
     if was_backup and to_user_id and contact_id is not None:
@@ -1942,7 +2024,9 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                       skip_conversation_upsert=False,
                       control_click=False,
                       inbound_event=True,
-                      created_source=None):
+                      created_source=None,
+                      funnel_intake=None,
+                      funnel_intake_at=None):
     """Cria ou atualiza um contato WhatsApp.
 
     Para canais coexistence, auto_assign_user_id atribui automaticamente
@@ -1984,9 +2068,18 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     `skip_conversation_upsert=True`: caller chama save_wa_message logo em
     seguida (que ja upserta a mesma conversation com message_at correto).
     Evita o dobro de read+write de conversation por mensagem.
+
+    `funnel_intake` (ADR 0015): catalogo do funil decidido UMA vez por
+    payload pelo webhook (None = sem entrada automatica). So mensagem ao
+    vivo DO CLIENTE (nao eco, agenda, history ou clique de controle) coloca
+    no funil um contato que ainda nao tem etapa — no MESMO write que ja
+    acontece aqui (zero escrita extra). `funnel_intake_at` = hora real da
+    mensagem (reprocessamento de pending nao conta como entrada de hoje).
     """
     wa_id = normalize_br_phone(wa_id)
     now = utcnow()
+    if not (from_message_event and inbound_event and not control_click):
+        funnel_intake = None
     existing = _find_contact_by_wa_id_any_variant(wa_id)
     if existing:
         return _update_existing_wa_contact(
@@ -1995,6 +2088,8 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
             skip_conversation_upsert=skip_conversation_upsert,
             control_click=control_click,
             inbound_event=inbound_event,
+            funnel_intake=funnel_intake,
+            funnel_intake_at=funnel_intake_at,
         )
 
     phone_formatted = format_phone_br(wa_id)
@@ -2040,6 +2135,16 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
     }
     # Picker v2.1: campos de busca derivados no MESMO write da criacao.
     new_contact.update(build_contact_search_fields(new_contact))
+    # Funil comercial: entrada no MESMO write da criacao (intake_fields nunca
+    # levanta; catalogo None = {}). Entrada/coorte = hora REAL da mensagem; a
+    # etapa muda AGORA, no mesmo relogio de last_inbound_at (o selo "mensagem
+    # nova" compara os dois e nao pode acender com a propria mensagem).
+    if funnel_intake:
+        _funnel = funnel_catalog.intake_fields(
+            None, funnel_intake_at or now, funnel_intake, origin="live")
+        if _funnel:
+            _funnel[funnel_catalog.F_CHANGED_AT] = now
+        new_contact.update(_funnel)
     # Auto-atribuir para coexistence
     if auto_assign_user_id:
         user = _get_doc("users", auto_assign_user_id)
@@ -2074,6 +2179,8 @@ def upsert_wa_contact(wa_id, display_name="", channel_id=None,
                 skip_conversation_upsert=skip_conversation_upsert,
                 control_click=control_click,
                 inbound_event=inbound_event,
+                funnel_intake=funnel_intake,
+                funnel_intake_at=funnel_intake_at,
             )
         logger.warning(
             "wa_contact_index %s aponta p/ contato inexistente (%s) — recriando",
@@ -2101,7 +2208,9 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
                                 auto_assign_user_id, from_message_event, now,
                                 skip_conversation_upsert=False,
                                 control_click=False,
-                                inbound_event=True):
+                                inbound_event=True,
+                                funnel_intake=None,
+                                funnel_intake_at=None):
     """Aplica updates a um contato JA existente. Usado pelo caminho normal
     (achado por wa_id) e pelo fallback do claim atomico (corrida perdida).
     Retorna o contact_id.
@@ -2165,6 +2274,22 @@ def _update_existing_wa_contact(existing, wa_id, display_name, channel_id,
                 updates["department_id"] = user["department_id"]
             if existing.get("qualification") == "novo":
                 updates["qualification"] = "em_atendimento"
+    # Funil comercial (ADR 0015): contato ainda sem etapa que recebe mensagem
+    # ao vivo do cliente entra no funil no MESMO write (que sempre existe
+    # neste caminho: last_message_at/last_inbound_at). upsert_wa_contact ja
+    # zerou funnel_intake fora de inbound ao vivo; aqui so o predicado local.
+    # Quem ja conversava antes entra em A classificar (intake_fields).
+    # changed_at = o MESMO instante de last_inbound_at acima: o selo "mensagem
+    # nova" de A classificar (last_inbound_at > changed_at) nao pode acender
+    # com a propria mensagem de entrada (a hora da Meta e sempre anterior).
+    # Entrada/coorte seguem com a hora REAL da mensagem.
+    if funnel_intake and from_message_event and inbound_event and not control_click \
+            and not existing.get(funnel_catalog.F_STAGE):
+        _funnel = funnel_catalog.intake_fields(
+            existing, funnel_intake_at or now, funnel_intake, origin="live")
+        if _funnel:
+            _funnel[funnel_catalog.F_CHANGED_AT] = now
+        updates.update(_funnel)
     # So escreve se ha mudanca real. state_sync repetido (agenda inteira a
     # cada reconexao do celular) com nada mudado = 0 writes; era 1 write
     # vazio POR CONTATO da agenda (milhares por sync).
@@ -2225,8 +2350,12 @@ def bump_contact_last_inbound_at(contact_id, inbound_at):
 
 
 def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_admin_override=False,
-                             auto_assume=True):
+                             auto_assume=True, funnel_intake=None):
     """Cria contato manualmente pelo operador.
+
+    `funnel_intake` (ADR 0015): catalogo do funil do tenant do operador
+    (None = sem entrada). Contato novo ou reaberto sem etapa entra no funil
+    no MESMO write; o ramo admin-override nao escreve no contato.
 
     Retorna (contact_id, error_message).
 
@@ -2298,6 +2427,10 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
             updates.update(_search_fields_for_update(existing, updates))
         if not existing.get("department_id") and user.get("department_id"):
             updates["department_id"] = user["department_id"]
+        if funnel_intake and not existing.get(funnel_catalog.F_STAGE):
+            updates.update(funnel_catalog.intake_fields(
+                existing, utcnow(), funnel_intake, origin="manual",
+                user_id=user_id, user_uid=user.get("firebase_uid", "")))
         document("wa_contacts", existing["id"]).set(updates, merge=True)
         return existing["id"], None
 
@@ -2342,6 +2475,10 @@ def create_manual_wa_contact(declared_name, wa_id, channel_id, user_id, allow_ad
     }
     # Picker v2.1: campos de busca derivados no MESMO write da criacao.
     new_contact.update(build_contact_search_fields(new_contact))
+    if funnel_intake:
+        new_contact.update(funnel_catalog.intake_fields(
+            None, now, funnel_intake, origin="manual",
+            user_id=user_id, user_uid=user.get("firebase_uid", "")))
     document("wa_contacts", contact_id).set(new_contact)
     # Fase 3: cria conversation associada para o contato manual aparecer
     # imediatamente na sidebar (que agora itera por threads, nao contatos).
@@ -2664,12 +2801,15 @@ def assign_wa_contact(contact_id, to_user_id, to_department_id, transferred_by, 
     from_user = current.get("assigned_to")
     from_dept = current.get("department_id")
     to_user = _get_doc("users", to_user_id) if to_user_id else None
-    document("wa_contacts", contact_id).set({
+    contact_fields = {
         "assigned_to": to_user_id,
         "assigned_to_uid": (to_user or {}).get("firebase_uid", ""),
         "department_id": to_department_id,
         "is_backup": False,  # reatribuir o Lead gradua o contato (sai do Backup)
-    }, merge=True)
+    }
+    if current.get("is_backup"):
+        contact_fields.update(_funnel_graduation_fields(current))
+    document("wa_contacts", contact_id).set(contact_fields, merge=True)
     # Backup graduado via reassign-lead: gradua tambem as conversas historicas
     # do contato + suas mensagens (senao o novo dono ve o contato mas threads
     # vazias). Escopo backup-only — nao mexe em contato vivo multi-canal (3B).
@@ -3227,13 +3367,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     promote_qualification=True,
                     reopen_attendance=True,
                     control_message=False,
-                    human_outbound=True):
+                    human_outbound=True,
+                    funnel_human_reply=False):
     """Persiste mensagem WhatsApp.
 
     human_outbound=False: outbound com operador identificado que NAO conta
     como atencao humana (uso: template da reabertura em lote — carimbar
     last_human_outbound_at desarmaria a valvula/auto-close do Modo Recepcao
     em massa; revisao adversarial C2). Autoria/auditoria seguem normais.
+
+    funnel_human_reply=True: SO os endpoints REST de envio humano do CRM
+    (main.py: texto, midia, audio, localizacao, template manual, correcao).
+    A 1a resposta de uma pessoa da equipe move o funil comercial (automacao
+    human_reply, ADR 0015 emenda de 28/10): Novo contato / A classificar ->
+    Em atendimento, no MESMO write do contato; a Activity vai depois,
+    best-effort. Eco do celular, history, lote de reabertura, recibo/sistema
+    e bot nunca passam (default False).
 
     reopen_attendance=False: a mensagem nao conta como "atividade" pro ciclo
     de vida — nao reabre attendance_status fechado (uso: recibo de
@@ -3466,8 +3615,22 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
             _commercial_released = released_by_patient_message(contact, _eff_msg_at)
             if _commercial_released:
                 updates[_CC_FIELD] = _commercial_released
+        # Funil comercial (automacao human_reply): SO com o kwarg explicito
+        # dos endpoints de envio humano e com o mesmo criterio de resposta
+        # humana do last_human_outbound_at (lote com human_outbound=False e
+        # recibo com promote_qualification=False ficam de fora mesmo se
+        # alguem passar o kwarg). Campos no MESMO write do contato; nunca
+        # qualification (a promocao legada acima segue a regra de sempre).
+        _funnel_activity, _funnel_tenant = None, ""
+        if (funnel_human_reply and direction == "outbound" and sender_user_id is not None
+                and human_outbound and promote_qualification and not control_message):
+            _funnel_fields, _funnel_activity, _funnel_tenant = funnel_auto_transition(
+                dict(contact, id=contact_id), funnel_catalog.AUTO_HUMAN_REPLY, _eff_msg_at)
+            updates.update(_funnel_fields)
         if updates:
             document("wa_contacts", contact_id).set(updates, merge=True)
+        if _funnel_activity:
+            record_funnel_auto_activity(_funnel_tenant, _funnel_activity)
         if _commercial_released:
             try:
                 log_audit(None, "COMMERCIAL_CONTACT_UNBLOCK",

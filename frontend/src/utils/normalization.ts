@@ -20,6 +20,33 @@ export function num(value: unknown) {
   return 0;
 }
 
+// Funil comercial: chave de etapa estavel (mesma regra do funnel_catalog.py).
+// Valor fora do formato vira undefined (= fora do funil), nunca texto livre.
+const FUNNEL_KEY = /^[a-z][a-z0-9_]{1,39}$/;
+
+function funnelKey(value: unknown) {
+  return typeof value === "string" && FUNNEL_KEY.test(value) ? value : undefined;
+}
+
+// Origem da etapa: chave simples (user, intake...) ou automacao por evento
+// com o prefixo do funnel_catalog.SOURCE_RULE_PREFIX ("rule:handoff").
+const FUNNEL_RULE_PREFIX = "rule:";
+
+function funnelSource(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const key = value.startsWith(FUNNEL_RULE_PREFIX) ? value.slice(FUNNEL_RULE_PREFIX.length) : value;
+  return FUNNEL_KEY.test(key) ? value : undefined;
+}
+
+function funnelVersion(value: unknown) {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function optionalIso(value: unknown) {
+  return iso(value) || undefined;
+}
+
 export function normalizeContact(record: Record<string, unknown>, docId: string): Contact {
   const preference = record.commercial_contact_block;
   const block = preference && typeof preference === "object" ? preference as Record<string, unknown> : null;
@@ -71,6 +98,15 @@ export function normalizeContact(record: Record<string, unknown>, docId: string)
       version: num(block?.version),
       updated_at: iso(block?.updated_at),
     },
+    lead_temperature_at: optionalIso(record.lead_temperature_at),
+    // Funil (whitelist obrigatoria em snapshot): sem estes campos o cartao
+    // "Etapa do funil" ficaria sempre "Fora do funil" no modo ao vivo.
+    crm_stage: funnelKey(record.crm_stage),
+    crm_stage_version: funnelVersion(record.crm_stage_version),
+    crm_stage_changed_at: optionalIso(record.crm_stage_changed_at),
+    crm_stage_source: funnelSource(record.crm_stage_source),
+    crm_funnel_entered_at: optionalIso(record.crm_funnel_entered_at),
+    is_backup: Boolean(record.is_backup),
   };
 }
 
