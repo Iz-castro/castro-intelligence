@@ -1235,9 +1235,15 @@ def cenario_continuar_devolve_ao_agente():
     names = ("get_wa_message_by_wa_message_id", "get_wa_conversation_by_id", "get_wa_contact", "document",
              "set_attendance_status", "get_current_protocol_id", "insert_transfer_system_message", "log_audit",
              "mark_contact_bot_done", "_run_bot_turn_and_send", "_tenant_bot_engine_is_cx", "REOPEN_RESUME_BOT_TEXT",
-             "queue_cx_session_params")
+             "queue_cx_session_params", "discard_cx_session_params", "get_conversations_by_contact")
     saved = {n: getattr(wh, n) for n in names}
-    rec = {"turns": [], "marks": [], "status": [], "docs": [], "queued": []}
+    rec = {"turns": [], "marks": [], "status": [], "docs": [], "queued": [], "discarded": [], "reply": "",
+           "threads": None, "threads_boom": False}
+
+    def fake_threads(cid):
+        if rec.get("threads_boom"):
+            raise RuntimeError("Firestore fora do ar")
+        return [dict(t) for t in (rec.get("threads") or [])]
 
     class _Doc:
         def __init__(self, name, key):
@@ -1250,9 +1256,9 @@ def cenario_continuar_devolve_ao_agente():
         rec["turns"].append((contact_id, text, token, phone_id, kw.get("channel_id")))
         if rec.get("boom"):
             raise RuntimeError("CX fora do ar")
+        return rec.get("reply")
 
     wh.get_wa_message_by_wa_message_id = lambda wamid: None
-    wh.get_wa_conversation_by_id = lambda cid: {"id": cid, "contact_id": 1, "channel_id": 6}
     wh.document = lambda name, key: _Doc(name, key)
     wh.set_attendance_status = lambda cid, st: rec["status"].append((cid, st))
     wh.get_current_protocol_id = lambda cid: None
@@ -1261,16 +1267,33 @@ def cenario_continuar_devolve_ao_agente():
     wh.mark_contact_bot_done = lambda cid: rec["marks"].append(cid)
     wh._run_bot_turn_and_send = fake_turn
     wh.queue_cx_session_params = lambda cid, params: rec["queued"].append((cid, dict(params)))
+    wh.discard_cx_session_params = lambda cid: rec["discarded"].append(cid)
+    wh.get_conversations_by_contact = fake_threads
     channel = {"id": 6, "access_token": "tok-canal", "phone_number_id": "pnid-canal", "owner_user_id": None}
+    CONV_ID = "6__5531900000001"
 
-    def click(contact, cx=True, text="Quero continuar o atendimento.", boom=False):
-        rec["turns"].clear(); rec["marks"].clear(); rec["status"].clear(); rec["queued"].clear(); rec["boom"] = boom
+    def handoff_writes():
+        return [d for d in rec["docs"] if d[0] == "wa_conversations" and "handoff_at" in d[2]]
+
+    def response_writes():
+        return [d for d in rec["docs"] if d[0] == "wa_conversations" and "reopen_response" in d[2]]
+
+    def click(contact, cx=True, text="Quero continuar o atendimento.", boom=False,
+              reply="Que bom te ver de novo! Como posso ajudar?", conv=None, button="Continuar",
+              threads=None, threads_boom=False):
+        for k in ("turns", "marks", "status", "docs", "queued", "discarded"):
+            rec[k].clear()
+        rec["boom"] = boom
+        rec["reply"] = reply
+        rec["threads"] = threads
+        rec["threads_boom"] = threads_boom
         wh.get_wa_contact = lambda cid: contact
+        wh.get_wa_conversation_by_id = lambda cid: dict({"id": cid, "contact_id": 1, "channel_id": 6}, **(conv or {}))
         wh._tenant_bot_engine_is_cx = lambda: cx
         wh.REOPEN_RESUME_BOT_TEXT = text
         asyncio.run(wh._handle_reopen_button(
-            contact_id=1, wa_id="5531900000001", channel=channel, button={"text": "Continuar"},
-            context={"id": "wamid.template"}, db_id=10, content="Continuar", ts_iso="2026-10-29T13:00:00Z",
+            contact_id=1, wa_id="5531900000001", channel=channel, button={"text": button},
+            context={"id": "wamid.template"}, db_id=10, content=button, ts_iso="2026-10-29T13:00:00Z",
             reply_fields=None, ws_notify_callback=None))
 
     try:
@@ -1278,24 +1301,106 @@ def cenario_continuar_devolve_ao_agente():
         click(bot_phase)
         check(rec["turns"] == [(1, "Quero continuar o atendimento.", "tok-canal", "pnid-canal", 6)],
               "CX + fase de bot: turno do agente com o texto sintetico e credenciais do canal")
-        check(rec["marks"] == [], "CX + fase de bot: NAO marca bot_completed (lead segue com o agente)")
+        check(rec["marks"] == [] and rec["discarded"] == [],
+              "CX + fase de bot: NAO marca bot_completed nem descarta o param (lead segue com o agente)")
         check(rec["queued"] == [(1, {"origem": "retomada_lote"})], "origem=retomada_lote enfileirado para o turno (ADR 0013 item 4)")
-        check(("6__5531900000001", "aberto") in rec["status"], "atendimento reaberto antes do turno")
+        check((CONV_ID, "aberto") in rec["status"], "atendimento reaberto antes do turno")
+        check(handoff_writes() == [], "lead com o agente: handoff_at nao e tocado")
 
         click(dict(bot_phase, bot_completed=True))
         check(rec["turns"] == [] and rec["marks"] == [], "lead ja fora do bot (Recepcao): sem turno e sem marcar")
 
         click(bot_phase, cx=False)
-        check(rec["turns"] == [] and rec["marks"] == [1], "motor builtin/pausado: caminho antigo (equipe)")
+        check(rec["turns"] == [] and rec["marks"] == [1] and rec["discarded"] == [],
+              "motor builtin/pausado: caminho antigo (equipe), nada enfileirado nem descartado")
 
         click(bot_phase, boom=True)
-        check(len(rec["turns"]) == 1 and rec["marks"] == [1], "turno do agente falhou: cai no caminho antigo (equipe)")
+        check(len(rec["turns"]) == 1 and rec["marks"] == [1] and rec["discarded"] == [1],
+              "turno do agente falhou: cai no caminho antigo (equipe) e descarta a origem pendente")
+
+        # Cenario 25 (plano v2.2): o turno rodou mas o agente nao respondeu
+        # (bot desligado, motor pausado, human_active, saiu da fase de bot).
+        click(bot_phase, reply="")
+        check(len(rec["turns"]) == 1 and rec["marks"] == [1] and rec["discarded"] == [1],
+              "reply vazio (cenario 25): lead vai para a equipe + origem pendente descartada")
+        click(bot_phase, reply=None)
+        check(rec["marks"] == [1] and rec["discarded"] == [1], "reply None: idem")
 
         click(bot_phase, text="")
         check(rec["turns"] == [] and rec["marks"] == [1], "REOPEN_RESUME_BOT_TEXT vazio = desliga (equipe)")
 
         click(dict(bot_phase, assigned_to=7))
         check(rec["turns"] == [] and rec["marks"] == [1], "lead com dono nao e fase de bot: comportamento antigo")
+
+        # Cenario 22b: clique duplo (dois wamid) - mesma acao ha menos de 60s e repeticao.
+        _now = wh.utcnow()
+        click(bot_phase, conv={"reopen_response": "retomar",
+                               "reopen_response_at": (_now - timedelta(seconds=10)).isoformat()})
+        check(rec["turns"] == [] and rec["marks"] == [] and rec["status"] == [] and rec["queued"] == []
+              and response_writes() == [],
+              "2o Continuar em menos de 60s: nenhum turno, nenhuma escrita (clique repetido)")
+        click(bot_phase, conv={"reopen_response": "retomar",
+                               "reopen_response_at": (_now - timedelta(seconds=120)).isoformat()})
+        check(len(rec["turns"]) == 1 and len(response_writes()) == 1, "Continuar apos 120s: turno normal")
+        click(bot_phase, conv={"reopen_response": "encerrar",
+                               "reopen_response_at": (_now - timedelta(seconds=10)).isoformat()})
+        check(len(rec["turns"]) == 1, "acao diferente (Encerrar antes, Continuar agora) nao e repeticao")
+        check(wh._reopen_click_is_repeat({"reopen_response": "encerrar",
+                                          "reopen_response_at": _now - timedelta(seconds=5)}, "encerrar")
+              and not wh._reopen_click_is_repeat({"reopen_response": "encerrar", "reopen_response_at": "lixo"}, "encerrar")
+              and not wh._reopen_click_is_repeat(None, "encerrar"),
+              "Encerrar dobrado em menos de 60s e repeticao (datetime aceito); carimbo ilegivel ou thread ausente nao e")
+
+        # Caso 3 x caso 4 (plano v2.2, secao 3): renovacao condicional de
+        # handoff_at, so quando o lead vai para a EQUIPE.
+        recepcao = dict(bot_phase, bot_completed=True)
+        click(recepcao, conv={"handoff_at": _now - timedelta(days=2)})
+        _hw = handoff_writes()
+        check(len(_hw) == 1 and _hw[0][1] == CONV_ID and isinstance(_hw[0][2]["handoff_at"], datetime)
+              and _hw[0][2]["handoff_at"] >= _now,
+              "caso 3: handoff nunca atendido -> handoff_at renovado (datetime UTC agora)")
+        click(recepcao, conv={"handoff_at": _now - timedelta(days=2),
+                              "last_human_outbound_at": _now - timedelta(days=1)})
+        check(handoff_writes() == [], "caso 4: thread ja atendida apos o handoff NAO renova")
+        click(recepcao, conv={"handoff_at": (_now - timedelta(days=2)).isoformat(),
+                              "last_human_outbound_at": _now - timedelta(days=3)})
+        check(len(handoff_writes()) == 1,
+              "resposta humana ANTERIOR ao handoff (ciclo velho) conta como nunca atendida; ISO aceito")
+        click(recepcao, conv={})
+        check(handoff_writes() == [], "sem handoff_at (doc legado / fase de bot): nao carimba")
+        click(bot_phase, reply="", conv={"handoff_at": _now - timedelta(days=2)})
+        check(rec["marks"] == [1] and len(handoff_writes()) == 1,
+              "fallback do Continuar (equipe) com handoff nunca atendido tambem renova")
+
+        # Revisao de 09/11 (achados 2 e 3): a renovacao espelha o handoff e
+        # passa por TODAS as threads nao-backup do contato, relidas do banco.
+        _old = _now - timedelta(days=2)
+        click(recepcao, conv={"handoff_at": _old}, threads=[
+            {"id": CONV_ID, "handoff_at": _old},
+            {"id": "9__5531900000001", "handoff_at": _old},
+            {"id": "3__5531900000001", "handoff_at": _old, "last_human_outbound_at": _now - timedelta(days=1)},
+            {"id": "bk__5531900000001", "handoff_at": _old, "is_backup": True},
+        ])
+        _ids = sorted(d[1] for d in handoff_writes())
+        check(_ids == sorted([CONV_ID, "9__5531900000001"]),
+              "renova TODAS as threads nao-backup com handoff nunca atendido (2 de 4); atendida e backup ficam")
+        click(recepcao, conv={"handoff_at": _old},
+              threads=[{"id": CONV_ID, "handoff_at": _old, "last_human_outbound_at": _now}])
+        check(handoff_writes() == [],
+              "thread RELIDA vence o conv do clique: operador respondeu durante o turno -> nao renova")
+        click(recepcao, conv={"handoff_at": _old}, threads_boom=True)
+        check(len(handoff_writes()) == 1 and handoff_writes()[0][1] == CONV_ID,
+              "leitura das threads falhou: cai na thread do clique")
+        click(recepcao, conv={"handoff_at": _old}, threads=[])
+        check(len(handoff_writes()) == 1, "lista vazia: cai na thread do clique")
+
+        # Achado 1: D4 so para mensagem posterior ao clique de Encerrar.
+        check(wh._reopen_message_after_opt_out((_now + timedelta(seconds=1)).isoformat(), _now.isoformat())
+              and not wh._reopen_message_after_opt_out(_now.isoformat(), _now.isoformat())
+              and not wh._reopen_message_after_opt_out((_now - timedelta(hours=1)).isoformat(), _now)
+              and wh._reopen_message_after_opt_out(_now.isoformat(), None)
+              and wh._reopen_message_after_opt_out("", _now.isoformat()),
+              "D4: mensagem posterior ao Encerrar limpa; igual/anterior nao; sem carimbo ou data, limpa")
     finally:
         for n, v in saved.items():
             setattr(wh, n, v)

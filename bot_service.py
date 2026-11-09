@@ -261,6 +261,16 @@ def queue_cx_session_params(contact_id: int, params: dict) -> None:
     _set_bot_state(contact_id, {"pending_session_params": dict(params)})
 
 
+def discard_cx_session_params(contact_id: int) -> None:
+    """Descarta params de UM turno ainda NAO consumidos. Caso de uso: Continuar
+    do lote (plano v2.2, cenario 25) cujo turno do agente nao aconteceu ou
+    veio vazio e o lead foi para a equipe. Sem isto, origem=retomada_lote
+    ficaria em bot_states e entraria no 1o turno do PROXIMO ciclo com o bot
+    (semanas depois, apos um release), com a saudacao de retorno errada.
+    Idempotente: se o turno ja consumiu, o pendente ja esta vazio."""
+    _set_bot_state(contact_id, {"pending_session_params": {}})
+
+
 def _clear_bot_state(contact_id: int):
     document("bot_states", contact_id).delete()
     document("bot_buffers", contact_id).delete()
@@ -1266,26 +1276,52 @@ def _cx_snapshot(params, signals=None) -> dict:
     return snap
 
 
-# Contrato do param de sessao desfecho_bot (docs/CX_RETOMADA_LOTE_DEV_IA.md,
-# pedido 3): escalar, vocabulario FECHADO. Lido exatamente com estes nomes.
+# Contrato do desfecho com a Val (P5, plano de reabertura 2.2.5). Dois nomes
+# de param, escalares, vocabulario FECHADO; o valor gravado em
+# wa_contacts.bot_outcome e SEMPRE o vocabulario do plano:
+# - desfecho_bot: contrato pedido ao dev do agente em 24/09
+#   (docs/CX_RETOMADA_LOTE_DEV_IA.md, pedido 3): link_enviado | agendado |
+#   duvida_respondida | sem_interesse.
+# - scheduling_outcome: o que o router da Val emite desde a v4.11 (06/10/2026;
+#   determine_scheduling_route / generate_handoff_summary, copiado pela LLM
+#   para a sessao): link_oferecido (rota standard = link_enviado) |
+#   encaminhado_atendente (handoff: NAO e desfecho com a Val, o CRM ja age
+#   pelo handoff_request; ignorado em silencio).
+# desfecho_bot tem precedencia quando os dois vierem validos.
 BOT_OUTCOME_VALUES = ("link_enviado", "agendado", "duvida_respondida", "sem_interesse")
+BOT_OUTCOME_PARAMS = ("desfecho_bot", "scheduling_outcome")
+_BOT_OUTCOME_ALIASES = {"link_oferecido": "link_enviado"}
+_BOT_OUTCOME_NOT_OUTCOME = ("encaminhado_atendente",)
 _BOT_OUTCOME_SAFE_RE = re.compile(r"[a-z0-9_]{1,40}")
 
 
 def _cx_bot_outcome(params, contact_id=None) -> Optional[str]:
-    """Valor de desfecho_bot nos params do turno, ou None (ausente, vazio,
-    null ou fora do contrato). Struct {desfecho_bot: valor} e desembrulhado
-    pelo MESMO helper do conector (_unwrap_struct_params — regressao de
-    2026-07-29, agente em DRAFT devolvendo params embrulhados); o conector ja
-    desembrulha na origem, isto e defesa em profundidade. Valor fora da lista
-    e ignorado com log (o valor so aparece no log se tiver cara de enum — o
-    param e livre no agente e nao pode vazar texto do paciente)."""
-    if not isinstance(params, dict) or params.get("desfecho_bot") is None:
+    """Desfecho (vocabulario do plano) lido dos params do turno, ou None
+    (ausente, vazio, null, handoff ou fora do contrato). Le desfecho_bot e
+    scheduling_outcome, nesta ordem; o primeiro valido vence."""
+    if not isinstance(params, dict):
         return None
-    raw = params.get("desfecho_bot")
+    for name in BOT_OUTCOME_PARAMS:
+        value = _cx_outcome_param(params, name, contact_id)
+        if value:
+            return value
+    return None
+
+
+def _cx_outcome_param(params, name, contact_id=None) -> Optional[str]:
+    """Valor de UM param de desfecho, normalizado para o plano. Struct
+    {nome: valor} e desembrulhado pelo MESMO helper do conector
+    (_unwrap_struct_params - regressao de 2026-07-29, agente em DRAFT
+    devolvendo params embrulhados); o conector ja desembrulha na origem, isto
+    e defesa em profundidade. Valor fora da lista e ignorado com log (o valor
+    so aparece no log se tiver cara de enum - o param e livre no agente e nao
+    pode vazar texto do paciente)."""
+    raw = params.get(name)
+    if raw is None:
+        return None
     if isinstance(raw, dict):
         import bot_engine_dialogflow
-        raw = bot_engine_dialogflow._unwrap_struct_params({"desfecho_bot": raw}).get("desfecho_bot")
+        raw = bot_engine_dialogflow._unwrap_struct_params({name: raw}).get(name)
     if raw is None:
         return None
     if isinstance(raw, (dict, list)):
@@ -1293,14 +1329,15 @@ def _cx_bot_outcome(params, contact_id=None) -> Optional[str]:
         shown = f"<{type(raw).__name__}>"
     else:
         value = str(raw).strip().lower()
-        if value in ("", "null", "none"):
+        if value in ("", "null", "none") or value in _BOT_OUTCOME_NOT_OUTCOME:
             return None
+        value = _BOT_OUTCOME_ALIASES.get(value, value)
         if value in BOT_OUTCOME_VALUES:
             return value
         shown = value if _BOT_OUTCOME_SAFE_RE.fullmatch(value) else f"<{type(raw).__name__}>"
     logger.warning(
-        "[BOT-CX] desfecho_bot fora do contrato ignorado | contato=%s | valor=%s",
-        contact_id, shown,
+        "[BOT-CX] %s fora do contrato ignorado | contato=%s | valor=%s",
+        name, contact_id, shown,
     )
     return None
 

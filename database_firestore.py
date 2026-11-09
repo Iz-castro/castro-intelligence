@@ -2925,6 +2925,11 @@ def return_contact_to_bot(contact_id, returned_by_user_id):
             "cx_summary_emitted_pid": None,
             "cx_fail_count": 0,
             "human_active": False,
+            # Params de UM turno (origem=retomada_lote do Continuar) ainda nao
+            # consumidos nao atravessam o ciclo: o proximo turno com o bot e
+            # de um ciclo novo (revisao de 09/11).
+            "pending_session_params": {},
+            "clear_session_params": [],
         }, merge=True)
     except Exception as exc:
         logger.warning("return_contact_to_bot: falha ao limpar bot_state %s: %s", contact_id, exc)
@@ -3036,6 +3041,11 @@ def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=No
             "cx_summary_emitted_pid": None,
             "cx_fail_count": 0,
             "human_active": False,
+            # Params de UM turno (origem=retomada_lote do Continuar) ainda nao
+            # consumidos nao atravessam o ciclo: o proximo turno com o bot e
+            # de um ciclo novo (revisao de 09/11).
+            "pending_session_params": {},
+            "clear_session_params": [],
         }, merge=True)
     except Exception as exc:
         logger.warning("release_lead_to_bot: falha ao limpar bot_state %s: %s", contact_id, exc)

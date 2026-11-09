@@ -29,9 +29,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (235).
-  Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente: `tools\sim_reception_flow.py` (333).
-  Buffer/debounce do webhook: `tools\sim_buffer_flow.py` (61).
+  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (241).
+  Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
+  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4): `tools\sim_buffer_flow.py` (69).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
   History sync/eco do coex (recência real, janela de 24h, dono da thread, idempotência por bloco): `tools\sim_history_recency.py` (62).
@@ -44,6 +44,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   Guias de conversa (limite por uso, rascunho+modo por guia, storage por uid + restauracao sem abrir, auto-fechamento so com dado do servidor, Ctrl+Alt+Seta, Sair apaga rascunho, Ver como/polling sem guias): na raiz, `node tools\sim_chat_tabs.mjs` (174).
   ⚠️ `tools\cx_smoke.py` **não é mockado** — bate no agente Dialogflow CX real (precisa ADC).
+  ⚠️ `tools\cx_outcome_probe.py --tenant <id>` **não é mockado** — lê `settings.ai` do tenant no Firestore real (só leitura,
+  precisa `FIRESTORE_PROJECT_ID`) e conversa com o agente CX real para checar se `scheduling_outcome`/`desfecho_bot` chega
+  aos params de sessão (09/11: chega, mas só no turno SEGUINTE ao da oferta do link).
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).

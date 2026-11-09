@@ -415,6 +415,27 @@ def _audio(mid, media_id, wa_id="5531999999999"):
     }
 
 
+def _button(mid, text, wa_id="5531999999999"):
+    return {
+        "from": wa_id,
+        "id": mid,
+        "type": "button",
+        "timestamp": str(int(time.time())),
+        "button": {"text": text, "payload": text},
+        "context": {"id": "wamid.template"},
+    }
+
+
+def _reaction(mid, target_mid, wa_id="5531999999999"):
+    return {
+        "from": wa_id,
+        "id": mid,
+        "type": "reaction",
+        "timestamp": str(int(time.time())),
+        "reaction": {"message_id": target_mid, "emoji": "👍"},
+    }
+
+
 async def _deliver(messages):
     await wh._process_messages(
         {
@@ -775,6 +796,62 @@ async def scenario_policy_date():
           "aceite legado sem carimbo: debounce intacto")
 
 
+async def scenario_reopen_opt_out_reset():
+    title("21. D4 (plano v2.2): mensagem nova do cliente desfaz o opt-out do Encerrar")
+    cid = _reset()
+    CONTACTS[str(cid)].update({"reopen_opt_out": True, "reopen_opt_out_at": "2026-11-01T12:00:00+00:00"})
+    await _deliver([_text("oo1", "oi, mudei de ideia")])
+    c = CONTACTS[str(cid)]
+    check(c.get("reopen_opt_out") is False and bool(c.get("reopen_opt_out_cleared_at"))
+          and c.get("reopen_opt_out_at") == "2026-11-01T12:00:00+00:00",
+          "texto novo: reopen_opt_out=False + reopen_opt_out_cleared_at (carimbo do Encerrar preservado)")
+    check(CX_CALLS == ["oi, mudei de ideia"], "o turno do bot segue normal depois do reset")
+
+    # Reentrega da Meta (mesmo wamid): was_dup protege (cenario 22a).
+    CONTACTS[str(cid)].update({"reopen_opt_out": True})
+    CONTACTS[str(cid)].pop("reopen_opt_out_cleared_at", None)
+    await _deliver([_text("oo1", "oi, mudei de ideia")])
+    check(CONTACTS[str(cid)].get("reopen_opt_out") is True
+          and "reopen_opt_out_cleared_at" not in CONTACTS[str(cid)],
+          "reentrega (was_dup): opt-out intacto")
+
+    # Clique no botao do template nao conta (cenario 13): o curto-circuito do
+    # botao vem ANTES do bloco. Handler do botao substituido por no-op.
+    saved_btn = wh._handle_reopen_button
+
+    async def _noop_btn(**kwargs):
+        return None
+
+    wh._handle_reopen_button = _noop_btn
+    try:
+        await _deliver([_button("oo2", "Encerrar")])
+    finally:
+        wh._handle_reopen_button = saved_btn
+    check(CONTACTS[str(cid)].get("reopen_opt_out") is True, "clique de botao do template: opt-out intacto")
+
+    # Reacao nao e mensagem nova (mesma regra da recusa comercial).
+    await _deliver([_reaction("oo3", "oo1")])
+    check(CONTACTS[str(cid)].get("reopen_opt_out") is True, "reacao: opt-out intacto")
+
+    # Achado 1 da revisao de 09/11: mensagem com data REAL anterior ao clique
+    # de Encerrar (midia reentregue, download paralelo, retry de pending) nao
+    # limpa; mensagem posterior limpa.
+    _stamp = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    CONTACTS[str(cid)].update({"reopen_opt_out": True, "reopen_opt_out_at": _stamp})
+    CONTACTS[str(cid)].pop("reopen_opt_out_cleared_at", None)
+    await _deliver([_text("oo5", "mensagem velha", unix_ts=int(time.time()) - 3600)])
+    check(CONTACTS[str(cid)].get("reopen_opt_out") is True, "mensagem anterior ao Encerrar: opt-out intacto")
+    await _deliver([_text("oo6", "mensagem nova")])
+    check(CONTACTS[str(cid)].get("reopen_opt_out") is False, "mensagem posterior ao Encerrar: opt-out limpo")
+
+    # Contato sem o carimbo: nenhuma escrita extra.
+    CONTACTS[str(cid)].pop("reopen_opt_out", None)
+    CONTACTS[str(cid)].pop("reopen_opt_out_cleared_at", None)
+    await _deliver([_text("oo4", "de novo")])
+    check("reopen_opt_out" not in CONTACTS[str(cid)] and "reopen_opt_out_cleared_at" not in CONTACTS[str(cid)],
+          "sem opt-out: o bloco nao escreve nada")
+
+
 def scenario_transaction_contracts():
     title("14. Contratos transacionais da persistencia real")
 
@@ -892,6 +969,7 @@ async def main():
     await scenario_kill_switch_key_absent()
     await scenario_new_cycle_hydration()
     await scenario_policy_date()
+    await scenario_reopen_opt_out_reset()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

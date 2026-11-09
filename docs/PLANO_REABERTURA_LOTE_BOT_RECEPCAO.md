@@ -277,6 +277,8 @@ Registradas em `docs/CX_AGENTE_PENDENCIAS_DEV_IA.md` (item 4):
    `midia_tipo`, `null` no turno seguinte.
 3. Parâmetro de sessão `desfecho_bot` (`link_enviado` | `agendado` | `duvida_respondida` | `sem_interesse`), escalar, no turno em que
    acontece — base do critério 2.2.5 (P5).
+   **09/11:** o que a Val 4.11 emite de fato é `scheduling_outcome` (`link_oferecido` | `encaminhado_atendente`), copiado
+   pela LLM para a sessão no turno **seguinte** ao da oferta; o CRM lê os dois nomes (ver 9.2).
 
 A flag do público Bot na UI só liga depois de 1 e 3 estarem no playbook publicado; até lá o script one-off é o caminho.
 Pedido formal ao Izael, com contrato e roteiro de teste: `docs/CX_RETOMADA_LOTE_DEV_IA.md` (05/10).
@@ -290,7 +292,7 @@ Pedido formal ao Izael, com contrato e roteiro de teste: `docs/CX_RETOMADA_LOTE_
 | 1. Contagem prévia | Repetir a contagem com o critério 2.2 completo (threads + `bot_states` + P4 + P5 heurística) e medir leituras por prévia; produzir a conciliação da seção 11 | números e custo na mão do PO |
 | 2. Marco de ciclo e campos | `bot_released_at` (datetime) em `release_lead_to_bot`/`return_contact_to_bot`; `bot_outcome` a partir de `desfecho_bot`; campos por tentativa (lote e pontual); `reopen_human_active_at`; leitura de `reopen_bot_sent_at` legado; chaves novas em `_DEFAULT_SYSTEM_SETTINGS` + coerção | `sim_reception_flow`: release → marco; template do lote não muda o balde; PUT das flags persiste |
 | 3. Seleção | Scan único com dois baldes, regras 2.1–2.3 (thread candidata, `aguardando_bot`, P4 só na Recepção, P5), flags, teto diário com reserva, prévia com cache. **Antes de promover: `reopen_batch_enabled=false` na Hubloc** | cenários da seção 10 (partição) + conciliação |
-| 4. Respostas | Continuar em fase de bot → `_run_immediate_bot_turn` devolvendo `reply` + `session_params_extra` + rede de segurança pelo retorno; reset de opt-out em bloco próprio; renovação condicional de `handoff_at`; `reopen_human_active_at`; mídia pelo `_buffered_bot_turn` com `was_dup` condicional; idempotência do clique duplo | `sim_cx_flow` + `sim_buffer_flow`: clique (Val responde / Val muda → equipe), clique duplo, reentrega de mídia, Encerrar → reentrega → mensagem nova → elegível |
+| 4. Respostas | **Feita em 09/11/2026, exceto a mídia (ver 9.2).** Continuar em fase de bot → `_run_immediate_bot_turn` devolvendo `reply` + `session_params_extra` + rede de segurança pelo retorno; reset de opt-out em bloco próprio; renovação condicional de `handoff_at`; `reopen_human_active_at`; mídia pelo `_buffered_bot_turn` com `was_dup` condicional; idempotência do clique duplo | `sim_cx_flow` + `sim_buffer_flow`: clique (Val responde / Val muda → equipe), clique duplo, reentrega de mídia, Encerrar → reentrega → mensagem nova → elegível |
 | 5. Worker | Público no lote, revalidação, auto-resolve por audiência da tentativa com fallbacks (D9), teto por contato, falhas, TTL único, cancelamento | cenário 22 do sim para os dois públicos; contato carimbado pelo script de 23/09 |
 | 6. UI | Seletor, textos por público, motivos, cancelar, teto diário, auto-resolve separado | `npm run build` + roteiro visual |
 | 7. Liberação | Flags no `varizemed-test`, canário, depois Varizemed real (Bot só após playbook do Izael). Hubloc segue `false` | critérios da seção 11 |
@@ -330,6 +332,43 @@ Contato-level (sem threads nem `bot_states`; teto superior para o Bot):
 Dry-run do script (23/09, com threads e `bot_states`, critério 2.2.4 na forma antiga): 365 elegíveis no Bot da Varizemed (≤7d 50,
 8–30d 167, 31–90d 148). O script enviou 368 templates em 23/09 (lotes 2–6). Leitura de 24h: 229 lidos, 73 entregues, 53 sem entrega,
 108 respostas (19 Continuar, 71 Encerrar, 16 texto, 1 áudio, 1 reação); número GREEN.
+
+### 9.2 Etapa 4 fechada (09/11/2026)
+
+Entregue no `develop` (gates: `sim_cx_flow` 241, `sim_reception_flow` 350, `sim_buffer_flow` 69, `sim_bot_flow` 76):
+
+- **Continuar em fase de bot** (em prod desde 29/10, rev 00216-huw): turno do agente com `origem=retomada_lote` por um turno.
+  Agora com a **rede de segurança pelo retorno** (cenário 25): `_run_bot_turn_and_send` devolve o `reply`; vazio ou exceção →
+  `mark_contact_bot_done` + equipe + log com motivo, e o param pendente `origem` é descartado de `bot_states`
+  (`discard_cx_session_params`) para não vazar no primeiro turno do próximo ciclo com o bot. O código em prod usa
+  `_run_bot_turn_and_send` direto (sem passar pelo claim do buffer); o plano citava `_run_immediate_bot_turn`.
+- **Clique duplo** (22b): `_reopen_click_is_repeat` — mesma ação com `reopen_response_at` há menos de 60 s é ignorada. Vale
+  para Continuar e Encerrar (o segundo Encerrar não manda o recibo de protocolo de novo).
+- **Renovação condicional de `handoff_at`** (caso 3 × caso 4): só quando o lead vai para a equipe; espelha o handoff e passa
+  por **todas** as threads não-backup do contato, **relidas** do banco no clique (a válvula de 7 dias julga thread por thread, mas o
+  release é do contato inteiro; e o `conv` do clique pode ter ~2 min de idade quando o turno do agente rodou antes), renovando as que
+  têm `handoff_at` sem `last_human_outbound_at` posterior. Sem `handoff_at` não carimba. **Efeito colateral a confirmar com o PO:**
+  a renovação rearma o aviso de espera da pool (Hubloc, 15 min) e zera o relógio da fila no Monitor — coerente com "o cliente voltou
+  a esperar", mas é uma mensagem automática a mais.
+- **Reset do opt-out (D4, cenário 13):** bloco próprio em `_process_messages`, depois do curto-circuito do botão e do clique de
+  avaliação, condicionado ao carimbo, protegido por `was_dup` (22a); reação não conta; **só mensagem com data real (ts da Meta)
+  posterior ao clique de Encerrar** (o carimbo `reopen_opt_out_at` passou a ser o ts da Meta do clique) — cobre mídia reentregue (sem
+  `was_dup`), foto em download paralelo ao clique e retry manual de pending. Grava `reopen_opt_out=False` +
+  `reopen_opt_out_cleared_at` (o `reopen_opt_out_at` original fica como histórico).
+- **Desfecho com a Val (P5):** o contrato real da Val 4.11 é o param `scheduling_outcome` (`link_oferecido` |
+  `encaminhado_atendente`), não `desfecho_bot`. O CRM lê os dois nomes (`desfecho_bot` tem precedência), normaliza
+  `link_oferecido` → `link_enviado` e ignora `encaminhado_atendente` (é handoff, não desfecho). **Verificado no agente real**
+  (`tools/cx_outcome_probe.py`, varizemed-test, Draft, 09/11): o link saiu no turno 4 e `scheduling_outcome=link_oferecido`
+  apareceu nos parâmetros de sessão **só no turno 5** (a LLM copia o campo junto do `conversation_summary`, no turno seguinte).
+  Consequência: paciente que some logo depois do link fica sem `bot_outcome`; a heurística `_reopen_val_sent_link`
+  (`marcaconsultas`) continua como fallback no scan e no script. `agendado`/`duvida_respondida`/`sem_interesse` só existirão se o
+  agente um dia setar `desfecho_bot`. Pedido ao Izael (copiar no mesmo turno) em `docs/CX_RETOMADA_LOTE_DEV_IA.md`, seção 3.
+- `reopen_human_active_at` já estava feito na etapa 2 (`save_wa_message`).
+
+**Fora desta etapa, de propósito:** o turno de **mídia** em fase de bot (D10, `bot_media_turn_enabled`) muda o comportamento da
+Val para todos os pacientes, depende do marcador `[MIDIA:...]` do router 4.11 e do YAML 4.7.0 publicados, e fica como frente
+própria, por último (decisão de 09/11). As etapas 5–7 ficam sob demanda: enquanto a Castro roda o lote semanal pelo script, o
+script é o produto.
 
 ---
 
