@@ -32,7 +32,7 @@ from database import (
     assign_wa_contact, update_wa_contact_qualification,
     is_reception_mode,
     normalize_br_phone,
-    get_wa_conversation_by_id, set_attendance_status,
+    get_wa_conversation_by_id, set_attendance_status, get_conversations_by_contact,
     insert_transfer_system_message, get_current_protocol_id,
     mark_contact_bot_done,
     append_bot_buffer, claim_and_drain_bot_buffer,
@@ -42,7 +42,9 @@ from database import (
 )
 from media import download_media
 from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
-from bot_service import process_bot_message_async, lgpd_consent_resolved, queue_cx_session_params
+from bot_service import (
+    process_bot_message_async, lgpd_consent_resolved, queue_cx_session_params, discard_cx_session_params,
+)
 from bot_transport import extract_interactive_inbound
 from bot_sender import send_bot_reply
 from firestore_common import (
@@ -319,6 +321,99 @@ def _reopen_action_from_choice(raw):
     return None
 
 
+# Clique duplo no botao do template (plano v2.2, cenario 22b): dois toques sao
+# dois wamid distintos e was_dup nao cobre. Mesma acao com reopen_response_at
+# mais novo que esta janela = repeticao.
+REOPEN_CLICK_REPEAT_SECONDS = 60
+
+
+def _reopen_ts(value):
+    """datetime AWARE (UTC) a partir de datetime ou ISO-8601; None se nao der.
+    Carimbos da thread chegam como datetime (Firestore) ou isoformat() (handler)."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _reopen_click_is_repeat(conv, action, window_seconds=REOPEN_CLICK_REPEAT_SECONDS):
+    """True se a thread ja registrou a MESMA acao ha menos de window_seconds."""
+    if not isinstance(conv, dict) or not action or conv.get("reopen_response") != action:
+        return False
+    prev = _reopen_ts(conv.get("reopen_response_at"))
+    if prev is None:
+        return False
+    return (utcnow() - prev) < timedelta(seconds=window_seconds)
+
+
+def _reopen_handoff_unattended(thread):
+    """True se a thread tem handoff_at e NENHUMA resposta humana posterior
+    (mesma leitura de _reception_handoff_unattended, sem o teto de dias)."""
+    if not isinstance(thread, dict):
+        return False
+    handoff_at = _reopen_ts(thread.get("handoff_at"))
+    if handoff_at is None:
+        return False
+    human_at = _reopen_ts(thread.get("last_human_outbound_at"))
+    return human_at is None or human_at <= handoff_at
+
+
+def _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id):
+    """Plano v2.2 (secao 3, caso 3): Retomar/Continuar que leva o lead para a
+    EQUIPE renova handoff_at das threads com handoff NUNCA atendido, senao a
+    valvula de 7 dias do Modo Recepcao (_reception_unattended_release_due)
+    devolve o lead ao bot logo depois do clique. Thread ja atendida
+    (last_human_outbound_at posterior ao handoff) NAO renova: renovar
+    desarmaria o ciclo de 24h (caso 4). Sem handoff_at (fase de bot que caiu
+    na equipe pelo fallback, doc legado) nao carimba: a valvula nao age sem
+    marco.
+
+    Passa por TODAS as threads nao-backup do contato, como o proprio handoff
+    (bot_service carimba todas): a valvula julga thread por thread, mas o
+    release e do CONTATO inteiro - renovar so a do clique deixaria uma 2a
+    thread aberta com o marco velho estourar o teto e devolver o contato ao
+    bot (revisao de 09/11). As threads sao RELIDAS aqui: o `conv` do clique
+    pode ter ate ~2 min de idade quando o turno do agente rodou antes, e um
+    operador pode ter assumido e respondido nesse meio-tempo. Se a leitura
+    falhar, usa so a thread do clique. Retorna os ids renovados."""
+    threads = {}
+    try:
+        for thread in get_conversations_by_contact(contact_id) or []:
+            if isinstance(thread, dict) and thread.get("id") and not thread.get("is_backup"):
+                threads[str(thread["id"])] = thread
+    except Exception as exc:
+        logger.warning("[REOPEN BTN] leitura das threads do contato falhou contato=%s: %s",
+                       contact_id, exc)
+    if not threads and isinstance(conv, dict) and conversation_id:
+        threads[str(conversation_id)] = conv
+    now = utcnow()
+    renewed = []
+    for thread_id, thread in threads.items():
+        if not _reopen_handoff_unattended(thread):
+            continue
+        document("wa_conversations", thread_id).set({"handoff_at": now}, merge=True)
+        renewed.append(thread_id)
+    return renewed
+
+
+def _reopen_message_after_opt_out(ts_iso, opt_out_at):
+    """D4 so vale para mensagem POSTERIOR ao clique de Encerrar (mesma regra
+    da recusa comercial): compara a data REAL da mensagem (ts da Meta) com o
+    carimbo do clique (tambem ts da Meta desde 09/11). Cobre foto cujo
+    download corria em paralelo ao clique, reentrega de midia (was_dup nao
+    cobre imagem/video/documento) e retry manual de pending antigo. Sem
+    carimbo ou data legiveis, a mensagem vale."""
+    stamp = _reopen_ts(opt_out_at)
+    msg_at = _reopen_ts(ts_iso)
+    if stamp is None or msg_at is None:
+        return True
+    return msg_at > stamp
+
+
 async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
                                 db_id, content, ts_iso, reply_fields, ws_notify_callback=None):
     """Processa a resposta de um botao quick-reply do template de reabertura.
@@ -367,6 +462,14 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
     conv = get_wa_conversation_by_id(conversation_id)
     contact = get_wa_contact(contact_id)
 
+    # Cenario 22b: sem o guard, Continuar dobrado rodaria dois turnos do
+    # agente e Encerrar dobrado mandaria o recibo de protocolo duas vezes. A
+    # mensagem do 2o clique ja foi persistida e emitida acima.
+    if _reopen_click_is_repeat(conv, action):
+        logger.info("[REOPEN BTN] clique repetido em menos de %ds ignorado | conv=%s | acao=%s",
+                    REOPEN_CLICK_REPEAT_SECONDS, conversation_id, action)
+        return
+
     # Registra a escolha na conversation (auditavel + trava de reabertura
     # em lote: nao reabrir quem ja pediu encerramento).
     response_fields = {
@@ -386,9 +489,11 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         # revogacao LGPD (J-3): o lead segue atendivel normalmente; so nao
         # recebe mais template de reabertura.
         try:
+            # reopen_opt_out_at = data REAL do clique (ts da Meta), para o
+            # reset D4 comparar mensagem x clique no mesmo relogio.
             document("wa_contacts", contact_id).set({
                 "reopen_opt_out": True,
-                "reopen_opt_out_at": utcnow().isoformat(),
+                "reopen_opt_out_at": ts_iso or utcnow().isoformat(),
             }, merge=True)
         except Exception as exc:
             logger.warning("[REOPEN BTN] opt-out stamp falhou contato=%s: %s", contact_id, exc)
@@ -417,24 +522,45 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         # no caminho antigo (equipe), para o cliente nao ficar sem resposta.
         in_bot_phase = bool(contact) and not contact.get("bot_completed") and not contact.get("assigned_to")
         resumed_by_bot = False
+        _queued_origem = False
         if in_bot_phase and REOPEN_RESUME_BOT_TEXT and _tenant_bot_engine_is_cx():
             try:
                 # ADR 0013 item 4: o agente recebe origem=retomada_lote neste
                 # turno (saudacao de retorno, sem apresentacao completa) e
                 # origem=None no seguinte.
                 queue_cx_session_params(contact_id, {"origem": "retomada_lote"})
-                await _run_bot_turn_and_send(
+                _queued_origem = True
+                _reply = await _run_bot_turn_and_send(
                     contact_id, REOPEN_RESUME_BOT_TEXT, str(contact.get("display_name") or ""), wa_id,
                     str((channel or {}).get("access_token") or WHATSAPP_TOKEN or "").strip(),
                     str((channel or {}).get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID or "").strip(),
                     channel_id=channel_id,
                     channel_owner_user_id=(channel or {}).get("owner_user_id"),
                 )
-                resumed_by_bot = True
-                logger.info("[REOPEN BTN] Continuar devolvido ao agente | conv=%s", conversation_id)
+                # Rede de seguranca pelo RETORNO (plano v2.2, cenario 25): o
+                # turno devolve o reply; vazio = o agente nao respondeu (bot
+                # desligado no tenant, motor pausado, human_active, lead saiu
+                # da fase de bot entre o envio e o clique, settings.ai
+                # incompleto). O lead nao pode ficar sem resposta: cai na
+                # equipe, abaixo, como na excecao.
+                resumed_by_bot = bool(_reply)
+                if resumed_by_bot:
+                    logger.info("[REOPEN BTN] Continuar devolvido ao agente | conv=%s", conversation_id)
+                else:
+                    logger.warning("[REOPEN BTN] agente sem resposta no Continuar; lead vai para a equipe | conv=%s",
+                                   conversation_id)
             except Exception as exc:
                 logger.warning("[REOPEN BTN] turno do agente no Continuar falhou conv=%s: %s",
                                conversation_id, exc)
+        if _queued_origem and not resumed_by_bot:
+            # origem=retomada_lote nao foi consumido por um turno real: sai de
+            # bot_states, senao entraria no 1o turno do PROXIMO ciclo com o
+            # bot (semanas depois, apos um release) com a saudacao errada.
+            try:
+                discard_cx_session_params(contact_id)
+            except Exception as exc:
+                logger.warning("[REOPEN BTN] descartar origem pendente falhou contato=%s: %s",
+                               contact_id, exc)
         # Revisao adversarial C2: lead devolvido ao bot (reception) que clica
         # Retomar/Continuar caia em zona morta — bot_completed falso esconde a
         # thread da aba Recepcao e clique de botao nao dispara turno de bot.
@@ -446,6 +572,18 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
             except Exception as exc:
                 logger.warning("[REOPEN BTN] mark_contact_bot_done falhou contato=%s: %s",
                                contact_id, exc)
+        # Plano v2.2 (secao 3, caso 3): so quando o lead vai para a EQUIPE -
+        # thread com handoff nunca atendida ganha handoff_at novo, senao a
+        # valvula de 7 dias devolve o lead ao bot logo apos o clique. Thread
+        # ja atendida nao renova (caso 4).
+        if not resumed_by_bot:
+            try:
+                _renewed = _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id)
+                if _renewed:
+                    logger.info("[REOPEN BTN] handoff_at renovado em %d thread(s) nunca atendida(s) | conv=%s",
+                                len(_renewed), conversation_id)
+            except Exception as exc:
+                logger.warning("[REOPEN BTN] renovar handoff_at falhou conv=%s: %s", conversation_id, exc)
         # Reabre o Atendimento diario se existir (espelha set-attendance).
         pid = get_current_protocol_id(contact_id)
         if pid:
@@ -1581,6 +1719,32 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 ws_notify_callback=ws_notify_callback,
             )
             continue
+
+        # -- Reabertura (plano v2.2, D4 / cenario 13): mensagem NOVA do cliente
+        # desfaz o opt-out do Encerrar (mesma decisao do PO da recusa
+        # comercial). Bloco proprio, DEPOIS do curto-circuito do botao (o
+        # clique nao limpa) e do de avaliacao; condicionado ao carimbo (zero
+        # writes para quem nao tem), protegido por was_dup (reentrega da Meta
+        # nao limpa - cenario 22a) e so para mensagem com data REAL posterior
+        # ao clique (midia reentregue nao tem was_dup; foto em download
+        # paralelo ao clique; retry manual de pending). Reacao nao e mensagem
+        # nova. Historico e pending antigo drenados saem pelo gate silencioso.
+        if (
+            contact_row
+            and contact_row.get("reopen_opt_out")
+            and not was_dup
+            and effective_msg_type != "reaction"
+            and _reopen_message_after_opt_out(ts_iso, contact_row.get("reopen_opt_out_at"))
+        ):
+            try:
+                document("wa_contacts", contact_id).set({
+                    "reopen_opt_out": False,
+                    "reopen_opt_out_cleared_at": utcnow().isoformat(),
+                }, merge=True)
+                contact_row["reopen_opt_out"] = False
+                logger.info("[REOPEN] opt-out desfeito por mensagem nova | contato=%s", contact_id)
+            except Exception as exc:
+                logger.warning("reset de reopen_opt_out falhou contato=%s: %s", contact_id, exc)
 
         # -- Takeover temporario (coexistence) --
         # A mensagem chegou no canal de channel_owner_id (dono do numero), mas o

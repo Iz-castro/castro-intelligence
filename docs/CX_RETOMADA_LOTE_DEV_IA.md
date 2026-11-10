@@ -117,6 +117,14 @@ CRM manda `midia_tipo = null`.
 
 Se preferir outros nomes ou valores, me avise antes de publicar, porque o CRM vai ler exatamente estes.
 
+> **Atualização 09/11/2026 (CRM):** a Val 4.11 passou a emitir `scheduling_outcome` (`link_oferecido` na rota de agendamento
+> online, `encaminhado_atendente` no handoff), e o CRM já lê **os dois nomes**: `desfecho_bot` (este contrato) e
+> `scheduling_outcome`. `link_oferecido` é tratado como `link_enviado`; `encaminhado_atendente` é ignorado (o CRM já age pelo
+> `handoff_request`). Teste no `varizemed-test` (Draft) em 09/11: o link saiu no 4º turno e o parâmetro chegou à sessão só no
+> 5º, junto do `conversation_summary`. Se der para a LLM copiar o campo **no mesmo turno** em que a tool devolve, o CRM registra
+> o desfecho mesmo quando o paciente some logo depois do link. Os valores `agendado`, `duvida_respondida` e `sem_interesse`
+> seguem só pelo `desfecho_bot`, se um dia existir.
+
 ---
 
 ## Como testar

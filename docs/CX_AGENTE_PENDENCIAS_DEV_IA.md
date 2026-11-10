@@ -159,6 +159,9 @@ read-only do Firestore de prod). Referências no CRM: conector
    agendamento), `agendado` (paciente confirmou que agendou), `duvida_respondida` (pergunta simples resolvida, sem agendamento),
    `sem_interesse`. Escalar, nao struct (mesma higiene do item 1). O CRM vai persistir no contato e tirar esses leads da retomada
    em lote do público Bot. Se preferir outro nome/valores, me avise antes de publicar.
+   **09/11:** a Val 4.11 emite `scheduling_outcome` (`link_oferecido` / `encaminhado_atendente`) e o CRM já lê os dois
+   nomes; chega à sessão só no turno seguinte ao da oferta. Detalhe e pedido (copiar no mesmo turno) em
+   `docs/CX_RETOMADA_LOTE_DEV_IA.md`, seção 3.
 
 Teste no `varizemed-test` (Draft) antes de publicar environment. Quem aciona no CRM: Rafael.
 

@@ -1412,6 +1412,50 @@ try:
     check(_c70.get("bot_outcome") == "agendado" and _c70.get("bot_outcome_at") == "SENTINELA"
           and not [x for x in _lh.records if "desfecho_bot" in x.getMessage()],
           "param null ou ausente nao mexe no contato nem loga")
+
+    # (f) Val 4.11 (router de 06/10): o param real e scheduling_outcome;
+    # link_oferecido vira link_enviado (vocabulario do plano), sem aviso.
+    STORE["wa_contacts"]["70"]["bot_outcome"] = None
+    STORE["wa_contacts"]["70"]["bot_outcome_at"] = "SENTINELA"
+    _lh.records.clear()
+    CX_SCRIPT.append(_cx_ok("Segue o link para agendar.", parameters={"scheduling_outcome": "link_oferecido"}))
+    envia(70, "quero o link")
+    _c70 = STORE["wa_contacts"]["70"]
+    check(_c70.get("bot_outcome") == "link_enviado" and isinstance(_c70.get("bot_outcome_at"), datetime),
+          "scheduling_outcome=link_oferecido (Val 4.11) grava bot_outcome=link_enviado")
+    check(not [x for x in _lh.records if "fora do contrato" in x.getMessage()],
+          "alias do vocabulario da Val nao gera aviso")
+
+    # (g) encaminhado_atendente e handoff, nao desfecho com a Val: ignorado em silencio.
+    STORE["wa_contacts"]["70"]["bot_outcome"] = None
+    STORE["wa_contacts"]["70"]["bot_outcome_at"] = "SENTINELA"
+    _lh.records.clear()
+    CX_SCRIPT.append(_cx_ok("Vou te encaminhar.", parameters={"scheduling_outcome": "encaminhado_atendente"}))
+    envia(70, "quero atendente")
+    _c70 = STORE["wa_contacts"]["70"]
+    check(_c70.get("bot_outcome") is None and _c70.get("bot_outcome_at") == "SENTINELA"
+          and not [x for x in _lh.records if "fora do contrato" in x.getMessage()],
+          "scheduling_outcome=encaminhado_atendente nao e desfecho: contato intacto, sem aviso")
+
+    # (h) struct no nome novo e precedencia do desfecho_bot.
+    CX_SCRIPT.append(_cx_ok("Link.", parameters={"scheduling_outcome": {"scheduling_outcome": "link_oferecido"}}))
+    envia(70, "link de novo")
+    check(STORE["wa_contacts"]["70"].get("bot_outcome") == "link_enviado",
+          "struct {scheduling_outcome: valor} desembrulhado e gravado")
+    CX_SCRIPT.append(_cx_ok("Marcado.", parameters={"desfecho_bot": "agendado", "scheduling_outcome": "link_oferecido"}))
+    envia(70, "ja marquei")
+    check(STORE["wa_contacts"]["70"].get("bot_outcome") == "agendado",
+          "desfecho_bot valido tem precedencia sobre scheduling_outcome")
+
+    # (i) valor fora do contrato no nome novo: 1 aviso nomeando o param.
+    STORE["wa_contacts"]["70"]["bot_outcome_at"] = "SENTINELA"
+    _lh.records.clear()
+    CX_SCRIPT.append(_cx_ok("Ok.", parameters={"scheduling_outcome": "sei_la"}))
+    envia(70, "ok")
+    _warn = [x.getMessage() for x in _lh.records if "scheduling_outcome fora do contrato" in x.getMessage()]
+    check(len(_warn) == 1 and "sei_la" in _warn[0]
+          and STORE["wa_contacts"]["70"].get("bot_outcome_at") == "SENTINELA",
+          "scheduling_outcome fora do contrato: 1 aviso nomeando o param, contato intacto")
     CX_SCRIPT.clear()
 finally:
     _bot_logger.removeHandler(_lh)
