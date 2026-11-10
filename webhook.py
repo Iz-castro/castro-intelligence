@@ -51,6 +51,7 @@ from firestore_common import (
     set_tenant_context, reset_tenant_context, get_tenant_context, document, utcnow,
 )
 from tenant_service import lookup_phone_routing, get_tenant
+from funnel_catalog import intake_catalog_for_channel
 from pii_redaction import redact_phone, redact_name
 from pending_events import enqueue_pending_event
 from contextvars import ContextVar
@@ -964,6 +965,17 @@ class _DeferredBotBuffer:
         self.token = token
 
 
+# Tipos de mensagem que nao colocam o contato no funil comercial (ADR 0015):
+# reacao, mensagem de sistema e tipo desconhecido. request_welcome (o cliente
+# abriu o chat pela 1a vez) CONTA como entrada em Novo contato desde a decisao
+# do PO de 28/10/2026, assim como a midia que a Cloud API nao interpreta
+# (unsupported e ephemeral, ex.: visualizacao unica). Residuo
+# (docs/funil_crm_varizemed.md secao 2): o upsert grava last_inbound_at tambem
+# nos tipos de fora, entao o 1o texto de um contato sem conversa anterior que
+# comecou por um deles (ex.: reacao a um template) entra em A classificar.
+_FUNNEL_INTAKE_SKIP_TYPES = frozenset({"reaction", "system", "unknown"})
+
+
 def _tenant_bot_buffer_seconds() -> float:
     """Janela efetiva do tenant; zero para builtin/CX pausado/config invalida."""
     tid = get_tenant_context()
@@ -1387,6 +1399,13 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         logger.exception("[BOT-BUFFER] pre-varredura falhou; payload segue sem buffer")
         buffer_seconds = 0.0
         last_buffer_candidate = {}
+    # Funil comercial (ADR 0015): habilitacao da entrada automatica decidida
+    # UMA vez por payload (cache do tenant), nunca por mensagem. Falha = sem
+    # entrada automatica neste payload; a mensagem segue normalmente.
+    try:
+        funnel_intake = intake_catalog_for_channel(channel, get_tenant_context())
+    except Exception:
+        funnel_intake = None
     deferred_payload_buffers = {}
     # Um deadline de parede por request: vale para todos os remetentes do
     # payload e para o fechamento dos appends deferidos (F02).
@@ -1404,10 +1423,12 @@ async def _process_messages(value, ws_notify_callback, channel=None):
 
         # Converter timestamp Unix para ISO
         ts_iso = ""
+        msg_dt = None
         if timestamp:
             try:
                 dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
                 ts_iso = dt.isoformat()
+                msg_dt = dt
             except (ValueError, OSError):
                 ts_iso = datetime.now(timezone.utc).isoformat()
 
@@ -1437,6 +1458,10 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             auto_assign_user_id=channel_owner_id if channel_type == CHANNEL_TYPE_COEXISTENCE else None,
             skip_conversation_upsert=True,
             control_click=_click_shape is not None,
+            # Reacao, sistema e tipo desconhecido nao contam como "1a
+            # mensagem do cliente" para o funil (_FUNNEL_INTAKE_SKIP_TYPES).
+            funnel_intake=funnel_intake if msg_type not in _FUNNEL_INTAKE_SKIP_TYPES else None,
+            funnel_intake_at=msg_dt,
         )
         reply_fields = _resolve_reply_reference(contact_id, msg.get("context"))
 

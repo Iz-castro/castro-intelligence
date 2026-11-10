@@ -5,9 +5,9 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from config import FEATURE_FOLLOWUP
-from database import get_user_raw_by_id, get_wa_conversation
+from database import get_user_raw_by_id
 from firestore_common import get_tenant_context, tenant_collection
-from followup_access import build_authorizer
+from followup_access import build_authorizer, list_authorized_conversations, load_authorized_messages
 from followup_repository import FollowupRepository
 from followup_service import FollowupService
 from commercial_contact_policy import (
@@ -53,6 +53,10 @@ def create_followup_router(get_current_user, require_contact_access):
         tenant_id = str(current_user.get("tenant_id") or "")
         if not tenant_id or get_tenant_context() != tenant_id:
             raise HTTPException(403, "Sessão sem contexto de tenant válido")
+        # "Ver como" (ADR 0014) le o escopo do alvo com os toggles DELE: o
+        # follow-up nunca opera nessa sessao, alem da trava do middleware.
+        if current_user.get("impersonation"):
+            raise HTTPException(403, "Sessão de visualização não opera follow-up")
         if not tenant_followup_enabled(tenant_id):
             raise HTTPException(404, "Follow-up indisponível para este cliente")
         row = get_user_raw_by_id(current_user.get("id"))
@@ -64,6 +68,7 @@ def create_followup_router(get_current_user, require_contact_access):
         # Flags de sessao read-only nao podem ser apagadas pelo documento.
         user["read_only"] = bool(current_user.get("read_only"))
         user["impersonating"] = bool(current_user.get("impersonating"))
+        user["impersonation"] = bool(current_user.get("impersonation"))
         ensure_permission(user, "gerenciar_followup")
         return user
 
@@ -199,31 +204,16 @@ def create_followup_router(get_current_user, require_contact_access):
                 user=Depends(require_user)):
         authorize = build_authorizer(user["tenant_id"], require_contact_access)
         source = authorize(contact_id, conversation_id, user)
-        rows = []
         if conversation_id:
             rows = [source["conversation"]]
         else:
-            # Leitura limitada por contato; nao materializa nem assume thread.
-            query = (tenant_collection(user["tenant_id"], "wa_conversations")
-                     .where("contact_id", "==", contact_id).order_by("__name__").limit(30))
-            for snap in query.stream():
-                try:
-                    row = authorize(contact_id, snap.id, user)["conversation"]
-                except HTTPException as exc:
-                    if exc.status_code in (403, 404, 503):  # 503 = checagem indisponivel: pula o candidato
-                        continue
-                    raise
-                rows.append(row)
+            rows = list_authorized_conversations(user["tenant_id"], authorize, contact_id, user, limit=30)
         return {"contact": source["contact"], "conversations": rows}
 
     @router.get("/contacts/{contact_id}/messages")
     def messages(contact_id: int, conversation_id: str,
                  limit: int = Query(30, ge=1, le=50), user=Depends(require_user)):
-        build_authorizer(user["tenant_id"], require_contact_access)(contact_id, conversation_id, user)
-        rows = get_wa_conversation(contact_id, limit=limit, conversation_id=conversation_id)
-        if not can_see_all_tenant(user):
-            rows = [row for row in rows if not row.get("admin_only") and not row.get("is_backup")
-                    and row.get("visibility") != "admin_only"]
-        return {"messages": rows}
+        authorize = build_authorizer(user["tenant_id"], require_contact_access)
+        return {"messages": load_authorized_messages(authorize, contact_id, conversation_id, user, limit)}
 
     return router

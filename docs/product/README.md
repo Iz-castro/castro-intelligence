@@ -21,6 +21,7 @@
 Visao funcional do CRM hoje.
 
 - [Guia das operadoras — Follow-up](GUIA_OPERADORAS_FOLLOWUP.md): F1 implementada localmente sob flag, com filas, tentativas, calendário e recusas; aguarda liberação.
+- [Funil comercial — guia da equipe e da gestão](GUIA_FUNIL_COMERCIAL.md): etapas, motivos, quadro e painel gerencial; implementado localmente sob flag e habilitação por tenant (ADR 0015).
 
 ## Objetivo do produto
 

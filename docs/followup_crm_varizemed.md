@@ -41,6 +41,7 @@ Esta revisão é local, sem rede, consultas de produção, importação da plani
 - **[DECISÃO DO PO — 13/10]** Menu de configuração dos horários de follow-up para Cristina/gestão autorizada. Dias e faixas horárias, feriados e tratamento dos prazos são detalhados como proposta na seção 9; o pedido do menu não define seus valores ou autoriza mensagens automáticas.
 
 **[DECISÃO DO PO]** F1 não inclui envio WhatsApp pelo módulo/vencimento, IA criando tarefas, nova classificação de lead, Automation Engine, Kanban completo, múltiplas oportunidades, agenda integrada sem fonte ou campanhas automáticas.
+**Emenda de 25/10/2026:** o Kanban e a etapa comercial (`crm_stage`) passam a existir como fase própria, o funil comercial, separada das tarefas — ver [plano do funil](funil_crm_varizemed.md) e [ADR 0015](decisions/0015-funil-comercial-crm-stage.md). A F1 em si não muda.
 
 Atraso é calculado por `status=pending AND due_at < agora`, sem persistir `overdue` ou criar cron apenas para mudar status. Abrir contato/conversa, chegar o prazo, receber inbound ou registrar entrega/leitura não concluem tarefas.
 
@@ -577,7 +578,7 @@ Implementação futura usa `C:\Rafael\castro-intelligence\.venv\Scripts\python.e
 | 2 envios em massa por contato em 90 dias | Lista única `reopen_batch_sent_at`, `{at, audience}`; inbound não zera |
 | Sem aceite LGPD / revogado / desatualizado | Nenhum envio em massa; compartilhar gate por data da política |
 | Encerrar em retomada | `reopen_opt_out` bloqueia até inbound novo válido; Task/reentrega/adiamento não limpam |
-| Recusa geral de novos contatos comerciais | Preferência comum no contato, distinta do opt-out de retomada; produtores comerciais existentes e futuros respeitam; inbound genérico não libera |
+| Recusa geral de novos contatos comerciais | Preferência comum no contato, distinta do opt-out de retomada; produtores comerciais existentes e futuros respeitam; mensagem nova do paciente desfaz (§7.5) |
 | Hubloc limitada | Nenhuma massa lá enquanto vigorar o bloqueio, inclusive follow-up |
 | Automático não passa pelo gate do operador | Não chamar `_check_conv_send_permission`, silenciar Val ou simular atenção humana |
 | Canal de massa | Standard ativo do tenant; coexistence fora |
@@ -688,7 +689,7 @@ Estados futuros paused/closed precisarão de política explícita de elegibilida
 | 47 | AGENDOU pode ser nova consulta ou procedimento/tratamento | Registro humano identifica categoria e objetivo resolvido, sem detalhes clínicos, novo status, conclusão de outras tarefas ou prova de pagamento |
 | 48 | Paciente recusa somente aquele orçamento/procedimento | Encerra explicitamente o acompanhamento correspondente; demais tarefas, consulta e preferência comercial geral preservadas |
 | 49 | Paciente pede fim de novos contatos comerciais | Preferência estruturada/auditada no contato; retomadas comerciais impedidas, Tasks pendentes visíveis para revisão; consultas e tarefas independentes preservadas |
-| 50 | Novo inbound após recusa comercial geral | Pode liberar somente o opt-out herdado conforme sua regra; não apaga preferência comercial geral nem recompõe 2/90 ou orçamento diário |
+| 50 | Novo inbound após recusa comercial geral | Mensagem nova do paciente, posterior ao registro, desfaz a preferência (decisão do PO de 18/10, §7.5; critério corrigido em 25/10); clique de controle, reação e histórico não desfazem; não recompõe 2/90 nem orçamento diário |
 | 51 | Reabertura/worker/script comercial tenta enviar após recusa geral | Mesmo estado consultado e envio impedido; cobertura dos produtores é dependência de liberação, não promessa de implementação futura só em F3 |
 | 52 | Há data combinada com o paciente | Data/hora combinada têm prioridade sobre atalhos; conflito com calendário exige escolha humana, sem deslocamento silencioso |
 | 53 | Sem data combinada ou após tentativa sem resposta | Operadora escolhe próximo prazo com prévia, dias/faixas permitidos e responsabilidade conforme decisão 3; sem intervalo universal, nova Task ou tentativa fictícia |
@@ -817,9 +818,11 @@ Uso pela equipe: [guia das operadoras](product/GUIA_OPERADORAS_FOLLOWUP.md).
   e o ciclo atual de retorno à Val continuam independentes das tarefas.
 - Recusa específica cancela apenas aquela tarefa. Recusa comercial geral
   usa `commercial_contact_block` no contato, com versão, confirmação explícita
-  e auditoria atômica existente. Reversão exige permissão própria e novo pedido
-  específico do paciente; inbound genérico não remove o bloqueio. Os demais
-  gates de LGPD/opt-out continuam separados.
+  e auditoria atômica existente. A recusa se desfaz quando o paciente manda
+  mensagem nova depois do registro (decisão do PO de 18/10, §7.5; corrigido em
+  25/10 — a versão anterior deste item dizia o contrário do código); a reversão
+  manual exige permissão própria. Os demais gates de LGPD/opt-out continuam
+  separados.
 - Reabertura pontual, scanner, worker e script de reabertura verificam a
   preferência; há releitura antes do HTTP. Templates manuais têm finalidade
   comercial/serviço declarada pela equipe, sem inferir por categoria Meta.

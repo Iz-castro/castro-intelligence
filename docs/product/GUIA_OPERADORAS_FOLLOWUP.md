@@ -67,8 +67,9 @@ suas tarefas; o CRM não recebe mudanças automáticas do ProDoctor.
 Se o paciente pedir para parar todos os novos contatos comerciais, registre
 esse pedido na **Preferência de contato comercial**, confirmando sua manifestação.
 Isso impede retomadas comerciais, preservando consultas e ações de serviço
-pertinentes. A reversão exige permissão própria e um novo pedido explícito do
-paciente. Uma mensagem genérica nova não remove essa preferência.
+pertinentes. Se o paciente mandar uma mensagem nova depois do registro, a
+recusa se desfaz sozinha (cliques em botões e reações não contam); a reversão
+manual, para quem pediu por outro canal, exige permissão própria.
 
 No envio manual de templates, declare a finalidade real: comercial ou serviço.
 A categoria Utility da Meta não substitui essa escolha. A reabertura continua

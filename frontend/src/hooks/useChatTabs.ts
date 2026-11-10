@@ -215,6 +215,26 @@ function pruneStoredDrafts(uid: string, keep: string[], removeNow: string[]) {
   saveStoredDrafts(uid, cleanup);
 }
 
+// Camadas modais (painel, drawer e "Mover para…" do funil, lightbox de midia
+// e modais do CRM, dialogos com aria-modal): o atalho das guias nao troca a
+// conversa por baixo delas (trocaria o chat e dispararia o POST de lido).
+const MODAL_LAYER_SELECTOR = '[aria-modal="true"], .fn-layer, .lightbox';
+
+function insideModalLayer(node: unknown): boolean {
+  const element = node as { closest?: (selector: string) => unknown } | null;
+  return typeof element?.closest === "function" && element.closest(MODAL_LAYER_SELECTOR) != null;
+}
+
+// Alvo da tecla ou foco dentro de uma camada modal, ou camada modal aberta
+// com o foco fora dela (ex.: lightbox aberto com o foco no botao do chat).
+function modalLayerActive(event: KeyboardEvent): boolean {
+  if (insideModalLayer(event.target)) return true;
+  const doc = typeof window !== "undefined" ? window.document : undefined;
+  if (!doc) return false;
+  if (insideModalLayer(doc.activeElement)) return true;
+  return typeof doc.querySelector === "function" && doc.querySelector(MODAL_LAYER_SELECTOR) != null;
+}
+
 // Estado observado de cada guia: o fechamento automatico reage a MUDANCA
 // (abrir uma thread que ja e de outro ou ja esta fechada nao fecha a guia).
 type TabWatch = { pool: boolean; mine: boolean; closed: boolean };
@@ -673,13 +693,15 @@ export function useChatTabs(params: ChatTabsParams): ChatTabsApi {
 
   // Atalho: Ctrl+Alt+Seta baixo = proxima guia, Ctrl+Alt+Seta cima = anterior
   // (circular). Nao age num <select>, com a lista de mensagens rapidas aberta
-  // (as setas sao dela) nem em tecla ja tratada por outro handler.
+  // (as setas sao dela), com uma camada modal aberta nem em tecla ja tratada
+  // por outro handler.
   useEffect(() => {
     if (!active) return undefined;
     const handler = (event: KeyboardEvent) => {
       if (event.defaultPrevented || !event.ctrlKey || !event.altKey || event.metaKey || event.shiftKey || event.isComposing) return;
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
       if ((event.target as HTMLElement | null)?.tagName === "SELECT" || latest.current.suggestionsOpen) return;
+      if (modalLayerActive(event)) return;
       const tabs = openTabsRef.current;
       if (!tabs.length) return;
       const selected = latest.current.selectedThreadId;

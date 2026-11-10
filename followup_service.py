@@ -12,6 +12,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from fastapi import HTTPException
 
 from config import SECRET_KEY
+from funnel_catalog import STAGE_EVENT_PREFIX
 
 try:
     from zoneinfo import ZoneInfo
@@ -119,7 +120,7 @@ class FollowupService:
         return _dt(self.clock())
 
     def _actor(self):
-        if self.user.get("read_only") or self.user.get("impersonating"):
+        if self.user.get("read_only") or self.user.get("impersonating") or self.user.get("impersonation"):
             _fail("Sessão somente de leitura não opera follow-up.", 403)
         row = self.repo.user(self.user_id)
         if not row or row.get("is_active", 1) not in (1, True) or str(row.get("firebase_uid") or "") != self.uid:
@@ -791,6 +792,10 @@ class FollowupService:
                 examined += 1
                 last = (_dt(row["recorded_at"]), row["id"])
                 after = last
+                # Historico do funil (motivo, nota livre) sai so pela rota do
+                # funil, com ver_funil; aqui so os fatos do follow-up.
+                if str(row.get("event_type") or "").startswith(STAGE_EVENT_PREFIX):
+                    continue
                 try:
                     self._access(row["contact_id"], row.get("conversation_id"))
                 except HTTPException as exc:

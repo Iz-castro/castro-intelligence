@@ -9,7 +9,9 @@ import { useAccessSignal } from "./useAccessSignal";
 type Thread = { id: string; channel_label?: string; channel_id?: number; status?: string; assigned_to?: number | null };
 type Message = { id: number | string; direction?: string; content?: string; msg_type?: string; filename?: string; media_path?: string; created_at?: string; timestamp_wa?: string | number; sender_name?: string; sent_by_name?: string };
 
-export function ReadOnlyContext({ auth, contactId, conversationId }: { auth: Auth; contactId: number; conversationId?: string | null }) {
+// basePath: o funil reusa este componente com as rotas proprias
+// (/api/funnel, mesmo contrato de contexto/mensagens, permissao ver_funil).
+export function ReadOnlyContext({ auth, contactId, conversationId, basePath = "/api/followup" }: { auth: Auth; contactId: number; conversationId?: string | null; basePath?: string }) {
   const id = useId();
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selected, setSelected] = useState("");
@@ -20,7 +22,7 @@ export function ReadOnlyContext({ auth, contactId, conversationId }: { auth: Aut
   const generation = useRef(0);
   const contextReady = useRef(false);
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
-  const contextKey = `${contactId}/${conversationId || ""}/${reload}`;
+  const contextKey = `${basePath}/${contactId}/${conversationId || ""}/${reload}`;
   const accessSignal = useAccessSignal(contactId, selected || conversationId);
 
   useEffect(() => {
@@ -29,7 +31,7 @@ export function ReadOnlyContext({ auth, contactId, conversationId }: { auth: Aut
     const request = ++generation.current;
     setLoading(true); setError(""); setMessages([]); setThreads([]); setSelected("");
     const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : "";
-    void getJson<{ conversations: Thread[] }>(auth, `/api/followup/contacts/${contactId}/context${query}`).then((response) => {
+    void getJson<{ conversations: Thread[] }>(auth, `${basePath}/contacts/${contactId}/context${query}`).then((response) => {
       if (cancelled || request !== generation.current) return;
       contextReady.current = true; setLoadedFor(contextKey);
       setThreads(response.conversations || []);
@@ -37,18 +39,18 @@ export function ReadOnlyContext({ auth, contactId, conversationId }: { auth: Aut
       if (!response.conversations?.length) setLoading(false);
     }).catch((reason) => { if (!cancelled && request === generation.current) { generation.current++; contextReady.current = false; setLoadedFor(null); setMessages([]); setThreads([]); setSelected(""); setError(requestError(reason)); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [auth, contactId, conversationId, reload, contextKey]);
+  }, [auth, contactId, conversationId, reload, contextKey, basePath]);
 
   useEffect(() => {
     if (!selected || !contextReady.current || loadedFor !== contextKey) return;
     let cancelled = false;
     const request = ++generation.current;
     setLoading(true); setMessages([]); setError("");
-    void getJson<{ messages: Message[] }>(auth, `/api/followup/contacts/${contactId}/messages?conversation_id=${encodeURIComponent(selected)}&limit=50`).then((response) => {
+    void getJson<{ messages: Message[] }>(auth, `${basePath}/contacts/${contactId}/messages?conversation_id=${encodeURIComponent(selected)}&limit=50`).then((response) => {
       if (!cancelled && request === generation.current) setMessages(response.messages || []);
     }).catch((reason) => { if (!cancelled && request === generation.current) { generation.current++; contextReady.current = false; setLoadedFor(null); setMessages([]); setThreads([]); setSelected(""); setError(requestError(reason)); setLoading(false); } }).finally(() => { if (!cancelled && request === generation.current) setLoading(false); });
     return () => { cancelled = true; };
-  }, [auth, contactId, selected, accessSignal, loadedFor, contextKey]);
+  }, [auth, contactId, selected, accessSignal, loadedFor, contextKey, basePath]);
 
   useEffect(() => {
     if (!selected || !contextReady.current || loadedFor !== contextKey) return;
@@ -57,7 +59,7 @@ export function ReadOnlyContext({ auth, contactId, conversationId }: { auth: Aut
       if (document.visibilityState !== "visible") return;
       const request = generation.current;
       try {
-        await getJson(auth, `/api/followup/contacts/${contactId}/context?conversation_id=${encodeURIComponent(selected)}`);
+        await getJson(auth, `${basePath}/contacts/${contactId}/context?conversation_id=${encodeURIComponent(selected)}`);
       } catch (reason) {
         if (!cancelled && request === generation.current) { generation.current++; contextReady.current = false; setLoadedFor(null); setMessages([]); setThreads([]); setSelected(""); setError(requestError(reason)); setLoading(false); }
       }
@@ -65,7 +67,7 @@ export function ReadOnlyContext({ auth, contactId, conversationId }: { auth: Aut
     void validate();
     const timer = window.setInterval(() => void validate(), 30000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [auth, contactId, selected, accessSignal, loadedFor, contextKey]);
+  }, [auth, contactId, selected, accessSignal, loadedFor, contextKey, basePath]);
 
   return <section className="fu-readonly" aria-labelledby={`${id}-title`}>
     <div className="fu-section-heading"><h4 id={`${id}-title`}>Contexto da conversa</h4><button className="fu-button" type="button" disabled={loading} onClick={() => setReload((value) => value + 1)}>Atualizar contexto</button></div>

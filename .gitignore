@@ -27,6 +27,9 @@ scripts/_exports/
 # Listas de numeros / relatorios de campanha (PII — LGPD). docs/ e versionado,
 # entao qualquer CSV largado la seria commitado por acidente.
 docs/*.csv
+# Anotacoes/transcricoes de reuniao exportadas (.docx): trazem telefones e
+# credenciais de teste. Citar so as decisoes, sem PII, nos docs versionados.
+docs/*.docx
 *.xlsx
 # Backups/exports de conversas WhatsApp (PII pesada — LGPD: NUNCA versionar)
 backup*/

@@ -22,6 +22,9 @@ export type ClientConfig = {
   impersonation_environment: string;
   impersonation_polling_interval_ms: number;
   feature_followup?: boolean;
+  // Funil comercial (FEATURE_FUNNEL): flag GLOBAL; o tenant liga por
+  // settings.funnel (vem em /api/session.funnel.enabled).
+  feature_funnel?: boolean;
   allowed_email_domain: string;
   firebase_web_config: FirebaseWebConfig;
   firestore: {
@@ -71,6 +74,10 @@ export type PermissionKey =
   | "gerenciar_horarios_followup"
   | "registrar_recusa_comercial"
   | "reativar_contato_comercial"
+  | "ver_funil"
+  | "mover_etapa_funil"
+  | "ver_contatos_agente_funil"
+  | "ver_dashboard_funil"
   | "editar_declared_name"
   | "arquivar_lead"
   | "adicionar_contato_manual"
@@ -205,7 +212,18 @@ export type Contact = {
   bot_setor_nome?: string;
   // Temperatura do lead (tenants com motor CX; gravada UMA vez, no handoff).
   lead_temperature?: "quente" | "morno" | "frio" | string;
+  lead_temperature_at?: string;
   commercial_contact_block?: { active: boolean; version: number; updated_at?: string };
+  // Funil comercial (ADR 0015): etapa em campos PLANOS do contato, escritos
+  // so pelo backend. Ausente = fora do funil. O motivo NAO vem no contato.
+  crm_stage?: string;
+  crm_stage_version?: number;
+  crm_stage_changed_at?: string;
+  crm_stage_source?: "user" | "intake" | "graduation" | "migration" | "system" | string;
+  crm_funnel_entered_at?: string;
+  // Lead de backup (historico importado): o funil nao muda a etapa dele
+  // (409 contact_unavailable no backend), entao o cartao nem oferece.
+  is_backup?: boolean;
 };
 
 // Conversation = thread unica (channel_id + wa_id). Mesmo wa_id em

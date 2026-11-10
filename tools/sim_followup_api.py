@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import tools.sim_followup_flow as fake
+import firestore_common as common
 import followup_access as access
 import followup_routes as routes
 import rbac
@@ -77,10 +78,14 @@ def enriched_contact(contact_id):
 access.get_wa_contact = enriched_contact
 access.get_wa_conversation_by_id = lambda conversation_id: raw("wa_conversations", conversation_id)
 access.get_channel = lambda channel_id: copy.deepcopy(fake.DATA.get(("__global__", "channels", str(channel_id))))
+# Contexto/mensagens moraram para followup_access (helpers reusados pelo funil).
+access.get_wa_conversation = messages
+access.tenant_collection = fake.repository_module.tenant_collection
 fake.repository_module.global_document = lambda name, doc_id: fake.Reference("__global__", name, doc_id)
 routes.get_user_raw_by_id = lambda user_id: raw("users", user_id)
-routes.get_wa_conversation = messages
 routes.tenant_collection = fake.repository_module.tenant_collection
+# Qualquer caminho que escape dos fakes acima nao pode criar cliente com ADC.
+common.get_firestore_client = lambda: (_ for _ in ()).throw(AssertionError("cliente real proibido"))
 routes.FollowupService = lambda repo, user, authorize, **kwargs: FollowupService(
     repo, user, authorize, clock=lambda: fake.NOW[0], **kwargs)
 rbac._read_perfil_doc = lambda tenant_id, profile_id: copy.deepcopy(PROFILES.get(profile_id))
