@@ -30,7 +30,7 @@ export function QuickMessagesEditor({ items, onChange, addLabel, max }: Props) {
 
   return (
     <div className="qm-editor">
-      {items.length === 0 ? <div className="sub qm-hint">Nenhuma mensagem rapida cadastrada.</div> : null}
+      {items.length === 0 ? <div className="sub qm-hint">Nenhuma mensagem rápida cadastrada.</div> : null}
       {items.map((qm, idx) => {
         const complete = isQuickMessageComplete(qm);
         const duplicate = duplicates.has(normalizeShortcut(qm.shortcut));
@@ -39,18 +39,18 @@ export function QuickMessagesEditor({ items, onChange, addLabel, max }: Props) {
           <div key={idx} className={cardClass}>
             <div className="qm-card-head">
               <span className="qm-index">{idx + 1}</span>
-              <input className="qm-title" value={qm.title ?? ""} onChange={(e) => update(idx, { title: e.target.value })} placeholder="Titulo (ex.: Saudacao Tanusa)" aria-label="Titulo" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
+              <input className="qm-title" value={qm.title ?? ""} onChange={(e) => update(idx, { title: e.target.value })} placeholder="Título (ex.: Saudação Tanusa)" aria-label="Título" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
               <input className="qm-shortcut" value={qm.shortcut} onChange={(e) => update(idx, { shortcut: e.target.value })} placeholder="/atalho" aria-label="Atalho" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
               <button type="button" className="ghost qm-remove" onClick={() => onChange(items.filter((_, i) => i !== idx))} aria-label="Remover mensagem" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : "Remover"}>X</button>
             </div>
             <textarea className="qm-text" value={qm.message} onChange={(e) => update(idx, { message: e.target.value })} placeholder="Mensagem completa (como vai pro cliente)" rows={2} aria-label="Mensagem" disabled={readOnly} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
-            {complete ? null : <div className="qm-warn">Preencha titulo, atalho e mensagem — ou remova este item.</div>}
+            {complete ? null : <div className="qm-warn">Preencha título, atalho e mensagem — ou remova este item.</div>}
             {duplicate ? <div className="qm-warn">Atalho repetido: outra mensagem desta lista usa {normalizeShortcut(qm.shortcut)}.</div> : null}
           </div>
         );
       })}
       {atLimit ? (
-        <div className="sub qm-hint">Limite de {max} mensagens rapidas atingido.</div>
+        <div className="sub qm-hint">Limite de {max} mensagens rápidas atingido.</div>
       ) : (
         <button
           type="button"

@@ -18,7 +18,7 @@ export function resolveMessageMedia(message: ChatMessage): ResolvedMessageMedia 
 
   const msgType = String(message.msg_type || "").toLowerCase();
   const mime = String(message.media_mime || "").toLowerCase();
-  const alt = message.filename || (msgType === "sticker" ? "figurinha" : "midia");
+  const alt = message.filename || (msgType === "sticker" ? "figurinha" : "mídia");
 
   if (msgType === "audio" || mime.startsWith("audio/")) return { kind: "audio" };
   if (msgType === "gif") {

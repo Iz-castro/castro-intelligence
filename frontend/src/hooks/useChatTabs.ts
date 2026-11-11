@@ -592,7 +592,7 @@ export function useChatTabs(params: ChatTabsParams): ChatTabsApi {
       let stopped = false;
       let unsubscribe: () => void;
       try {
-        if (!VALID_TAB_ID.test(id)) throw new Error("id de thread invalido");
+        if (!VALID_TAB_ID.test(id)) throw new Error("id de thread inválido");
         unsubscribe = watchSessionDocument(auth, firestoreDoc(db, conversationsPath, id),
           (snap) => {
             if (stopped || !openTabsRef.current.includes(id)) return;

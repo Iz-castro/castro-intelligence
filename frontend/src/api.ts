@@ -86,7 +86,7 @@ async function performRequest<T>(auth: Auth | null, path: string, init: RequestI
       const detail = payload.detail || payload.error || payload.message || `Erro HTTP ${response.status}`;
       // 422 do FastAPI manda detail como ARRAY de erros de validacao.
       const message = Array.isArray(detail)
-        ? detail.map((d: { msg?: string }) => d?.msg || "Valor invalido").join("; ")
+        ? detail.map((d: { msg?: string }) => d?.msg || "Valor inválido").join("; ")
         : detail;
       throw new ApiError(String(message), response.status);
     }

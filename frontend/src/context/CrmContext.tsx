@@ -2701,11 +2701,11 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     const text = messageCopyText(message);
     if (!text) {
       setError("");
-      setNotice("Essa mensagem nao tem texto para copiar.");
+      setNotice("Essa mensagem não tem texto para copiar.");
       return;
     }
     if (!navigator.clipboard?.writeText) {
-      setError("Nao foi possivel copiar a mensagem neste navegador.");
+      setError("Não foi possível copiar a mensagem neste navegador.");
       return;
     }
     try {
@@ -2909,7 +2909,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   async function startRecording() {
     if (readOnly) return;
     if (!selectedContact || correctionTargetRef.current || recordingRequestRef.current) return;
-    if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === "undefined") { setError("O navegador nao oferece suporte para gravacao de audio."); return; }
+    if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === "undefined") { setError("O navegador não oferece suporte para gravação de áudio."); return; }
     const request = {};
     recordingRequestRef.current = request;
     try {
@@ -2947,7 +2947,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       if (recorder.state !== "inactive") { await new Promise<void>((res) => { recorder.addEventListener("stop", () => res(), { once: true }); recorder.stop(); }); }
       const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
       audioChunksRef.current = []; setRecording(false); setRecordingSeconds(0);
-      if (!audioBlob.size) throw new Error("Nao foi possivel capturar o audio gravado.");
+      if (!audioBlob.size) throw new Error("Não foi possível capturar o áudio gravado.");
       const form = new FormData();
       const target = buildSendTarget();
       if (target.conversation_id) form.append("conversation_id", target.conversation_id);
@@ -2955,7 +2955,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       form.append("file", audioBlob, "gravacao.webm");
       appendReplyFields(form);
       await sendForm(bundle.auth, "/api/wa/send-audio", form);
-      setReplyTarget(null); setNotice("Audio enviado.");
+      setReplyTarget(null); setNotice("Áudio enviado.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); discardRecording(); }
     finally { releaseAudioStream(); mediaRecorderRef.current = null; audioChunksRef.current = []; setRecording(false); setRecordingSeconds(0); setBusyAudio(false); }
@@ -3134,8 +3134,8 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       // mostraria "novo" salvo e o listener reverteria sem explicacao.
       const effective = r?.qualification_effective || qualification;
       setNotice(effective !== qualification && qualification === "novo"
-        ? "Notas salvas. Lead ja em atendimento nao volta a Novo."
-        : "Qualificacao atualizada.");
+        ? "Notas salvas. Lead já em atendimento não volta a Novo."
+        : "Qualificação atualizada.");
       // Contato hidratado sob demanda (extraContacts, fora do top-50 ao vivo)
       // e um fetch unico — sem este patch o chip e o filtro por qualificacao
       // da sidebar ficariam com o valor antigo ate recarregar a pagina. Quem
@@ -3226,7 +3226,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
       const body: Record<string, unknown> = { role: editRole, department_id: editDeptId || null };
       if (editPerfilId) body.perfil_acesso_id = editPerfilId;
       await putJson(bundle.auth, `/api/admin/users/${userId}`, body);
-      setNotice("Usuario atualizado.");
+      setNotice("Usuário atualizado.");
       setEditingUserId(null);
       // Patch local (evita full-scan server-side de /api/operators por
       // clique): os valores novos ja estao no estado do editor; perfil
@@ -3246,7 +3246,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (readOnly) return;
     if (!bundle) return;
     const digits = coexPhoneInput.replace(/\D/g, "");
-    if (digits.length < 10) { setError("Numero invalido. Informe DDI+DDD+numero (ex: 5531999990000)."); return; }
+    if (digits.length < 10) { setError("Número inválido. Informe DDI+DDD+número (ex: 5531999990000)."); return; }
     try { setBusyCoexUpdate(true); setError(""); await sendJson(bundle.auth, `/api/admin/users/${userId}/coex`, { phone: digits }); setNotice("Coexistence liberado para o operador."); setCoexEditingUserId(null); setCoexPhoneInput(""); setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators")); }
     catch (e) { setError(errorText(e)); }
     finally { setBusyCoexUpdate(false); }
@@ -3254,7 +3254,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   async function revokeCoex(userId: number) {
     if (readOnly) return;
     if (!bundle) return;
-    try { setBusyCoexUpdate(true); setError(""); await deleteJson(bundle.auth, `/api/admin/users/${userId}/coex`); setNotice("Autorizacao coexistence revogada."); setCoexEditingUserId(null); setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators")); }
+    try { setBusyCoexUpdate(true); setError(""); await deleteJson(bundle.auth, `/api/admin/users/${userId}/coex`); setNotice("Autorização coexistence revogada."); setCoexEditingUserId(null); setOperators(await getJson<Operator[]>(bundle.auth, "/api/operators")); }
     catch (e) { setError(errorText(e)); }
     finally { setBusyCoexUpdate(false); }
   }
@@ -3271,7 +3271,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // Janela de 24h: o cliente acabou de escrever, entao em geral esta aberta.
     // Se estiver fechada, o /send recusa e avisamos (sem reverter o takeover).
     try { await sendJson(bundle.auth, `/api/wa/send`, { conversation_id: conversationId, content: msg }); setNotice("Atendimento assumido e mensagem enviada."); }
-    catch (e) { setNotice("Atendimento assumido. A mensagem nao pode ser enviada: " + errorText(e)); }
+    catch (e) { setNotice("Atendimento assumido. A mensagem não pode ser enviada: " + errorText(e)); }
   }
   async function returnConversation(conversationId: string) {
     if (readOnly) return;
@@ -3947,7 +3947,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusyTransfer(true); setError(""); setNotice("");
       await sendJson(bundle.auth, "/api/admin/reassign-lead", { contact_id: selectedContact.id, to_user_id: toUserId, to_department_id: toDeptId, reason, summary });
-      setNotice("Lead reatribuido (atendimentos mantidos).");
+      setNotice("Lead reatribuído (atendimentos mantidos).");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusyTransfer(false); }
@@ -3961,7 +3961,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     try {
       setBusyTransfer(true); setError(""); setNotice("");
       await sendJson(bundle.auth, `/api/wa/conversation/${conversationId}/supervisor-takeover`, {});
-      setNotice("Atendimento assumido pela supervisao.");
+      setNotice("Atendimento assumido pela supervisão.");
       if (!snapshotMode) await refreshPollingViews();
     } catch (e) { setError(errorText(e)); }
     finally { setBusyTransfer(false); }
@@ -4045,7 +4045,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     // setError("") antes: o modal de Administracao mostra o erro inline (o 400
     // do backend, ex.: data da politica LGPD futura) — sem limpar, um erro
     // velho ficaria la depois de um save que deu certo.
-    try { setBusySettings(true); setError(""); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSavedSystemSettings(r); setSettingsLoaded(true); setNotice("Configuracoes do sistema salvas."); }
+    try { setBusySettings(true); setError(""); const r = await putJson(bundle.auth, "/api/settings/system", systemSettings) as SystemSettings; setSystemSettings(r); setSavedSystemSettings(r); setSettingsLoaded(true); setNotice("Configurações do sistema salvas."); }
     catch (e) { setNotice(""); setError(errorText(e)); }
     finally { setBusySettings(false); }
   }
@@ -4053,9 +4053,9 @@ export function CrmProvider({ children }: { children: ReactNode }) {
   async function saveUserSettingsAction() {
     if (readOnly) return;
     if (!bundle) return;
-    const problem = quickMessagesProblem(userSettings.quick_messages, "Minhas mensagens rapidas");
+    const problem = quickMessagesProblem(userSettings.quick_messages, "Minhas mensagens rápidas");
     if (problem) { setError(problem); return; }
-    try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/user", userSettings) as UserSettings; setUserSettings(r); setNotice("Suas configuracoes salvas."); }
+    try { setBusySettings(true); const r = await putJson(bundle.auth, "/api/settings/user", userSettings) as UserSettings; setUserSettings(r); setNotice("Suas configurações salvas."); }
     catch (e) { setError(errorText(e)); }
     finally { setBusySettings(false); }
   }

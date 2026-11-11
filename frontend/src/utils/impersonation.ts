@@ -18,7 +18,7 @@ export function assertImpersonationRead(bundle: FirebaseBundle, result: Imperson
   assertFirebaseSessionActive(bundle.auth);
   const deadline = Date.parse(result.expires_at);
   if (!Number.isFinite(deadline) || deadline !== Date.parse(bundle.impersonationExpiresAt || "") || deadline <= Date.now()) {
-    throw new Error("A sessao de visualizacao expirou.");
+    throw new Error("A sessão de visualização expirou.");
   }
 }
 

@@ -167,22 +167,22 @@ function TopBar() {
           </button>
         )}
         <div ref={settingsMenuRef} style={{ position: "relative" }}>
-          <button className="composer-icon" onClick={toggleSettingsMenu} title="Configuracoes" aria-label="Configuracoes"><GearIcon /></button>
+          <button className="composer-icon" onClick={toggleSettingsMenu} title="Configurações" aria-label="Configurações"><GearIcon /></button>
           {showSettings === "menu" && (
             <div className="settings-dropdown">
-              <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
-              <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rapidas</span></button>
-              <button type="button" className="attach-option" onClick={() => void openSettingsPage("tags")}><span>🏷️</span><span>Tags de leads</span></button>
-              {can("reabrir_em_lote") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("reopen")}><span>🔁</span><span>Reabertura em lote</span></button>}
-              {can("gerenciar_config_sistema") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administracao</span></button>}
-              {can("gerenciar_perfis_acesso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("perfis")}><span>🛡️</span><span>Perfis de acesso</span></button>}
-              {(can("gerenciar_canais") || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
-              {can("gerenciar_canais") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp-standard")}><span>☁️</span><span>Conectar numero (Cloud API)</span></button>}
-              {/* Monitor (admin da hubloc) substitui o Dashboard; quem nao tem o
+              {/* Itens em ordem alfabetica pelo rotulo; manter ao incluir item novo.
+                  Monitor (admin da hubloc) substitui o Dashboard; quem nao tem o
                   monitor (supervisao, outros tenants) segue com o Dashboard. */}
-              {monitorEnabled && can("ver_monitor_atendimento")
-                ? <button type="button" className="attach-option" onClick={() => void openSettingsPage("monitor")}><span>📈</span><span>Monitor</span></button>
-                : can("ver_dashboard_uso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
+              {can("gerenciar_config_sistema") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("admin")}><span>🔧</span><span>Administração</span></button>}
+              <button type="button" className="attach-option" onClick={() => void openSettingsPage("chat")}><span>💬</span><span>Chat</span></button>
+              {can("gerenciar_canais") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp-standard")}><span>☁️</span><span>Conectar número (Cloud API)</span></button>}
+              {!(monitorEnabled && can("ver_monitor_atendimento")) && can("ver_dashboard_uso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("dashboard")}><span>📊</span><span>Dashboard</span></button>}
+              <button type="button" className="attach-option" onClick={() => void openSettingsPage("quick")}><span>⚡</span><span>Mensagens rápidas</span></button>
+              {monitorEnabled && can("ver_monitor_atendimento") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("monitor")}><span>📈</span><span>Monitor</span></button>}
+              {can("gerenciar_perfis_acesso") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("perfis")}><span>🛡️</span><span>Perfis de acesso</span></button>}
+              {can("reabrir_em_lote") && <button type="button" className="attach-option" onClick={() => void openSettingsPage("reopen")}><span>🔁</span><span>Reabertura em lote</span></button>}
+              <button type="button" className="attach-option" onClick={() => void openSettingsPage("tags")}><span>🏷️</span><span>Tags de leads</span></button>
+              {(can("gerenciar_canais") || !!sessionUser.coex_authorized) && <button type="button" className="attach-option" onClick={() => void openSettingsPage("whatsapp")}><span>📱</span><span>WhatsApp Coexistence</span></button>}
             </div>
           )}
         </div>
@@ -205,7 +205,7 @@ function NavBar() {
         <span className="nav-label">Bot</span>
         {botUnread > 0 && <span className="nav-badge">{botUnread > 99 ? "99+" : botUnread}</span>}
       </button>}
-      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); setTagFilter([]); }} title={poolReception ? "Recepcao (pool compartilhada)" : "Novos leads"}>
+      <button className={`nav-item ${activeView === "novos" ? "active" : ""}`} onClick={() => { setActiveView("novos"); setQualificationFilter(""); setTagFilter([]); }} title={poolReception ? "Recepção (pool compartilhada)" : "Novos leads"}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="14"/><line x1="9" y1="11" x2="15" y2="11"/></svg>
         <span className="nav-label">{poolReception ? "Recepção" : "Novos"}</span>
         {novosUnread > 0 && <span className="nav-badge">{novosUnread > 99 ? "99+" : novosUnread}</span>}
@@ -215,7 +215,7 @@ function NavBar() {
         <span className="nav-label">Meus</span>
         {meusUnread > 0 && <span className="nav-badge">{meusUnread > 99 ? "99+" : meusUnread}</span>}
       </button>
-      <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); setTagFilter([]); }} title="Nao qualificados">
+      <button className={`nav-item ${activeView === "nao_qualificados" ? "active" : ""}`} onClick={() => { setActiveView("nao_qualificados"); setQualificationFilter(""); setTagFilter([]); }} title="Não qualificados">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
         <span className="nav-label">N/Q</span>
         {nqUnread > 0 && <span className="nav-badge">{nqUnread > 99 ? "99+" : nqUnread}</span>}
@@ -225,7 +225,7 @@ function NavBar() {
         <span className="nav-label">Equipe</span>
         {equipeUnread > 0 && <span className="nav-badge">{equipeUnread > 99 ? "99+" : equipeUnread}</span>}
       </button>}
-      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); setTagFilter([]); }} title="Conversas em backup (historico importado)">
+      {canSeeAll && <button className={`nav-item ${activeView === "backup" ? "active" : ""}`} onClick={() => { setActiveView("backup"); setQualificationFilter(""); setTagFilter([]); }} title="Conversas em backup (histórico importado)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/></svg>
         <span className="nav-label">Backup</span>
         {backupUnread > 0 && <span className="nav-badge">{backupUnread > 99 ? "99+" : backupUnread}</span>}
@@ -376,7 +376,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
     const ready = hasLetter ? t.replace(/[^\p{L}\p{N}]+/gu, "").length >= 2 : digitCount >= 4;
     if (!ready) {
       v2SearchSeq.current++; setV2SearchRows(null); setV2Truncated(false);
-      setV2Hint("Digite ao menos 2 letras ou 4 numeros.");
+      setV2Hint("Digite ao menos 2 letras ou 4 números.");
       return;
     }
     const seq = ++v2SearchSeq.current;
@@ -411,7 +411,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
       if (seq === v2PageSeq.current) {
         if (e instanceof ApiError && e.status === 400) {
           // Cursor expirado (TTL 24h) ou de outro filtro: recomeca do A.
-          setV2Hint("A lista expirou — recarregando do inicio.");
+          setV2Hint("A lista expirou — recarregando do início.");
           keepHintRef.current = true;
           setPageNonce((n) => n + 1);
         } else {
@@ -528,20 +528,20 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
                 setSearchNonce((n) => n + 1);
               }
             }}
-            placeholder={pickerV2 ? "Nome (pelo comeco) ou telefone (completo, comeco ou final)" : "Buscar contato por nome ou telefone"}
+            placeholder={pickerV2 ? "Nome (pelo começo) ou telefone (completo, começo ou final)" : "Buscar contato por nome ou telefone"}
             maxLength={120}
             aria-describedby={pickerV2 ? "picker-v2-hint" : undefined}
             autoFocus
             style={{ flex: 1, minWidth: "12rem" }}
           />
-          <select value={qualFilter} onChange={(e) => { setQualFilter(e.target.value); setV2Tag(""); }} title="Filtrar por qualificacao" aria-label="Filtrar por qualificacao" style={{ width: "auto", flexShrink: 0 }}>
+          <select value={qualFilter} onChange={(e) => { setQualFilter(e.target.value); setV2Tag(""); }} title="Filtrar por qualificação" aria-label="Filtrar por qualificação" style={{ width: "auto", flexShrink: 0 }}>
             <option value="">Todos</option>
             <option value="novo">Novo</option>
             <option value="em_atendimento">Em atend.</option>
             <option value="qualificado">Qualificado</option>
-            <option value="nao_qualificado">Nao qualificado</option>
+            <option value="nao_qualificado">Não qualificado</option>
             <option value="convertido">Convertido</option>
-            <option value="nao_convertido">Nao convertido</option>
+            <option value="nao_convertido">Não convertido</option>
           </select>
           {v2TagAllowed && v2TagOptions.length > 0 ? (
             <select
@@ -556,7 +556,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
                   setOwnerFilter(null); setQualFilter("");
                 }
               }}
-              title="Filtrar por tag (nao combina com busca nem com os outros filtros)"
+              title="Filtrar por tag (não combina com busca nem com os outros filtros)"
               aria-label="Filtrar por tag"
               style={{ width: "auto", flexShrink: 0, maxWidth: "10rem" }}
             >
@@ -609,7 +609,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
             {loadingList && v2List.length === 0 ? (
               <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
             ) : v2List.length === 0 && !v2Hint && v2HiddenByFilters === 0 ? (
-              <p className="sub" style={{ padding: "0.5rem 0" }}>{v2SearchRows != null ? "Nenhum contato encontrado." : v2Tag ? "Nenhum contato com essa tag (no seu escopo)." : qualFilter ? "Nenhum contato com essa qualificacao." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato na agenda."}</p>
+              <p className="sub" style={{ padding: "0.5rem 0" }}>{v2SearchRows != null ? "Nenhum contato encontrado." : v2Tag ? "Nenhum contato com essa tag (no seu escopo)." : qualFilter ? "Nenhum contato com essa qualificação." : ownerFilter != null ? "Nenhum contato atribuído a este operador." : "Nenhum contato na agenda."}</p>
             ) : (
               <ul style={{ listStyle: "none", margin: 0, padding: 0, opacity: loadingList ? 0.6 : 1 }} aria-busy={loadingList}>
                 {v2List.map((r) => {
@@ -661,7 +661,7 @@ function NewContactModal({ onClose }: { onClose: () => void }) {
           {loadingList && allContacts.length === 0 ? (
             <p className="sub" style={{ padding: "0.5rem 0" }}>Carregando...</p>
           ) : visibleContacts.length === 0 ? (
-            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : qualFilter ? "Nenhum contato com essa qualificacao." : ownerFilter != null ? "Nenhum contato atribuido a este operador." : "Nenhum contato sincronizado."}</p>
+            <p className="sub" style={{ padding: "0.5rem 0" }}>{search ? "Nenhum contato encontrado." : qualFilter ? "Nenhum contato com essa qualificação." : ownerFilter != null ? "Nenhum contato atribuído a este operador." : "Nenhum contato sincronizado."}</p>
           ) : (
             <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
               {visibleContacts.map((c) => (
@@ -757,7 +757,7 @@ function ReassignLeadCard() {
   const [reason, setReason] = useState("");
   return (
     <CollapsibleCard title="Reatribuir Lead (dono)" defaultOpen={false}>
-      <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Muda so o dono do Lead — os atendimentos abertos mantem seus donos.</span>
+      <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Muda só o dono do Lead — os atendimentos abertos mantém seus donos.</span>
       <select value={uid} onChange={(e) => setUid(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Selecione o operador</option>{operators.filter((o) => o.id !== sessionUser?.id).map((o) => <option key={o.id} value={o.id}>{o.display_name}</option>)}</select>
       <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
       <button className="primary" onClick={() => { if (uid) { void reassignLead(Number(uid), null, reason, ""); setReason(""); setUid(""); } }} disabled={readOnly || (!uid || busyTransfer)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTransfer ? "..." : "Reatribuir Lead"}</button>
@@ -800,7 +800,7 @@ function ConflictsPanel() {
             {lead.conversations.map((cv) => (
               <button key={cv.conversation_id} type="button" className="ghost" style={{ display: "flex", justifyContent: "space-between", gap: "0.4rem", padding: "0.3rem 0.45rem", fontSize: "0.72rem", textAlign: "left" }} onClick={() => jump(cv.conversation_id)} title="Abrir este atendimento">
                 <span>👤 {opName(cv.assigned_to)}</span>
-                <span className="sub" style={{ whiteSpace: "nowrap" }}>{cv.channel_phone_number || cv.channel_label || "—"}{cv.channel_active === false ? " ⚠" : ""}{cv.unread ? ` · ${cv.unread} nao lida(s)` : ""}</span>
+                <span className="sub" style={{ whiteSpace: "nowrap" }}>{cv.channel_phone_number || cv.channel_label || "—"}{cv.channel_active === false ? " ⚠" : ""}{cv.unread ? ` · ${cv.unread} não lida(s)` : ""}</span>
               </button>
             ))}
           </div>
@@ -814,9 +814,9 @@ function ConflictsPanel() {
 // Data-driven: sem campo no doc (tenants sem IA) -> null, nenhum plumbing de
 // plano/modulo necessario. Gravada pelo backend UMA vez, no handoff do bot.
 const LEAD_TEMPERATURE_META: Record<string, { bg: string; border: string; label: string }> = {
-  quente: { bg: "#dc2626", border: "#dc2626", label: "Lead quente — alta intencao (priorize este atendimento)" },
-  morno: { bg: "#f59e0b", border: "#f59e0b", label: "Lead morno — exploratorio" },
-  frio: { bg: "#ffffff", border: "#94a3b8", label: "Lead frio — suporte generico / curiosidade" },
+  quente: { bg: "#dc2626", border: "#dc2626", label: "Lead quente — alta intenção (priorize este atendimento)" },
+  morno: { bg: "#f59e0b", border: "#f59e0b", label: "Lead morno — exploratório" },
+  frio: { bg: "#ffffff", border: "#94a3b8", label: "Lead frio — suporte genérico / curiosidade" },
 };
 function LeadTemperatureDot({ temperature }: { temperature?: string }) {
   if (!temperature) return null;
@@ -862,7 +862,7 @@ function ContactList() {
     });
     return () => { disposed = true; };
   }, [countAllContacts, contactsCountNonce]);
-  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? (poolReception ? "Recepção" : "Novos Leads") : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Nao Qualificados";
+  const viewTitle = activeView === "bot" ? "Bot" : activeView === "novos" ? (poolReception ? "Recepção" : "Novos Leads") : activeView === "meus" ? "Meus Atendimentos" : activeView === "equipe" ? "Equipe" : activeView === "backup" ? "Backup" : "Não Qualificados";
   // 15 s sem as listas chegarem: aviso extra sob o "Carregando conversas"
   // (multiplas abas disputam o cache persistente do Firestore). Some quando
   // os dados chegam.
@@ -940,7 +940,7 @@ function ContactList() {
           ) : null}
         </div>
         {activeView === "equipe" && visibleTeamOperators.length ? (
-          <div className="operator-presence-strip" aria-label="Operadores com conversas visiveis">
+          <div className="operator-presence-strip" aria-label="Operadores com conversas visíveis">
             {visibleTeamOperators.map((operator) => {
               const color = operatorColor(operator.id);
               return (
@@ -971,7 +971,7 @@ function ContactList() {
             N/Q ja e um filtro por qualificacao (so nao_qualificado) e o Backup e
             historico importado — sem seletor nelas. O match em si
             (filteredConversations) e client-side sobre o que esta carregado. */}
-        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificacao ou nao lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option><option value="nao_lidos">Não lidas</option></select>}
+        {QUALIFICATION_FILTER_VIEWS.has(activeView) && <select className="compact" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)} title="Filtrar conversas (qualificação ou não lidas)" aria-label="Filtrar conversas"><option value="">Todos</option><option value="novo">Novo</option><option value="em_atendimento">Em atend.</option><option value="qualificado">Qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Não convertido</option><option value="nao_lidos">Não lidas</option></select>}
         {/* "So espiar" (admin/supervisor): abrir conversa sem marcar como lida
             — badge e alarme continuam ate alguem tratar. Lembrado por navegador. */}
         {QUALIFICATION_FILTER_VIEWS.has(activeView) && canPeek && (
@@ -1086,7 +1086,7 @@ function ContactList() {
             {listsSlow ? <p className="sub" style={{ margin: "0.4rem 0 0" }}>Ainda conectando ao banco. Se houver outras abas do CRM abertas, feche-as e mantenha só esta.</p> : null}
           </div>
         ) : null}
-        {!renderItems.length && listsReady ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato nao qualificado."}</div> : null}
+        {!renderItems.length && listsReady ? <div className="empty">{unreadMode ? (loadingMoreConvs ? "Buscando conversas não lidas..." : "Nenhuma conversa não lida nesta caixa.") : activeView === "bot" ? "Nenhum contato no bot." : activeView === "novos" ? (poolReception ? "Nenhum atendimento na recepção." : "Nenhum lead novo na fila.") : activeView === "meus" ? "Nenhum atendimento ativo." : activeView === "equipe" ? "Nenhum atendimento da equipe." : activeView === "backup" ? "Nenhuma conversa em backup." : "Nenhum contato não qualificado."}</div> : null}
         {(() => {
           // Dois papeis no mesmo botao: (1) REVELAR itens ja carregados alem dos
           // 100 mostrados ("Mostrar mais"); (2) BUSCAR no Firestore alem da
@@ -1141,7 +1141,7 @@ function MessageMedia({ message }: { message: ChatMessage }) {
   }
   if (media.kind === "video") {
     if (media.gifLike) return <button type="button" className="media-button gif-button" onClick={() => openLightbox(message.media_path || "", "video", media.alt, true)} aria-label="Ampliar GIF"><video className="media video-media gif-video" src={message.media_path} autoPlay loop muted playsInline /></button>;
-    return <a href={message.media_path} download={message.filename || "video"} target="_blank" rel="noreferrer" className="video-download-link"><VideoIcon /> <span>Baixar video{message.filename ? ` — ${message.filename}` : ""}</span></a>;
+    return <a href={message.media_path} download={message.filename || "video"} target="_blank" rel="noreferrer" className="video-download-link"><VideoIcon /> <span>Baixar vídeo{message.filename ? ` — ${message.filename}` : ""}</span></a>;
   }
   if (media.kind === "audio") return (
     <div className="audio-container">
@@ -1245,7 +1245,7 @@ function ChatPanel() {
     : "observador";
   const channelInactive = selectedThread?.channel_active === false;
   const clientGreetName = selectedContact?.declared_name || selectedContact?.whatsapp_profile_name || "";
-  const greetSuggestion = `Ola${clientGreetName ? " " + clientGreetName : ""}! Aqui e ${sessionUser?.display_name || "o atendimento"}. Vi no nosso sistema que voce costuma falar com ${leadOwnerName}. Como voce me chamou por aqui, como posso te ajudar hoje?`;
+  const greetSuggestion = `Olá${clientGreetName ? " " + clientGreetName : ""}! Aqui é ${sessionUser?.display_name || "o atendimento"}. Vi no nosso sistema que você costuma falar com ${leadOwnerName}. Como você me chamou por aqui, como posso te ajudar hoje?`;
   const openTakeoverPrompt = () => { setGreetDraft(greetSuggestion); setShowTakeoverPrompt(true); };
   const confirmTakeover = async (withMessage: boolean) => { if (!selectedThreadId) return; setBusyTakeover(true); try { await takeoverConversation(selectedThreadId, withMessage ? greetDraft : undefined); setShowTakeoverPrompt(false); } finally { setBusyTakeover(false); } };
   const doReturn = async () => { if (!selectedThreadId) return; setBusyTakeover(true); try { await returnConversation(selectedThreadId); } finally { setBusyTakeover(false); } };
@@ -1379,12 +1379,12 @@ function ChatPanel() {
               </div>
             ) : null}
             <div className="sub">{selectedContact.phone_formatted || selectedContact.wa_id}{selectedContact.assigned_name ? ` · ${selectedContact.assigned_name}` : ""}</div>
-            {selectedContact.attendance_protocol ? <div className="sub" style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "0.72rem", marginTop: "0.2rem" }}>{selectedContact.attendance_protocol}{selectedContact.attendance_started_at ? ` · inicio ${when(selectedContact.attendance_started_at)}` : ""}</div> : null}
+            {selectedContact.attendance_protocol ? <div className="sub" style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "0.72rem", marginTop: "0.2rem" }}>{selectedContact.attendance_protocol}{selectedContact.attendance_started_at ? ` · início ${when(selectedContact.attendance_started_at)}` : ""}</div> : null}
           </div>
           <div className="banner-actions">
             <div className="chips">
               <span className="chip">{selectedContact.department_name || "Sem setor"}</span>
-              <span className="chip">{selectedContact.qualification || "sem classificacao"}</span>
+              <span className="chip">{selectedContact.qualification || "sem classificação"}</span>
               {(selectedThread?.lead_temperature || selectedContact.lead_temperature) ? (
                 <span className="chip" style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem" }}>
                   <LeadTemperatureDot temperature={selectedThread?.lead_temperature || selectedContact.lead_temperature} />
@@ -1399,7 +1399,7 @@ function ChatPanel() {
               {ctx.can("assumir_atendimento") && (!selectedContact.assigned_to || selectedContact.assigned_to !== sessionUser!.id) ? <button className="assume-btn" onClick={() => void assumeContact(selectedContact.id)} disabled={readOnly || (busyAssume)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyAssume ? "Assumindo..." : "Assumir atendimento"}</button> : null}
               <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleChatSearch} aria-label="Buscar na conversa" title="Buscar na conversa">{showChatSearch ? <CloseIcon /> : <SearchIcon />}</button>
               <div ref={dotsMenuRef} style={{ position: "relative" }}>
-                <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleDotsMenu} aria-label="Mais opcoes" title="Mais opcoes"><DotsIcon /></button>
+                <button className="composer-icon" style={{ width: 34, height: 34 }} onClick={toggleDotsMenu} aria-label="Mais opções" title="Mais opções"><DotsIcon /></button>
                 {showDotsMenu ? (
                   <div className="attach-menu" style={{ right: 0, left: "auto", bottom: "auto", top: "calc(100% + 0.5rem)", minWidth: 220 }}>
                     <button type="button" className="attach-option" onClick={() => { setShowTemplatePicker(true); closeDotsMenu(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>📋</span><span>Enviar template</span></button>
@@ -1443,7 +1443,7 @@ function ChatPanel() {
             <span style={{ flex: 1 }}>
               {isTakeoverPending
                 ? <>Este contato pertence a <strong>{leadOwnerName}</strong>. Assuma para responder sem transferir o lead.</>
-                : <>Voce assumiu este atendimento temporariamente — lead de <strong>{leadOwnerName}</strong>.</>}
+                : <>Você assumiu este atendimento temporariamente — lead de <strong>{leadOwnerName}</strong>.</>}
             </span>
             {isTakeoverActive ? <button type="button" className="ghost" style={{ whiteSpace: "nowrap" }} disabled={readOnly || (busyTakeover)} onClick={() => void doReturn()} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTakeover ? "..." : "Encerrar e devolver"}</button> : null}
           </div>
@@ -1477,7 +1477,7 @@ function ChatPanel() {
               <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""}`} style={isInternal ? { background: "#fef9c3", borderColor: "#facc15", color: "#713f12" } : operatorAccentStyle(bubbleColor)}>
                 {canInteract ? (
                   <div className="bubble-menu-anchor" ref={isMenuOpen ? activeMessageMenuRef : null}>
-                    <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Acoes da mensagem" aria-expanded={isMenuOpen}>v</button>
+                    <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Ações da mensagem" aria-expanded={isMenuOpen}>v</button>
                     {isMenuOpen ? (
                       <div className={`bubble-menu attach-menu ${openMessageMenuDirection === "up" ? "open-upward" : ""}`}>
                         <button type="button" className="attach-option" onClick={() => { startReplyToMessage(message); setOpenMessageMenuId(null); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><span>Responder</span></button>
@@ -1501,7 +1501,7 @@ function ChatPanel() {
         </div>
 
         {quickSuggestions.length > 0 && (
-          <div className="quick-suggestions" role="listbox" aria-label="Mensagens rapidas" ref={quickListRef}>{quickSuggestions.map((qm, idx) => (
+          <div className="quick-suggestions" role="listbox" aria-label="Mensagens rápidas" ref={quickListRef}>{quickSuggestions.map((qm, idx) => (
             <button key={idx} type="button" role="option" aria-selected={idx === quickSelectedIndex} className={idx === quickSelectedIndex ? "quick-suggestion-item is-selected" : "quick-suggestion-item"} onClick={() => applyQuickMessage(qm)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
               <strong>{qm.shortcut.startsWith("/") ? qm.shortcut : `/${qm.shortcut}`}</strong>
               {qm.title ? <span className="qs-title">{qm.title}</span> : null}
@@ -1513,14 +1513,14 @@ function ChatPanel() {
         {channelInactive ? (
           <div className="composer" style={{ padding: "0.8rem 1rem" }}>
             <div className="sub" style={{ textAlign: "center", width: "100%" }}>{selectedThread?.is_backup
-              ? "📦 Conversa de backup (historico) — somente leitura. Transfira para um operador para atender quando o cliente voltar."
-              : "⚠ Canal removido/antigo — somente leitura. Nao e possivel enviar por este atendimento."}</div>
+              ? "📦 Conversa de backup (histórico) — somente leitura. Transfira para um operador para atender quando o cliente voltar."
+              : "⚠ Canal removido/antigo — somente leitura. Não é possível enviar por este atendimento."}</div>
           </div>
         ) : isTakeoverPending ? (
           <div className="composer" style={{ padding: "0.8rem 1rem", flexDirection: "column", gap: "0.5rem" }}>
             {showTakeoverPrompt ? (
               <>
-                <span className="sub" style={{ width: "100%" }}>Mensagem ao cliente (opcional, editavel):</span>
+                <span className="sub" style={{ width: "100%" }}>Mensagem ao cliente (opcional, editável):</span>
                 <textarea value={greetDraft} onChange={(e) => setGreetDraft(e.target.value)} rows={3} style={{ width: "100%", resize: "vertical" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
                 <div style={{ display: "flex", gap: "0.5rem", width: "100%", flexWrap: "wrap" }}>
                   <button type="button" className="primary" style={{ flex: 1 }} disabled={readOnly || (busyTakeover)} onClick={() => void confirmTakeover(true)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTakeover ? "..." : "Assumir e enviar"}</button>
@@ -1537,7 +1537,7 @@ function ChatPanel() {
           </div>
         ) : noInboundWindow ? (
           <div className="composer" style={{ padding: "0.8rem 1rem" }}>
-            <div className="sub" style={{ textAlign: "center", width: "100%" }}>Janela de 24h indisponivel. Use o menu de templates para iniciar a conversa.</div>
+            <div className="sub" style={{ textAlign: "center", width: "100%" }}>Janela de 24h indisponível. Use o menu de templates para iniciar a conversa.</div>
           </div>
         ) : (
         <form className="composer" onSubmit={submitText}>
@@ -1548,7 +1548,7 @@ function ChatPanel() {
                 <p style={{ margin: "0.2rem 0 0", fontSize: "0.85rem" }}>{(correctionTarget.content || "").slice(0, 100)}</p>
                 <span className="sub">Envia uma nova mensagem como resposta à original.</span>
               </div>
-              <button type="button" className="reply-preview-close" onClick={cancelCorrection} disabled={busySend} aria-label="Cancelar correcao">x</button>
+              <button type="button" className="reply-preview-close" onClick={cancelCorrection} disabled={busySend} aria-label="Cancelar correção">x</button>
             </div>
           ) : replyTarget ? (
             <div className="composer-reply-preview">
@@ -1560,7 +1560,7 @@ function ChatPanel() {
             <div className="composer-menu" ref={attachMenuRef}>
               <button type="button" className="composer-icon attach-trigger" onClick={toggleAttachMenu} disabled={readOnly || (!selectedContact || busySend || busyUpload || busyAudio || Boolean(correctionTarget))} aria-label="Abrir menu de anexos" title={readOnly ? READ_ONLY_TOOLTIP : undefined}><PlusIcon /></button>
               {ctx.can("enviar_nota_interna") ? (
-                <button type="button" className="composer-icon" disabled={readOnly || (busySend || Boolean(correctionTarget))} onClick={() => setInternalMode(!internalMode)} title={readOnly ? READ_ONLY_TOOLTIP : (internalMode ? "Modo interno ATIVO — cliente nao recebe" : "Nota interna (sussurro ao operador)")} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
+                <button type="button" className="composer-icon" disabled={readOnly || (busySend || Boolean(correctionTarget))} onClick={() => setInternalMode(!internalMode)} title={readOnly ? READ_ONLY_TOOLTIP : (internalMode ? "Modo interno ATIVO — cliente não recebe" : "Nota interna (sussurro ao operador)")} aria-pressed={internalMode} style={internalMode ? { background: "#facc15" } : undefined}><img src={sussurroIcon} alt="" style={{ width: 22, height: 22, display: "block" }} /></button>
               ) : null}
               {showAttachMenu ? (
                 <div className="attach-menu">
@@ -1575,9 +1575,9 @@ function ChatPanel() {
               <input ref={documentInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void submitFile(f, "Documento"); }} hidden title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             </div>
             <div className="composer-field">
-              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando audio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={correctionTarget ? "Digite o texto corrigido" : internalMode ? "Nota interna — o cliente nao ve" : "Digite uma mensagem"} title={readOnly ? READ_ONLY_TOOLTIP : ("Ctrl+B negrito | Ctrl+I italico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespacado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia")} disabled={readOnly || (busySend || busyAudio)} style={internalMode ? { background: "#fef9c3" } : undefined} />}
+              {recording ? <div className="recording-status"><span className="recording-dot" /><span>Gravando áudio</span><strong>{formatRecordingTime(recordingSeconds)}</strong><button type="button" className="recording-cancel" onClick={discardRecording}>Cancelar</button></div> : <textarea ref={composerInputRef} value={draft} onChange={handleDraftChange} onKeyDown={handleDraftKeyDown} rows={1} placeholder={correctionTarget ? "Digite o texto corrigido" : internalMode ? "Nota interna — o cliente não vê" : "Digite uma mensagem"} title={readOnly ? READ_ONLY_TOOLTIP : ("Ctrl+B negrito | Ctrl+I itálico | Ctrl+Shift+X riscado | Ctrl+Shift+M monoespaçado | /atalho: setas navegam, Enter ou Tab completa no campo, Enter de novo envia")} disabled={readOnly || (busySend || busyAudio)} style={internalMode ? { background: "#fef9c3" } : undefined} />}
             </div>
-            <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={readOnly || (!selectedContact || busyUpload || busyComposerAction || (Boolean(correctionTarget) && !hasDraft))} aria-label={correctionTarget ? "Enviar correção" : recording ? "Enviar audio gravado" : hasDraft ? "Enviar mensagem" : "Gravar audio"} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
+            <button type="button" className={`composer-icon mic-trigger ${recording ? "recording" : ""} ${hasDraft && !recording ? "send-ready" : ""}`} onClick={handlePrimaryAction} disabled={readOnly || (!selectedContact || busyUpload || busyComposerAction || (Boolean(correctionTarget) && !hasDraft))} aria-label={correctionTarget ? "Enviar correção" : recording ? "Enviar áudio gravado" : hasDraft ? "Enviar mensagem" : "Gravar áudio"} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
               {busyComposerAction ? <span className="button-spinner" aria-hidden="true" /> : correctionTarget || recording || hasDraft ? <SendIcon /> : <MicIcon />}
             </button>
           </div>
@@ -1630,14 +1630,14 @@ function CloseAttendanceModal({ contact, threadId, onClose }: { contact: Contact
       <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
         <h2 style={{ margin: "0 0 0.6rem" }}>Encerrar atendimento</h2>
         {error ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{error}</span></div> : null}
-        <p className="sub" style={{ marginBottom: "0.8rem" }}>Este lead ainda esta como <strong>{currentLabel}</strong>. Qualifique o desfecho antes de encerrar.</p>
+        <p className="sub" style={{ marginBottom: "0.8rem" }}>Este lead ainda está como <strong>{currentLabel}</strong>. Qualifique o desfecho antes de encerrar.</p>
         <label className="sub" style={{ display: "block", marginBottom: "0.3rem" }}>Desfecho *</label>
         <select value={outcome} onChange={(e) => setOutcome(e.target.value)} style={{ width: "100%" }} autoFocus title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
           <option value="">Selecione...</option>
           <option value="convertido">Convertido</option>
-          <option value="nao_convertido">Nao convertido</option>
+          <option value="nao_convertido">Não convertido</option>
           <option value="qualificado">Qualificado</option>
-          <option value="nao_qualificado">Nao qualificado</option>
+          <option value="nao_qualificado">Não qualificado</option>
         </select>
         <label className="sub" style={{ display: "block", margin: "0.8rem 0 0.3rem" }}>Tags</label>
         <TagDraftEditor draft={tags} onChange={setTags} meta={tagMeta} listId="tag-suggestions-close" onNewLabel={(slug, label) => setTagLabels((prev) => ({ ...prev, [slug]: label }))} />
@@ -2118,7 +2118,7 @@ function DetailPanel() {
         action: bulkAction,
         to_user_id: bulkAction === "transfer" ? bulkToUser || undefined : undefined,
       });
-      setNotice(`${res.count} contato(s) reatribuido(s)`);
+      setNotice(`${res.count} contato(s) reatribuído(s)`);
       setBulkFromUser("");
       await refreshPollingViews();
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
@@ -2137,7 +2137,7 @@ function DetailPanel() {
 
   return (
     <aside className="panel detail-panel">
-      <div className="panel-head"><div><p className="eyebrow">Contato</p><h2>Operacao</h2></div><span className="sub">{operators.length} operadores - {departments.length} setores</span></div>
+      <div className="panel-head"><div><p className="eyebrow">Contato</p><h2>Operação</h2></div><span className="sub">{operators.length} operadores - {departments.length} setores</span></div>
       <div className="detail-scroll">
         {selectedContact ? <>
           <CommercialContactBanner contact={selectedContact} />
@@ -2156,15 +2156,15 @@ function DetailPanel() {
               carimbo agora so existe com pedido realmente enviado. */}
           {canSeeAll && selectedContact.rating != null ? (
             <div style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
-              <span style={{ fontWeight: 600 }}>Avaliacao:</span>
+              <span style={{ fontWeight: 600 }}>Avaliação:</span>
               <span className="chip" style={{ fontSize: "0.8rem", background: ratingChipColor(selectedContact.rating, selectedContact.rating_label), color: "#fff" }}>
                 {ratingChipText(selectedContact.rating, selectedContact.rating_label)}
               </span>
             </div>
           ) : null}
 
-          <CollapsibleCard title="Qualificacao">
-            <select value={qualification} onChange={(e) => setQualification(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Nao qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Nao convertido</option></select>
+          <CollapsibleCard title="Qualificação">
+            <select value={qualification} onChange={(e) => setQualification(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="novo">Novo</option><option value="em_atendimento">Em atendimento</option><option value="qualificado">Qualificado</option><option value="nao_qualificado">Não qualificado</option><option value="convertido">Convertido</option><option value="nao_convertido">Não convertido</option></select>
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Notas do atendimento" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <button className="primary" onClick={() => void saveQualification()} disabled={readOnly || (busySave)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySave ? "Salvando..." : "Salvar"}</button>
             {can("editar_dono_lead") && selectedContact.assigned_to ? (
@@ -2173,15 +2173,15 @@ function DetailPanel() {
           </CollapsibleCard>
           <ContactTagsCard contact={selectedContact} />
           {can("transferir_atendimento") ? <CollapsibleCard title="Transferir atendimento" defaultOpen={false}>
-            <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move so este atendimento (thread). O Dono do Lead nao muda.</span>
+            <span className="sub" style={{ display: "block", marginBottom: "0.3rem", opacity: 0.75 }}>Move só este atendimento (thread). O Dono do Lead não muda.</span>
             <select value={toUserId} onChange={(e) => setToUserId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Selecione um operador</option>{operators.filter((item) => item.id !== sessionUser!.id).map((item) => <option key={item.id} value={item.id}>{item.display_name} - {item.department_name || "Sem setor"}</option>)}</select>
             <select value={toDepartmentId} onChange={(e) => setToDepartmentId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Manter departamento atual</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-            <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferencia" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-            <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatorio" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <input value={transferReason} onChange={(e) => setTransferReason(e.target.value)} placeholder="Motivo da transferência" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+            <textarea value={transferSummary} onChange={(e) => setTransferSummary(e.target.value)} rows={3} placeholder="Resumo obrigatório" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
             <button className="primary" onClick={() => void transferContact()} disabled={readOnly || (!toUserId || !transferSummary.trim() || busyTransfer)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyTransfer ? "Transferindo..." : "Transferir"}</button>
           </CollapsibleCard> : null}
           {can("editar_dono_lead") ? <ReassignLeadCard /> : null}
-        </> : <div className="empty">As acoes do contato aparecem aqui.</div>}
+        </> : <div className="empty">As ações do contato aparecem aqui.</div>}
 
         {can("ver_painel_conflitos") ? (
           <CollapsibleCard title="Conflitos de atendimento" defaultOpen={false}>
@@ -2192,7 +2192,7 @@ function DetailPanel() {
         {can("buscar_protocolo") ? <ProtocolSearchCard /> : null}
 
         {can("gerenciar_usuarios") || (config?.feature_impersonate && can("ver_como_usuario") && sessionUser?.role === "admin") ? (
-          <CollapsibleCard title={can("gerenciar_perfis_acesso") ? "Usuarios e Roles" : "Operadores"} defaultOpen={false}>
+          <CollapsibleCard title={can("gerenciar_perfis_acesso") ? "Usuários e Roles" : "Operadores"} defaultOpen={false}>
             <div className="admin-user-list">{operators.map((op) => (
               <div key={op.id} className="admin-user-row">
                 <div className="admin-user-info"><strong>{op.display_name}</strong><span className="sub">{op.email || ""}</span></div>
@@ -2200,7 +2200,7 @@ function DetailPanel() {
                   <div className="admin-user-edit">
                     <select value={editRole} onChange={(e) => { setEditRole(e.target.value); setEditPerfilId(""); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="admin">admin</option><option value="supervisor">supervisor</option><option value="operador">operador</option></select>
                     <select value={editPerfilId} onChange={(e) => setEditPerfilId(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : ("Perfil de acesso (RBAC)")} disabled={readOnly}>
-                      <option value="">Perfil padrao do cargo</option>
+                      <option value="">Perfil padrão do cargo</option>
                       {(perfilOptions || []).map((p) => <option key={p.id} value={p.id}>{p.nome}</option>)}
                     </select>
                     <select value={editDeptId} onChange={(e) => setEditDeptId(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}><option value="">Sem setor</option>{departments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>
@@ -2211,11 +2211,11 @@ function DetailPanel() {
                   </div>
                 ) : coexEditingUserId === op.id ? (
                   <div className="admin-user-edit">
-                    <input type="tel" value={coexPhoneInput} onChange={(e) => setCoexPhoneInput(e.target.value)} placeholder="Numero coex (ex: 5531999990000)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-                    <span className="sub" style={{ fontSize: "0.66rem", lineHeight: 1.3 }}>Numero corporativo que o operador vai conectar. Libera o Embedded Signup pra ele.</span>
+                    <input type="tel" value={coexPhoneInput} onChange={(e) => setCoexPhoneInput(e.target.value)} placeholder="Número coex (ex: 5531999990000)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+                    <span className="sub" style={{ fontSize: "0.66rem", lineHeight: 1.3 }}>Número corporativo que o operador vai conectar. Libera o Embedded Signup pra ele.</span>
                     <div style={{ display: "flex", gap: "0.4rem" }}>
                       <button className="primary" style={{ flex: 1, padding: "0.5rem" }} onClick={() => void saveCoex(op.id)} disabled={readOnly || (busyCoexUpdate)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyCoexUpdate ? "..." : "Salvar"}</button>
-                      {op.coex_authorized ? <button className="ghost" style={{ padding: "0.5rem 0.7rem", color: "var(--danger)" }} onClick={() => void revokeCoex(op.id)} disabled={readOnly || (busyCoexUpdate)} title={readOnly ? READ_ONLY_TOOLTIP : ("Revogar autorizacao")}>⊘</button> : null}
+                      {op.coex_authorized ? <button className="ghost" style={{ padding: "0.5rem 0.7rem", color: "var(--danger)" }} onClick={() => void revokeCoex(op.id)} disabled={readOnly || (busyCoexUpdate)} title={readOnly ? READ_ONLY_TOOLTIP : ("Revogar autorização")}>⊘</button> : null}
                       <button className="ghost" style={{ padding: "0.5rem 0.7rem" }} onClick={() => cancelEditCoex()}>✕</button>
                     </div>
                   </div>
@@ -2235,7 +2235,7 @@ function DetailPanel() {
         ) : null}
 
         {can("editar_dono_lead") ? (
-          <CollapsibleCard title="Reatribuicao em lote" defaultOpen={false}>
+          <CollapsibleCard title="Reatribuição em lote" defaultOpen={false}>
             <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Reatribuir todos os contatos de um operador:</span>
             <select value={bulkFromUser} onChange={(e) => setBulkFromUser(e.target.value ? Number(e.target.value) : "")} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
               <option value="">Selecione operador de origem</option>
@@ -2251,7 +2251,7 @@ function DetailPanel() {
                 {operators.filter((op) => op.id !== bulkFromUser).map((op) => <option key={op.id} value={op.id}>{op.display_name}</option>)}
               </select>
             ) : null}
-            <button className="primary" style={{ marginTop: "0.4rem" }} disabled={readOnly || (!bulkFromUser || (bulkAction === "transfer" && !bulkToUser) || busyBulk)} onClick={() => { if (confirm("Reatribuir TODOS os contatos deste operador?")) void executeBulkReassign(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyBulk ? "Processando..." : "Executar reatribuicao"}</button>
+            <button className="primary" style={{ marginTop: "0.4rem" }} disabled={readOnly || (!bulkFromUser || (bulkAction === "transfer" && !bulkToUser) || busyBulk)} onClick={() => { if (confirm("Reatribuir TODOS os contatos deste operador?")) void executeBulkReassign(); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyBulk ? "Processando..." : "Executar reatribuição"}</button>
           </CollapsibleCard>
         ) : null}
       </div>
@@ -2409,11 +2409,11 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
           // generico, que nao distingue "desistiu" de "quebrou na etapa X".
           const d = diagRef.current;
           if (d?.error_message) {
-            setErrorMsg(d.error_code ? `${d.error_message} (codigo ${d.error_code})` : d.error_message);
+            setErrorMsg(d.error_code ? `${d.error_message} (código ${d.error_code})` : d.error_message);
           } else if (d?.current_step) {
             setErrorMsg(`Fluxo interrompido na etapa ${d.current_step}.`);
           } else {
-            setErrorMsg("Signup cancelado ou nenhum codigo retornado.");
+            setErrorMsg("Signup cancelado ou nenhum código retornado.");
           }
           setStep("error");
           return;
@@ -2441,12 +2441,12 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
   }, [signupConfig, bundle, channelType, isStandard, canPickOwner, ownerChoice]);
 
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label={isStandard ? "Conectar numero (Cloud API)" : "WhatsApp Coexistence"} onClick={() => setShowSettings(false)}>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label={isStandard ? "Conectar número (Cloud API)" : "WhatsApp Coexistence"} onClick={() => setShowSettings(false)}>
       <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 600 }}>
-        <h2 style={{ margin: "0 0 1.2rem" }}>{isStandard ? "Conectar numero oficial (Cloud API)" : "WhatsApp Coexistence"}</h2>
+        <h2 style={{ margin: "0 0 1.2rem" }}>{isStandard ? "Conectar número oficial (Cloud API)" : "WhatsApp Coexistence"}</h2>
 
-        {step === "loading" && <p>Carregando configuracao...</p>}
+        {step === "loading" && <p>Carregando configuração...</p>}
 
         {step === "error" && (
           <div className="settings-section">
@@ -2455,20 +2455,20 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             </div>
             {diag && (diag.event || diag.current_step || diag.error_code || diag.session_id) && (
               <div style={{ marginTop: "0.8rem" }}>
-                <strong style={{ fontSize: "0.85rem" }}>Diagnostico do popup da Meta</strong>
+                <strong style={{ fontSize: "0.85rem" }}>Diagnóstico do popup da Meta</strong>
                 <pre style={{ background: "#f8fafc", border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.8rem", marginTop: "0.4rem", fontSize: "0.8rem", whiteSpace: "pre-wrap", wordBreak: "break-all", userSelect: "all" }}>
 {[
   diag.event ? `evento......: ${diag.event}` : "",
   diag.current_step ? `etapa.......: ${diag.current_step}` : "",
-  diag.error_code ? `codigo......: ${diag.error_code}` : "",
-  diag.session_id ? `sessao......: ${diag.session_id}` : "",
+  diag.error_code ? `código......: ${diag.error_code}` : "",
+  diag.session_id ? `sessão......: ${diag.session_id}` : "",
   diag.timestamp ? `timestamp...: ${diag.timestamp}` : "",
   sessionInfoRef.current.waba_id ? `waba_id.....: ${sessionInfoRef.current.waba_id}` : "",
   sessionInfoRef.current.phone_number_id ? `phone_id....: ${sessionInfoRef.current.phone_number_id}` : "",
 ].filter(Boolean).join("\n")}
                 </pre>
                 <p style={{ fontSize: "0.78rem", color: "var(--muted, #64748b)", margin: 0 }}>
-                  Copie este bloco ao pedir suporte — a Meta identifica a tentativa pelo id de sessao.
+                  Copie este bloco ao pedir suporte — a Meta identifica a tentativa pelo id de sessão.
                 </p>
               </div>
             )}
@@ -2481,31 +2481,31 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             {isStandard ? (
               <>
                 <p style={{ marginBottom: "1rem", lineHeight: 1.6 }}>
-                  Conecte (ou migre) o numero oficial da empresa para a <strong>Cloud API</strong> como canal padrao.
-                  O numero <strong>sai do app do WhatsApp Business</strong> e passa a ser gerenciado 100% pelo CRM.
-                  Faca login no popup com a conta que administra a WABA.
+                  Conecte (ou migre) o número oficial da empresa para a <strong>Cloud API</strong> como canal padrão.
+                  O número <strong>sai do app do WhatsApp Business</strong> e passa a ser gerenciado 100% pelo CRM.
+                  Faça login no popup com a conta que administra a WABA.
                 </p>
                 <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginBottom: "1rem", fontSize: "0.9rem" }}>
                   <strong>Requisitos:</strong>
                   <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
-                    <li>Forma de pagamento ativa na WABA (linha de credito ou cartao)</li>
-                    <li>Voce define o PIN de 6 digitos no popup (verificacao em 2 etapas)</li>
-                    <li>O app do WhatsApp Business desconecta deste numero</li>
+                    <li>Forma de pagamento ativa na WABA (linha de crédito ou cartão)</li>
+                    <li>Você define o PIN de 6 dígitos no popup (verificação em 2 etapas)</li>
+                    <li>O app do WhatsApp Business desconecta deste número</li>
                   </ul>
                 </div>
               </>
             ) : (
               <>
                 <p style={{ marginBottom: "1rem", lineHeight: 1.6 }}>
-                  Conecte um numero do WhatsApp Business App ao CRM via Coexistence.
-                  O administrador do portfolio <strong>cliente</strong> deve fazer login no popup do Facebook.
+                  Conecte um número do WhatsApp Business App ao CRM via Coexistence.
+                  O administrador do portfólio <strong>cliente</strong> deve fazer login no popup do Facebook.
                 </p>
                 <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginBottom: "1rem", fontSize: "0.9rem" }}>
                   <strong>Requisitos:</strong>
                   <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
-                    <li>Numero ativo no WhatsApp Business App (Android/iOS)</li>
-                    <li>App versao 2.24.17 ou superior</li>
-                    <li>Portfolio do cliente verificado no Meta Business Manager</li>
+                    <li>Número ativo no WhatsApp Business App (Android/iOS)</li>
+                    <li>App versão 2.24.17 ou superior</li>
+                    <li>Portfólio do cliente verificado no Meta Business Manager</li>
                     <li>Camera do celular pronta para escanear QR Code</li>
                   </ul>
                 </div>
@@ -2513,33 +2513,33 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             )}
             {canPickOwner && (
               <div style={{ marginBottom: "1rem" }}>
-                <label htmlFor="coex-owner" style={{ display: "block", fontWeight: 600, marginBottom: "0.35rem" }}>De quem e o numero que sera conectado?</label>
+                <label htmlFor="coex-owner" style={{ display: "block", fontWeight: 600, marginBottom: "0.35rem" }}>De quem é o número que será conectado?</label>
                 <select id="coex-owner" value={ownerChoice} onChange={(e) => setOwnerChoice(e.target.value)} style={{ width: "100%" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
-                  <option value="">Selecione o operador dono do numero...</option>
+                  <option value="">Selecione o operador dono do número...</option>
                   {coexOwnerOptions.map((op) => (
                     <option key={op.id} value={String(op.id)} disabled={!op.firebase_uid}>
-                      {op.display_name}{op.coex_phone ? ` (final ${op.coex_phone.slice(-4)})` : ""}{op.firebase_uid ? "" : " - ainda nao entrou no CRM"}
+                      {op.display_name}{op.coex_phone ? ` (final ${op.coex_phone.slice(-4)})` : ""}{op.firebase_uid ? "" : " - ainda não entrou no CRM"}
                     </option>
                   ))}
                   <option value="self" disabled={!selfCoexPhone}>
-                    {selfCoexPhone ? `Eu mesmo(a) - meu numero (final ${selfCoexPhone.slice(-4)})` : "Eu mesmo(a) - autorize antes seu numero em Usuarios > Coex"}
+                    {selfCoexPhone ? `Eu mesmo(a) - meu número (final ${selfCoexPhone.slice(-4)})` : "Eu mesmo(a) - autorize antes seu número em Usuários > Coex"}
                   </option>
                 </select>
                 <p className="sub" style={{ fontSize: "0.78rem", margin: "0.35rem 0 0" }}>
-                  O canal e as conversas do celular (historico e agenda) vao para o dono escolhido. O numero escaneado tem que ser o autorizado para ele em Usuarios &gt; Coex.
+                  O canal e as conversas do celular (histórico e agenda) vão para o dono escolhido. O número escaneado tem que ser o autorizado para ele em Usuários &gt; Coex.
                 </p>
               </div>
             )}
             <button className="primary" style={{ fontSize: "1rem", padding: "0.75rem 1.5rem" }} onClick={launchSignup} disabled={readOnly || (canPickOwner && !ownerChoice)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>
-              {isStandard ? "Conectar numero (Cloud API)" : "Iniciar Embedded Signup"}
+              {isStandard ? "Conectar número (Cloud API)" : "Iniciar Embedded Signup"}
             </button>
           </div>
         )}
 
         {step === "signing" && (
           <div className="settings-section" style={{ textAlign: "center" }}>
-            <p>Aguardando conclusao do signup no popup do Facebook...</p>
-            <p style={{ fontSize: "0.85rem", color: "#666" }}>Complete o fluxo no popup: login, selecao do WABA, e escaneamento do QR Code no celular.</p>
+            <p>Aguardando conclusão do signup no popup do Facebook...</p>
+            <p style={{ fontSize: "0.85rem", color: "#666" }}>Complete o fluxo no popup: login, seleção do WABA, e escaneamento do QR Code no celular.</p>
           </div>
         )}
 
@@ -2552,7 +2552,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
         {step === "done" && result && (
           <div className="settings-section">
             <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: "1rem", marginBottom: "1rem" }}>
-              <strong>Conexao realizada com sucesso!</strong>
+              <strong>Conexão realizada com sucesso!</strong>
             </div>
             <table style={{ width: "100%", fontSize: "0.9rem", borderCollapse: "collapse" }}>
               <tbody>
@@ -2560,7 +2560,7 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
                   ...(isStandard ? [] : [["Operador dono", result.owner_display_name]]),
                   ["WABA ID", result.waba_id],
                   ["Phone Number ID", result.phone_number_id],
-                  ["Numero", result.display_phone_number],
+                  ["Número", result.display_phone_number],
                   ["Nome Verificado", result.verified_name],
                   ["Status", result.phone_status],
                   ["Plataforma", result.platform_type],
@@ -2576,12 +2576,12 @@ function WhatsAppSignupModal({ channelType = "coexistence" }: { channelType?: "c
             </table>
             {isStandard ? (
               <div style={{ background: "#eff6ff", border: "1px solid #93c5fd", borderRadius: 8, padding: "1rem", marginTop: "1rem", fontSize: "0.85rem" }}>
-                <strong>Pronto.</strong> Canal standard criado. O envio usa o <strong>token do proprio canal</strong>.
-                <br />NAO defina <code>WHATSAPP_TOKEN</code>/<code>WHATSAPP_PHONE_NUMBER_ID</code> no Cloud Run — deixe vazios para suportar mais de uma empresa (multi-tenant).
+                <strong>Pronto.</strong> Canal standard criado. O envio usa o <strong>token do próprio canal</strong>.
+                <br />NÃO defina <code>WHATSAPP_TOKEN</code>/<code>WHATSAPP_PHONE_NUMBER_ID</code> no Cloud Run — deixe vazios para suportar mais de uma empresa (multi-tenant).
               </div>
             ) : (
               <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "1rem", marginTop: "1rem", fontSize: "0.85rem" }}>
-                <strong>Proximo passo:</strong> Atualize o <code>.env</code> do servidor com os novos valores:
+                <strong>Próximo passo:</strong> Atualize o <code>.env</code> do servidor com os novos valores:
                 <pre style={{ margin: "0.5rem 0 0", whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
 {`WHATSAPP_TOKEN=${result.access_token || "???"}
 WHATSAPP_PHONE_NUMBER_ID=${result.phone_number_id || "???"}
@@ -2603,7 +2603,7 @@ function SettingsModals() {
   return (
     <>
       {showSettings === "chat" ? (
-        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Configuracoes do Chat" onClick={() => setShowSettings(false)}>
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Configurações do Chat" onClick={() => setShowSettings(false)}>
           <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
           <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
             <h2 style={{ margin: "0 0 1.2rem" }}>Chat</h2>
@@ -2612,9 +2612,9 @@ function SettingsModals() {
               {systemSettings.chat_prefix_roles.includes(sessionUser.role) ? (
                 <div className="settings-block">
                   <label className="settings-toggle"><input type="checkbox" checked={userSettings.chat_prefix_enabled} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>Usar prefixo (ex: <strong>Rafael:</strong> Bom dia...)</span></label>
-                  {userSettings.chat_prefix_enabled && <input value={userSettings.chat_prefix_name} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_name: e.target.value }))} placeholder="Nome que aparecera como prefixo" style={{ marginTop: "0.5rem" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />}
+                  {userSettings.chat_prefix_enabled && <input value={userSettings.chat_prefix_name} onChange={(e) => setUserSettings((prev) => ({ ...prev, chat_prefix_name: e.target.value }))} placeholder="Nome que aparecerá como prefixo" style={{ marginTop: "0.5rem" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />}
                 </div>
-              ) : <div className="empty" style={{ fontSize: "0.88rem" }}>Prefixo de mensagem nao habilitado para seu cargo.</div>}
+              ) : <div className="empty" style={{ fontSize: "0.88rem" }}>Prefixo de mensagem não habilitado para seu cargo.</div>}
               <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => void saveUserSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar"}</button>
             </div>
           </div>
@@ -2622,17 +2622,17 @@ function SettingsModals() {
       ) : null}
 
       {showSettings === "quick" ? (
-        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Mensagens rapidas" onClick={() => setShowSettings(false)}>
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Mensagens rápidas" onClick={() => setShowSettings(false)}>
           <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
           <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ margin: "0 0 1.2rem" }}>Mensagens rapidas</h2>
+            <h2 style={{ margin: "0 0 1.2rem" }}>Mensagens rápidas</h2>
             <div className="settings-section">
-              <h3>Minhas mensagens rapidas</h3>
+              <h3>Minhas mensagens rápidas</h3>
               <div className="settings-block">
                 <QuickMessagesEditor
                   items={userSettings.quick_messages}
                   onChange={(items) => setUserSettings((prev) => ({ ...prev, quick_messages: items }))}
-                  addLabel="+ Adicionar mensagem rapida"
+                  addLabel="+ Adicionar mensagem rápida"
                   max={systemSettings.quick_message_max}
                 />
               </div>
@@ -2704,14 +2704,14 @@ function TagsSettingsModal() {
         {can("gerenciar_tags_globais") ? (
           <div className="settings-section">
             <h3>Tags globais do tenant</h3>
-            <p className="sub" style={{ marginBottom: "0.6rem" }}>Aparecem no autocomplete de toda a equipe. Mantenha o vocabulario oficial aqui (ex.: varizes, hemorroidas, convenio, retorno).</p>
+            <p className="sub" style={{ marginBottom: "0.6rem" }}>Aparecem no autocomplete de toda a equipe. Mantenha o vocabulário oficial aqui (ex.: varizes, hemorroidas, convênio, retorno).</p>
             <TagEditorRows tags={globalDraft} onChange={(next) => { globalDirty.current = true; setGlobalDraft(next); }} />
             <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveGlobalTags(globalDraft)) globalDirty.current = false; })(); }} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar tags globais"}</button>
           </div>
         ) : null}
         <div className="settings-section" style={{ marginTop: can("gerenciar_tags_globais") ? "1.2rem" : 0 }}>
           <h3>Minhas tags</h3>
-          <p className="sub" style={{ marginBottom: "0.6rem" }}>Criadas automaticamente quando voce aplica uma tag nova num lead. So aparecem no seu autocomplete.</p>
+          <p className="sub" style={{ marginBottom: "0.6rem" }}>Criadas automaticamente quando você aplica uma tag nova num lead. Só aparecem no seu autocomplete.</p>
           <TagEditorRows tags={personalDraft} onChange={(next) => { personalDirty.current = true; setPersonalDraft(next); }} />
           <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { void (async () => { if (await saveUserTags(personalDraft)) personalDirty.current = false; })(); }} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar minhas tags"}</button>
         </div>
@@ -2748,31 +2748,31 @@ type ReopenBatchDoc = {
 const REOPEN_SKIP_LABELS: Record<string, string> = {
   janela_aberta: "Conversa recente (janela de 24h ainda aberta)",
   janela_desconhecida: "Sem registro de mensagem do cliente",
-  cooldown: "Retomada enviada ha pouco (aguardando cooldown)",
-  opt_out: "Cliente pediu para nao ser reaberto",
-  ja_resolvido: "Ja encerrado por lote anterior (sem resposta)",
+  cooldown: "Retomada enviada há pouco (aguardando cooldown)",
+  opt_out: "Cliente pediu para não ser reaberto",
+  ja_resolvido: "Já encerrado por lote anterior (sem resposta)",
   lgpd_revogado: "Consentimento LGPD revogado",
-  commercial_contact_blocked: "Pediu para nao receber contatos comerciais",
+  commercial_contact_blocked: "Pediu para não receber contatos comerciais",
   arquivado: "Lead arquivado",
   backup: "Lead da Caixa Backup",
   canal_invalido: "Canal inativo ou coexistence",
   sem_template: "Canal sem template de retomada aprovado",
   // Reabertura por publico (plano v2.2, secao 5)
   consentimento_ausente: "Sem aceite LGPD (aviso pendente ou recusado)",
-  politica_desatualizada: "Aceite LGPD anterior a politica vigente",
-  fase_bot: "Lead com a assistente virtual (publico Bot)",
-  atendimento_humano: "Lead com a equipe (publico Recepcao)",
+  politica_desatualizada: "Aceite LGPD anterior a política vigente",
+  fase_bot: "Lead com a assistente virtual (público Bot)",
+  atendimento_humano: "Lead com a equipe (público Recepção)",
   aguardando_bot: "Aguardando o bot (empresa sem assistente com fase de conversa)",
   sem_thread_standard: "Sem conversa em canal standard ativo",
-  mais_antigo_que_limite: "Lead novo (pos-handoff) parado alem do limite de dias",
-  teto_contato: "Limite de retomadas por contato no periodo atingido",
-  teto_diario: "Teto diario de reaberturas atingido",
-  desfecho_bot: "Ja teve desfecho com a assistente virtual (agendou ou recebeu o link)",
-  bot_indisponivel: "Publico Bot indisponivel",
-  estado_alterado: "Mudou de situacao entre a previa e o envio",
-  tentativa_outro_publico: "Retomada pendente do outro publico",
+  mais_antigo_que_limite: "Lead novo (pós-handoff) parado além do limite de dias",
+  teto_contato: "Limite de retomadas por contato no período atingido",
+  teto_diario: "Teto diário de reaberturas atingido",
+  desfecho_bot: "Já teve desfecho com a assistente virtual (agendou ou recebeu o link)",
+  bot_indisponivel: "Público Bot indisponível",
+  estado_alterado: "Mudou de situação entre a prévia e o envio",
+  tentativa_outro_publico: "Retomada pendente do outro público",
   atendimento_pos_retomada: "Atendido pela equipe depois da retomada",
-  limite_varredura: "Alem do limite de leads avaliados por previa",
+  limite_varredura: "Além do limite de leads avaliados por prévia",
 };
 
 function ReopenBatchModal() {
@@ -2847,13 +2847,13 @@ function ReopenBatchModal() {
         <h2 style={{ margin: "0 0 0.4rem" }}>Reabertura em lote</h2>
         <p className="sub" style={{ marginBottom: "1rem" }}>
           Envia o template de retomada aos leads <strong>em atendimento</strong> frios (fora da janela de 24h).
-          Quem ja recebeu retomada e nunca respondeu e <strong>encerrado automaticamente</strong>, sem novo envio.
+          Quem já recebeu retomada e nunca respondeu é <strong>encerrado automaticamente</strong>, sem novo envio.
         </p>
         {localError ? <div className="alert danger" style={{ marginBottom: "0.6rem" }}><span>{localError}</span></div> : null}
 
         {batchId !== null ? (
           <div className="settings-section">
-            <h3>{running ? "Executando..." : batch?.status === "abortado" ? "Lote abortado" : batch?.status === "interrompido" ? "Lote interrompido (sem progresso)" : "Lote concluido"}</h3>
+            <h3>{running ? "Executando..." : batch?.status === "abortado" ? "Lote abortado" : batch?.status === "interrompido" ? "Lote interrompido (sem progresso)" : "Lote concluído"}</h3>
             <div className="settings-block" style={{ fontSize: "0.9rem", lineHeight: 1.8 }}>
               <div>Enviados: <strong>{batch?.enviados ?? 0}</strong> de {batch?.planejados ?? "?"}</div>
               <div>Encerrados sem resposta (auto-resolve): <strong>{batch?.resolvidos ?? 0}</strong> de {batch?.auto_resolve_planejados ?? "?"}</div>
@@ -2862,24 +2862,24 @@ function ReopenBatchModal() {
               {running ? <div className="sub">O progresso atualiza a cada ~10 envios. Pode fechar esta janela — o lote continua no servidor.</div> : null}
             </div>
             {!running ? (
-              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { setBatchId(null); setBatch(null); void loadPreview(); }}>Nova previa</button>
+              <button className="primary" style={{ marginTop: "0.8rem" }} onClick={() => { setBatchId(null); setBatch(null); void loadPreview(); }}>Nova prévia</button>
             ) : null}
           </div>
         ) : (
           <>
             <div className="settings-section">
-              <h3>Previa {busyPreview ? "(atualizando...)" : ""}</h3>
+              <h3>Prévia {busyPreview ? "(atualizando...)" : ""}</h3>
               {preview ? (
                 <div className="settings-block" style={{ fontSize: "0.9rem", lineHeight: 1.8 }}>
-                  <div>Receberao a retomada: <strong>{preview.enviaveis}</strong></div>
-                  <div>Serao encerrados sem novo envio (ja tentado, sem resposta): <strong>{preview.auto_resolve}</strong></div>
+                  <div>Receberão a retomada: <strong>{preview.enviaveis}</strong></div>
+                  <div>Serão encerrados sem novo envio (já tentado, sem resposta): <strong>{preview.auto_resolve}</strong></div>
                   {preview.por_setor.length ? (
                     <div style={{ marginTop: "0.4rem" }}>
                       <div style={{ fontWeight: 600 }}>Setor de destino das respostas:</div>
                       {preview.por_setor.map((s) => (
                         <div key={String(s.department_id)} style={{ paddingLeft: "0.8rem" }}>{s.department_name}: <strong>{s.count}</strong></div>
                       ))}
-                      <div className="sub" style={{ paddingLeft: "0.8rem" }}>A distribuicao considera todos os elegiveis; o limite de envios corta a lista na ordem da varredura.</div>
+                      <div className="sub" style={{ paddingLeft: "0.8rem" }}>A distribuição considera todos os elegíveis; o limite de envios corta a lista na ordem da varredura.</div>
                     </div>
                   ) : null}
                   {skips.length ? (
@@ -2901,8 +2901,8 @@ function ReopenBatchModal() {
                     </div>
                   ) : null}
                 </div>
-              ) : <div className="sub">{busyPreview ? "Carregando previa..." : "Previa indisponivel."}</div>}
-              <button className="ghost" style={{ marginTop: "0.6rem", fontSize: "0.85rem", padding: "0.4rem 0.8rem" }} onClick={() => void loadPreview()} disabled={busyPreview}>Atualizar previa</button>
+              ) : <div className="sub">{busyPreview ? "Carregando prévia..." : "Prévia indisponível."}</div>}
+              <button className="ghost" style={{ marginTop: "0.6rem", fontSize: "0.85rem", padding: "0.4rem 0.8rem" }} onClick={() => void loadPreview()} disabled={busyPreview}>Atualizar prévia</button>
             </div>
 
             {canManage && preview && (preview.enviaveis > 0 || preview.auto_resolve > 0) ? (
@@ -2915,9 +2915,9 @@ function ReopenBatchModal() {
                 {confirming ? (
                   <div className="settings-block" style={{ fontSize: "0.9rem" }}>
                     <p style={{ margin: "0 0 0.6rem" }}>
-                      Confirmar: enviar retomada a ate <strong>{Math.min(preview.enviaveis, Math.max(1, Math.min(parseInt(maxSends, 10) || preview.max_sends_default, 250)))}</strong> leads
+                      Confirmar: enviar retomada a até <strong>{Math.min(preview.enviaveis, Math.max(1, Math.min(parseInt(maxSends, 10) || preview.max_sends_default, 250)))}</strong> leads
                       {preview.auto_resolve > 0 ? <> e encerrar <strong>{preview.auto_resolve}</strong> sem resposta</> : null}?
-                      Templates fora da janela sao <strong>conversas pagas</strong> na Meta.
+                      Templates fora da janela são <strong>conversas pagas</strong> na Meta.
                     </p>
                     <div style={{ display: "flex", gap: "0.6rem" }}>
                       <button className="primary" onClick={() => void executeBatch()} disabled={readOnly || (busyExec)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busyExec ? "Disparando..." : "Confirmar disparo"}</button>
@@ -3035,7 +3035,7 @@ function PerfisAcessoModal() {
           .map((item) => [item.chave, draftToggles[item.chave] === true]),
       );
       await putJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`, { nome: draftNome, descricao: draftDescricao, toggles });
-      setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em ate 1 minuto.`);
+      setNotice(`Perfil "${draftNome}" salvo. Operadores logados refletem em até 1 minuto.`);
       await load(selected.id);
     } catch (e: unknown) { setError(errorText(e)); }
     setBusy(false);
@@ -3056,11 +3056,11 @@ function PerfisAcessoModal() {
 
   async function removePerfil() {
     if (!bundle || !selected) return;
-    if (!confirm(`Excluir o perfil "${selected.nome}"? Usuarios ativos com este perfil bloqueiam a exclusao.`)) return;
+    if (!confirm(`Excluir o perfil "${selected.nome}"? Usuários ativos com este perfil bloqueiam a exclusão.`)) return;
     setBusy(true);
     try {
       await deleteJson(bundle.auth, `/api/admin/perfis-acesso/${selected.id}`);
-      setNotice(`Perfil "${selected.nome}" excluido.`);
+      setNotice(`Perfil "${selected.nome}" excluído.`);
       setSelectedId(null);
       await load();
     } catch (e: unknown) { setError(errorText(e)); }
@@ -3073,8 +3073,8 @@ function PerfisAcessoModal() {
       <div className="settings-modal access-profiles-modal" onClick={(e) => e.stopPropagation()}>
         <h2 style={{ margin: "0 0 0.3rem" }}>Perfis de acesso</h2>
         <p className="sub" style={{ margin: "0 0 0.9rem", fontSize: "0.82rem" }}>
-          Cada usuario segue um perfil. Ajustes valem para todos os usuarios do perfil, sem deploy.
-          O catalogo de permissoes e fixo da plataforma.
+          Cada usuário segue um perfil. Ajustes valem para todos os usuários do perfil, sem deploy.
+          O catálogo de permissões e fixo da plataforma.
         </p>
         <div className="access-profiles-layout">
           {/* Mestre: lista de perfis */}
@@ -3117,10 +3117,10 @@ function PerfisAcessoModal() {
             <div className="access-profiles-editor">
               <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.6rem", flexWrap: "wrap" }}>
                 <input value={draftNome} onChange={(e) => setDraftNome(e.target.value)} disabled={readOnly || (selected.is_system_locked)} style={{ flex: "1 1 180px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} />
-                <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descricao" style={{ flex: "2 1 240px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+                <input value={draftDescricao} onChange={(e) => setDraftDescricao(e.target.value)} placeholder="Descrição" style={{ flex: "2 1 240px" }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               </div>
               {selected.is_system_locked ? (
-                <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: todas as permissoes ficam sempre ligadas (e o teto do tenant — protecao contra auto-bloqueio). Para um perfil administrativo limitado, crie um perfil customizado com base Administrador.</p>
+                <p className="sub" style={{ fontSize: "0.75rem", margin: "0 0 0.6rem" }}>🔒 Perfil de sistema: todas as permissões ficam sempre ligadas (e o teto do tenant — proteção contra auto-bloqueio). Para um perfil administrativo limitado, crie um perfil customizado com base Administrador.</p>
               ) : null}
               {Object.entries(grupos).map(([grupo, itens]) => (
                 <section key={grupo} className="access-profile-group" aria-label={grupo}>
@@ -3242,7 +3242,7 @@ function DashboardBody() {
         {/* Date range */}
         <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "1rem", flexWrap: "wrap" }}>
           <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
-          <span>ate</span>
+          <span>até</span>
           <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
           <button className="primary" style={{ padding: "0.4rem 0.8rem" }} onClick={() => void loadDashboard()} disabled={loading}>{loading ? "..." : "Atualizar"}</button>
           <button className="ghost" style={{ padding: "0.4rem 0.8rem", fontSize: "0.8rem" }} onClick={() => void exportCsv()}>Exportar CSV</button>
@@ -3311,7 +3311,7 @@ function DashboardBody() {
             {/* Ratings table */}
             {ratings.length > 0 && (
               <div className="settings-section">
-                <h3>Avaliacoes de atendimento</h3>
+                <h3>Avaliações de atendimento</h3>
                 <div style={{ overflowX: "auto" }}>
                   <table style={{ width: "100%", fontSize: "0.8rem", borderCollapse: "collapse" }}>
                     <thead><tr style={{ borderBottom: "1px solid var(--border)" }}>
@@ -3450,17 +3450,17 @@ function AdminSettingsModal() {
   }, [bundle, reloadChans, setError, setNotice]);
 
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Administracao" onClick={() => setShowSettings(false)}>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Administração" onClick={() => setShowSettings(false)}>
       <button type="button" className="lightbox-close" onClick={() => setShowSettings(false)} aria-label="Fechar">Fechar</button>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
-        <h2 style={{ margin: "0 0 1rem" }}>Administracao</h2>
+        <h2 style={{ margin: "0 0 1rem" }}>Administração</h2>
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.2rem", borderBottom: "1px solid var(--border)", paddingBottom: "0.5rem" }}>
           <button className={adminTab === "system" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("system")}>Sistema</button>
           <button className={adminTab === "departments" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("departments")}>Departamentos</button>
           <button className={adminTab === "channels" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("channels")}>Canais WhatsApp</button>
-          <button className={adminTab === "notifications" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("notifications")}>Notificacoes</button>
+          <button className={adminTab === "notifications" ? "primary" : "ghost"} style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }} onClick={() => setAdminTab("notifications")}>Notificações</button>
         </div>
 
         {/* Tab: Sistema */}
@@ -3469,7 +3469,7 @@ function AdminSettingsModal() {
             {systemSettings.bot_reminder_available && <BotRemindersSettings />}
             <div className="settings-section">
               <h3>Prefixo de mensagem</h3>
-              <div className="settings-block"><label className="settings-toggle"><input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>Habilitar prefixo de mensagem (padrao do sistema)</span></label></div>
+              <div className="settings-block"><label className="settings-toggle"><input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>Habilitar prefixo de mensagem (padrão do sistema)</span></label></div>
               <div className="settings-block">
                 <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Cargos que podem usar prefixo:</span>
                 {["admin", "supervisor", "operador"].map((role) => (
@@ -3478,14 +3478,14 @@ function AdminSettingsModal() {
               </div>
             </div>
             <div className="settings-section" style={{ marginTop: "1.2rem" }}>
-              <h3>Mensagens rapidas</h3>
+              <h3>Mensagens rápidas</h3>
               <div className="settings-block">
-                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Limite por usuario:</span>
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Limite por usuário:</span>
                 <input type="number" min={1} max={100} value={systemSettings.quick_message_max} onChange={(e) => setSystemSettings((prev) => ({ ...prev, quick_message_max: Math.max(1, Number(e.target.value) || 1) }))} style={{ width: 100 }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               </div>
               <div className="settings-block">
-                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens globais (padrao para todos):</span>
-                <div className="sub qm-hint" style={{ marginBottom: "0.6rem" }}>Valem pra todos os operadores do tenant. O titulo identifica a mensagem aqui e na lista do chat — nao vai pro cliente.</div>
+                <span className="sub" style={{ display: "block", marginBottom: "0.4rem" }}>Mensagens globais (padrão para todos):</span>
+                <div className="sub qm-hint" style={{ marginBottom: "0.6rem" }}>Valem pra todos os operadores do tenant. O título identifica a mensagem aqui e na lista do chat — não vai pro cliente.</div>
                 <QuickMessagesEditor items={systemSettings.quick_messages_global} onChange={(items) => setSystemSettings((prev) => ({ ...prev, quick_messages_global: items }))} addLabel="+ Adicionar mensagem global" />
               </div>
             </div>
@@ -3590,7 +3590,7 @@ function AdminSettingsModal() {
                   })}
                   {(systemSettings.picker_v2_user_ids || []).length > 0 ? (
                     <button type="button" className="ghost" style={{ padding: "0.25rem 0.6rem", fontSize: "0.72rem" }}
-                      title={readOnly ? READ_ONLY_TOOLTIP : ("Zera a lista inteira — inclusive ids de usuarios desativados que nao aparecem como chip")}
+                      title={readOnly ? READ_ONLY_TOOLTIP : ("Zera a lista inteira — inclusive ids de usuários desativados que não aparecem como chip")}
                       onClick={() => setSystemSettings((prev) => ({ ...prev, picker_v2_user_ids: [] }))} disabled={readOnly}>
                       Limpar canário ({(systemSettings.picker_v2_user_ids || []).length})
                     </button>
@@ -3608,7 +3608,7 @@ function AdminSettingsModal() {
             {/* Erro do save (ex.: 400 da politica LGPD) visivel DENTRO do modal — o alerta global fica atras do lightbox. */}
             {error ? <div className="alert danger" role="alert" style={{ marginTop: "1rem" }}><span>{error}</span><button type="button" className="alert-close" onClick={() => setError("")} aria-label="Fechar">&#10005;</button></div> : null}
             {notice ? <div className="alert success" style={{ marginTop: "1rem" }}><span>{notice}</span><button type="button" className="alert-close" onClick={() => setNotice("")} aria-label="Fechar">&#10005;</button></div> : null}
-            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
+            <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar configurações do sistema"}</button>
           </>
         )}
 
@@ -3622,10 +3622,10 @@ function AdminSettingsModal() {
                   {editingDeptId === dept.id ? (
                     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", flex: 1 }}>
                       <input value={editDeptName} onChange={(e) => setEditDeptName(e.target.value)} placeholder="Nome" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-                      <input value={editDeptDesc} onChange={(e) => setEditDeptDesc(e.target.value)} placeholder="Descricao (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-                      <label className="sub" style={{ fontSize: "0.75rem" }}>Setor do bot (roteamento automatico):</label>
+                      <input value={editDeptDesc} onChange={(e) => setEditDeptDesc(e.target.value)} placeholder="Descrição (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+                      <label className="sub" style={{ fontSize: "0.75rem" }}>Setor do bot (roteamento automático):</label>
                       <select value={editDeptBotKey} onChange={(e) => setEditDeptBotKey(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
-                        <option value="">Nenhum (nao recebe do bot)</option>
+                        <option value="">Nenhum (não recebe do bot)</option>
                         <option value="comercial">Comercial</option>
                         <option value="financeiro">Financeiro</option>
                         <option value="administrativo">Administrativo</option>
@@ -3655,7 +3655,7 @@ function AdminSettingsModal() {
             <div style={{ marginTop: "1rem", display: "flex", flexDirection: "column", gap: "0.4rem", borderTop: "1px solid var(--border)", paddingTop: "0.8rem" }}>
               <span className="sub">Novo departamento:</span>
               <input value={newDeptName} onChange={(e) => setNewDeptName(e.target.value)} placeholder="Nome do departamento" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-              <input value={newDeptDesc} onChange={(e) => setNewDeptDesc(e.target.value)} placeholder="Descricao (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
+              <input value={newDeptDesc} onChange={(e) => setNewDeptDesc(e.target.value)} placeholder="Descrição (opcional)" title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
               <select value={newDeptBotKey} onChange={(e) => setNewDeptBotKey(e.target.value)} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>
                 <option value="">Setor do bot: Nenhum</option>
                 <option value="comercial">Setor do bot: Comercial</option>
@@ -3673,7 +3673,7 @@ function AdminSettingsModal() {
           <div className="settings-section">
             <h3>Canais WhatsApp conectados</h3>
             {chans.length === 0 ? (
-              <p className="sub">Nenhum canal configurado. Use o Embedded Signup para conectar um numero.</p>
+              <p className="sub">Nenhum canal configurado. Use o Embedded Signup para conectar um número.</p>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
                 {chans.map((ch) => {
@@ -3704,7 +3704,7 @@ function AdminSettingsModal() {
               </div>
             )}
             <div style={{ marginTop: "1rem", borderTop: "1px solid var(--border)", paddingTop: "0.8rem" }}>
-              <p className="sub">Para adicionar um canal coexistence, use a opcao <strong>WhatsApp Coexistence</strong> no menu de configuracoes.</p>
+              <p className="sub">Para adicionar um canal coexistence, use a opção <strong>WhatsApp Coexistence</strong> no menu de configurações.</p>
             </div>
           </div>
         )}
@@ -3739,7 +3739,7 @@ function NotificationsTab() {
         ...prev,
         [kind === "alarm" ? "alarm_sound_path" : "notification_sound_path"]: res.path,
       }));
-      setNotice(`Som de ${kind === "alarm" ? "alarme" : "notificacao"} atualizado`);
+      setNotice(`Som de ${kind === "alarm" ? "alarme" : "notificação"} atualizado`);
     } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
     setter(false);
   }, [bundle, setError, setNotice, setSystemSettings]);
@@ -3757,12 +3757,12 @@ function NotificationsTab() {
   return (
     <>
       <div className="settings-section">
-        <h3>Notificacao de nova mensagem</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Todos os usuarios ouvem um beep quando chega mensagem nova numa conversa das caixas Novos/Recepcao ou Meus. Equipe, Bot, Backup e Nao qualificados nao fazem som.</p>
+        <h3>Notificação de nova mensagem</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Todos os usuários ouvem um beep quando chega mensagem nova numa conversa das caixas Novos/Recepção ou Meus. Equipe, Bot, Backup e Não qualificados não fazem som.</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.notification_sound_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, notification_sound_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-            <span>Habilitar som de notificacao</span>
+            <span>Habilitar som de notificação</span>
           </label>
         </div>
         <div className="settings-block" style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.4rem" }}>
@@ -3772,7 +3772,7 @@ function NotificationsTab() {
           {systemSettings.notification_sound_path && <span className="sub" style={{ fontSize: "0.75rem" }}>Personalizado ativo</span>}
           <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => testSound(systemSettings.notification_sound_path, 880)} title="Testar som">Testar</button>
           {systemSettings.notification_sound_path && (
-            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, notification_sound_path: "" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Usar padrao</button>
+            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, notification_sound_path: "" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Usar padrão</button>
           )}
           <input ref={notifFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "notification"); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         </div>
@@ -3780,7 +3780,7 @@ function NotificationsTab() {
 
       <div className="settings-section" style={{ marginTop: "1.2rem" }}>
         <h3>Alarme de mensagens sem resposta</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Alarme sonoro para usuarios dos departamentos selecionados: toca ao entrar e depois a cada 30 s enquanto houver conversa nas caixas Novos/Recepcao ou Meus com mensagem nao lida cuja ultima mensagem do cliente tem mais tempo que o limite abaixo. Para quando a conversa e aberta (exceto com "So espiar" ligado, modo de admin/supervisor que nao marca como lida).</p>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Alarme sonoro para usuários dos departamentos selecionados: toca ao entrar e depois a cada 30 s enquanto houver conversa nas caixas Novos/Recepção ou Meus com mensagem não lida cuja última mensagem do cliente tem mais tempo que o limite abaixo. Para quando a conversa é aberta (exceto com "Só espiar" ligado, modo de admin/supervisor que não marca como lida).</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.alarm_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, alarm_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
@@ -3813,26 +3813,26 @@ function NotificationsTab() {
           {systemSettings.alarm_sound_path && <span className="sub" style={{ fontSize: "0.75rem" }}>Personalizado ativo</span>}
           <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem" }} onClick={() => testSound(systemSettings.alarm_sound_path, 660)} title="Testar alarme">Testar</button>
           {systemSettings.alarm_sound_path && (
-            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, alarm_sound_path: "" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Usar padrao</button>
+            <button className="ghost" style={{ padding: "0.4rem 0.6rem", fontSize: "0.8rem", color: "var(--danger)" }} onClick={() => setSystemSettings((prev) => ({ ...prev, alarm_sound_path: "" }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly}>Usar padrão</button>
           )}
           <input ref={alarmFileRef} type="file" accept="audio/mpeg,audio/wav,audio/ogg,audio/webm,.mp3,.wav,.ogg" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadSound(f, "alarm"); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
         </div>
       </div>
 
       <div className="settings-section" style={{ marginTop: "1.2rem" }}>
-        <h3>Avaliacao pos-atendimento</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Ligada, o encerramento manual envia junto do protocolo a pergunta "como voce avalia o atendimento?" com botoes Ruim / Bom / Excelente. Dentro da janela de 24h a mensagem e gratuita; fora dela vai por template aprovado (conversa paga iniciada pela empresa). A nota do cliente fica visivel apenas para administradores e supervisores.</p>
+        <h3>Avaliação pós-atendimento</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Ligada, o encerramento manual envia junto do protocolo a pergunta "como você avalia o atendimento?" com botões Ruim / Bom / Excelente. Dentro da janela de 24h a mensagem é gratuita; fora dela vai por template aprovado (conversa paga iniciada pela empresa). A nota do cliente fica visível apenas para administradores e supervisores.</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.rating_request_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, rating_request_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
-            <span>Perguntar avaliacao ao encerrar atendimento</span>
+            <span>Perguntar avaliação ao encerrar atendimento</span>
           </label>
         </div>
       </div>
 
       <div className="settings-section" style={{ marginTop: "1.2rem" }}>
-        <h3>Fechamento automatico por inatividade</h3>
-        <p className="sub" style={{ marginBottom: "0.6rem" }}>Com esta opcao ligada, o sistema fecha sozinho (a cada 30 min) atendimentos parados ha mais de 24h sem mensagem. Desligada, nenhuma conversa atendida fecha sozinha — o encerramento passa a ser sempre manual.{systemSettings.pool_mode === "reception" ? " Em qualquer caso, leads entregues pela recepcao que nunca receberam resposta humana voltam ao assistente virtual apos 7 dias (valvula de seguranca)." : ""}</p>
+        <h3>Fechamento automático por inatividade</h3>
+        <p className="sub" style={{ marginBottom: "0.6rem" }}>Com esta opção ligada, o sistema fecha sozinho (a cada 30 min) atendimentos parados há mais de 24h sem mensagem. Desligada, nenhuma conversa atendida fecha sozinha — o encerramento passa a ser sempre manual.{systemSettings.pool_mode === "reception" ? " Em qualquer caso, leads entregues pela recepção que nunca receberam resposta humana voltam ao assistente virtual após 7 dias (válvula de segurança)." : ""}</p>
         <div className="settings-block">
           <label className="settings-toggle">
             <input type="checkbox" checked={systemSettings.auto_close_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, auto_close_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} />
@@ -3844,7 +3844,7 @@ function NotificationsTab() {
       {/* Mesmo save da aba Sistema (objeto inteiro): o 400 aparece aqui tambem. */}
       {error ? <div className="alert danger" role="alert" style={{ marginTop: "1rem" }}><span>{error}</span><button type="button" className="alert-close" onClick={() => setError("")} aria-label="Fechar">&#10005;</button></div> : null}
       {notice ? <div className="alert success" style={{ marginTop: "1rem" }}><span>{notice}</span><button type="button" className="alert-close" onClick={() => setNotice("")} aria-label="Fechar">&#10005;</button></div> : null}
-      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar configuracoes do sistema"}</button>
+      <button className="primary" style={{ marginTop: "1rem" }} onClick={() => void saveSystemSettingsAction()} disabled={readOnly || (busySettings)} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busySettings ? "Salvando..." : "Salvar configurações do sistema"}</button>
     </>
   );
 }
@@ -3853,8 +3853,8 @@ function Lightbox() {
   const { lightboxMedia, closeLightbox } = useCrm();
   if (!lightboxMedia) return null;
   return (
-    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Visualizacao de midia" onClick={closeLightbox}>
-      <button type="button" className="lightbox-close" onClick={closeLightbox} aria-label="Fechar visualizacao">Fechar</button>
+    <div className="lightbox" role="dialog" aria-modal="true" aria-label="Visualização de mídia" onClick={closeLightbox}>
+      <button type="button" className="lightbox-close" onClick={closeLightbox} aria-label="Fechar visualização">Fechar</button>
       <div className="lightbox-content" onClick={(e) => e.stopPropagation()}>
         {lightboxMedia.kind === "image" ? <img className="lightbox-media" src={lightboxMedia.src} alt={lightboxMedia.alt} /> : <video className="lightbox-media" src={lightboxMedia.src} controls={!lightboxMedia.gifLike} autoPlay loop={lightboxMedia.gifLike} muted={lightboxMedia.gifLike} playsInline />}
       </div>
@@ -3898,8 +3898,8 @@ function BillingHealthBanner() {
 
   const isError = !status.ok;
   const message = isError
-    ? `Nao foi possivel verificar o billing da Meta para o canal ${standardChannel.label}. ${status.error || ""}`
-    : `O canal ${standardChannel.label} ainda nao tem metodo de pagamento configurado na Meta. Templates de marketing/utility nao serao entregues ate isso ser corrigido.`;
+    ? `Não foi possível verificar o billing da Meta para o canal ${standardChannel.label}. ${status.error || ""}`
+    : `O canal ${standardChannel.label} ainda não tem método de pagamento configurado na Meta. Templates de marketing/utility não serão entregues até isso ser corrigido.`;
 
   return (
     <div style={{
@@ -3945,7 +3945,7 @@ function CrmApp() {
   const { booting, config, firebaseUser, sessionUser, error, impersonationEndMessage, readOnly, impersonationScopeGeneration } = useCrm();
 
   if (booting) return <BootScreen />;
-  if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Configuracao invalida</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "O backend deve operar em modo Firebase."}</p></div></div>;
+  if (config?.auth_mode !== "firebase") return <div className="screen"><div className="hero-card"><p className="eyebrow">Configuração inválida</p><h1>Este frontend exige Firebase Auth</h1><p>{error || "O backend deve operar em modo Firebase."}</p></div></div>;
   if (!firebaseUser || !sessionUser) return impersonationTab
     ? <div className="screen"><div className="hero-card"><h1>Modo de visualização</h1><p>{impersonationEndMessage || error || (firebaseUser ? "Carregando o acesso..." : "A sessão foi encerrada ou expirou. Gere um novo acesso na aba do administrador.")}</p></div></div>
     // Firebase autenticado sem sessao do CRM ainda = conectando (nao e login).

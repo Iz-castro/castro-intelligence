@@ -18,9 +18,9 @@ export function formatRecordingTime(seconds: number) {
 export function messageTypeLabel(value?: string) {
   const kind = String(value || "").trim().toLowerCase();
   if (!kind) return "mensagem";
-  if (kind === "unsupported" || kind === "unknown") return "midia";
+  if (kind === "unsupported" || kind === "unknown") return "mídia";
   if (kind === "contacts") return "contato";
-  if (kind === "location") return "localizacao";
+  if (kind === "location") return "localização";
   return kind;
 }
 
@@ -29,7 +29,7 @@ export function messageContentLabel(message: ChatMessage) {
   if (!content) return "";
   const kind = String(message.msg_type || "").trim().toLowerCase();
   if (content.toLowerCase() === "[unknown]" || content.toLowerCase() === "[unsupported]" || kind === "unsupported" || kind === "unknown") {
-    return "Midia nao suportada pelo payload recebido do WhatsApp.";
+    return "Mídia não suportada pelo payload recebido do WhatsApp.";
   }
   return content;
 }
@@ -65,16 +65,16 @@ export function messagePreviewText(message: ChatMessage) {
   const filename = String(message.filename || "").trim();
   const kind = String(message.msg_type || "").trim().toLowerCase();
   if (filename && kind === "document") return `Documento: ${filename}`;
-  if (filename && kind === "video") return `Video: ${filename}`;
+  if (filename && kind === "video") return `Vídeo: ${filename}`;
   if (filename && kind === "image") return `Imagem: ${filename}`;
-  if (filename && kind === "audio") return `Audio: ${filename}`;
+  if (filename && kind === "audio") return `Áudio: ${filename}`;
 
-  if (kind === "audio") return "Audio";
+  if (kind === "audio") return "Áudio";
   if (kind === "image") return "Imagem";
-  if (kind === "video" || kind === "gif") return "Video";
+  if (kind === "video" || kind === "gif") return "Vídeo";
   if (kind === "sticker") return "Figurinha";
   if (kind === "document") return "Documento";
-  if (kind === "location") return "Localizacao";
+  if (kind === "location") return "Localização";
   if (kind === "template") return "Template";
   return "Mensagem";
 }

@@ -31,7 +31,7 @@ export function duplicateQuickShortcuts(items: QuickMessage[]): string[] {
 export function quickMessagesProblem(items: QuickMessage[], label: string): string | null {
   const incomplete = items.map((qm, i) => (isQuickMessageComplete(qm) ? 0 : i + 1)).filter((n) => n > 0);
   if (incomplete.length) {
-    return `${label}: preencha titulo, atalho e mensagem (item${incomplete.length > 1 ? "s" : ""} ${incomplete.join(", ")}) ou remova.`;
+    return `${label}: preencha título, atalho e mensagem (item${incomplete.length > 1 ? "s" : ""} ${incomplete.join(", ")}) ou remova.`;
   }
   const dup = duplicateQuickShortcuts(items);
   if (dup.length) return `${label}: atalho repetido (${dup.join(", ")}).`;
