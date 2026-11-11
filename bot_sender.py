@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 from bot_transport import build_outbound_payload
 from config import GRAPH_API_BASE
@@ -34,7 +35,7 @@ async def send_bot_reply(
             resp = await client.post(url, json=payload_msg, headers=headers)
             result = resp.json()
         wa_msg_id = result.get("messages", [{}])[0].get("id", "") if resp.status_code == 200 else ""
-        save_wa_message(
+        await run_in_threadpool(save_wa_message,
             wa_message_id=wa_msg_id,
             contact_id=contact_id,
             direction="outbound",
@@ -54,3 +55,36 @@ async def send_bot_reply(
     except Exception as exc:
         logger.error("[BOT] Erro ao enviar resposta: %s", exc, exc_info=True)
     return False
+
+
+def send_bot_reminder(contact, thread, channel, text, stage):
+    """POST sem retry. Chamado somente no worker fora do event loop."""
+    from database_firestore import save_wa_message
+    payload, content = build_outbound_payload(
+        text + "\n\nPara desativar os lembretes, envie PARAR LEMBRETES.", str(thread["wa_id"]))
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(f"{GRAPH_API_BASE}/{channel['phone_number_id']}/messages", json=payload,
+                                   headers={"Authorization": f"Bearer {channel['access_token']}"})
+        result = response.json()
+        if response.status_code != 200:
+            code = (result.get("error") or {}).get("code")
+            logger.warning("[BOT-REMINDER] envio recusado | status=%s code=%s contact=%s etapa=%s",
+                           response.status_code, code, contact.get("id"), stage)
+            return {"ok": False, "code": code}
+        message_id = (result.get("messages") or [{}])[0].get("id")
+        if not message_id:
+            return {"ok": False, "code": "sem_id"}
+        save_wa_message(message_id, contact["id"], "outbound", "text", content=content, status="sent",
+                        timestamp_wa=datetime.now(timezone.utc).isoformat(), channel_id=thread["channel_id"],
+                        conversation_id=thread["id"], sender_user_id=None, operator_id=None,
+                        advance_recency=False, reopen_attendance=False, promote_qualification=False,
+                        human_outbound=False, sent_by_name="Lembrete automático", contact=contact,
+                        automation_kind="bot_reminder", automation_stage=stage)
+        return {"ok": True, "message_id": message_id}
+    except Exception as exc:
+        # Timeout e persistencia incerta nao autorizam outro POST. So o tipo
+        # da excecao no log: a mensagem pode trazer PII do provedor.
+        logger.error("[BOT-REMINDER] falha no envio/persistencia | erro=%s contact=%s etapa=%s",
+                     type(exc).__name__, contact.get("id"), stage)
+        return {"ok": False, "code": "envio_ou_persistencia"}

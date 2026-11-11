@@ -3318,7 +3318,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     promote_qualification=True,
                     reopen_attendance=True,
                     control_message=False,
-                    human_outbound=True):
+                    human_outbound=True, automation_kind="", automation_stage=""):
     """Persiste mensagem WhatsApp.
 
     human_outbound=False: outbound com operador identificado que NAO conta
@@ -3469,6 +3469,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "operator_id": operator_id,
         "sender_user_id": sender_user_id,
         "sent_by_name": sent_by_name or "",
+        **({"automation_kind": automation_kind, "automation_stage": automation_stage} if automation_kind else {}),
         "channel_owner_user_id": channel_owner_user_id,
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
@@ -3500,6 +3501,12 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         updates = {"last_message_at": _eff_msg_at} if (_lma_advances and advance_recency and not control_message) else {}
         if direction == "inbound" and status == "received" and not control_message:
             updates["unread_count"] = int(contact.get("unread_count", 0)) + 1
+        if direction == "inbound" and status == "received":
+            # Entrada NOVA de verdade: este trecho nao roda na reentrega da Meta
+            # (dedup por wamid retorna antes). O last_inbound_at do contato sobe
+            # no upsert pre-dedup e por isso nao serve de marcador de ciclo dos
+            # lembretes (ADR 0015).
+            updates["last_new_inbound_at"] = created_at
         # Reforma de qualificacoes (2026-09): a 1a interacao HUMANA promove o
         # lead "novo" a "em_atendimento" e deixa rastro na nota. Mesmo sinal
         # do last_human_outbound_at (outbound com operador identificado) —
@@ -3620,6 +3627,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         msg_type=msg_type,
         template_category=template_category,
         media_size_bytes=media_size_bytes,
+        **({"automation_stage": automation_stage} if automation_kind == "bot_reminder" else {}),
     )
     return message_id
 
@@ -3852,7 +3860,7 @@ def _usage_metrics_doc_id(year_month=None):
 _VALID_TEMPLATE_CATEGORIES = ("marketing", "utility", "authentication")
 
 
-def increment_usage_metrics(direction, msg_type="", template_category=None, media_size_bytes=0):
+def increment_usage_metrics(direction, msg_type="", template_category=None, media_size_bytes=0, automation_stage=""):
     """Incrementa usage_{YYYY_MM} do tenant atual com Increment atomico.
 
     Campos atualizados conforme direction/msg_type:
@@ -3884,6 +3892,9 @@ def increment_usage_metrics(direction, msg_type="", template_category=None, medi
 
     if media_size_bytes and int(media_size_bytes) > 0:
         updates["media_uploaded_bytes"] = firestore.Increment(int(media_size_bytes))
+
+    if automation_stage in ("etapa_1", "etapa_2", "fechamento") and direction == "outbound":
+        updates["bot_reminders_sent"] = {"B": {automation_stage: firestore.Increment(1)}}
 
     try:
         document("audit_metrics", doc_id).set(updates, merge=True)
@@ -4998,10 +5009,10 @@ POOL_WAIT_NOTICE_MAX_CHARS = 1000
 
 def get_system_settings():
     doc = _get_doc("system_settings", "chat")
-    if not doc:
-        return dict(_DEFAULT_SYSTEM_SETTINGS)
-    result = dict(_DEFAULT_SYSTEM_SETTINGS)
-    result.update({k: v for k, v in doc.items() if k in _DEFAULT_SYSTEM_SETTINGS})
+    from bot_reminders import DEFAULTS as _REMINDER_DEFAULTS
+    result = {**_DEFAULT_SYSTEM_SETTINGS, **_REMINDER_DEFAULTS}
+    if doc:
+        result.update({k: v for k, v in doc.items() if k in result})
     return result
 
 

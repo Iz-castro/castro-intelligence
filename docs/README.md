@@ -5,8 +5,8 @@
 > prod e o que continua pendente) e [PENDENCIAS_E_ROADMAP.md](PENDENCIAS_E_ROADMAP.md).
 > Deploy de rotina do CRM = [deploy/DEPLOY_CLOUDRUN_A.md](deploy/DEPLOY_CLOUDRUN_A.md)
 > (prod = projeto `project-4a851bf9-f475-418c-800`, regiao `us-west1`; trafego PINADO
-> por revisao). Ultimo ADR: [0014](decisions/0014-impersonate-somente-leitura.md)
-> (identidade e HTTP/polling de 15 s implementados/validados localmente, feature desligada);
+> por revisao). Ultimo ADR: [0015](decisions/0015-lembretes-automaticos-pos-aceite.md)
+> (lembretes pos-aceite e tela implementados localmente, recurso desligado por padrao);
 > diario de referencia: [internal/2026-08-21-diagnostico-alarme-sonoro.md](internal/2026-08-21-diagnostico-alarme-sonoro.md).
 > `internal/RETOMAR.md` e `internal/resumo.md` sao HISTORICO pre-cutover de Oregon —
 > nao rode os comandos `gcloud` de la (apontam pro projeto/regiao antigos de SP).

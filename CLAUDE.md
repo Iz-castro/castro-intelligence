@@ -27,12 +27,13 @@ lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente 
 
 Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os gates são:
 
-- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py`
+- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py bot_reminders.py bot_reminder_routes.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (241).
+  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (246).
   Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
   Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4): `tools\sim_buffer_flow.py` (69).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
+  Lembretes pos-aceite (classificacao, agenda, transacao, comandos, API e envio): `tools\sim_bot_reminders.py` (128).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
   History sync/eco do coex (recência real, janela de 24h, dono da thread, idempotência por bloco): `tools\sim_history_recency.py` (62).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
@@ -215,6 +216,14 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   (Cloud Run mata em 300s) — não tire nenhum dos dois (`docs/BUFFER_MENSAGENS_BOT.md` §Revisão).
 
 ## Mapa de módulos (onde mexer)
+
+- **Lembretes pos-aceite (ADR 0015):** `FEATURE_BOT_REMINDER=false` por default, modo comercial `off|dry_run|on`
+  por tenant e toggle proprio na UI. Apenas CX/LGPD local aceita. Tres etapas, classificacao textual, sem link
+  atual e sem cortesia; mensagem nova encerra ciclo. `PARAR LEMBRETES` persiste ate `ATIVAR LEMBRETES`.
+  Claim transacional antes do POST, sem retry incerto; envio nao sobe recencia, nao reabre nem simula humano.
+  API `/api/settings/bot-reminders` com RBAC/versao; generic PUT e upload de som preservam configuracao.
+  Mudanca de modo/religamento invalida agenda antiga. Nenhum contador do lote e alterado; uso mensal por etapa.
+  Modulos: `bot_reminders.py`, `bot_reminder_routes.py`; cron novo exige job Scheduler e env, nao criados localmente.
 
 | Assunto | Arquivos |
 |---|---|

@@ -149,6 +149,11 @@ IMPERSONATE_POLLING_INTERVAL_MS = 15000
 # finalidade do template e as permissoes no editor de perfis).
 FEATURE_FOLLOWUP = _bool_env("FEATURE_FOLLOWUP", "false")
 
+# Lembretes pos-LGPD: chave comercial por tenant e configuracao propria na UI.
+FEATURE_BOT_REMINDER = _bool_env("FEATURE_BOT_REMINDER", "false")
+BOT_REMINDER_MARGIN_MINUTES = max(5, _as_int(os.getenv("BOT_REMINDER_MARGIN_MINUTES"), 5))
+BOT_REMINDER_MAX_PER_TICK = max(1, _as_int(os.getenv("BOT_REMINDER_MAX_PER_TICK"), 30))
+
 # -- Log TEMPORARIO do payload cru do webhook (descoberta do referral de anuncio) --
 # CSV de channel_id (ex.: "4"); vazio = desligado (default). Grava em
 # tenants/{tid}/webhook_raw_debug com expire_at (TTL policy do Firestore no

@@ -1481,7 +1481,10 @@ async def delete_perfil_acesso(perfil_id: str, current_user: dict = Depends(get_
 _LGPD_AUDIT_KEYS = ("lgpd_policy_date", "lgpd_privacy_url", "lgpd_notice")
 
 # Flags da reabertura em lote: so a Castro liga/desliga (script), nunca o PUT da UI.
-_CASTRO_ONLY_SETTINGS = ("reopen_batch_enabled", "reopen_bot_audience_enabled", "bot_media_turn_enabled")
+_CASTRO_ONLY_SETTINGS = ("reopen_batch_enabled", "reopen_bot_audience_enabled", "bot_media_turn_enabled",
+                        "bot_reminder_enabled", "bot_reminder_text_1", "bot_reminder_text_2", "bot_reminder_text_3",
+                        "bot_reminder_minutes_1", "bot_reminder_minutes_2", "bot_reminder_closing_minutes",
+                        "bot_reminder_generation")
 
 
 def _lgpd_policy_audit_detail(before: dict, after: dict) -> str:
@@ -1505,7 +1508,10 @@ def _lgpd_policy_audit_detail(before: dict, after: dict) -> str:
 
 @app.get("/api/settings/system")
 async def get_settings_system(current_user: dict = Depends(get_current_user)):
-    return get_system_settings()
+    from bot_reminders import available
+    def read():
+        return {**get_system_settings(), "bot_reminder_available": available()}
+    return await run_in_threadpool(read)
 
 
 @app.put("/api/settings/system")
@@ -1546,6 +1552,8 @@ async def update_settings_system(request: Request, current_user: dict = Depends(
         _lgpd_detail = _lgpd_policy_audit_detail(_lgpd_before, result)
         if _lgpd_detail:
             log_audit(current_user["id"], "LGPD_POLICY_UPDATE", _lgpd_detail)
+    from bot_reminders import available
+    result["bot_reminder_available"] = await run_in_threadpool(available)
     return result
 
 
@@ -7342,6 +7350,10 @@ async def embedded_signup_exchange(
 from followup_routes import create_followup_router
 
 app.include_router(create_followup_router(get_current_user, _require_contact_access))
+
+from bot_reminder_routes import create_router as create_bot_reminder_router
+
+app.include_router(create_bot_reminder_router(get_current_user, _verify_cron_auth))
 
 # -- Execucao --
 

@@ -6,6 +6,7 @@ import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
 import { ChatTabs, CHAT_TABPANEL_ID, chatTabDomId } from "./components/chat/ChatTabs";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
+import { BotRemindersSettings } from "./components/settings/BotRemindersSettings";
 import { MonitorModal } from "./components/monitor/MonitorModal";
 import { resolveMessageMedia } from "./utils/media";
 import { playBeep } from "./utils/audio";
@@ -3465,6 +3466,7 @@ function AdminSettingsModal() {
         {/* Tab: Sistema */}
         {adminTab === "system" && (
           <>
+            {systemSettings.bot_reminder_available && <BotRemindersSettings />}
             <div className="settings-section">
               <h3>Prefixo de mensagem</h3>
               <div className="settings-block"><label className="settings-toggle"><input type="checkbox" checked={systemSettings.chat_prefix_enabled} onChange={(e) => setSystemSettings((prev) => ({ ...prev, chat_prefix_enabled: e.target.checked }))} title={readOnly ? READ_ONLY_TOOLTIP : undefined} disabled={readOnly} /><span>Habilitar prefixo de mensagem (padrao do sistema)</span></label></div>
