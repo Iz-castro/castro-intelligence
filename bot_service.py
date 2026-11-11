@@ -828,7 +828,7 @@ def lgpd_consent_resolved(state, contact, ai_cfg=None, sys_settings=None) -> boo
 
 
 async def process_bot_message_async(
-    contact_id: int, text: str, contact_name: str = ""
+    contact_id: int, text: str, contact_name: str = "", *, turn_meta=None
 ) -> Optional[Union[str, dict]]:
     """Fachada assincrona do bot: decide o motor pelo tenant atual.
 
@@ -857,7 +857,7 @@ async def process_bot_message_async(
     if engine == "dialogflow_cx":
         status = str(ai_cfg.get("status") or "active").strip().lower()
         if status == "active":
-            return await _process_cx_message(contact_id, text, ai_cfg)
+            return await _process_cx_message(contact_id, text, ai_cfg, turn_meta=turn_meta)
         logger.info("[BOT] motor CX pausado (status=%s) — bot silencioso", status)
         return None
     logger.warning(
@@ -868,7 +868,7 @@ async def process_bot_message_async(
 
 
 async def _process_cx_message(
-    contact_id: int, text: str, ai_cfg: dict
+    contact_id: int, text: str, ai_cfg: dict, *, turn_meta=None
 ) -> Optional[Union[str, dict]]:
     """Turno do motor Dialogflow CX para o contato do tenant atual."""
     import bot_engine_dialogflow
@@ -876,6 +876,8 @@ async def _process_cx_message(
 
     # UMA leitura de system_settings por turno: toggle do bot + conteudo LGPD.
     sys_settings = get_system_settings()
+    if turn_meta is not None:
+        turn_meta.update(kind="cx_reply", generation=sys_settings.get("bot_reminder_generation", ""))
     if not bool(sys_settings.get("bot_enabled", False)):
         return None
 
@@ -947,6 +949,8 @@ async def _process_cx_message(
             if not first_cx_text:
                 return lgpd_response
         else:
+            if turn_meta is not None:
+                turn_meta["kind"] = "lgpd_refusal" if state.get("lgpd_consent") is False else "lgpd_notice"
             if not state.get("step"):
                 state["step"] = "lgpd"
                 state["started_at"] = utcnow().isoformat()
@@ -1084,6 +1088,8 @@ async def _process_cx_message(
     # Falha do motor: 1a -> fallback educado; 2a consecutiva -> handoff.
     # ------------------------------------------------------------------
     if not result.get("ok"):
+        if turn_meta is not None:
+            turn_meta["kind"] = "engine_fallback"
         # Increment atomico + releitura: 2 mensagens concorrentes durante um
         # outage do CX nao subcontam mais (lost update de read-modify-write).
         # Pode, no pior caso, disparar o handoff em ambas — _finalize e
@@ -1093,6 +1099,8 @@ async def _process_cx_message(
         _state_ref.set({"cx_fail_count": _gcf.Increment(1)}, merge=True)
         fails = int((_state_ref.get().to_dict() or {}).get("cx_fail_count") or 0)
         if fails >= _CX_MAX_CONSECUTIVE_FAILURES:
+            if turn_meta is not None:
+                turn_meta["kind"] = "handoff"
             # Sem params (motor caiu) -> temperatura classifica frio; sem
             # detalhes coletados no sumario. contact vai pro carimbo do
             # protocolo do dia. Falha de persistencia aqui NAO pode calar o
@@ -1118,6 +1126,8 @@ async def _process_cx_message(
     # de erro NUNCA chega ao lead.
     # ------------------------------------------------------------------
     if _cx_reply_is_error(result.get("reply_text"), ai_cfg):
+        if turn_meta is not None:
+            turn_meta["kind"] = "handoff"
         logger.warning(
             "[BOT-CX] frase de erro apos %d reenvios — handoff | contato=%d",
             _CX_ERROR_RETRY_MAX, contact_id,
@@ -1156,6 +1166,8 @@ async def _process_cx_message(
     # Detecta por parametro OU por texto (o agente nem sempre seta o param).
     # ------------------------------------------------------------------
     if _cx_is_handoff(result, ai_cfg):
+        if turn_meta is not None:
+            turn_meta["kind"] = "handoff"
         # Falha de persistencia NUNCA cala o cliente: a resposta de
         # transferencia sai mesmo se o Firestore falhar aqui. Como
         # bot_completed e o ULTIMO write do handoff (commit-point), uma falha

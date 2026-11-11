@@ -41,7 +41,9 @@ from database import (
     claim_history_chunk, finish_history_chunk,
 )
 from media import download_media
-from channel_service import get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE
+from channel_service import (
+    get_channel_by_phone_id, get_default_channel, CHANNEL_TYPE_COEXISTENCE, CHANNEL_TYPE_STANDARD,
+)
 from bot_service import (
     process_bot_message_async, lgpd_consent_resolved, queue_cx_session_params, discard_cx_session_params,
 )
@@ -1068,13 +1070,31 @@ async def _run_bot_turn_and_send(
     contact_id, text, contact_name, wa_id, token, phone_id,
     channel_id=None, channel_owner_user_id=None,
 ):
-    reply = await process_bot_message_async(contact_id, text, contact_name)
+    from config import FEATURE_BOT_REMINDER
+    metadata = None
+    if FEATURE_BOT_REMINDER:
+        from bot_reminders import prepare_turn
+        try:
+            metadata = await run_in_threadpool(prepare_turn, contact_id, channel_id)
+        except Exception as exc:
+            # Falha do lembrete nunca deve impedir a resposta normal do bot.
+            logger.error("bot-reminder preparacao falhou | contato=%s erro=%s", contact_id, type(exc).__name__)
+    if metadata is None:
+        reply = await process_bot_message_async(contact_id, text, contact_name)
+    else:
+        reply = await process_bot_message_async(contact_id, text, contact_name, turn_meta=metadata)
     if reply:
-        await _send_bot_reply(
+        sent = await _send_bot_reply(
             wa_id, reply, contact_id, token, phone_id,
             channel_id=channel_id,
             channel_owner_user_id=channel_owner_user_id,
         )
+        if sent and metadata:
+            from bot_reminders import stamp_turn
+            try:
+                await run_in_threadpool(stamp_turn, contact_id, reply, metadata)
+            except Exception as exc:
+                logger.error("bot-reminder carimbo falhou | contato=%s erro=%s", contact_id, type(exc).__name__)
     return reply
 
 
@@ -1694,6 +1714,24 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 ws_notify_callback=ws_notify_callback,
             )
             continue
+
+        # Comandos exatos do lembrete sao controle proprio, nunca texto para a Val.
+        # So no canal STANDARD (decisao do PO 11/11): em numero coex o texto
+        # segue o fluxo normal e o bot nao responde pelo numero pessoal.
+        from config import FEATURE_BOT_REMINDER
+        if (FEATURE_BOT_REMINDER and effective_msg_type == "text"
+                and channel_type == CHANNEL_TYPE_STANDARD):
+            from bot_reminders import command, commands_available, apply_command
+            action = command(content)
+            if action and await run_in_threadpool(commands_available):
+                if not was_dup:
+                    changed = await run_in_threadpool(apply_command, contact_id, action, ts_iso)
+                    if changed:
+                        ack = ("Lembretes automáticos desativados. Para reativar, envie ATIVAR LEMBRETES."
+                               if action == "stop" else "Lembretes automáticos reativados. Eles valerão nas próximas conversas.")
+                        await _send_bot_reply(wa_id, ack, contact_id, channel_token, channel_phone_id,
+                                              channel_id=channel_id, channel_owner_user_id=channel_owner_id)
+                continue
 
         # -- Reabertura (plano v2.2, D4 / cenario 13): mensagem NOVA do cliente
         # desfaz o opt-out do Encerrar (mesma decisao do PO da recusa

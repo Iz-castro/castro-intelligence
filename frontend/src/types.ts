@@ -429,6 +429,7 @@ export type SystemSettings = {
   pool_wait_notice_enabled: boolean;
   pool_wait_notice_minutes: number;
   pool_wait_notice_text: string;
+  bot_reminder_available?: boolean;
   // P2b: conteudo LGPD do aviso do bot, editado pela clinica. Vazio = o bot
   // usa o fallback (settings.ai no CX; texto/link fixos no builtin).
   // lgpd_policy_date = AAAA-MM-DD da politica vigente: aceite anterior e

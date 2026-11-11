@@ -52,7 +52,7 @@ Atraso é calculado por `status=pending AND due_at < agora`, sem persistir `over
 
 ### F3 — eventuais mensagens automáticas, futura
 
-**[DECISÃO DO PO]** Automação de mensagem é separada de Task e usa as mesmas políticas de LGPD, opt-out, canal, limites e orçamento da reabertura, sem contador paralelo. Não implementar nem escolher um motor genérico agora. Contratos herdados e pré-requisitos estão na seção 11.
+**[DECISÃO DO PO]** Automação de mensagem é separada de Task e usa as mesmas políticas de LGPD, opt-out, canal, limites e orçamento da reabertura, sem contador paralelo. Não implementar nem escolher um motor genérico agora. Contratos herdados e pré-requisitos estão na seção 11. **Exceção aprovada em 10–11/11/2026:** os três lembretes de silêncio pós-aceite da Val, dentro da janela, têm uso próprio por etapa e não consomem o teto nem o orçamento do lote (ADR 0015).
 
 ## 3. Fatos do código e implicações
 
@@ -559,7 +559,7 @@ Implementação futura usa `C:\Rafael\castro-intelligence\.venv\Scripts\python.e
 
 ## 11. Contratos de envio — limites, decisão 9 e integração da decisão 6
 
-**[DECISÃO DO PO — 18/10]** A recusa geral de contatos comerciais deve alcançar também os envios comerciais já existentes antes da liberação de F1, conforme seção 7.5. As demais regras abaixo são contratos herdados para integrações e futura F3; a aprovação não autoriza implementar mensagens automáticas nesta fase.
+**[DECISÃO DO PO — 18/10]** A recusa geral de contatos comerciais deve alcançar também os envios comerciais já existentes antes da liberação de F1, conforme seção 7.5. As demais regras abaixo são contratos herdados para integrações e futura F3; a aprovação não autoriza implementar mensagens automáticas nesta fase. Os lembretes pós-aceite foram autorizados separadamente em 11/11 (ADR 0015), fora de F1/F3 e sem alterar o lote.
 
 **[DECISÃO DO PO]** Reativação/campanha de contatos abandonados na Val é distinta de Task individual. Script/fluxo de reabertura existe ou está preparado; não representá-lo como tentativas humanas em `crm_tasks`. Futura automação compartilha as políticas abaixo, não a semântica inteira de cada tentativa de reabertura.
 
@@ -582,13 +582,13 @@ Implementação futura usa `C:\Rafael\castro-intelligence\.venv\Scripts\python.e
 | Automático não passa pelo gate do operador | Não chamar `_check_conv_send_permission`, silenciar Val ou simular atenção humana |
 | Canal de massa | Standard ativo do tenant; coexistence fora |
 
-**[DECISÃO DO PO — 18/10, aprovação provisória]** Decisão 9: incluir **todo follow-up automático proativo**, inclusive job individual e texto livre dentro da janela de 24h, com `audience="followup"` na lista única `reopen_batch_sent_at`. Consome o mesmo teto de 2 envios/90 dias do contato e orçamento diário CRM compartilhado, sem contador de follow-up. A abrangência inclui eventuais confirmações e lembretes automáticos de consulta. Texto livre dentro de 24h continua sem consumo do limite Meta segundo a regra herdada; o consumo aqui é interno ao CRM.
+**[DECISÃO DO PO — 18/10, aprovação provisória]** Decisão 9: incluir **todo follow-up automático proativo**, inclusive job individual e texto livre dentro da janela de 24h, com `audience="followup"` na lista única `reopen_batch_sent_at`. Consome o mesmo teto de 2 envios/90 dias do contato e orçamento diário CRM compartilhado, sem contador de follow-up. A abrangência inclui eventuais confirmações e lembretes automáticos de consulta. Texto livre dentro de 24h continua sem consumo do limite Meta segundo a regra herdada; o consumo aqui é interno ao CRM. **Emenda de 10–11/11:** excluem-se apenas os lembretes de silêncio pós-aceite da Val (ADR 0015), sem escrita em `reopen_batch_sent_at` e sem consumo do teto 2/90 ou orçamento diário do lote. Isso não amplia o teto dos demais produtores.
 
-Exemplo: uma reabertura e um follow-up automático consomem os dois envios do 2/90. A contagem é por envio efetivo, não por quantidade de Tasks ou finalidades cumpridas pela mesma mensagem. Tentativa humana, registro, prazo e tarefa não consomem teto por si; mensagens humanas unitárias e respostas reativas da Val mantêm os caminhos/regras próprios. A aprovação provisória do planejamento não autoriza automação em F1 nem alteração do teto em produção.
+Exemplo: uma reabertura e um follow-up automático consomem os dois envios do 2/90. A contagem é por envio efetivo, não por quantidade de Tasks ou finalidades cumpridas pela mesma mensagem. Tentativa humana, registro, prazo e tarefa não consomem teto por si; mensagens humanas unitárias e respostas reativas da Val mantêm os caminhos/regras próprios. A aprovação provisória do planejamento não autoriza automação em F1 nem alteração do teto em produção. Um lembrete de silêncio da Val não entra nesse exemplo: registra somente seu uso próprio por etapa.
 
 Três tentativas humanas usuais, ou continuidade além delas, não autorizam três envios em massa quando o teto é 2/90. Silêncio, consulta e pagamento não substituem aceite LGPD nem eliminam opt-out. Contagem humana e consumo de mensagens são fontes/finalidades diferentes; não reutilizar `reopen_attempts` para acompanhar tentativas de operadora.
 
-O plano paralelo registra folga `cap + ~20` e reserva não transacional; isso conflita com o teto estrito desta sessão. Antes de F3, um mecanismo comum precisa de reserva atômica por portfólio/contato, cobertura dos produtores de massa inclusive scripts, horário efetivo de cada consumo e janela móvel de últimas 24h. Não criar contador de follow-up paralelo ou somas informais entre dois motores.
+O plano paralelo registra folga `cap + ~20` e reserva não transacional; isso conflita com o teto estrito desta sessão. Antes de F3, um mecanismo comum precisa de reserva atômica por portfólio/contato, cobertura dos produtores de massa inclusive scripts, horário efetivo de cada consumo e janela móvel de últimas 24h. Não criar contador de follow-up paralelo ou somas informais entre dois motores. A exceção do ADR 0015 autoriza uso próprio dos lembretes de silêncio, não um segundo orçamento para campanhas ou follow-up proativo.
 
 Sucesso confirma consumo uma vez; timeout/resultado incerto mantém reserva conservadora e exige reconciliação, sem retry cego. Agendamentos duráveis, revalidação antes de cada envio, cancelamento e freios de billing/qualidade são pré-requisitos futuros. Código desta branch não comprova que toda a evolução da reabertura esteja implementada ou em produção.
 

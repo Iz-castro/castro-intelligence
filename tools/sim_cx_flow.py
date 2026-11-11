@@ -1520,6 +1520,34 @@ CX_SCRIPT.append(_cx_ok("Ok."))
 envia(61, "obrigado")
 check("origem" not in CX_CALLS[-1]["params"], "3o turno: sem a chave origem")
 
+print("\n=== Metadados dos turnos para lembretes: resposta, LGPD, falha e handoff ===")
+_meta = {}
+CX_SCRIPT.append(_cx_ok("Qual seu nome?"))
+asyncio.run(bot.process_bot_message_async(61, "Uma pergunta nova", turn_meta=_meta))
+check(_meta.get("kind") == "cx_reply", "resposta normal tem tipo cx_reply")
+novo_contato(97)
+_meta = {}
+asyncio.run(bot.process_bot_message_async(97, "Quero atendimento", turn_meta=_meta))
+check(_meta.get("kind") == "lgpd_notice", "aviso LGPD nao vira resposta elegivel")
+_meta = {}
+asyncio.run(bot.process_bot_message_async(97, "Não", turn_meta=_meta))
+check(_meta.get("kind") == "lgpd_refusal", "recusa tem tipo proprio")
+_meta = {}
+CX_SCRIPT.append({"ok": False})
+asyncio.run(bot.process_bot_message_async(61, "Outra pergunta", turn_meta=_meta))
+check(_meta.get("kind") == "engine_fallback", "instabilidade nao arma lembretes")
+_meta = {}
+CX_SCRIPT.append({"ok": False})
+_real_finalize = bot._finalize_cx_handoff
+def _handoff_persist_fails(*args, **kwargs):
+    raise RuntimeError("falha local simulada")
+bot._finalize_cx_handoff = _handoff_persist_fails
+try:
+    asyncio.run(bot.process_bot_message_async(61, "Nova tentativa", turn_meta=_meta))
+    check(_meta.get("kind") == "handoff", "handoff por falha nao arma mesmo sem persistencia")
+finally:
+    bot._finalize_cx_handoff = _real_finalize
+
 print("\n" + "=" * 70)
 if FAILS:
     print(f"RESULTADO: {len(FAILS)}/{CHECKS} checagens FALHARAM:")
