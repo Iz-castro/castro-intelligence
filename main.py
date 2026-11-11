@@ -1484,7 +1484,8 @@ _LGPD_AUDIT_KEYS = ("lgpd_policy_date", "lgpd_privacy_url", "lgpd_notice")
 _CASTRO_ONLY_SETTINGS = ("reopen_batch_enabled", "reopen_bot_audience_enabled", "bot_media_turn_enabled",
                         "bot_reminder_enabled", "bot_reminder_text_1", "bot_reminder_text_2", "bot_reminder_text_3",
                         "bot_reminder_minutes_1", "bot_reminder_minutes_2", "bot_reminder_closing_minutes",
-                        "bot_reminder_generation")
+                        "bot_reminder_generation", "bot_reminder_lgpd_text_1", "bot_reminder_lgpd_text_2",
+                        "bot_reminder_lgpd_text_3")
 
 
 def _lgpd_policy_audit_detail(before: dict, after: dict) -> str:

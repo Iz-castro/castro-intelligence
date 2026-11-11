@@ -9,13 +9,21 @@ type Settings = {
   bot_reminder_text_1: string;
   bot_reminder_text_2: string;
   bot_reminder_text_3: string;
+  bot_reminder_lgpd_text_1: string;
+  bot_reminder_lgpd_text_2: string;
+  bot_reminder_lgpd_text_3: string;
   bot_reminder_minutes_1: number;
   bot_reminder_minutes_2: number;
   bot_reminder_closing_minutes: number;
 };
 type Payload = { settings: Settings; version: string; simulation: boolean };
 const FOOTER = "Para desativar os lembretes, envie PARAR LEMBRETES.";
-const textKeys = ["bot_reminder_text_1", "bot_reminder_text_2", "bot_reminder_text_3"] as const;
+// Serie B: depois do aceite da LGPD. Serie A: sem resposta ao aviso da LGPD
+// (sai com os botoes Sim/Nao do aviso). Mesmos horarios nas duas.
+const acceptedKeys = ["bot_reminder_text_1", "bot_reminder_text_2", "bot_reminder_text_3"] as const;
+const noticeKeys = ["bot_reminder_lgpd_text_1", "bot_reminder_lgpd_text_2", "bot_reminder_lgpd_text_3"] as const;
+type TextKey = typeof acceptedKeys[number] | typeof noticeKeys[number];
+const textKeys: readonly TextKey[] = [...acceptedKeys, ...noticeKeys];
 
 function duration(minutes: number) {
   const hours = Math.floor(minutes / 60);
@@ -73,6 +81,20 @@ export function BotRemindersSettings() {
   const timings = draft ? [duration(draft.bot_reminder_minutes_1), duration(draft.bot_reminder_minutes_2), duration(draft.bot_reminder_closing_minutes)] : [];
   const dirty = !!draft && !!loaded && JSON.stringify(draft) !== JSON.stringify(loaded.settings);
   const empty = !!draft?.bot_reminder_enabled && textKeys.every((key) => !draft[key].trim());
+  const group = (d: Settings, keys: readonly TextKey[], notice: boolean) => keys.map((key, index) => <div className="settings-block" key={key} style={{ marginTop: "1rem" }}>
+    <label htmlFor={key} style={{ display: "block", fontWeight: 600 }}>{index === 0 ? "Primeiro" : index === 1 ? "Segundo" : "Último"} lembrete · {timings[index]}</label>
+    <p className="sub" style={{ fontSize: "0.8rem" }}>{index < 2 ? (notice ? "Depois do aviso da política de privacidade." : "Depois da resposta do assistente.") : "Depois da última mensagem do cliente, antes de terminar a janela de 24 horas."}</p>
+    <textarea id={key} rows={4} maxLength={1000} value={d[key]} disabled={readOnly || busy} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
+      placeholder="Escreva a mensagem que será enviada ao cliente." style={{ width: "100%", resize: "vertical" }}
+      onChange={(event) => setDraft({ ...d, [key]: event.target.value })} />
+    <p className="sub" style={{ fontSize: "0.75rem" }}>{d[key].length}/1.000 caracteres · Campo vazio desativa esta etapa.</p>
+    {d[key].trim() && <details><summary>Ver como fica no WhatsApp</summary><div className="settings-block" style={{ whiteSpace: "pre-wrap", padding: 12 }}>
+      {notice
+        ? <><WaText text={d[key]} /><p className="sub" style={{ fontSize: "0.75rem", margin: "0.5rem 0" }}>{FOOTER}</p>
+          <div style={{ display: "flex", gap: 8 }}>{["Sim", "Não"].map((label) => <span key={label} className="chip">{label}</span>)}</div></>
+        : <WaText text={`${d[key]}\n\n${FOOTER}`} />}
+    </div></details>}
+  </div>);
 
   return <div className="settings-section" style={{ marginTop: "1.2rem" }}>
     <h3>Lembretes automáticos</h3>
@@ -96,7 +118,7 @@ export function BotRemindersSettings() {
           <h2 id="reminder-title">Lembretes automáticos</h2>
           <button type="button" className="ghost" onClick={close} disabled={busy} aria-label="Fechar lembretes">Fechar</button>
         </div>
-        <p className="sub">Após o aceite da política de privacidade, o assistente pode enviar até três lembretes enquanto espera uma resposta. Uma mensagem nova cancela a sequência anterior. Despedidas, transferência para a equipe e envio do link de agendamento interrompem os lembretes.</p>
+        <p className="sub">O assistente pode enviar até três lembretes enquanto espera uma resposta, em duas situações: depois do aceite da política de privacidade e quando o cliente não respondeu ao aviso da política. Uma mensagem nova cancela a sequência anterior. Despedidas, transferência para a equipe e envio do link de agendamento interrompem os lembretes.</p>
         <p className="sub">Os envios acontecem aproximadamente nos intervalos indicados, inclusive à noite e nos fins de semana, dentro da janela de atendimento do WhatsApp.</p>
         {error && <div className="alert" role="alert">{error}</div>}
         {notice && <p role="status">{notice}</p>}
@@ -108,22 +130,19 @@ export function BotRemindersSettings() {
               onChange={(event) => setDraft({ ...draft, bot_reminder_enabled: event.target.checked })} />
             <span>Ativar lembretes automáticos</span>
           </label>
-          {textKeys.map((key, index) => <div className="settings-block" key={key} style={{ marginTop: "1rem" }}>
-            <label htmlFor={key} style={{ display: "block", fontWeight: 600 }}>{index === 0 ? "Primeiro" : index === 1 ? "Segundo" : "Último"} lembrete · {timings[index]}</label>
-            <p className="sub" style={{ fontSize: "0.8rem" }}>{index < 2 ? "Depois da resposta do assistente." : "Depois da última mensagem do cliente, antes de terminar a janela de 24 horas."}</p>
-            <textarea id={key} rows={4} maxLength={1000} value={draft[key]} disabled={readOnly || busy} title={readOnly ? READ_ONLY_TOOLTIP : undefined}
-              placeholder="Escreva a mensagem que será enviada ao cliente." style={{ width: "100%", resize: "vertical" }}
-              onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} />
-            <p className="sub" style={{ fontSize: "0.75rem" }}>{draft[key].length}/1.000 caracteres · Campo vazio desativa esta etapa.</p>
-            {draft[key].trim() && <details><summary>Ver como fica no WhatsApp</summary><div className="settings-block" style={{ whiteSpace: "pre-wrap", padding: 12 }}><WaText text={`${draft[key]}\n\n${FOOTER}`} /></div></details>}
-          </div>)}
+          <h3 style={{ marginTop: "1.2rem" }}>Depois do aceite da política de privacidade</h3>
+          <p className="sub">O cliente aceitou a política e parou de responder ao assistente.</p>
+          {group(draft, acceptedKeys, false)}
+          <h3 style={{ marginTop: "1.6rem" }}>Sem resposta ao aviso da política de privacidade</h3>
+          <p className="sub">O cliente recebeu o aviso e não respondeu. Os lembretes saem com os botões Sim e Não do aviso: um toque em Sim registra o aceite. Quem recusou não recebe. Não use nome nem dados do cliente, porque ele ainda não aceitou a política.</p>
+          {group(draft, noticeKeys, true)}
           <p className="sub" style={{ fontSize: "0.8rem", marginTop: "1rem" }}>O sistema acrescenta a cada mensagem: “{FOOTER}” A preferência permanece até o cliente enviar ATIVAR LEMBRETES.</p>
           <details style={{ margin: "1rem 0" }}><summary>Ajustar intervalos</summary>
             {(["bot_reminder_minutes_1", "bot_reminder_minutes_2"] as const).map((key, index) => <label key={key} style={{ display: "block", marginTop: 12 }}>
               {index === 0 ? "Primeiro" : "Segundo"} lembrete, em minutos após a resposta: <input type="number" min={10} step={1} value={draft[key]} disabled={readOnly || busy} style={{ width: 90 }} onChange={(event) => setDraft({ ...draft, [key]: Number(event.target.value) })} />
             </label>)}
             <label style={{ display: "block", marginTop: 12 }}>Último lembrete, minutos antes das 24 horas: <input type="number" min={15} step={1} value={1440 - draft.bot_reminder_closing_minutes} disabled={readOnly || busy} style={{ width: 90 }} onChange={(event) => setDraft({ ...draft, bot_reminder_closing_minutes: 1440 - Number(event.target.value) })} /></label>
-            <p className="sub">Mínimo de 10 minutos para o primeiro e 60 minutos entre as etapas. O último precisa de pelo menos 15 minutos de antecedência.</p>
+            <p className="sub">Mínimo de 10 minutos para o primeiro e 60 minutos entre as etapas. O último precisa de pelo menos 15 minutos de antecedência. Os intervalos valem para as duas situações.</p>
           </details>
           {empty && <p role="alert">Preencha pelo menos uma mensagem antes de ativar.</p>}
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 20 }}>

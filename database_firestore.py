@@ -3318,7 +3318,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     promote_qualification=True,
                     reopen_attendance=True,
                     control_message=False,
-                    human_outbound=True, automation_kind="", automation_stage=""):
+                    human_outbound=True, automation_kind="", automation_stage="",
+                    automation_series=""):
     """Persiste mensagem WhatsApp.
 
     human_outbound=False: outbound com operador identificado que NAO conta
@@ -3469,7 +3470,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "operator_id": operator_id,
         "sender_user_id": sender_user_id,
         "sent_by_name": sent_by_name or "",
-        **({"automation_kind": automation_kind, "automation_stage": automation_stage} if automation_kind else {}),
+        **({"automation_kind": automation_kind, "automation_stage": automation_stage,
+            **({"automation_series": automation_series} if automation_series else {})} if automation_kind else {}),
         "channel_owner_user_id": channel_owner_user_id,
         "assigned_to": (contact or {}).get("assigned_to"),
         "assigned_to_uid": (contact or {}).get("assigned_to_uid", ""),
@@ -3627,7 +3629,8 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         msg_type=msg_type,
         template_category=template_category,
         media_size_bytes=media_size_bytes,
-        **({"automation_stage": automation_stage} if automation_kind == "bot_reminder" else {}),
+        **({"automation_stage": automation_stage, "automation_series": automation_series or "B"}
+           if automation_kind == "bot_reminder" else {}),
     )
     return message_id
 
@@ -3860,7 +3863,8 @@ def _usage_metrics_doc_id(year_month=None):
 _VALID_TEMPLATE_CATEGORIES = ("marketing", "utility", "authentication")
 
 
-def increment_usage_metrics(direction, msg_type="", template_category=None, media_size_bytes=0, automation_stage=""):
+def increment_usage_metrics(direction, msg_type="", template_category=None, media_size_bytes=0, automation_stage="",
+                            automation_series="B"):
     """Incrementa usage_{YYYY_MM} do tenant atual com Increment atomico.
 
     Campos atualizados conforme direction/msg_type:
@@ -3894,7 +3898,9 @@ def increment_usage_metrics(direction, msg_type="", template_category=None, medi
         updates["media_uploaded_bytes"] = firestore.Increment(int(media_size_bytes))
 
     if automation_stage in ("etapa_1", "etapa_2", "fechamento") and direction == "outbound":
-        updates["bot_reminders_sent"] = {"B": {automation_stage: firestore.Increment(1)}}
+        # Serie A = lead parado no aviso da LGPD; B = pos-aceite (ADR 0015).
+        series = "A" if automation_series == "A" else "B"
+        updates["bot_reminders_sent"] = {series: {automation_stage: firestore.Increment(1)}}
 
     try:
         document("audit_metrics", doc_id).set(updates, merge=True)

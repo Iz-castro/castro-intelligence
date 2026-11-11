@@ -33,7 +33,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
   Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4): `tools\sim_buffer_flow.py` (69).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
-  Lembretes pos-aceite (classificacao, agenda, transacao, comandos, API e envio): `tools\sim_bot_reminders.py` (128).
+  Lembretes (series A e B: classificacao, agenda, transacao, comandos, API e envio): `tools\sim_bot_reminders.py` (175).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
   History sync/eco do coex (recência real, janela de 24h, dono da thread, idempotência por bloco): `tools\sim_history_recency.py` (62).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
@@ -218,7 +218,9 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 ## Mapa de módulos (onde mexer)
 
 - **Lembretes pos-aceite (ADR 0015):** `FEATURE_BOT_REMINDER=false` por default, modo comercial `off|dry_run|on`
-  por tenant e toggle proprio na UI. Apenas CX/LGPD local aceita. Tres etapas, classificacao textual, sem link
+  por tenant e toggle proprio na UI. Apenas CX com LGPD local: serie B (aceite resolvido) e serie A (emenda 11/11:
+  parado no aviso, `lgpd_status=awaiting`; sai com os botoes Sim/Nao do aviso; textos `bot_reminder_lgpd_text_*`;
+  recusa nunca recebe). Mesmos horarios nas duas; `bot_reminder_series` na thread. Tres etapas, classificacao textual, sem link
   atual e sem cortesia; mensagem nova encerra ciclo. `PARAR LEMBRETES` persiste ate `ATIVAR LEMBRETES`.
   Claim transacional antes do POST, sem retry incerto; envio nao sobe recencia, nao reabre nem simula humano.
   API `/api/settings/bot-reminders` com RBAC/versao; generic PUT e upload de som preservam configuracao.

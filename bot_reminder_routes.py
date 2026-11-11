@@ -57,8 +57,9 @@ def save_config(body, user_id=None):
         raise HTTPException(422, "Configuração inválida.")
     cfg = _save(get_firestore_client().transaction(), document("system_settings", "chat"), body)
     from database_firestore import log_audit
-    log_audit(user_id, "BOT_REMINDER_SETTINGS_UPDATE", "enabled=%s caracteres=%s" % (
-        cfg["bot_reminder_enabled"], ",".join(str(len(cfg[f"bot_reminder_text_{i}"])) for i in range(1, 4))))
+    log_audit(user_id, "BOT_REMINDER_SETTINGS_UPDATE", "enabled=%s caracteres=%s lgpd=%s" % (
+        cfg["bot_reminder_enabled"], ",".join(str(len(cfg[f"bot_reminder_text_{i}"])) for i in range(1, 4)),
+        ",".join(str(len(cfg[f"bot_reminder_lgpd_text_{i}"])) for i in range(1, 4))))
     return read_config()
 
 

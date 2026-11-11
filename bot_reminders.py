@@ -14,9 +14,26 @@ from firestore_common import collection, document, get_firestore_client, utcnow
 logger = logging.getLogger("castro_crm.bot_reminders")
 KEYS = ("bot_reminder_enabled", "bot_reminder_text_1", "bot_reminder_text_2",
         "bot_reminder_text_3", "bot_reminder_minutes_1", "bot_reminder_minutes_2",
-        "bot_reminder_closing_minutes", "bot_reminder_generation")
-DEFAULTS = dict(zip(KEYS, (False, "", "", "", 20, 240, 1420, "")))
+        "bot_reminder_closing_minutes", "bot_reminder_generation",
+        "bot_reminder_lgpd_text_1", "bot_reminder_lgpd_text_2", "bot_reminder_lgpd_text_3")
+DEFAULTS = dict(zip(KEYS, (False, "", "", "", 20, 240, 1420, "", "", "", "")))
 STAGES = ("etapa_1", "etapa_2", "fechamento")
+# Serie B: lead que aceitou a LGPD e parou de responder. Serie A (emenda de 11/11
+# ao ADR 0015): lead parado no aviso da LGPD. Mesmas etapas e horarios; so o texto
+# e a checagem de consentimento mudam.
+SERIES = ("B", "A")
+
+
+def text_key(series, index):
+    return ("bot_reminder_lgpd_text_%d" if series == "A" else "bot_reminder_text_%d") % index
+
+
+TEXT_KEYS = tuple(text_key(series, index) for series in SERIES for index in range(1, 4))
+
+
+def series_of(thread):
+    """Thread carimbada antes da serie A nao tem o campo: e serie B."""
+    return "A" if (thread or {}).get("bot_reminder_series") == "A" else "B"
 
 
 def timestamp(value):
@@ -112,8 +129,7 @@ def clean_settings(values, current=None):
     cfg = {k: cfg[k] for k in KEYS}
     cfg["bot_reminder_enabled"] = cfg["bot_reminder_enabled"] is True
     from config import REOPEN_DESFECHO_LINK, BOT_REMINDER_MARGIN_MINUTES
-    for index in range(1, 4):
-        key = f"bot_reminder_text_{index}"
+    for key in TEXT_KEYS:
         cfg[key] = str(cfg[key] or "").strip()
         if len(cfg[key]) > 1000:
             raise ValueError("Cada lembrete deve ter no máximo 1.000 caracteres.")
@@ -130,7 +146,7 @@ def clean_settings(values, current=None):
     if not (10 <= first < second < closing <= 1440 - BOT_REMINDER_MARGIN_MINUTES - 10
             and second - first >= 60 and closing - second >= 60):
         raise ValueError("Use intervalos em ordem, separados por pelo menos 60 minutos, dentro da janela de 24 horas.")
-    if cfg["bot_reminder_enabled"] and not any(cfg[f"bot_reminder_text_{i}"] for i in range(1, 4)):
+    if cfg["bot_reminder_enabled"] and not any(cfg[key] for key in TEXT_KEYS):
         raise ValueError("Preencha pelo menos um lembrete antes de ativar.")
     return cfg
 
@@ -149,10 +165,11 @@ def schedule(thread, settings, now):
     if now > limit:
         return {"action": "clear", "reason": "janela_fechada"}
     done = set(thread.get("bot_reminder_done") or [])
+    series = series_of(thread)
     stages = []
     skipped = []
     for i, stage in enumerate(STAGES, 1):
-        if stage in done or not str(settings.get(f"bot_reminder_text_{i}") or "").strip():
+        if stage in done or not str(settings.get(text_key(series, i)) or "").strip():
             continue
         due = (bot + timedelta(minutes=settings[f"bot_reminder_minutes_{i}"]) if i < 3
                else inbound + timedelta(minutes=settings["bot_reminder_closing_minutes"]))
@@ -202,13 +219,19 @@ def _stamp(transaction, thread_ref, contact_ref, cfg_ref, metadata, sent_at, cla
     old_cycle = timestamp(thread.get("bot_reminder_cycle"))
     if old_cycle and old_cycle > metadata["inbound"]:
         return False
-    scope = "todas" if classification == "pending" and not contact.get("bot_reminder_opt_out") else "nenhuma"
+    # Aviso da LGPD (e o "nao entendi") arma a serie A; resposta com pergunta, a B.
+    # Recusa da LGPD, cortesia, link, falha e handoff nao armam nenhuma.
+    series = "A" if classification == "lgpd_notice" else "B"
+    armable = classification in ("pending", "lgpd_notice")
+    scope = "todas" if armable and not contact.get("bot_reminder_opt_out") else "nenhuma"
+    same_cycle = (old_cycle == metadata["inbound"] and series_of(thread) == series
+                  and timestamp(thread.get("bot_reminder_entry")) == metadata["entry"])
     updates = {"last_bot_turn_at": sent_at, "last_bot_turn_kind": metadata["kind"],
-               "bot_reminder_scope": scope, "bot_reminder_cycle": metadata["inbound"],
+               "bot_reminder_scope": scope, "bot_reminder_series": series,
+               "bot_reminder_cycle": metadata["inbound"],
                "bot_reminder_entry": metadata["entry"], "bot_reminder_epoch": metadata["epoch"],
                "bot_reminder_generation": cfg["bot_reminder_generation"],
-               "bot_reminder_done": (thread.get("bot_reminder_done") or [])
-               if old_cycle == metadata["inbound"] and timestamp(thread.get("bot_reminder_entry")) == metadata["entry"] else []}
+               "bot_reminder_done": (thread.get("bot_reminder_done") or []) if same_cycle else []}
     plan = schedule({**thread, **updates}, cfg, sent_at)
     updates["bot_reminder_next_at"] = plan.get("next_at") if plan["action"] != "clear" else None
     transaction.update(thread_ref, updates)
@@ -285,7 +308,16 @@ def gate(thread, contact, state, buffer, tenant, cfg, channel, now):
     if released and bot <= released:
         return "devolvido_ao_bot"
     ai = (tenant.get("settings") or {}).get("ai") or {}
-    if (contact.get("lgpd_consent") is not True or state.get("human_active")
+    if series_of(thread) == "A":
+        # Serie A: so quem esta parado no aviso (awaiting, sem resposta). Recusa,
+        # no estado ou no contato, nunca recebe; sem doc de estado nao envia; aceite
+        # ja resolvido (ex.: prova do contato) nao precisa de lembrete.
+        if (state.get("human_active") or state.get("lgpd_status") != "awaiting"
+                or state.get("lgpd_consent") is not None or contact.get("lgpd_consent") is False):
+            return "fora_do_aviso"
+        if lgpd_consent_resolved(state, contact, ai, cfg):
+            return "ja_aceitou"
+    elif (contact.get("lgpd_consent") is not True or state.get("human_active")
             or not lgpd_consent_resolved(state, contact, ai, cfg)):
         return "sem_aceite"
     from database_firestore import _bot_buffer_live_claim, bot_buffer_claim_ttl_seconds
@@ -331,13 +363,14 @@ def _claim(transaction, thread_ref, contact_ref, state_ref, buffer_ref, tenant_r
     transaction.update(contact_ref, {"bot_reminder_claim_at": now})
     return {"thread": thread, "contact": contact, "plan": plan, "mode": tenant_mode(tenant),
             "channel": channel, "epoch": tenant["settings"]["bot_reminder_epoch"],
-            "text": cfg[f"bot_reminder_text_{plan['index']}"]}
+            "series": series_of(thread), "text": cfg[text_key(series_of(thread), plan["index"])]}
 
 
-def audit(action, contact_id, stage, **detail):
+def audit(action, contact_id, stage, series="B", **detail):
     from database_firestore import log_audit
     log_audit(None, "BOT_REMINDER_" + action,
-              "contact_id=%s serie=B etapa=%s %s" % (contact_id, stage, " ".join(f"{k}={v}" for k, v in detail.items())))
+              "contact_id=%s serie=%s etapa=%s %s" % (contact_id, series, stage,
+                                                      " ".join(f"{k}={v}" for k, v in detail.items())))
 
 
 @firestore.transactional
@@ -396,16 +429,17 @@ def run_tick(now=None):
                     if not claimed:
                         continue
                     plan = claimed["plan"]
+                    series = series_of(row)
                     for skipped in plan.get("skipped", []):
-                        audit("SKIPPED", cid, skipped, motivo="etapa_superada")
+                        audit("SKIPPED", cid, skipped, series, motivo="etapa_superada")
                     if claimed.get("blocked"):
                         if claimed["blocked"] not in ("buffer", "aguardando"):
-                            audit("SKIPPED", cid, plan.get("stage", "ciclo"), motivo=claimed["blocked"])
+                            audit("SKIPPED", cid, plan.get("stage", "ciclo"), series, motivo=claimed["blocked"])
                         continue
                     processed += 1
                     if claimed["mode"] == "dry_run":
                         result["simulated"] += 1
-                        audit("SIMULATED", cid, plan["stage"], vencimento=plan["due"].isoformat())
+                        audit("SIMULATED", cid, plan["stage"], series, vencimento=plan["due"].isoformat())
                         continue
                     # Kill-switch e preferencia relidos apos o claim, antes do POST.
                     live = tenant_doc_ref(tenant["id"]).get().to_dict() or {}
@@ -414,11 +448,12 @@ def run_tick(now=None):
                             or live["settings"].get("bot_reminder_epoch") != claimed["epoch"]
                             or live_contact.get("bot_reminder_opt_out")
                             or timestamp(live_contact.get("last_new_inbound_at")) != timestamp(row.get("bot_reminder_entry"))):
-                        audit("SKIPPED", cid, plan["stage"], motivo="alterado_apos_claim")
+                        audit("SKIPPED", cid, plan["stage"], series, motivo="alterado_apos_claim")
                         continue
-                    outcome = send_bot_reminder(claimed["contact"], row, claimed["channel"], claimed["text"], plan["stage"])
+                    outcome = send_bot_reminder(claimed["contact"], row, claimed["channel"], claimed["text"],
+                                                plan["stage"], series=series)
                     result["sent" if outcome["ok"] else "failed"] += 1
-                    audit("SENT" if outcome["ok"] else "FAILED", cid, plan["stage"], code=outcome.get("code", ""))
+                    audit("SENT" if outcome["ok"] else "FAILED", cid, plan["stage"], series, code=outcome.get("code", ""))
                     if outcome.get("code") == 131047:
                         _close_failed_window(get_firestore_client().transaction(), document("wa_conversations", row["id"]), row)
             except Exception as exc:

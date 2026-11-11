@@ -29,3 +29,29 @@ Evolução: sinal explícito por turno da Val. Erro síncrono 131047 encerra age
 fica para evolução. Há corrida residual entre checagem e POST externo. Sem validação em produção.
 
 Decisões detalhadas: resposta de 11/11 em `docs/HANDOFF_MENSAGENS_AUTOMATICAS.md`.
+
+## Emenda — 2026-11-11 (tarde): série A, sem resposta ao aviso da LGPD
+
+Pedido do PO no mesmo dia, depois do primeiro envio real: o mesmo sistema para o lead que recebeu o aviso da LGPD e
+não respondeu. Reintroduz a série A do desenho original (handoff, seções 4.3 e 4.5), com os mesmos horários. A série
+pós-aceite descrita acima passa a se chamar série B.
+
+- Arma no turno `lgpd_notice` (o aviso e o "não entendi"). A série fica na thread (`bot_reminder_series`, `A` ou `B`;
+  thread carimbada antes da emenda, sem o campo, é `B`). Troca de série no mesmo ciclo zera as etapas feitas.
+- Gate da série A: `bot_states.lgpd_status == "awaiting"` sem `lgpd_consent`, contato sem recusa e sem
+  `human_active`; consentimento já resolvido barra (`ja_aceitou`); sem doc de estado não envia. Quem recusou nunca
+  recebe, em nenhuma série. Os demais gates são os da série B (canal standard, sem dono, `PARAR LEMBRETES`, recusa
+  comercial, revogação, thread aberta etc.).
+- Textos próprios (`bot_reminder_lgpd_text_1..3`, até 1.000 caracteres, sem o link de agendamento), mesmo toggle e
+  mesmos intervalos; série sem texto fica desligada. Na tela, segundo grupo: "Sem resposta ao aviso da política de
+  privacidade".
+- Envio interativo com os botões do próprio aviso (`lgpd_aceitar` "Sim" e `lgpd_recusar` "Não"): o toque entra no
+  gate que já existe. A instrução de parada vai no rodapé da mensagem (51 dos 60 caracteres). O texto não leva nome
+  nem dado do paciente, que ainda não aceitou a política.
+- Auditoria (`serie=A`), uso mensal (`bot_reminders_sent.A.<etapa>`) e o campo `automation_series` da mensagem
+  separam as séries.
+- Limite conhecido (R16 do handoff): depois do aceite, o toque em "Não" de um aviso ou lembrete antigo chega à Val
+  como texto e não registra recusa. Já acontecia com o aviso; a série A acrescenta até três mensagens com esse botão.
+
+Simulador: 175 verificações (inclui a série A: carimbo, agenda, gate, claim, envio com botões, toque no gate real,
+worker, uso mensal e API).

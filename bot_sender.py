@@ -57,11 +57,27 @@ async def send_bot_reply(
     return False
 
 
-def send_bot_reminder(contact, thread, channel, text, stage):
-    """POST sem retry. Chamado somente no worker fora do event loop."""
+REMINDER_FOOTER = "Para desativar os lembretes, envie PARAR LEMBRETES."
+
+
+def send_bot_reminder(contact, thread, channel, text, stage, series="B"):
+    """POST sem retry. Chamado somente no worker fora do event loop.
+
+    Serie A (lead parado no aviso da LGPD) sai com os botoes do proprio aviso,
+    mesmos ids, para o toque entrar no gate que ja existe; a instrucao de
+    parada vai no rodape da mensagem interativa. Serie B sai como texto simples.
+    """
     from database_firestore import save_wa_message
-    payload, content = build_outbound_payload(
-        text + "\n\nPara desativar os lembretes, envie PARAR LEMBRETES.", str(thread["wa_id"]))
+    if series == "A":
+        from lgpd_bot import _BTN_ACEITAR, _BTN_RECUSAR
+        reply = {"type": "interactive_buttons", "body": text, "footer": REMINDER_FOOTER,
+                 "buttons": [dict(_BTN_ACEITAR), dict(_BTN_RECUSAR)]}
+    else:
+        reply = text + "\n\n" + REMINDER_FOOTER
+    payload, content = build_outbound_payload(reply, str(thread["wa_id"]))
+    if series == "A":
+        # O chat do CRM mostra o rodape como na serie B (o corpo gravado e so o body).
+        content = content + "\n\n" + REMINDER_FOOTER
     try:
         with httpx.Client(timeout=15.0) as client:
             response = client.post(f"{GRAPH_API_BASE}/{channel['phone_number_id']}/messages", json=payload,
@@ -69,8 +85,8 @@ def send_bot_reminder(contact, thread, channel, text, stage):
         result = response.json()
         if response.status_code != 200:
             code = (result.get("error") or {}).get("code")
-            logger.warning("[BOT-REMINDER] envio recusado | status=%s code=%s contact=%s etapa=%s",
-                           response.status_code, code, contact.get("id"), stage)
+            logger.warning("[BOT-REMINDER] envio recusado | status=%s code=%s contact=%s serie=%s etapa=%s",
+                           response.status_code, code, contact.get("id"), series, stage)
             return {"ok": False, "code": code}
         message_id = (result.get("messages") or [{}])[0].get("id")
         if not message_id:
@@ -80,11 +96,11 @@ def send_bot_reminder(contact, thread, channel, text, stage):
                         conversation_id=thread["id"], sender_user_id=None, operator_id=None,
                         advance_recency=False, reopen_attendance=False, promote_qualification=False,
                         human_outbound=False, sent_by_name="Lembrete automático", contact=contact,
-                        automation_kind="bot_reminder", automation_stage=stage)
+                        automation_kind="bot_reminder", automation_stage=stage, automation_series=series)
         return {"ok": True, "message_id": message_id}
     except Exception as exc:
         # Timeout e persistencia incerta nao autorizam outro POST. So o tipo
         # da excecao no log: a mensagem pode trazer PII do provedor.
-        logger.error("[BOT-REMINDER] falha no envio/persistencia | erro=%s contact=%s etapa=%s",
-                     type(exc).__name__, contact.get("id"), stage)
+        logger.error("[BOT-REMINDER] falha no envio/persistencia | erro=%s contact=%s serie=%s etapa=%s",
+                     type(exc).__name__, contact.get("id"), series, stage)
         return {"ok": False, "code": "envio_ou_persistencia"}

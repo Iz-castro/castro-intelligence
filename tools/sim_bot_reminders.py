@@ -81,7 +81,8 @@ class Tx:
 
 def fixture():
     cfg = {**br.DEFAULTS, "bot_reminder_enabled": True, "bot_enabled": True,
-           "bot_reminder_generation": "g1", **{f"bot_reminder_text_{i}": f"texto {i}" for i in range(1, 4)}}
+           "bot_reminder_generation": "g1", **{f"bot_reminder_text_{i}": f"texto {i}" for i in range(1, 4)},
+           **{f"bot_reminder_lgpd_text_{i}": f"aviso {i}" for i in range(1, 4)}}
     thread = {"id": "thread", "contact_id": 1, "wa_id": "5500000000000", "channel_id": 4,
               "last_inbound_at": NOW - timedelta(minutes=21), "last_bot_turn_at": NOW - timedelta(minutes=20),
               "attendance_status": "aberto", "bot_reminder_cycle": NOW - timedelta(minutes=21),
@@ -137,7 +138,8 @@ def pure():
     check(br.schedule(thread, cfg, NOW)["action"] == "clear", "inbound recuado nao cria ciclo")
     for changes in ({"bot_reminder_minutes_1": 5}, {"bot_reminder_closing_minutes": 1430},
                     {"bot_reminder_text_1": "x" * 1001}, {"bot_reminder_text_1": "marcaconsultas"},
-                    {"bot_reminder_enabled": True, **{f"bot_reminder_text_{i}": "" for i in range(1, 4)}}):
+                    {"bot_reminder_lgpd_text_2": "y" * 1001}, {"bot_reminder_lgpd_text_3": "veja marcaconsultas"},
+                    {"bot_reminder_enabled": True, **{key: "" for key in br.TEXT_KEYS}}):
         try:
             br.clean_settings(changes, cfg)
         except ValueError:
@@ -272,7 +274,7 @@ def worker():
                 (tenant_service, "list_tenants", lambda **kw: [store[("tenants", "test")].data]),
                 (tenant_service, "tenant_doc_ref", lambda tid: ref("tenants", tid)),
                 (channel_service, "get_channel", lambda cid: channel),
-                (bot_sender, "send_bot_reminder", lambda *a: sent.append(a) or {"ok": True})):
+                (bot_sender, "send_bot_reminder", lambda *a, **kw: sent.append(a) or {"ok": True})):
             stack.enter_context(patch.object(target, name, value))
         check(br.run_tick(NOW)["sent"] == 1, "worker integrado envia uma vez")
         check(br.run_tick(NOW)["sent"] == 0 and len(sent) == 1, "tick repetido sem reenvio")
@@ -308,7 +310,7 @@ def worker():
             check(br.run_tick(NOW)["sent"] == 1 and sent[-1][-1] == "fechamento", "prioriza fechamento antes das outras etapas")
         check(br.run_tick(NOW)["sent"] == 30, "teto tecnico global por tick")
         real_close = br._close_failed_window
-        with patch.object(bot_sender, "send_bot_reminder", lambda *a: {"ok": False, "code": 131047}), \
+        with patch.object(bot_sender, "send_bot_reminder", lambda *a, **kw: {"ok": False, "code": 131047}), \
                 patch.object(br, "_close_failed_window", lambda tx, *a: real_close.to_wrap(tx, *a)):
             check(br.run_tick(NOW + timedelta(minutes=5))["failed"] == 4, "falhas de janela nas quatro restantes")
             check(br.run_tick(NOW + timedelta(minutes=10))["failed"] == 0, "janela fechada nao repete falhas")
@@ -352,6 +354,16 @@ def persistence():
         check(ref("wa_messages", 4242).data["automation_stage"] == "etapa_1", "marcador persistido real")
         usages = [value.data for (name, key), value in store.items() if key.startswith("usage_")]
         check(len(usages) == 1 and "etapa_1" in usages[0]["bot_reminders_sent"]["B"], "uso mensal por serie e etapa")
+        check("automation_series" not in ref("wa_messages", 4242).data or ref("wa_messages", 4242).data["automation_series"] == "",
+              "serie B legada sem campo novo obrigatorio")
+        db.save_wa_message("local_test_only_a", 1, "outbound", "text", "lembrete A", status="sent", timestamp_wa=NOW.isoformat(),
+                           contact=contact, channel_id=4, conversation_id=cid, advance_recency=False,
+                           reopen_attendance=False, promote_qualification=False, human_outbound=False,
+                           sent_by_name="Lembrete automático", automation_kind="bot_reminder", automation_stage="etapa_1",
+                           automation_series="A")
+        check(ref("wa_messages", 4242).data["automation_series"] == "A", "serie A persistida na mensagem")
+        usages = [value.data for (name, key), value in store.items() if key.startswith("usage_")]
+        check("etapa_1" in usages[0]["bot_reminders_sent"].get("A", {}), "uso mensal separa a serie A")
         # Entrada nova carimba o marcador; reentrega do mesmo wamid nao.
         db.save_wa_message("wamid_local_in", 1, "inbound", "text", "oi", status="received", timestamp_wa=NOW.isoformat(),
                            contact=contact, channel_id=4, conversation_id=cid)
@@ -399,6 +411,14 @@ def api():
             body = client.get("/api/settings/bot-reminders").json()
             body["settings"]["bot_reminder_text_1"] = "x" * 1001
             check(client.put("/api/settings/bot-reminders", json=body).status_code == 400, "HTTP limite de texto")
+            body = client.get("/api/settings/bot-reminders").json()
+            body["settings"].update({f"bot_reminder_text_{i}": "" for i in range(1, 4)})
+            body["settings"]["bot_reminder_lgpd_text_1"] = "Podemos continuar?"
+            check(client.put("/api/settings/bot-reminders", json=body).status_code == 200, "ativa so com texto da serie A")
+            body = client.get("/api/settings/bot-reminders").json()
+            check(body["settings"]["bot_reminder_lgpd_text_1"] == "Podemos continuar?", "texto da serie A persistido")
+            body["settings"]["bot_reminder_lgpd_text_2"] = "veja marcaconsultas"
+            check(client.put("/api/settings/bot-reminders", json=body).status_code == 400, "link recusado tambem na serie A")
             user["role"] = "operador"
             check(client.get("/api/settings/bot-reminders").status_code == 403, "GET exige permissao")
             check(client.put("/api/settings/bot-reminders", json=body).status_code == 403, "PUT exige permissao")
@@ -436,6 +456,136 @@ def pipeline():
         check(reply == "Qual seu nome?", "falha de preparacao nao silencia Val")
 
 
+def aguardando_aviso():
+    """Fixture da serie A: lead recebeu o aviso da LGPD e nao respondeu."""
+    thread, contact, state, buffer, tenant, cfg, channel = fixture()
+    contact.pop("lgpd_consent")
+    return thread, contact, {"lgpd_status": "awaiting", "step": "lgpd"}, buffer, tenant, cfg, channel
+
+
+def serie_a():
+    """Emenda de 11/11 ao ADR 0015: lembretes para quem parou no aviso da LGPD."""
+    import bot_service
+    tx = Tx()
+    check(br.text_key("A", 2) == "bot_reminder_lgpd_text_2" and br.text_key("B", 2) == "bot_reminder_text_2", "chaves por serie")
+    check(br.series_of({}) == "B" and br.series_of({"bot_reminder_series": "A"}) == "A", "thread antiga continua serie B")
+    thread, contact, state, buffer, tenant, cfg, channel = aguardando_aviso()
+    t, c, cfg_ref = Ref(thread), Ref(contact), Ref(cfg)
+    meta = {"entry": contact["last_new_inbound_at"], "inbound": thread["last_inbound_at"], "epoch": "e1",
+            "kind": "lgpd_notice", "generation": "g1"}
+    check(br.classify_reply({"type": "interactive_buttons", "body": "Podemos continuar?"}, "lgpd_notice") == "lgpd_notice",
+          "aviso com botoes classificado pelo tipo do turno")
+    check(br._stamp.to_wrap(tx, t, c, cfg_ref, meta, NOW, "lgpd_notice"), "aviso da LGPD carimba")
+    check(t.data["bot_reminder_series"] == "A" and t.data["bot_reminder_scope"] == "todas", "aviso arma a serie A")
+    check(t.data["bot_reminder_next_at"] == NOW + timedelta(minutes=20), "serie A usa os mesmos 20 minutos")
+    a_thread = {**t.data, "id": "thread"}
+    plan = br.schedule(a_thread, cfg, NOW + timedelta(minutes=20))
+    check(plan["action"] == "send" and plan["index"] == 1, "serie A vence no mesmo horario")
+    check(br.schedule(a_thread, cfg, NOW + timedelta(hours=4))["index"] == 2, "serie A segunda etapa em 4 h")
+    closing = thread["last_inbound_at"] + timedelta(minutes=1420)
+    check(br.schedule(a_thread, cfg, closing)["index"] == 3, "serie A fechamento pela entrada")
+    only_b = {**cfg, **{br.text_key("A", i): "" for i in range(1, 4)}}
+    check(br.schedule(a_thread, only_b, NOW + timedelta(minutes=20))["action"] == "clear", "sem textos da serie A nada sai")
+    only_a = {**cfg, **{br.text_key("B", i): "" for i in range(1, 4)}}
+    check(br.schedule({**thread, "id": "thread"}, only_a, NOW)["action"] == "clear", "textos da serie A nao valem para a B")
+    # Turno seguinte no mesmo ciclo vira serie B: etapas da A nao contam como feitas.
+    t.data["bot_reminder_done"] = ["etapa_1"]
+    br._stamp.to_wrap(tx, t, c, cfg_ref, {**meta, "kind": "cx_reply"}, NOW, "pending")
+    check(t.data["bot_reminder_series"] == "B" and t.data["bot_reminder_done"] == [], "troca de serie zera etapas feitas")
+    br._stamp.to_wrap(tx, t, c, cfg_ref, {**meta, "kind": "lgpd_refusal"}, NOW, "lgpd_refusal")
+    check(t.data["bot_reminder_scope"] == "nenhuma" and t.data["bot_reminder_next_at"] is None, "recusa nao arma e limpa agenda")
+    with fc.tenant_context("test"):
+        check(br.gate(a_thread, contact, state, buffer, tenant, cfg, channel, NOW) is None, "parado no aviso e elegivel")
+        for label, st, extra in (("recusou no estado", {"lgpd_status": "refused", "lgpd_consent": False}, {}),
+                                 ("recusou no contato", state, {"lgpd_consent": False}),
+                                 ("aceitou", {"lgpd_status": "accepted", "lgpd_consent": True}, {"lgpd_consent": True}),
+                                 ("sem doc de estado", {}, {}),
+                                 ("humano conduzindo", {**state, "human_active": True}, {}),
+                                 ("revogado", state, {"lgpd_revoked": True}),
+                                 ("parou lembretes", state, {"bot_reminder_opt_out": True})):
+            check(bool(br.gate(a_thread, {**contact, **extra}, st, buffer, tenant, cfg, channel, NOW)), "serie A barra: " + label)
+        with patch.object(bot_service, "lgpd_consent_resolved", lambda *a, **kw: True):
+            check(br.gate(a_thread, contact, state, buffer, tenant, cfg, channel, NOW) == "ja_aceitou", "aceite ja resolvido barra a serie A")
+        check(br.gate({**thread, "id": "thread"}, contact, state, buffer, tenant, cfg, channel, NOW) == "sem_aceite",
+              "serie B continua exigindo aceite")
+    refs = [Ref(a_thread, "thread"), Ref(contact, "1"), Ref(state, "2"), Ref(buffer, "3"), Ref(tenant, "4"), Ref(cfg, "5")]
+    with fc.tenant_context("test"):
+        claimed = br._claim.to_wrap(tx, *refs, Ref(channel), a_thread, NOW + timedelta(minutes=20))
+    check(claimed["series"] == "A" and claimed["text"] == "aviso 1", "claim usa o texto da serie A")
+
+
+def sender_serie_a():
+    import lgpd_bot
+    thread, contact, _, _, _, _, channel = aguardando_aviso()
+    posted, writes = [], []
+    class Client:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def post(self, url, json=None, headers=None):
+            posted.append(json)
+            return type("Response", (), {"status_code": 200, "json": lambda s: {"messages": [{"id": "local_a"}]}})()
+    with patch.object(bot_sender.httpx, "Client", Client), patch.object(db, "save_wa_message", lambda *a, **kw: writes.append(kw)):
+        check(bot_sender.send_bot_reminder(contact, thread, channel, "Podemos continuar?", "etapa_1", series="A")["ok"], "serie A envia")
+        check(bot_sender.send_bot_reminder(contact, thread, channel, "texto", "etapa_1")["ok"], "serie B segue padrao")
+    interactive = posted[0].get("interactive") or {}
+    ids = [b["reply"]["id"] for b in interactive.get("action", {}).get("buttons", [])]
+    check(posted[0]["type"] == "interactive" and ids == ["lgpd_aceitar", "lgpd_recusar"], "serie A sai com os botoes do aviso")
+    check(interactive["body"]["text"] == "Podemos continuar?" and "PARAR LEMBRETES" in interactive["footer"]["text"],
+          "corpo e o texto da clinica; parada no rodape")
+    check(len(interactive["footer"]["text"]) <= 60, "rodape dentro do limite da Meta")
+    check(writes[0]["automation_series"] == "A" and "PARAR LEMBRETES" in writes[0]["content"], "serie gravada e rodape visivel no CRM")
+    check(not writes[0]["advance_recency"] and writes[0]["sender_user_id"] is None, "serie A tambem nao simula humano")
+    check(posted[1]["type"] == "text" and writes[1]["automation_series"] == "B", "serie B continua texto simples")
+    # O toque nos botoes do lembrete entra no gate LGPD que ja existe.
+    st = {"lgpd_status": "awaiting"}
+    lgpd_bot.handle_lgpd(st, ids[0])
+    check(st.get("lgpd_consent") is True, "toque em Sim do lembrete registra o aceite")
+    st = {"lgpd_status": "awaiting"}
+    lgpd_bot.handle_lgpd(st, ids[1])
+    check(st.get("lgpd_consent") is False, "toque em Nao do lembrete registra a recusa")
+
+
+def worker_serie_a():
+    thread, contact, state, buffer, tenant, cfg, channel = aguardando_aviso()
+    thread.update(bot_reminder_series="A", bot_reminder_next_at=NOW)
+    store = {("wa_conversations", "thread"): Ref(thread, "thread"), ("wa_contacts", "1"): Ref(contact, "1"),
+             ("bot_states", "1"): Ref(state), ("bot_buffers", "1"): Ref(buffer),
+             ("tenants", "test"): Ref(tenant), ("system_settings", "chat"): Ref(cfg), ("channels", "4"): Ref(channel)}
+    def ref(name, key):
+        return store.setdefault((name, str(key)), Ref(None, str(key)))
+    class Query:
+        def __init__(self, name): self.name, self.filters = name, []
+        def where(self, field, op, value): self.filters.append((field, op, value)); return self
+        def order_by(self, *a, **kw): return self
+        def limit(self, *a): return self
+        def stream(self):
+            for (name, key), item in list(store.items()):
+                if name == self.name and all(item.data.get(field) is not None and
+                                             (item.data[field] >= value if op == ">=" else item.data[field] <= value)
+                                             for field, op, value in self.filters):
+                    yield item
+    audits, sent = [], []
+    real_claim = br._claim
+    with ExitStack() as stack:
+        for target, name, value in (
+                (config, "FEATURE_BOT_REMINDER", True), (br, "document", ref), (br, "collection", Query),
+                (br, "get_firestore_client", lambda: type("Client", (), {"transaction": lambda self: Tx()})()),
+                (br, "_claim", lambda tx, *a: real_claim.to_wrap(tx, *a)),
+                (br, "audit", lambda *a, **kw: audits.append(a)),
+                (tenant_service, "list_tenants", lambda **kw: [store[("tenants", "test")].data]),
+                (tenant_service, "tenant_doc_ref", lambda tid: ref("tenants", tid)),
+                (bot_sender, "send_bot_reminder", lambda *a, **kw: sent.append((a, kw)) or {"ok": True})):
+            stack.enter_context(patch.object(target, name, value))
+        check(br.run_tick(NOW)["sent"] == 1, "worker envia a serie A")
+        check(sent[0][1].get("series") == "A" and sent[0][0][3] == "aviso 1", "worker passa serie e texto A")
+        check(any(a[0] == "SENT" and a[3] == "A" for a in audits), "auditoria registra a serie A")
+        # Lead respondeu ao aviso (aceitou) antes da etapa 2: o claim barra.
+        ref("bot_states", 1).data.update(lgpd_status="accepted", lgpd_consent=True)
+        check(br.run_tick(NOW + timedelta(hours=4))["sent"] == 0, "aceite antes da etapa seguinte barra a serie A")
+        check(any(a[0] == "SKIPPED" and a[3] == "A" for a in audits), "pulo da serie A auditado")
+
+
 def main():
     pure()
     transactions()
@@ -444,6 +594,9 @@ def main():
     persistence()
     api()
     pipeline()
+    serie_a()
+    sender_serie_a()
+    worker_serie_a()
     from bot_reminder_measure import summarize
     report = summarize([{"conversation_id": "private", "direction": "outbound", "msg_type": "text", "timestamp_wa": NOW, "content": "Qual seu nome?"}], NOW)
     check(report["tempo_de_resposta"]["ainda_em_observacao"] == 1, "medidor nao inventa nunca respondeu")
