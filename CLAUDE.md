@@ -218,7 +218,10 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   por canal standard do tenant** (`resolve_orphan_buffer_channel`, em `webhook.py`) — nunca por
   `wa_contacts.channel_id`, que é o canal de CRIAÇÃO do contato: contato nascido em número coex e
   devolvido ao agente receberia a resposta pelo WhatsApp pessoal da vendedora (achado 2026-11-12, só no
-  simulador). Com `lgpd_by_agent` (Hugo) o buffer arma desde a 1ª mensagem do lead.
+  simulador). Com `lgpd_by_agent` (Hugo) o buffer arma desde a 1ª mensagem do lead. Ligado (10 s) nos 3
+  tenants; hubloc desde 2026-11-12 (rev `castro-crm-00130-jx5`). **Rollback para revisão anterior a essa
+  só depois de zerar o buffer da hubloc** (`--seconds 0` + 60 s + 1 tick do cron): a revisão antiga
+  ignora o `ch` e volta a responder pelo canal de criação.
 
 ## Mapa de módulos (onde mexer)
 
