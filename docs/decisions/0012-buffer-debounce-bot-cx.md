@@ -69,3 +69,18 @@ persistido em doc PRÓPRIO tenant-scoped `bot_buffers/{contact_id}`:
 - Gate: `tools/sim_buffer_flow.py` (52 checagens, webhook real com
   persistência/CX/envio mockados; contratos transacionais reais).
 - ADRs relacionados: 0010 (modo Recepção / pool), 0011 (não-lido derivado).
+
+## Emenda (2026-11-12) — canal da resposta no flush de órfãos
+
+O flush do cron respondia pelo `wa_contacts.channel_id`, que é o canal de
+CRIAÇÃO do contato. Em tenant com números coexistence (Hubloc), contato nascido
+no WhatsApp pessoal de uma vendedora e devolvido ao agente receberia a resposta
+do flush por esse número pessoal. Decisão: o item do buffer guarda o canal por
+onde a mensagem chegou (`ch`) e o cron responde por ele; o canal de criação só
+vale para lote gravado antes do campo; e o cron **só envia por canal standard
+do tenant do contexto** — qualquer outro caso descarta o lote sem envio (falha
+fechado). Rejeitado: usar `channels.is_bot_enabled` como trava (nenhum runtime
+lê o campo e o default é False — emudeceria a Val). Detalhes, limite conhecido
+do caminho ao vivo e nota de rollback em `docs/BUFFER_MENSAGENS_BOT.md`
+§Emenda 2026-11-12. Gate: `tools/sim_buffer_flow.py` (97 checagens, cenário 22
+roda o corpo real do cron).

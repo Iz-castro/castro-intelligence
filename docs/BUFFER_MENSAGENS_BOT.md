@@ -74,8 +74,10 @@ em voo ressuscitaria itens drenados e o handoff apagaria rajada pendente.
 Coleção nova tenant-scoped `bot_buffers`, doc por contato:
 
 ```
-items: [{"text": str, "ts": iso_da_Meta, "n": int, "at": iso_do_append}]
+items: [{"text": str, "ts": iso_da_Meta, "n": int, "at": iso_do_append, "ch": id_do_canal}]
         # ordem do join = (ts, n); IDADE (descarte 10min) = at [REV-IMPL F05]
+        # ch = canal por onde a mensagem CHEGOU (flush do cron responde por
+        # ele); ausente em item anterior a 2026-11-12 [EMENDA 2026-11-12]
 token: str (uuid4, rotacionado a cada append)         # NUNCA contador int
 claimed_at: iso | null   # identidade opaca do claim
 claim_hb: iso | null     # heartbeat, renovado a cada drain [REV-IMPL F01]
@@ -168,9 +170,12 @@ mensagem do contato drena tudo; (b) passo novo no cron de 30min:
   entrada do request e **1 turno por contato** (`max_drain_loops=1`), rodando
   DEPOIS do trabalho existente do cron (expire/close não podem ser
   sacrificados; request do cron também morre em 300s) **[REV-IMPL F03]**;
-- pra ENVIAR é preciso resolver canal/token/phone_id pelo contato (padrão de
-  `main.py:3958-3968`); extrair helper de envio compartilhado com
-  `_send_bot_reply` (webhook.py:279) em vez de duplicar.
+- pra ENVIAR é preciso resolver canal/token/phone_id; extrair helper de envio
+  compartilhado com `_send_bot_reply` (webhook.py:279) em vez de duplicar.
+  **[EMENDA 2026-11-12]** O canal NÃO é o do contato: `wa_contacts.channel_id`
+  é o canal de CRIAÇÃO (só gravado se vazio). O cron responde pelo canal por
+  onde a rajada CHEGOU (`ch` do item mais recente) e só por canal standard do
+  tenant — ver §Emenda 2026-11-12.
 
 ## Config e kill-switch
 
@@ -240,6 +245,14 @@ pros cenários concorrentes:
     [REV-IMPL F02/F03/F12].
 17. Interativa com claim vivo além da espera → clique roda turno direto.
 18. Kill-switch com a config real do deploy (chave ausente + env 0).
+22. **[EMENDA 2026-11-12]** Flush do cron pelo canal de chegada: roda o corpo
+    REAL de `main.cron_expire_takeovers` (extraído por AST, sem importar o
+    `main.py`). Contato nascido em coexistence + rajada órfã que chegou pelo
+    standard → resposta pelo standard; canal coexistence / de outro tenant /
+    inexistente / sem tipo → lote descartado sem envio; lote antigo sem `ch` +
+    contato nascido em standard → respondido como antes; ponta a ponta com o
+    lote gravado pelo próprio webhook (request morta na janela). (Os cenários 19–21 do
+    simulador são os de ciclo novo, data da política LGPD e reset do opt-out.)
 
 ## Revisão da implementação (2026-09-14) [REV-IMPL]
 
@@ -312,6 +325,73 @@ exigiu antes de LIGAR (o deploy desligado não depende delas):
 8. **Retry de pending pela UI admin:** re-entra pelo caminho com debounce
    (janela + turno dentro do request do admin); com F05 a mensagem atrasada
    não nasce vencida. Aceito.
+
+## Emenda 2026-11-12 — canal da resposta no flush do cron (Hubloc / Hugo)
+
+**Achado.** Na conferência do buffer do Hugo (Hubloc, `buffer_seconds=0` desde
+a virada de 23/10) o flush do cron resolvia o canal por
+`wa_contacts.channel_id`, sem conferir `channel_type`. Esse campo é o canal de
+CRIAÇÃO do contato (só gravado se vazio). Na Varizemed há um único canal e o
+resultado era sempre certo; na Hubloc há 8 números coexistence (WhatsApp
+pessoal das vendedoras). Contato nascido num coexistence e devolvido ao agente,
+que escreve no número da empresa e tem a rajada esquecida (request morta na
+janela) receberia a resposta do Hugo **pelo número pessoal da vendedora**.
+Reproduzido no simulador com o código real do cron; nenhum envio real (o
+buffer da Hubloc nunca esteve ligado). Exposição em 12/11: 3 contatos de 7.438
+nascidos em coexistence estavam sem dono e sem `bot_completed`.
+
+**Correção.**
+
+- `append_bot_buffer(..., channel_id=...)` grava no item o canal por onde a
+  mensagem chegou (`ch`); claim e drain preservam o campo.
+- `webhook.resolve_orphan_buffer_channel(items, contact)` decide o canal do
+  flush: `ch` do item mais recente; sem `ch` (lote gravado antes do campo), o
+  canal de criação do contato. Em qualquer caso o canal precisa existir e estar
+  ativo, ser do tenant do contexto e ser `standard` — senão o lote é
+  descartado sem envio, com warning só de ids (`cron bot-buffer: lote do
+  contato N descartado sem envio: <motivo>`). Canal sem `channel_type` falha
+  fechado.
+- O caminho ao vivo não muda: já respondia pelo canal da mensagem.
+
+**Não coberto (pré-existente, fora desta emenda).** O gate do bot no webhook
+não confere o tipo do canal; quem impede o agente de rodar em número
+coexistence é a auto-atribuição ao dono do canal. Ela só falha quando
+`owner_user_id` aponta para um usuário cujo doc foi APAGADO: nesse caso o
+caminho AO VIVO responderia pelo coexistence, com ou sem buffer (o flush do
+cron recusa). Os outros dois casos não abrem o caminho: dono DESATIVADO
+continua recebendo a auto-atribuição (`deactivate_user` só grava
+`is_active=0`; o lead fica com ele, sem agente) e canal coexistence SEM
+`owner_user_id` vai para `pending_webhook_events` (`coex_no_owner`). Em 12/11
+os 8 canais coexistence da Hubloc tinham dono com doc existente.
+
+**Rollback com a Hubloc ligada.** Antes de promover uma revisão ANTERIOR a
+esta emenda com `buffer_seconds > 0` em tenant que tenha canal coexistence:
+`--seconds 0`, esperar >60 s + 1 tick do cron e conferir `_diag_bot_buffers`
+vazio. A revisão antiga ignora o `ch` e volta a responder pelo canal de
+criação.
+
+**Ativação na Hubloc.** Com `settings.ai.lgpd_by_agent=true` não há fase de
+consentimento no CRM: a janela vale para TODO texto, inclusive a 1ª mensagem do
+lead (medido em 12/11, sem buffer: p50 9,3 s, p95 20,8 s; com 10 s de janela a
+soma dá ~19 s e ~31 s). Ligar/desligar:
+`.venv\Scripts\python.exe -m scripts.set_tenant_buffer --tenant hubloc --seconds 10 --yes`
+(`--seconds 0` = kill-switch, vale em até 60 s).
+
+**Gate.** `tools/sim_buffer_flow.py` (97 checagens): cenário 22 e os contratos
+do campo `ch` no cenário 14. O cenário 22 foi rodado contra 8 mutantes (cron
+antigo; sem trava de standard; sem checagem de tenant; ignorando o canal de
+chegada; webhook sem repassar o canal; webhook gravando o canal do contato em
+vez do de chegada; claim perdendo o `ch`; canal do item mais antigo) e falhou
+em todos.
+
+**Revisão (4 revisores Opus + cético).** Nenhum achado no código da correção
+(cron, persistência/convivência de revisões, caminho ao vivo). Dois ajustes
+aplicados: (1) o dublê `_upsert_contact` do simulador regravava o canal do
+contato a cada inbound — o real só grava quando vazio — e apagava a premissa
+"contato nascido em coexistence"; agora espelha o real, e o caso 22m cobre
+webhook → órfão → cron de ponta a ponta; (2) o parágrafo "Não coberto" acima
+dizia "dono inexistente/inativo" e foi corrigido para o único caso real (doc
+do usuário apagado).
 
 **Canário executado e APROVADO em 2026-09-14 11:12–11:16Z** (rev `00099-lxq`,
 PO confirmou): 4 textos em 15s → `turno 1 com 4 item(ns)` → 1 resposta; 1 texto

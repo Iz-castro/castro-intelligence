@@ -217,18 +217,23 @@ def _filter_and_sort_bot_buffer_items(items, now, max_item_age_seconds):
             order = int(raw.get("n") or 0)
         except (TypeError, ValueError):
             order = 0
-        kept.append({
+        entry = {
             "text": text,
             "ts": _bot_buffer_iso(raw.get("ts"), fallback=now),
             "n": order,
             "at": _bot_buffer_iso(raw.get("at") or raw.get("ts"), fallback=now),
-        })
+        }
+        # ch = canal por onde a mensagem CHEGOU; o flush do cron responde por
+        # ele. Ausente em item gravado antes do campo (2026-11-12).
+        if raw.get("ch") is not None:
+            entry["ch"] = raw.get("ch")
+        kept.append(entry)
     kept.sort(key=lambda item: (item["ts"], item["n"]))
     return kept, discarded
 
 
 @firestore.transactional
-def _transactional_append_bot_buffer(transaction, ref, text, timestamp_iso):
+def _transactional_append_bot_buffer(transaction, ref, text, timestamp_iso, channel_id=None):
     snapshot = ref.get(transaction=transaction)
     data = snapshot.to_dict() or {} if snapshot.exists else {}
     items = list(data.get("items") or [])
@@ -247,7 +252,14 @@ def _transactional_append_bot_buffer(transaction, ref, text, timestamp_iso):
     # (IDADE p/ descarte e p/ oldest_at do flush do cron). Separados porque
     # uma entrega atrasada/reprocesso de pending chegaria "vencida" (F05).
     item_ts = _bot_buffer_iso(timestamp_iso, fallback=now)
-    items.append({"text": str(text), "ts": item_ts, "n": next_n, "at": now_iso})
+    item = {"text": str(text), "ts": item_ts, "n": next_n, "at": now_iso}
+    # ch = canal por onde a mensagem chegou. wa_contacts.channel_id e o canal
+    # de CRIACAO do contato (so gravado se vazio) e nao serve para o flush do
+    # cron escolher o numero da resposta: contato nascido em numero coexistence
+    # e devolvido ao agente responderia pelo WhatsApp pessoal do operador.
+    if channel_id is not None:
+        item["ch"] = channel_id
+    items.append(item)
     oldest_at = (
         _bot_buffer_iso(data.get("oldest_at"), fallback=now)
         if data.get("oldest_at") else now_iso
@@ -263,12 +275,16 @@ def _transactional_append_bot_buffer(transaction, ref, text, timestamp_iso):
     return {"token": token, "n": next_n, "oldest_at": oldest_at}
 
 
-def append_bot_buffer(contact_id, text, timestamp_iso=""):
-    """Anexa texto ao buffer do contato e rotaciona seu token atomicamente."""
+def append_bot_buffer(contact_id, text, timestamp_iso="", channel_id=None):
+    """Anexa texto ao buffer do contato e rotaciona seu token atomicamente.
+
+    channel_id = canal por onde a mensagem chegou; fica no item (`ch`) para o
+    flush do cron responder pelo mesmo numero.
+    """
     ref = document("bot_buffers", contact_id)
     client = get_firestore_client()
     return _transactional_append_bot_buffer(
-        client.transaction(), ref, str(text or ""), timestamp_iso,
+        client.transaction(), ref, str(text or ""), timestamp_iso, channel_id,
     )
 
 

@@ -116,7 +116,10 @@ from rbac import (
 )
 from pii_redaction import redact_phone, redact_name
 from commercial_contact_policy import is_commercial_contact_blocked
-from webhook import process_webhook_payload, validate_signature, process_claimed_bot_buffer
+from webhook import (
+    process_webhook_payload, validate_signature, process_claimed_bot_buffer,
+    resolve_orphan_buffer_channel,
+)
 from webhook_google_chat import validate_google_chat_token, process_google_chat_event
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
@@ -5332,12 +5335,14 @@ async def cron_expire_takeovers(request: Request):
                     )
                     release_bot_buffer_claim(contact_id, claim_id)
                     continue
-                from channel_service import get_channel as _get_buffer_channel
-                channel_b = _get_buffer_channel(contact_b.get("channel_id")) \
-                    if contact_b.get("channel_id") else None
+                # Canal da RESPOSTA = o da chegada da rajada (item `ch`), nunca o
+                # de criacao do contato, e so canal standard do tenant: numero
+                # coexistence e WhatsApp pessoal de operador (2026-11-12).
+                channel_b, skip_reason = resolve_orphan_buffer_channel(items, contact_b)
                 if not channel_b:
                     logger.warning(
-                        "cron bot-buffer: canal do contato %s nao encontrado", contact_id,
+                        "cron bot-buffer: lote do contato %s descartado sem envio: %s",
+                        contact_id, skip_reason,
                     )
                     release_bot_buffer_claim(contact_id, claim_id)
                     continue

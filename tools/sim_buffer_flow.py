@@ -6,8 +6,11 @@ Exercita o codigo real de webhook._process_messages e seus caminhos concorrentes
 Os adaptadores de persistencia, CX e envio sao stores deterministas em memoria.
 """
 
+import ast
 import asyncio
 import copy
+import inspect
+import logging
 import os
 import sys
 import time
@@ -26,6 +29,10 @@ except Exception:
 import webhook as wh  # noqa: E402
 import database_firestore as dbf  # noqa: E402
 import bot_service  # noqa: E402
+import channel_service  # noqa: E402
+import config  # noqa: E402
+import database  # noqa: E402
+import tenant_service  # noqa: E402
 
 
 CONTACTS = {}
@@ -36,6 +43,7 @@ WA_MESSAGES = {}
 SAVED = []
 CX_CALLS = []
 SENT = []
+APPEND_CHANNELS = []
 FAILS = []
 CHECKS = 0
 NEXT_CONTACT = 0
@@ -63,6 +71,38 @@ CHANNEL = {
     "channel_type": "standard",
     "owner_user_id": None,
     "access_token": "token-test",
+}
+
+# Registry de canais do cenario 22 (flush do cron). O coexistence e o numero
+# pessoal de um operador: o agente nunca pode responder por ele.
+COEX_CHANNEL = {
+    "id": 3,
+    "tenant_id": "varizemed-test",
+    "phone_number_id": "phone-3-coex",
+    "channel_type": "coexistence",
+    "owner_user_id": 55,
+    "access_token": "token-coex",
+}
+OTHER_TENANT_CHANNEL = {
+    "id": 99,
+    "tenant_id": "outro-tenant",
+    "phone_number_id": "phone-99",
+    "channel_type": "standard",
+    "owner_user_id": None,
+    "access_token": "token-outro-tenant",
+}
+UNTYPED_CHANNEL = {
+    "id": 12,
+    "tenant_id": "varizemed-test",
+    "phone_number_id": "phone-12",
+    "owner_user_id": None,
+    "access_token": "token-sem-tipo",
+}
+CHANNELS = {
+    CHANNEL["id"]: CHANNEL,
+    COEX_CHANNEL["id"]: COEX_CHANNEL,
+    OTHER_TENANT_CHANNEL["id"]: OTHER_TENANT_CHANNEL,
+    UNTYPED_CHANNEL["id"]: UNTYPED_CHANNEL,
 }
 
 
@@ -132,6 +172,7 @@ def _reset(consented=True, assigned=False, completed=False):
     SAVED.clear()
     CX_CALLS.clear()
     SENT.clear()
+    APPEND_CHANNELS.clear()
     NEXT_CONTACT = 0
     NEXT_MESSAGE = 0
     BLOCK_FIRST_CX = False
@@ -168,6 +209,7 @@ def _ensure_contact(wa_id, name="Paciente"):
         "wa_id": wa_id,
         "display_name": name,
         "channel_id": CHANNEL["id"],
+        "phone_number_id": CHANNEL["phone_number_id"],
         "assigned_to": None,
         "bot_completed": False,
         "qualification": "novo",
@@ -176,12 +218,18 @@ def _ensure_contact(wa_id, name="Paciente"):
 
 
 def _upsert_contact(wa_id, display_name="", **kwargs):
+    is_new = wh.normalize_br_phone(wa_id) not in CONTACT_BY_WA
     cid = _ensure_contact(wa_id, display_name)
     contact = CONTACTS[str(cid)]
-    contact.update({
-        "channel_id": kwargs.get("channel_id"),
-        "phone_number_id": kwargs.get("phone_number_id"),
-    })
+    # Espelha upsert_wa_contact/_update_existing_wa_contact: o canal do contato
+    # e o de CRIACAO e so e gravado quando ainda esta vazio. O duble antigo
+    # regravava a cada inbound e apagava a premissa "contato nascido em
+    # coexistence", escondendo o defeito do flush do cron (revisao 2026-11-12).
+    if kwargs.get("channel_id") is not None and (is_new or not contact.get("channel_id")):
+        contact.update({
+            "channel_id": kwargs.get("channel_id"),
+            "phone_number_id": kwargs.get("phone_number_id"),
+        })
     return cid
 
 
@@ -248,18 +296,28 @@ async def _fake_process_bot(contact_id, text, contact_name=""):
 
 
 async def _fake_send(wa_id, reply, contact_id, token, phone_id, **kwargs):
-    SENT.append({"wa_id": wa_id, "reply": copy.deepcopy(reply), "contact_id": contact_id})
+    SENT.append({
+        "wa_id": wa_id, "reply": copy.deepcopy(reply), "contact_id": contact_id,
+        # Por qual numero a resposta saiu (cenario 22).
+        "token": token, "phone_id": phone_id,
+        "channel_id": kwargs.get("channel_id"),
+    })
     return True
 
 
-def _append_buffer(contact_id, text, timestamp_iso="", at_iso=None):
-    # Espelha _transactional_append_bot_buffer: ts = ordem (Meta), at = idade.
+def _append_buffer(contact_id, text, timestamp_iso="", at_iso=None, channel_id=None):
+    # Espelha _transactional_append_bot_buffer: ts = ordem (Meta), at = idade,
+    # ch = canal de chegada (so quando informado).
     key = str(contact_id)
     data = BUFFERS.setdefault(key, {"items": [], "claimed_at": None, "oldest_at": None})
     n = max([int(i.get("n") or 0) for i in data["items"]] or [0]) + 1
     at = at_iso or datetime.now(timezone.utc).isoformat()
     ts = timestamp_iso or at
-    data["items"].append({"text": str(text), "ts": ts, "n": n, "at": at})
+    item = {"text": str(text), "ts": ts, "n": n, "at": at}
+    if channel_id is not None:
+        item["ch"] = channel_id
+    data["items"].append(item)
+    APPEND_CHANNELS.append(channel_id)
     data["token"] = str(uuid.uuid4())
     data["oldest_at"] = data.get("oldest_at") or at
     return {"token": data["token"], "n": n, "oldest_at": data["oldest_at"]}
@@ -375,6 +433,9 @@ def _install_patches():
     # tenant e substituida para nao tocar Firestore/tenant context.
     bot_service._get_tenant_ai_config = lambda: dict(AI_CFG)
     bot_service.get_system_settings = lambda: dict(SYS_SETTINGS)
+    # Registry de canais em memoria (mesma semantica do real: busca pela chave
+    # exata; so o flush do cron resolve canal por id neste harness).
+    channel_service.get_channel = lambda cid: copy.deepcopy(CHANNELS.get(cid))
 
     stt = types.ModuleType("transcription_service")
     stt.get_speech_client = lambda: object()
@@ -852,6 +913,262 @@ async def scenario_reopen_opt_out_reset():
           "sem opt-out: o bloco nao escreve nada")
 
 
+def _load_real_cron():
+    """Extrai o corpo REAL de main.cron_expire_takeovers por AST.
+
+    Importar o main.py inteiro subiria o app; aqui so a funcao do cron e
+    compilada (decorador removido) e roda com os dubles do harness. O defeito
+    de 2026-11-12 morava na cola do cron, que o cenario 8 nao exercita. Nome
+    global novo no cron aparece como erro no resumo do tenant: acrescente-o ao
+    namespace abaixo.
+    """
+    main_path = os.path.join(ROOT, "main.py")
+    with open(main_path, encoding="utf-8") as fh:
+        source = fh.read()
+    tree = ast.parse(source, filename=main_path)
+    fn = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "cron_expire_takeovers"
+    )
+    fn.decorator_list = []
+    code = compile(ast.Module(body=[fn], type_ignores=[]), main_path, "exec")
+
+    async def _inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def _noop_async(*args, **kwargs):
+        return None
+
+    # Imports feitos DENTRO do cron (resolvidos na chamada).
+    tenant_service.list_tenants = lambda active_only=True: [{"id": "varizemed-test"}]
+    database.is_auto_close_enabled = lambda: False
+    namespace = {
+        "Request": object,
+        "_verify_cron_auth": lambda request: None,
+        "run_in_threadpool": _inline,
+        "expire_stale_takeovers": lambda hours: [],
+        "close_stale_attendances": lambda *args, **kwargs: [],
+        "insert_transfer_system_message": lambda *args, **kwargs: None,
+        "log_audit": lambda *args, **kwargs: None,
+        "_close_daily_and_send_protocol": _noop_async,
+        "TAKEOVER_TIMEOUT_HOURS": config.TAKEOVER_TIMEOUT_HOURS,
+        "ATTENDANCE_AUTOCLOSE_HOURS": config.ATTENDANCE_AUTOCLOSE_HOURS,
+        "RECEPTION_UNATTENDED_RELEASE_DAYS": config.RECEPTION_UNATTENDED_RELEASE_DAYS,
+        "CX_DETECT_TIMEOUT_SECONDS": config.CX_DETECT_TIMEOUT_SECONDS,
+        "WHATSAPP_TOKEN": "env-token",
+        "WHATSAPP_PHONE_NUMBER_ID": "env-phone",
+        "get_wa_contact": _get_contact,
+        "flush_stale_bot_buffers": _flush_stale,
+        "release_bot_buffer_claim": _release_claim,
+        "process_claimed_bot_buffer": wh.process_claimed_bot_buffer,        # REAL
+        "resolve_orphan_buffer_channel": wh.resolve_orphan_buffer_channel,  # REAL
+        "fs_utcnow": lambda: datetime.now(timezone.utc),
+        "timedelta": timedelta,
+        "logger": logging.getLogger("castro_crm.main"),
+        "_monotonic": time.monotonic,
+    }
+    exec(code, namespace)
+    return namespace["cron_expire_takeovers"]
+
+
+class _WarningCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+async def scenario_cron_reply_channel():
+    title("22. Flush do cron: responde pelo canal de CHEGADA e so por canal standard")
+    cron = _load_real_cron()
+    capture = _WarningCapture()
+    cron_logger = logging.getLogger("castro_crm.main")
+    cron_logger.addHandler(capture)
+
+    def _orphan(cid, text, channel_id=None, minutes=6.0):
+        stamp = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        _append_buffer(cid, text, stamp, at_iso=stamp, channel_id=channel_id)
+
+    async def _tick():
+        capture.messages.clear()
+        result = await cron(None)
+        errors = [t.get("error") for t in result.get("tenants", []) if "error" in t]
+        return result, errors
+
+    def _via_standard():
+        return (
+            len(SENT) == 1
+            and SENT[0]["phone_id"] == CHANNEL["phone_number_id"]
+            and SENT[0]["token"] == CHANNEL["access_token"]
+            and SENT[0]["channel_id"] == CHANNEL["id"]
+        )
+
+    def _dropped(reason_fragment):
+        return (
+            not CX_CALLS and not SENT and not BUFFERS
+            and any(
+                "descartado sem envio" in message and reason_fragment in message
+                for message in capture.messages
+            )
+        )
+
+    try:
+        # 22a. O defeito: contato NASCIDO num numero coexistence e devolvido ao
+        # agente escreve no numero da empresa; a request morre na janela.
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)]["channel_id"] = COEX_CHANNEL["id"]
+        _orphan(cid, "escrevi no numero da empresa", channel_id=CHANNEL["id"])
+        result, errors = await _tick()
+        check(not errors, f"cron real roda sem erro no tenant ({errors or 'ok'})")
+        check(result.get("bot_buffers_flushed_total") == 1
+              and CX_CALLS == ["escrevi no numero da empresa"],
+              "lote orfao recuperado em 1 turno pelo cron real")
+        check(_via_standard(),
+              "contato nascido em coexistence: resposta sai pelo canal da CHEGADA (standard)")
+        check(not any(s["phone_id"] == COEX_CHANNEL["phone_number_id"] for s in SENT),
+              "nada sai pelo numero pessoal do operador")
+        check(not BUFFERS, "claim liberado depois do turno do cron")
+
+        # 22b. Lote gravado antes do campo `ch` + contato nascido em coexistence:
+        # o fallback e o canal de criacao, que nao e standard -> nao envia.
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)]["channel_id"] = COEX_CHANNEL["id"]
+        _orphan(cid, "lote antigo sem canal")
+        result, errors = await _tick()
+        check(not errors and _dropped("nao e standard (coexistence)"),
+              "lote sem canal de chegada + contato nascido em coexistence: descartado, nada enviado")
+
+        # 22c. Item que chegou por coexistence (gate do bot furado): nao envia.
+        cid = _reset(consented=True)
+        _orphan(cid, "chegou pelo numero pessoal", channel_id=COEX_CHANNEL["id"])
+        result, errors = await _tick()
+        check(not errors and _dropped("canal 3 (chegada) nao e standard"),
+              "item que chegou por coexistence: descartado mesmo com contato nascido em standard")
+
+        # 22d. Compatibilidade: lote antigo sem `ch` + contato nascido em
+        # standard continua respondido (comportamento da Val antes do campo).
+        cid = _reset(consented=True)
+        _orphan(cid, "lote antigo da val")
+        result, errors = await _tick()
+        check(not errors and CX_CALLS == ["lote antigo da val"] and _via_standard(),
+              "lote sem canal de chegada + contato nascido em standard: respondido pelo standard")
+
+        # 22e. Canal standard de OUTRO tenant: nunca.
+        cid = _reset(consented=True)
+        _orphan(cid, "canal de outro tenant", channel_id=OTHER_TENANT_CHANNEL["id"])
+        result, errors = await _tick()
+        check(not errors and _dropped("pertence a outro tenant"),
+              "canal de outro tenant: descartado, nada enviado")
+
+        # 22f. Canal inexistente/inativo (o registry so tem canais ativos).
+        cid = _reset(consented=True)
+        _orphan(cid, "canal desativado", channel_id=404)
+        result, errors = await _tick()
+        check(not errors and _dropped("inexistente ou inativo"),
+              "canal inexistente ou inativo: descartado, nada enviado")
+
+        # 22g. Canal sem channel_type: falha FECHADO.
+        cid = _reset(consented=True)
+        _orphan(cid, "canal sem tipo", channel_id=UNTYPED_CHANNEL["id"])
+        result, errors = await _tick()
+        check(not errors and _dropped("nao e standard (sem tipo)"),
+              "canal sem tipo: descartado (falha fechado)")
+
+        # 22h. Id do canal gravado como texto ainda resolve.
+        cid = _reset(consented=True)
+        _orphan(cid, "id como texto", channel_id=str(CHANNEL["id"]))
+        result, errors = await _tick()
+        check(not errors and CX_CALLS == ["id como texto"] and _via_standard(),
+              "id do canal gravado como texto: resolvido e respondido pelo standard")
+
+        # 22i. Lote com canais mistos: vale o do item MAIS RECENTE.
+        cid = _reset(consented=True)
+        _orphan(cid, "mais antigo", channel_id=COEX_CHANNEL["id"], minutes=7.0)
+        _orphan(cid, "mais recente", channel_id=CHANNEL["id"], minutes=6.0)
+        result, errors = await _tick()
+        check(not errors and CX_CALLS == ["mais antigo\nmais recente"] and _via_standard(),
+              "canais mistos: responde pelo canal do item mais recente (standard)")
+        cid = _reset(consented=True)
+        _orphan(cid, "mais antigo", channel_id=CHANNEL["id"], minutes=7.0)
+        _orphan(cid, "mais recente", channel_id=COEX_CHANNEL["id"], minutes=6.0)
+        result, errors = await _tick()
+        check(not errors and _dropped("canal 3 (chegada) nao e standard"),
+              "canais mistos com o mais recente em coexistence: descartado")
+
+        # 22j. O aviso do descarte so carrega ids (contato e canal), nunca texto.
+        check(all("mais recente" not in m and "mais antigo" not in m for m in capture.messages),
+              "aviso do descarte nao carrega o texto do cliente")
+
+        # 22m. Ponta a ponta: o lote orfao e gravado pelo PROPRIO webhook (a
+        # request morre na janela) para contato nascido em coexistence; o cron
+        # real responde pelo standard da chegada. Cobre webhook -> orfao -> cron
+        # sem depender de _append_buffer direto.
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)].update({
+            "channel_id": COEX_CHANNEL["id"],
+            "phone_number_id": COEX_CHANNEL["phone_number_id"],
+        })
+        AI_CFG["buffer_seconds"] = 5.0
+        dying = asyncio.create_task(_deliver([_text("e2e1", "escrevi e a request morreu")]))
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if (BUFFERS.get(str(cid)) or {}).get("items"):
+                break
+        dying.cancel()
+        try:
+            await dying
+        except asyncio.CancelledError:
+            pass
+        AI_CFG["buffer_seconds"] = 0.04
+        orphan = BUFFERS.get(str(cid)) or {}
+        check(len(orphan.get("items") or []) == 1 and not CX_CALLS and not SENT,
+              "request morta na janela deixa 1 item orfao, sem turno")
+        check(CONTACTS[str(cid)]["channel_id"] == COEX_CHANNEL["id"],
+              "inbound pelo standard nao troca o canal de criacao do contato (duble fiel ao upsert real)")
+        six_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+        for item in orphan.get("items") or []:
+            item["at"] = six_min_ago
+        if orphan:
+            orphan["oldest_at"] = six_min_ago
+        result, errors = await _tick()
+        check(not errors and CX_CALLS == ["escrevi e a request morreu"] and _via_standard(),
+              "ponta a ponta: lote gravado pelo webhook e respondido pelo cron no canal standard da chegada")
+        check(not BUFFERS, "ponta a ponta: nada orfao depois do cron")
+    finally:
+        cron_logger.removeHandler(capture)
+
+    # 22k. Caminho AO VIVO: o webhook grava no append o canal de CHEGADA (nao o
+    # do contato, que continua sendo o coexistence de criacao) e responde pelo
+    # canal da mensagem.
+    cid = _reset(consented=True)
+    CONTACTS[str(cid)].update({
+        "channel_id": COEX_CHANNEL["id"],
+        "phone_number_id": COEX_CHANNEL["phone_number_id"],
+    })
+    await _deliver([_text("ch1", "um"), _text("ch2", "dois")])
+    check(CONTACTS[str(cid)]["channel_id"] == COEX_CHANNEL["id"]
+          and APPEND_CHANNELS == [CHANNEL["id"], CHANNEL["id"]],
+          "webhook grava o canal de chegada em cada append do buffer")
+    check(CX_CALLS == ["um\ndois"] and _via_standard(),
+          "ao vivo: 1 turno, resposta pelo canal da mensagem")
+
+    # 22l. Contrato do resolvedor (sem cron): motivo vazio so quando ha canal.
+    channel, reason = wh.resolve_orphan_buffer_channel(
+        [{"text": "x", "ts": "2026-01-01T00:00:00+00:00", "n": 1, "ch": CHANNEL["id"]}],
+        {"channel_id": COEX_CHANNEL["id"]},
+    )
+    check(bool(channel) and channel.get("id") == CHANNEL["id"] and reason == "",
+          "resolvedor: canal de chegada vence o canal de criacao do contato")
+    channel, reason = wh.resolve_orphan_buffer_channel([], {})
+    check(channel is None and reason == "lote e contato sem canal",
+          "resolvedor: sem canal nenhum devolve motivo e nao envia")
+    channel, reason = wh.resolve_orphan_buffer_channel([{"text": "x", "ch": {"id": 7}}], None)
+    check(channel is None and "inexistente ou inativo" in reason,
+          "resolvedor: id de canal corrompido nao derruba o cron")
+
+
 def scenario_transaction_contracts():
     title("14. Contratos transacionais da persistencia real")
 
@@ -935,6 +1252,31 @@ def scenario_transaction_contracts():
     finally:
         dbf.utcnow = real_utcnow
 
+    # Canal de chegada no item (`ch`): gravado so quando informado e preservado
+    # por claim e drain reais — e o que o flush do cron usa para responder.
+    ref_ch = TxRef()
+    dbf._transactional_append_bot_buffer.to_wrap(tx, ref_ch, "sem canal", stamp)
+    dbf._transactional_append_bot_buffer.to_wrap(tx, ref_ch, "com canal", stamp, 7)
+    check("ch" not in ref_ch.data["items"][0] and ref_ch.data["items"][1].get("ch") == 7,
+          "append real grava o canal de chegada so quando informado")
+    claimed_ch = dbf._transactional_claim_and_drain_bot_buffer.to_wrap(
+        tx, ref_ch, None, 180, 600,
+    )
+    check([i.get("ch") for i in claimed_ch["items"]] == [None, 7],
+          "claim real preserva o canal de cada item")
+    dbf._transactional_append_bot_buffer.to_wrap(tx, ref_ch, "durante", stamp, 7)
+    drained_ch = dbf._transactional_drain_claimed_bot_buffer.to_wrap(
+        tx, ref_ch, claimed_ch["claim_id"], 600,
+    )
+    check([i.get("ch") for i in drained_ch["items"]] == [7],
+          "drain real preserva o canal do item")
+    # O harness troca wh.append_bot_buffer por um duble: sem esta checagem, uma
+    # assinatura real sem channel_id so apareceria em producao (TypeError no
+    # debounce -> turno direto, buffer desligado em silencio).
+    check("channel_id" in inspect.signature(dbf.append_bot_buffer).parameters
+          and "channel_id" in inspect.signature(database.append_bot_buffer).parameters,
+          "append_bot_buffer real aceita channel_id (mesmo contrato do duble)")
+
 
 def scenario_lgpd_by_agent():
     print("\n=== lgpd_by_agent: agente trata a LGPD, buffer arma sem aceite no CRM (Hugo, 2026-10-23) ===")
@@ -970,6 +1312,7 @@ async def main():
     await scenario_new_cycle_hydration()
     await scenario_policy_date()
     await scenario_reopen_opt_out_reset()
+    await scenario_cron_reply_channel()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

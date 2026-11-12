@@ -1098,6 +1098,76 @@ async def _run_bot_turn_and_send(
     return reply
 
 
+def _buffer_items_channel_id(items):
+    """Canal de chegada (`ch`) do item mais recente do lote, na ordem do join."""
+    ordered = sorted(
+        (item for item in (items or []) if isinstance(item, dict)),
+        key=lambda item: (str(item.get("ts") or ""), int(item.get("n") or 0)),
+    )
+    for item in reversed(ordered):
+        if item.get("ch") is not None:
+            return item.get("ch")
+    return None
+
+
+def _lookup_buffer_channel(channel_id):
+    """get_channel (so canais ATIVOS) tolerante a id gravado como texto."""
+    from channel_service import get_channel
+    candidates = [channel_id]
+    try:
+        as_int = int(channel_id)
+    except (TypeError, ValueError):
+        as_int = None
+    if as_int is not None and as_int not in candidates:
+        candidates.append(as_int)
+    for candidate in candidates:
+        try:
+            channel = get_channel(candidate)
+        except TypeError:
+            # id nao-hashavel (dado corrompido): trata como inexistente.
+            channel = None
+        if channel:
+            return channel
+    return None
+
+
+def resolve_orphan_buffer_channel(items, contact):
+    """Canal por onde o flush do cron responde um lote orfao do buffer.
+
+    Devolve (canal, "") ou (None, motivo); o motivo so traz ids, nunca PII.
+
+    O lote e respondido pelo canal por onde a rajada CHEGOU (`ch` do item mais
+    recente, gravado no append). `wa_contacts.channel_id` e o canal de CRIACAO
+    do contato (so gravado se vazio) e fica apenas de fallback para lote
+    gravado antes do campo `ch`. Em qualquer caso o cron so envia por canal
+    STANDARD do tenant atual: numero coexistence e o WhatsApp pessoal de um
+    operador e o agente nunca fala por ele. Sem esta regra, contato nascido
+    num numero coexistence e devolvido ao agente recebia a resposta do flush
+    pelo numero pessoal (achado 2026-11-12, reproduzido no simulador; nenhum
+    envio real).
+    """
+    channel_id = _buffer_items_channel_id(items)
+    source = "chegada"
+    if channel_id is None:
+        channel_id = (contact or {}).get("channel_id")
+        source = "criacao do contato"
+    if channel_id is None or channel_id == "":
+        return None, "lote e contato sem canal"
+    channel = _lookup_buffer_channel(channel_id)
+    if not channel:
+        return None, f"canal {channel_id} ({source}) inexistente ou inativo"
+    tenant_id = str(get_tenant_context() or _WEBHOOK_DEFAULT_TENANT)
+    if str(channel.get("tenant_id") or _WEBHOOK_DEFAULT_TENANT) != tenant_id:
+        return None, f"canal {channel_id} ({source}) pertence a outro tenant"
+    channel_type = str(channel.get("channel_type") or "").strip().lower()
+    if channel_type != CHANNEL_TYPE_STANDARD:
+        return None, (
+            f"canal {channel_id} ({source}) nao e standard "
+            f"({channel_type or 'sem tipo'})"
+        )
+    return channel, ""
+
+
 async def process_claimed_bot_buffer(
     contact_id, claim_id, items, contact_name, wa_id, token, phone_id,
     channel_id=None, channel_owner_user_id=None,
@@ -1289,7 +1359,11 @@ async def _buffered_bot_turn(
     appended = False
     my_token = None
     try:
-        append_result = append_bot_buffer(contact_id, text, timestamp_iso)
+        # channel_id = canal por onde ESTA mensagem chegou: o flush do cron
+        # responde por ele (nunca pelo canal de criacao do contato).
+        append_result = append_bot_buffer(
+            contact_id, text, timestamp_iso, channel_id=channel_id,
+        )
         appended = True
         my_token = append_result.get("token")
         if not wait_for_quiet:

@@ -31,7 +31,7 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (246).
   Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
-  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4): `tools\sim_buffer_flow.py` (69).
+  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4) + canal da resposta no flush do cron (roda o cron real, extraído do `main.py` por AST): `tools\sim_buffer_flow.py` (97).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Lembretes (series A e B: classificacao, agenda, transacao, comandos, API e envio): `tools\sim_bot_reminders.py` (175).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
@@ -214,6 +214,11 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar
   primeiro no `varizemed-test`. Claim com heartbeat + orçamento de parede de 240s por request
   (Cloud Run mata em 300s) — não tire nenhum dos dois (`docs/BUFFER_MENSAGENS_BOT.md` §Revisão).
+  **O flush do cron responde pelo canal de CHEGADA da rajada** (`ch` no item, gravado no append) **e só
+  por canal standard do tenant** (`resolve_orphan_buffer_channel`, em `webhook.py`) — nunca por
+  `wa_contacts.channel_id`, que é o canal de CRIAÇÃO do contato: contato nascido em número coex e
+  devolvido ao agente receberia a resposta pelo WhatsApp pessoal da vendedora (achado 2026-11-12, só no
+  simulador). Com `lgpd_by_agent` (Hugo) o buffer arma desde a 1ª mensagem do lead.
 
 ## Mapa de módulos (onde mexer)
 
