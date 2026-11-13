@@ -21,6 +21,7 @@
 Visao funcional do CRM hoje.
 
 - [Guia das operadoras — Follow-up](GUIA_OPERADORAS_FOLLOWUP.md): F1 implementada localmente sob flag, com filas, tentativas, calendário e recusas; aguarda liberação.
+- [Videos no chat](VIDEOS_NO_CHAT.md): player no balao, ampliacao e entrega por intervalos; implementado localmente, sem deploy.
 
 ## Objetivo do produto
 

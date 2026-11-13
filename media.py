@@ -37,6 +37,7 @@ logger = logging.getLogger("castro_crm.media")
 
 _storage_client = None
 _storage_backend_logged = False
+MEDIA_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 def _normalize_wa_target(wa_id):
@@ -337,6 +338,84 @@ def get_media_asset(media_path):
             "source": "local",
         }
     return None
+
+
+def _iter_gcs_media(blob, start, end):
+    """Le somente o intervalo pedido, em blocos limitados de memoria."""
+    while start <= end:
+        chunk_end = min(start + MEDIA_STREAM_CHUNK_SIZE - 1, end)
+        content = blob.download_as_bytes(
+            start=start, end=chunk_end, raw_download=True,
+            if_generation_match=blob.generation,
+        )
+        if len(content) != chunk_end - start + 1:
+            raise OSError("Tamanho inesperado no trecho de midia")
+        yield content
+        start = chunk_end + 1
+
+
+def _iter_local_media(filepath, start, end):
+    with open(filepath, "rb") as stream:
+        stream.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            content = stream.read(min(MEDIA_STREAM_CHUNK_SIZE, remaining))
+            if not content:
+                raise OSError("Arquivo de midia alterado durante a leitura")
+            yield content
+            remaining -= len(content)
+
+
+def _iter_memory_media(content, start, end):
+    while start <= end:
+        chunk_end = min(start + MEDIA_STREAM_CHUNK_SIZE, end + 1)
+        yield content[start:chunk_end]
+        start = chunk_end
+
+
+def get_media_stream(media_path):
+    """Resolve tamanho/tipo sem baixar o corpo do GCS; leitura posterior e sincrona."""
+    subdir, filename = _split_media_path(media_path)
+    if not subdir or not filename:
+        return None
+
+    if _using_gcs():
+        try:
+            blob = _get_bucket().blob(_build_object_name(subdir, filename))
+            # reload traz tamanho, tipo e generation; exists nao preenche os metadados.
+            blob.reload()
+        except Exception as exc:
+            logger.warning("Falha ao consultar midia no Cloud Storage | erro=%s", type(exc).__name__)
+        else:
+            return {
+                "size": int(blob.size),
+                "mime_type": blob.content_type or _default_mime_type(filename),
+                "iter_content": lambda start, end: _iter_gcs_media(blob, start, end),
+            }
+        # Preserva o fallback local, sem tentar baixar o objeto inteiro.
+        filepath = _build_local_path(subdir, filename)
+        asset = {"file_path": filepath} if os.path.isfile(filepath) else None
+    else:
+        # Firestore legado pode exigir descompressao do corpo inteiro.
+        # Este trabalho e a leitura local rodam fora do event loop na rota sync.
+        asset = get_media_asset(media_path)
+
+    if not asset:
+        return None
+    mime_type = asset.get("mime_type") or _default_mime_type(filename)
+    if asset.get("file_path"):
+        filepath = asset["file_path"]
+        return {
+            "size": os.path.getsize(filepath),
+            "mime_type": mime_type,
+            "iter_content": lambda start, end: _iter_local_media(filepath, start, end),
+        }
+    content = asset["content"]
+    return {
+        "size": len(content),
+        "mime_type": mime_type,
+        "iter_content": lambda start, end: _iter_memory_media(content, start, end),
+    }
 
 
 def convert_audio_to_ogg_opus(input_bytes, input_mime="audio/webm"):

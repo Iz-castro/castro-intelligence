@@ -4,6 +4,7 @@ import { MoonIcon, SunIcon, GearIcon, PlusIcon, AddressBookIcon, PhotoIcon, Vide
 import { when, formatRecordingTime, messageTypeLabel, messageContentLabel, messageSenderLabel } from "./utils/formatting";
 import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
+import { VideoMedia } from "./components/chat/VideoMedia";
 import { ChatTabs, CHAT_TABPANEL_ID, chatTabDomId } from "./components/chat/ChatTabs";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
 import { BotRemindersSettings } from "./components/settings/BotRemindersSettings";
@@ -1141,7 +1142,10 @@ function MessageMedia({ message }: { message: ChatMessage }) {
   }
   if (media.kind === "video") {
     if (media.gifLike) return <button type="button" className="media-button gif-button" onClick={() => openLightbox(message.media_path || "", "video", media.alt, true)} aria-label="Ampliar GIF"><video className="media video-media gif-video" src={message.media_path} autoPlay loop muted playsInline /></button>;
-    return <a href={message.media_path} download={message.filename || "video"} target="_blank" rel="noreferrer" className="video-download-link"><VideoIcon /> <span>Baixar vídeo{message.filename ? ` — ${message.filename}` : ""}</span></a>;
+    return (
+      <VideoMedia key={message.media_path} src={message.media_path} alt={media.alt} filename={message.filename}
+        onExpand={() => openLightbox(message.media_path || "", "video", media.alt)} />
+    );
   }
   if (media.kind === "audio") return (
     <div className="audio-container">
@@ -3856,7 +3860,13 @@ function Lightbox() {
     <div className="lightbox" role="dialog" aria-modal="true" aria-label="Visualização de mídia" onClick={closeLightbox}>
       <button type="button" className="lightbox-close" onClick={closeLightbox} aria-label="Fechar visualização">Fechar</button>
       <div className="lightbox-content" onClick={(e) => e.stopPropagation()}>
-        {lightboxMedia.kind === "image" ? <img className="lightbox-media" src={lightboxMedia.src} alt={lightboxMedia.alt} /> : <video className="lightbox-media" src={lightboxMedia.src} controls={!lightboxMedia.gifLike} autoPlay loop={lightboxMedia.gifLike} muted={lightboxMedia.gifLike} playsInline />}
+        {lightboxMedia.kind === "image" ? (
+          <img className="lightbox-media" src={lightboxMedia.src} alt={lightboxMedia.alt} />
+        ) : lightboxMedia.gifLike ? (
+          <video className="lightbox-media" src={lightboxMedia.src} autoPlay loop muted playsInline />
+        ) : (
+          <VideoMedia key={lightboxMedia.src} src={lightboxMedia.src} alt={lightboxMedia.alt} filename={lightboxMedia.alt} expanded />
+        )}
       </div>
     </div>
   );
