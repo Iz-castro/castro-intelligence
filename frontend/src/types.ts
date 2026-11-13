@@ -213,6 +213,7 @@ export type Contact = {
 // id deterministico: "{channel_id}__{wa_id}"
 export type Conversation = {
   id: string;
+  pinned_message?: PinnedMessage | null;
   contact_id: number;
   wa_id: string;
   channel_id: number | null;
@@ -307,6 +308,13 @@ export type MessageReplyReference = {
   sender_name: string;
 };
 
+export type PinnedMessage = {
+  message_id: number;
+  preview: string;
+  expires_at: string;
+  pinned_by: number;
+};
+
 export type ChatMessage = {
   id: number;
   wa_message_id?: string;
@@ -342,6 +350,9 @@ export type ChatMessage = {
   is_rating_message?: boolean;
   visibility?: "all" | "admin_only" | string;
   is_corrected?: boolean;
+  is_forwarded?: boolean;
+  latitude?: number | null;
+  longitude?: number | null;
   corrected_by_message_id?: number | null;
 };
 

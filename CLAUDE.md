@@ -51,6 +51,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
+  Encaminhar/fixar: `tools\sim_message_actions.py` (backend) e, na raiz,
+  `node tools\sim_message_actions.mjs` (frontend). ADR 0016; novo indice ASC em
+  `firestore.indexes.json` precisa ser aplicado antes da liberacao.
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
   `frontend/` (~32 asserts, exit 0/1; compila com o esbuild do Vite).
 

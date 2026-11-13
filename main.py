@@ -395,7 +395,8 @@ class WaSendRequest(BaseModel):
     # — backend resolve para (conversation, contact) via _resolve_send_target.
     conversation_id: str | None = None
     contact_id: int | None = None
-    content: str
+    content: str = ""
+    forward_message_id: int | None = PydanticField(default=None, gt=0)
     reply_to_message_id: int | None = None
     reply_to_preview: str = ""
     reply_to_sender_name: str = ""
@@ -404,8 +405,6 @@ class WaSendRequest(BaseModel):
     @classmethod
     def validate_content(cls, v):
         v = v.strip()
-        if not v:
-            raise ValueError("Mensagem vazia")
         if len(v) > MAX_MESSAGE_LENGTH:
             raise ValueError(f"Excede {MAX_MESSAGE_LENGTH} caracteres")
         return v
@@ -414,6 +413,10 @@ class WaSendRequest(BaseModel):
     @classmethod
     def trim_reply_fields(cls, v):
         return v.strip()
+
+
+class WaPinRequest(BaseModel):
+    duration_days: Literal[1, 7, 30] = 7
 
 
 class WaSendLocationRequest(BaseModel):
@@ -2490,6 +2493,107 @@ async def wa_transcribe_message(message_id: int, current_user: dict = Depends(ge
     return {"transcription": transcript}
 
 
+def _require_send_contact_access(conversation_id, contact_id, current_user):
+    if conversation_id:
+        conv = get_wa_conversation_by_id(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversa não encontrada")
+        contact_id = conv.get("contact_id")
+    contact = get_wa_contact(contact_id) if contact_id is not None else None
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato não encontrado")
+    _require_contact_access(contact, current_user)
+
+
+def _require_message_action_access(message_id, current_user):
+    """Autoriza origem sem efeitos de envio (bot/takeover/recencia)."""
+    msg = get_wa_message_by_id(message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Mensagem não encontrada")
+    contact = get_wa_contact(msg.get("contact_id"))
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contato não encontrado")
+    _require_contact_access(contact, current_user)
+    conv = get_wa_conversation_by_id(msg.get("conversation_id")) if msg.get("conversation_id") else None
+    if not can_see_all_tenant(current_user):
+        if msg.get("is_backup") or (conv or {}).get("is_backup"):
+            raise HTTPException(status_code=403, detail="Acesso negado: mensagem de backup")
+        if contact.get("assigned_to") != current_user.get("id"):
+            _require_transfer_source_access(conv, contact, current_user)
+    if msg.get("direction") not in ("inbound", "outbound") or (msg.get("visibility") or "all") != "all":
+        raise HTTPException(status_code=400, detail="Esta mensagem não permite encaminhar ou fixar")
+    kind = msg.get("msg_type")
+    if kind not in ("text", "template", "image", "audio", "video", "gif", "document", "sticker", "location"):
+        raise HTTPException(status_code=400, detail="Tipo de mensagem não suportado")
+    if kind in ("text", "template") and not str(msg.get("content") or "").strip():
+        raise HTTPException(status_code=400, detail="Mensagem sem conteúdo")
+    if kind == "location" and (msg.get("latitude") is None or msg.get("longitude") is None):
+        raise HTTPException(status_code=400, detail="Localização sem coordenadas")
+    return msg, conv
+
+
+def _read_forward_media(source):
+    asset = get_media_asset(source.get("media_path") or "")
+    if not asset:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado no Storage")
+    if "content" in asset:
+        content = asset["content"]
+    else:
+        with open(asset["file_path"], "rb") as stream:
+            content = stream.read(16 * 1024 * 1024 + 1)
+    if len(content) > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Arquivo excede 16MB")
+    return content, source.get("media_mime") or asset["mime_type"], source.get("filename") or asset["filename"]
+
+
+@app.post("/api/wa/messages/{message_id}/pin")
+def wa_pin_message(message_id: int, body: WaPinRequest, current_user: dict = Depends(get_current_user)):
+    msg, conv = _require_message_action_access(message_id, current_user)
+    if not conv:
+        raise HTTPException(status_code=400, detail="Mensagem sem conversa")
+    if not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
+        ensure_permission(current_user, "enviar_mensagem_propria_thread")
+    pin = {
+        "message_id": message_id,
+        "preview": _fallback_reply_preview(msg)[:280],
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=body.duration_days)).isoformat(),
+        "pinned_by": current_user["id"],
+    }
+    fs_document("wa_conversations", conv["id"]).update({"pinned_message": pin})
+    log_audit(current_user["id"], "WA_PIN", f"message_id={message_id} days={body.duration_days}")
+    return {"pinned_message": pin}
+
+
+@app.delete("/api/wa/conversation/{conversation_id}/pin")
+def wa_unpin_message(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    conv = get_wa_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversa não encontrada")
+    contact = get_wa_contact(conv.get("contact_id")) or {}
+    _require_contact_access(contact, current_user)
+    if not can_see_all_tenant(current_user):
+        if conv.get("is_backup"):
+            raise HTTPException(status_code=403, detail="Acesso negado: conversa de backup")
+        if contact.get("assigned_to") != current_user.get("id"):
+            _require_transfer_source_access(conv, contact, current_user)
+    if not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
+        ensure_permission(current_user, "enviar_mensagem_propria_thread")
+    fs_document("wa_conversations", conversation_id).update({"pinned_message": None})
+    log_audit(current_user["id"], "WA_UNPIN", f"conversation_id={conversation_id}")
+    return {"status": "ok"}
+
+
+@app.get("/api/wa/messages/{message_id}/context")
+def wa_message_context(message_id: int, current_user: dict = Depends(get_current_user)):
+    from database import get_wa_message_context
+    msg, _ = _require_message_action_access(message_id, current_user)
+    rows = get_wa_message_context(msg)
+    privileged = can_see_all_tenant(current_user)
+    return {"messages": [row for row in rows if privileged or (
+        not row.get("is_backup") and (row.get("visibility") or "all") == "all"
+    )]}
+
+
 # -- Helper: janela de 24h do WhatsApp --
 
 _24H = timedelta(hours=24)
@@ -2794,17 +2898,40 @@ def _maybe_credit_assume_counter(contact: dict, operator_id: int):
 
 @app.post("/api/wa/send")
 async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_user)):
-    conv, contact, channel = _resolve_send_target(body.conversation_id, body.contact_id)
-    token, phone_id, api_base = _resolve_channel_creds_by_id(
+    # Origem e destino autorizados antes do resolve (que pode criar thread).
+    source = None
+    if body.forward_message_id is not None:
+        source, _ = await run_in_threadpool(_require_message_action_access, body.forward_message_id, current_user)
+        if body.reply_to_message_id is not None:
+            raise HTTPException(status_code=400, detail="Encaminhamento não aceita resposta vinculada")
+    elif not body.content.strip():
+        raise HTTPException(status_code=400, detail="Mensagem vazia")
+    await run_in_threadpool(_require_send_contact_access, body.conversation_id, body.contact_id, current_user)
+    conv, contact, channel = await run_in_threadpool(_resolve_send_target, body.conversation_id, body.contact_id)
+    token, phone_id, api_base = await run_in_threadpool(_resolve_channel_creds_by_id,
         channel["id"] if channel else conv.get("channel_id")
     )
-    send_mode = _check_conv_send_permission(conv, current_user, contact, channel=channel)
+    send_mode = await run_in_threadpool(_check_conv_send_permission, conv, current_user, contact, channel=channel)
     _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
     # Modo 2 (co-pilotagem): intervencao de supervisao -> assina o texto.
-    content = body.content
+    content = str(source.get("content") or "") if source else body.content
+    msg_type = "text"
+    extra_fields = {"is_forwarded": True} if source else {}
+    if source:
+        kind = source.get("msg_type")
+        if kind in ("image", "audio", "video", "gif", "document", "sticker"):
+            file_content, mime_type, filename = await run_in_threadpool(_read_forward_media, source)
+            return await _deliver_wa_media(
+                conv, contact, channel, current_user, token, phone_id,
+                file_content, mime_type, filename, "video" if kind == "gif" else kind,
+                content, source["media_path"], {}, is_forwarded=True,
+            )
+        if kind == "location":
+            msg_type = "location"
+            extra_fields.update(latitude=source["latitude"], longitude=source["longitude"])
     if send_mode == "intervention":
         _sup_name = (current_user.get("display_name") or "Supervisao").split()[0]
         content = f"[Supervisao - {_sup_name}]: {content}"
@@ -2812,7 +2939,11 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     wa_id = _wa_target(contact["wa_id"])
     url = f"{api_base}/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": "text", "text": {"body": content, "preview_url": True}, **reply_context}
+    payload = {"messaging_product": "whatsapp", "to": wa_id, "type": msg_type, **reply_context}
+    if msg_type == "location":
+        payload["location"] = {"latitude": source["latitude"], "longitude": source["longitude"], "name": content[:1000]}
+    else:
+        payload["text"] = {"body": content, "preview_url": True}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
@@ -2820,9 +2951,9 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
 
     if resp.status_code == 200:
         wa_msg_id = result.get("messages", [{}])[0].get("id", "")
-        save_wa_message(
+        await run_in_threadpool(save_wa_message,
             wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
-            msg_type="text", content=content, status="sent",
+            msg_type=msg_type, content=content, status="sent",
             timestamp_wa=datetime.now(timezone.utc).isoformat(), operator_id=current_user["id"],
             channel_id=channel["id"] if channel else conv.get("channel_id"),
             conversation_id=conv["id"],
@@ -2830,9 +2961,11 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
             sent_by_name=str(current_user.get("display_name") or ""),
             channel_owner_user_id=(channel or {}).get("owner_user_id"),
             **reply_fields,
+            **extra_fields,
         )
         _maybe_credit_assume_counter(contact, current_user["id"])
-        log_audit(current_user["id"], "WA_SEND", f"Para {wa_id}: {content[:80]}")
+        log_audit(current_user["id"], "WA_FORWARD" if source else "WA_SEND",
+                  f"source_id={source['id']} destination_id={conv['id']}" if source else f"Para {wa_id}: {content[:80]}")
         return {"status": "sent", "wa_message_id": wa_msg_id}
     else:
         error_msg = result.get("error", {}).get("message", "Erro desconhecido")
@@ -2872,19 +3005,29 @@ async def wa_send_media(
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     msg_type = local_result["msg_type"]
 
+    return await _deliver_wa_media(
+        conv, contact, channel, current_user, token, phone_id, file_content,
+        mime_type, filename, msg_type, caption, local_result["path"], reply_fields, reply_context,
+    )
+
+
+async def _deliver_wa_media(conv, contact, channel, current_user, token, phone_id,
+                            file_content, mime_type, filename, msg_type, caption,
+                            media_path, reply_fields, reply_context=None, is_forwarded=False):
+    """Upload sempre no numero de destino, inclusive ao encaminhar midia."""
     media_id = await upload_media_to_whatsapp(file_content, mime_type, filename, token=token, phone_id=phone_id)
     if not media_id:
         raise HTTPException(status_code=502, detail="Falha no upload para a Meta")
 
-    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption, reply_context.get("context", {}).get("message_id", ""), token=token, phone_id=phone_id)
+    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption, (reply_context or {}).get("context", {}).get("message_id", ""), token=token, phone_id=phone_id)
     if not send_result or "error" in send_result:
         error = send_result.get("error", "Erro desconhecido") if send_result else "Sem resposta"
         raise HTTPException(status_code=502, detail=str(error))
 
     wa_msg_id = send_result.get("wa_message_id", "")
-    save_wa_message(
+    await run_in_threadpool(save_wa_message,
         wa_message_id=wa_msg_id, contact_id=contact["id"], direction="outbound",
-        msg_type=msg_type, content=caption, media_path=local_result["path"],
+        msg_type=msg_type, content=caption, media_path=media_path,
         media_mime=mime_type, media_id=media_id, filename=filename,
         status="sent", timestamp_wa=datetime.now(timezone.utc).isoformat(),
         operator_id=current_user["id"],
@@ -2894,11 +3037,13 @@ async def wa_send_media(
         sent_by_name=str(current_user.get("display_name") or ""),
         channel_owner_user_id=(channel or {}).get("owner_user_id"),
         media_size_bytes=len(file_content),
+        is_forwarded=is_forwarded,
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
-    log_audit(current_user["id"], "WA_SEND_MEDIA", f"{msg_type} para {contact['wa_id']}: {filename}")
-    return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": msg_type, "media_path": local_result["path"]}
+    log_audit(current_user["id"], "WA_FORWARD_MEDIA" if is_forwarded else "WA_SEND_MEDIA",
+              f"type={msg_type} destination_id={conv['id']}")
+    return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": msg_type, "media_path": media_path}
 
 
 @app.post("/api/wa/send-audio")

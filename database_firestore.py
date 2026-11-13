@@ -3335,7 +3335,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     reopen_attendance=True,
                     control_message=False,
                     human_outbound=True, automation_kind="", automation_stage="",
-                    automation_series=""):
+                    automation_series="", is_forwarded=False):
     """Persiste mensagem WhatsApp.
 
     human_outbound=False: outbound com operador identificado que NAO conta
@@ -3393,6 +3393,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                 "reply_to_message_id": reply_to_message_id if reply_to_message_id is not None else existing.get("reply_to_message_id"),
                 "reply_to_preview": reply_to_preview or existing.get("reply_to_preview", ""),
                 "reply_to_sender_name": reply_to_sender_name or existing.get("reply_to_sender_name", ""),
+                "is_forwarded": bool(is_forwarded or existing.get("is_forwarded")),
             }, merge=True)
             return existing["id"]
 
@@ -3486,6 +3487,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "operator_id": operator_id,
         "sender_user_id": sender_user_id,
         "sent_by_name": sent_by_name or "",
+        "is_forwarded": bool(is_forwarded),
         **({"automation_kind": automation_kind, "automation_stage": automation_stage,
             **({"automation_series": automation_series} if automation_series else {})} if automation_kind else {}),
         "channel_owner_user_id": channel_owner_user_id,
@@ -3693,6 +3695,23 @@ def get_wa_conversation(contact_id, limit=50, offset=0, conversation_id=None):
         item["operator_name"] = operators.get(row.get("operator_id"), {}).get("display_name", "")
         enriched.append(item)
     return _normalize_many(enriched)
+
+
+def get_wa_message_context(message, limit=10):
+    """Janela limitada ao redor da fixada, sem varrer o historico inteiro."""
+    if not message.get("conversation_id"):
+        return _normalize_many([message])
+    q = collection("wa_messages").where("conversation_id", "==", message["conversation_id"])
+    q = q.order_by("timestamp_wa", direction="DESCENDING")
+    cursor = {"timestamp_wa": message.get("timestamp_wa")}
+    older = q.start_at(cursor).limit(limit + 1).stream()
+    newer = q.end_at(cursor).limit_to_last(limit + 1).get()
+    rows = {message["id"]: message}
+    for snap in list(older) + list(newer):
+        row = _raw_doc(snap)
+        if row and row.get("contact_id") == message["contact_id"]:
+            rows[row["id"]] = row
+    return _normalize_many(sorted(rows.values(), key=lambda row: (row.get("timestamp_wa") or row["created_at"], row["id"])))
 
 
 def get_wa_message_by_id(message_id: int):

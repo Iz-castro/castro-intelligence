@@ -65,6 +65,7 @@ A leitura recomendada agora e:
 
 ### Decisoes
 - [ADRs](decisions/README.md)
+- [Encaminhamento e mensagem fixada por conversa](decisions/0016-encaminhamento-e-mensagem-fixada.md) — implementacao local; regras, testes e indice necessario para liberacao
 
 ### Compliance LGPD
 - [RoPA/RIPD versao cliente](compliance/LGPD_RoPA_RIPD_CLIENTE.md)
