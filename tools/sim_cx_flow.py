@@ -144,11 +144,35 @@ _TENANTS = {
 
 _CURRENT_TENANT = {"id": _TENANT_ID}
 
+BATCH_FAIL = {"on": False}
+
+
+class _Batch:
+    """WriteBatch em memoria: os sets so valem no commit (tudo ou nada)."""
+
+    def __init__(self):
+        self._ops = []
+
+    def set(self, ref, data, merge=False):
+        self._ops.append((ref, dict(data), merge))
+
+    def commit(self):
+        if BATCH_FAIL["on"]:
+            raise RuntimeError("commit do batch falhou (simulado)")
+        for ref, data, merge in self._ops:
+            ref.set(data, merge=merge)
+
+
+class _Client:
+    def batch(self):
+        return _Batch()
+
+
 _fc = types.ModuleType("firestore_common")
 _fc.document = lambda name, doc_id: _DocRef(name, doc_id)
 _fc.collection = lambda name: _CollRef(name)
 _fc.utcnow = lambda: datetime.now(timezone.utc)
-_fc.get_firestore_client = lambda: None
+_fc.get_firestore_client = lambda: _Client()
 _fc.get_tenant_context = lambda: _CURRENT_TENANT["id"]
 sys.modules["firestore_common"] = _fc
 
@@ -1547,6 +1571,491 @@ try:
     check(_meta.get("kind") == "handoff", "handoff por falha nao arma mesmo sem persistencia")
 finally:
     bot._finalize_cx_handoff = _real_finalize
+
+print("\n=== z: botoes do aviso DEPOIS do aceite — 2o Sim ignorado, Nao vale como recusa (PO 2026-11-13) ===")
+# Contato 1779 da varizemed, 12/11: tocou "Sim" no aviso e, 9 s depois, no
+# lembrete. O 2o toque ia ao agente como o texto "lgpd_aceitar" e a Val
+# respondia duas vezes. Com o aceite ja dado, "Nao" tambem ia ao agente e o
+# aceite seguia valendo. Decisao do PO: 2o "Sim" e ignorado; "Nao" vale como
+# recusa. So o TOQUE (id exato do botao) — texto digitado segue ao agente.
+from datetime import date as _date  # noqa: E402
+
+CX_SCRIPT.clear()
+
+
+def _n_audit(action):
+    return sum(1 for a in AUDIT if a["action"] == action)
+
+
+def _aceita(cid, wa_id, primeira="Oi, quero agendar uma avaliacao"):
+    """Contato novo que ve o aviso e aceita tocando em Sim (1 turno do agente)."""
+    novo_contato(cid, wa_id=wa_id)
+    envia(cid, primeira)
+    CX_SCRIPT.append(_cx_ok("Oi! Sou a Val. Qual o seu nome?"))
+    return envia(cid, "lgpd_aceitar")
+
+
+print("  -- z1: segundo toque em Sim --")
+_aceita(110, "5571990000110")
+_calls = len(CX_CALLS)
+_aceites = _n_audit("LGPD_CONSENT_ACCEPTED")
+bot.queue_cx_session_params(110, {"origem": "retomada_lote"})
+_meta = {}
+r = asyncio.run(bot.process_bot_message_async(110, "lgpd_aceitar", turn_meta=_meta))
+check(r is None, "2o toque em Sim: sem resposta")
+check(len(CX_CALLS) == _calls,
+      "2o toque em Sim: agente NAO e chamado (o id do botao nao vira fala do paciente)")
+check(_n_audit("LGPD_CONSENT_ACCEPTED") == _aceites, "2o toque em Sim: nenhum aceite novo no audit")
+check(STORE["bot_states"]["110"].get("pending_session_params") == {"origem": "retomada_lote"},
+      "2o toque em Sim: params de UM turno nao sao baixados sem turno do agente")
+check(STORE["bot_states"]["110"].get("lgpd_consent") is True
+      and STORE["wa_contacts"]["110"].get("lgpd_consent") is True,
+      "2o toque em Sim: aceite segue valendo (estado e contato)")
+check(_meta.get("kind") == "lgpd_repeat", "2o toque em Sim: turno sem resposta, tipo lgpd_repeat")
+r = envia(110, "  LGPD_ACEITAR ")
+check(r is None and len(CX_CALLS) == _calls, "id do botao com caixa/espacos diferentes tambem e toque")
+CX_SCRIPT.append(_cx_ok("Prazer, Ana! Em que posso ajudar?"))
+envia(110, "Meu nome e Ana")
+check(len(CX_CALLS) == _calls + 1 and CX_CALLS[-1]["text"] == "Meu nome e Ana"
+      and CX_CALLS[-1]["params"].get("origem") == "retomada_lote",
+      "turno seguinte vai ao agente com o texto digitado e os params que ficaram pendentes")
+
+print("  -- z2: texto DIGITADO depois do aceite nao e toque --")
+for _txt in ("sim", "Não", "nao", "ok", "recusar", "Recuso", "não aceito", "prefiro não", "n",
+             "aceito", "lgpd recusar"):
+    CX_SCRIPT.append(_cx_ok("Entendi."))
+    _n = len(CX_CALLS)
+    envia(110, _txt)
+    check(len(CX_CALLS) == _n + 1 and CX_CALLS[-1]["text"] == _txt
+          and STORE["bot_states"]["110"].get("lgpd_consent") is True
+          and STORE["wa_contacts"]["110"].get("lgpd_consent") is True,
+          f"'{_txt}' digitado depois do aceite segue para o agente e nao mexe no aceite")
+check(lgpd_bot.botao_lgpd("lgpd_aceitar") == "aceitar" and lgpd_bot.botao_lgpd(" LGPD_RECUSAR ") == "recusar",
+      "botao_lgpd reconhece os dois ids")
+check(all(lgpd_bot.botao_lgpd(t) == "" for t in
+          ("sim", "Sim", "nao", "Não", "aceitar", "recusar", "lgpd recusar", "lgpd_aceitar.",
+           "lgpd_recusar.", "lgpd_recusar!", "", None)),
+      "botao_lgpd ignora texto digitado, inclusive o vocabulario de aceite/recusa")
+
+print("  -- z3: toque em Nao depois do Sim --")
+_aceita(111, "5571990000111")
+_c111_antes = dict(STORE["wa_contacts"]["111"])
+_calls = len(CX_CALLS)
+_recusas = _n_audit("LGPD_CONSENT_REFUSED")
+_meta = {}
+r = asyncio.run(bot.process_bot_message_async(111, "lgpd_recusar", turn_meta=_meta))
+_st = STORE["bot_states"]["111"]
+_c = STORE["wa_contacts"]["111"]
+check(isinstance(r, str) and "não podemos prosseguir" in r.lower() and "Clínica Varizemed agradece" in r,
+      "Nao depois do Sim: despedida da recusa, com a marca do tenant")
+check(len(CX_CALLS) == _calls, "Nao depois do Sim: agente NAO e chamado")
+check(_st.get("lgpd_consent") is False and _st.get("lgpd_status") == "refused",
+      "Nao depois do Sim: estado vira recusa")
+check(_c.get("lgpd_consent") is False,
+      "Nao depois do Sim: a prova no CONTATO deixa de valer (lgpd_consent=False)")
+check(_c.get("lgpd_consent_at") == _c111_antes.get("lgpd_consent_at")
+      and _c.get("lgpd_policy_version") == _c111_antes.get("lgpd_policy_version"),
+      "data e versao do aceite anterior ficam como historico")
+check(bool(_c.get("lgpd_refused_at")), "carimbo lgpd_refused_at gravado no contato")
+check(not _c.get("lgpd_revoked"), "lgpd_revoked NAO e usado (revogacao da equipe, J-3 D8, e outra coisa)")
+check(_n_audit("LGPD_CONSENT_REFUSED") == _recusas + 1
+      and any(a["action"] == "LGPD_CONSENT_REFUSED" and "contato 111" in a["detail"]
+              and "varizemed-test-2026-07" in a["detail"] for a in AUDIT),
+      "audit LGPD_CONSENT_REFUSED com o contato e a versao da politica")
+check(_meta.get("kind") == "lgpd_refusal",
+      "tipo do turno lgpd_refusal (lembretes nao armam e a agenda e limpa)")
+check(_st.get("user_first_input") == "", "1a mensagem do ciclo nao fica guardada para replay")
+check(bot.lgpd_consent_resolved(_st, _c) is False,
+      "lgpd_consent_resolved: nao resolvido (texto novo nao entra no buffer; serie B barrada)")
+check(lgpd_bot.aceite_vigente(_c, _date(2020, 1, 1)) is False
+      and bot._contact_consent_hydrates(_c, None, _AI_CFG) is False
+      and bot.lgpd_consent_resolved({}, _c) is False,
+      "prova do contato nao hidrata mais, com ou sem data de politica")
+
+print("  -- z4: depois da recusa --")
+r = envia(111, "lgpd_recusar")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar"]
+      and _n_audit("LGPD_CONSENT_REFUSED") == _recusas + 1 and len(CX_CALLS) == _calls,
+      "novo toque em Nao ja recusado: lembrete de recusa so com o botao Sim, sem despedida nem audit repetidos")
+
+print("  -- z5: novo aceite depois da recusa --")
+_aceites = _n_audit("LGPD_CONSENT_ACCEPTED")
+# Carimbo antigo fixo no lugar do aceite anterior: a comparacao abaixo nao pode
+# depender da resolucao do relogio (no Windows, dois aceites no mesmo tick).
+_carimbo_antigo = "2020-01-01T00:00:00+00:00"
+STORE["wa_contacts"]["111"]["lgpd_consent_at"] = _carimbo_antigo
+r = envia(111, "lgpd_aceitar")
+_c = STORE["wa_contacts"]["111"]
+check(r == lgpd_bot._ACEITO_RESPOSTA and len(CX_CALLS) == _calls,
+      "novo aceite por botao: so a confirmacao, sem reenviar ao agente a 1a mensagem antiga")
+check(_c.get("lgpd_consent") is True and _n_audit("LGPD_CONSENT_ACCEPTED") == _aceites + 1
+      and _c.get("lgpd_consent_at") != _carimbo_antigo
+      and lgpd_bot.data_aceite_br(_c.get("lgpd_consent_at")) == _HOJE_BR
+      and STORE["bot_states"]["111"].get("lgpd_consent") is True,
+      "novo aceite volta a valer e grava prova nova (contato, estado e audit)")
+CX_SCRIPT.append(_cx_ok("Que bom! Vamos continuar."))
+envia(111, "quero marcar a avaliacao")
+check(len(CX_CALLS) == _calls + 1 and CX_CALLS[-1]["text"] == "quero marcar a avaliacao",
+      "depois do novo aceite a conversa volta ao agente")
+
+_aceita(112, "5571990000112")
+envia(112, "lgpd_recusar")
+_n = len(CX_CALLS)
+r = envia(112, "pensando bem, quero agendar")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar"]
+      and len(CX_CALLS) == _n,
+      "texto digitado depois da recusa: lembrete de recusa so com o botao Sim, sem agente")
+CX_SCRIPT.append(_cx_ok("Claro, vamos agendar."))
+r = envia(112, "lgpd_aceitar")
+check(len(CX_CALLS) == _n + 1 and CX_CALLS[-1]["text"] == "pensando bem, quero agendar"
+      and isinstance(r, str) and "vamos agendar" in r,
+      "o que o paciente DIGITOU durante a recusa e o que vai ao agente no novo aceite")
+
+print("  -- z6: recusa gravada durante o DetectIntent de outro turno --")
+_real_detect = _cx.detect_intent_text
+
+
+def _detect_com_recusa(cid_alvo, resposta):
+    async def _fake(cfg, session_id, text, session_params=None, timeout_s=None):
+        CX_CALLS.append({"cfg": dict(cfg), "session_id": session_id, "text": text,
+                         "params": dict(session_params or {}), "timeout_s": timeout_s})
+        # Enquanto o agente pensa, o toque em "Nao" e processado por outro turno.
+        await bot.process_bot_message_async(cid_alvo, "lgpd_recusar")
+        return resposta
+    return _fake
+
+
+_aceita(113, "5571990000113")
+_cx.detect_intent_text = _detect_com_recusa(
+    113, _cx_ok("Vou te passar para a equipe.", handoff_request=True, handoff_summary="quer agendar"))
+try:
+    r = envia(113, "Qual o endereco?")
+finally:
+    _cx.detect_intent_text = _real_detect
+check(r is None, "recusa durante o DetectIntent: a resposta atrasada do agente e descartada")
+check(not STORE["wa_contacts"]["113"].get("bot_completed"),
+      "recusa durante o DetectIntent: o handoff pedido nesse turno nao acontece")
+check(STORE.get("bot_states", {}).get("113", {}).get("lgpd_consent") is False
+      and STORE["wa_contacts"]["113"].get("lgpd_consent") is False,
+      "a recusa continua gravada (estado nao foi apagado pelo handoff; contato recusado)")
+
+novo_contato(114, wa_id="5571990000114")
+envia(114, "Quero agendar")
+_cx.detect_intent_text = _detect_com_recusa(114, _cx_ok("Oi! Sou a Val."))
+try:
+    r = envia(114, "lgpd_aceitar")
+finally:
+    _cx.detect_intent_text = _real_detect
+check(r is None and STORE["wa_contacts"]["114"].get("lgpd_consent") is False
+      and STORE["bot_states"]["114"].get("lgpd_consent") is False,
+      "Sim e Nao em sequencia rapida: nem a confirmacao nem a saudacao do agente saem depois da recusa")
+
+print("  -- z7: estado apagado e ciclo novo --")
+STORE["bot_states"].pop("113", None)
+r = envia(113, "oi, voltei")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar", "lgpd_recusar"],
+      "estado apagado depois da recusa: o contato NAO hidrata e o aviso completo sai de novo")
+
+novo_contato(115, wa_id="5571990000115", lgpd_consent=True,
+             lgpd_consent_at="2026-08-05T00:00:00+00:00",
+             lgpd_policy_version="varizemed-test-2026-07")
+CX_SCRIPT.append(_cx_ok("Ola de novo!"))
+_n = len(CX_CALLS)
+r = envia(115, "lgpd_aceitar")
+check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+      "conversa nova com prova antiga (estado hidratado): o toque em Sim vai ao agente, paciente nao fica sem resposta")
+
+# Estado do ciclo anterior que SOBREVIVEU (conversa encerrada por atendente:
+# release_lead_to_bot faz merge e preserva lgpd_*): mesmo tratamento (achado
+# da revisao de 13/11 — o criterio e o TEMPO desde o aceite, nao o estado).
+novo_contato(126, wa_id="5571990000126", lgpd_consent=True,
+             lgpd_consent_at="2026-08-05T00:00:00+00:00",
+             lgpd_policy_version="varizemed-test-2026-07")
+STORE["bot_states"]["126"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx",
+                              "human_active": False, "cx_fail_count": 0}
+CX_SCRIPT.append(_cx_ok("Que bom te ver de novo!"))
+_n = len(CX_CALLS)
+r = envia(126, "lgpd_aceitar")
+check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+      "conversa nova com o estado antigo preservado (encerrada por atendente): o toque em Sim vai ao agente")
+
+# Janela do toque repetido: conta do carimbo do aceite no contato.
+_aceita(127, "5571990000127")
+STORE["wa_contacts"]["127"]["lgpd_consent_at"] = (
+    datetime.now(timezone.utc) - timedelta(minutes=4)).isoformat()
+_n = len(CX_CALLS)
+r = envia(127, "lgpd_aceitar")
+check(r is None and len(CX_CALLS) == _n, "aceite ha 4 minutos: toque em Sim ainda e repeticao (ignorado)")
+STORE["wa_contacts"]["127"]["lgpd_consent_at"] = (
+    datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+CX_SCRIPT.append(_cx_ok("Oi! Posso ajudar?"))
+r = envia(127, "lgpd_aceitar")
+check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+      "aceite ha 6 minutos: toque em Sim segue ao agente (fora da janela)")
+for _carimbo in (None, "", "ontem", 12345):
+    STORE["wa_contacts"]["127"]["lgpd_consent_at"] = _carimbo
+    CX_SCRIPT.append(_cx_ok("Certo."))
+    _n = len(CX_CALLS)
+    r = envia(127, "lgpd_aceitar")
+    check(isinstance(r, str) and len(CX_CALLS) == _n + 1,
+          f"carimbo do aceite ausente ou ilegivel ({_carimbo!r}): toque em Sim segue ao agente")
+_agora = datetime.now(timezone.utc)
+check(bot._lgpd_accepted_recently({"lgpd_consent_at": (_agora - timedelta(seconds=280)).isoformat()}) is True
+      and bot._lgpd_accepted_recently({"lgpd_consent_at": (_agora - timedelta(seconds=320)).isoformat()}) is False,
+      "janela do toque repetido: 280 s ainda dentro, 320 s ja fora")
+check(bot._lgpd_accepted_recently({"lgpd_consent_at": (_agora + timedelta(seconds=30)).isoformat()}) is True
+      and bot._lgpd_accepted_recently({"lgpd_consent_at": (_agora + timedelta(minutes=2)).isoformat()}) is False,
+      "carimbo no futuro: folga de 60 s para relogios de instancias diferentes, nao mais que isso")
+check(bot._lgpd_accepted_recently({"lgpd_consent_at": _agora.replace(tzinfo=None).isoformat()}) is True
+      and bot._lgpd_accepted_recently({"lgpd_consent_at": _agora.isoformat().replace("+00:00", "Z")}) is True
+      and bot._lgpd_accepted_recently({"lgpd_consent_at": _agora}) is True
+      and bot._lgpd_accepted_recently(None) is False,
+      "carimbo sem fuso, com Z ou como datetime e lido; contato ausente nao e recente")
+
+# Falha do motor no turno do aceite: o paciente so recebeu o pedido de reenviar.
+novo_contato(128, wa_id="5571990000128")
+envia(128, "Oi quero agendar")
+CX_SCRIPT.append(dict(_CX_FAIL))
+r = envia(128, "lgpd_aceitar")
+check(isinstance(r, str) and STORE["bot_states"]["128"].get("cx_fail_count") == 1
+      and STORE["wa_contacts"]["128"].get("lgpd_consent") is True,
+      "turno do aceite com falha do motor: aceite gravado e paciente recebe o pedido de reenviar")
+CX_SCRIPT.append(_cx_ok("Oi! Sou a Val."))
+_n = len(CX_CALLS)
+r = envia(128, "lgpd_aceitar")
+check(isinstance(r, str) and "Sou a Val" in r and len(CX_CALLS) == _n + 1,
+      "novo toque em Sim depois da falha do motor: vai ao agente (paciente nao fica sem resposta)")
+r = envia(128, "lgpd_aceitar")
+check(r is None and len(CX_CALLS) == _n + 1,
+      "com o agente ja tendo respondido, o toque seguinte volta a ser repeticao (ignorado)")
+
+# Estado sem lgpd_* e step ja em "cx" (prova hidratada so em memoria, sem
+# regravacao): a conferencia depois do DetectIntent nao pode calar o agente.
+novo_contato(129, wa_id="5571990000129", lgpd_consent=True,
+             lgpd_consent_at="2026-08-05T00:00:00+00:00",
+             lgpd_policy_version="varizemed-test-2026-07")
+STORE["bot_states"]["129"] = {"step": "cx", "human_active": False}
+CX_SCRIPT.append(_cx_ok("Claro!"))
+r = envia(129, "qual o horario?")
+check(r == "Claro!" and STORE["bot_states"]["129"].get("lgpd_consent") is None,
+      "estado sem lgpd_* (aceite hidratado so em memoria): a resposta do agente sai")
+
+# Ciclo novo de quem recusou fora da fase de bot (estado apagado, contato
+# recusado): toque num botao antigo nao pode virar a "1a mensagem" do paciente.
+novo_contato(131, wa_id="5571990000131", lgpd_consent=False,
+             lgpd_refused_at="2026-11-13T12:00:00+00:00",
+             lgpd_consent_at="2026-11-10T12:00:00+00:00",
+             lgpd_policy_version="varizemed-test-2026-07")
+r = envia(131, "lgpd_aceitar")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar", "lgpd_recusar"]
+      and STORE["bot_states"]["131"].get("user_first_input") == "",
+      "toque em botao antigo sem estado: o aviso sai de novo e o id NAO fica guardado como 1a mensagem")
+_n = len(CX_CALLS)
+r = envia(131, "lgpd_aceitar")
+check(r == lgpd_bot._ACEITO_RESPOSTA and len(CX_CALLS) == _n
+      and STORE["wa_contacts"]["131"].get("lgpd_consent") is True,
+      "aceite em seguida: so a confirmacao; o id do botao nao vai ao agente como fala do paciente")
+
+# Com DATA de politica configurada na aba Sistema (P2b).
+_sys_bak_z = bot.get_system_settings
+bot.get_system_settings = lambda: {"bot_enabled": True, "lgpd_policy_date": _DATA_POL}
+try:
+    novo_contato(132, wa_id="5571990000132", lgpd_consent=True,
+                 lgpd_consent_at=_ACEITE_RECENTE, lgpd_policy_version=_DATA_POL)
+    STORE["bot_states"]["132"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    _n = len(CX_CALLS)
+    r = envia(132, "lgpd_recusar")
+    check(isinstance(r, str) and "não podemos prosseguir" in r.lower() and len(CX_CALLS) == _n
+          and STORE["wa_contacts"]["132"].get("lgpd_consent") is False
+          and STORE["bot_states"]["132"].get("lgpd_consent") is False,
+          "com data de politica e aceite em dia: toque em Nao vale como recusa (estado e contato)")
+    novo_contato(133, wa_id="5571990000133", lgpd_consent=True,
+                 lgpd_consent_at=_ACEITE_ANTIGO, lgpd_policy_version="varizemed-test-2026-07")
+    STORE["bot_states"]["133"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    _n = len(CX_CALLS)
+    r = envia(133, "lgpd_recusar")
+    check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar", "lgpd_recusar"]
+          and STORE["bot_states"]["133"].get("user_first_input") == "" and len(CX_CALLS) == _n,
+          "aceite anterior a politica vigente: o toque mostra o aviso novo e o id nao fica como 1a mensagem")
+    r = envia(133, "lgpd_recusar")
+    check(isinstance(r, str) and "não podemos prosseguir" in r.lower()
+          and STORE["bot_states"]["133"].get("lgpd_consent") is False and len(CX_CALLS) == _n,
+          "no aviso novo, o toque em Nao e a recusa de sempre")
+finally:
+    bot.get_system_settings = _sys_bak_z
+
+novo_contato(116, wa_id="5571990000116", lgpd_consent=True,
+             lgpd_consent_at="2026-08-05T00:00:00+00:00",
+             lgpd_policy_version="varizemed-test-2026-07")
+_n = len(CX_CALLS)
+r = envia(116, "lgpd_recusar")
+check(isinstance(r, str) and "não podemos prosseguir" in r.lower() and len(CX_CALLS) == _n
+      and STORE["wa_contacts"]["116"].get("lgpd_consent") is False
+      and STORE["bot_states"]["116"].get("lgpd_consent") is False,
+      "ciclo novo com prova antiga: toque em Nao vale como recusa (estado e contato)")
+
+print("  -- z8: gravacao da recusa e tudo ou nada --")
+_aceita(118, "5571990000118")
+_recusas = _n_audit("LGPD_CONSENT_REFUSED")
+BATCH_FAIL["on"] = True
+try:
+    try:
+        envia(118, "lgpd_recusar")
+        _levantou = False
+    except RuntimeError:
+        _levantou = True
+finally:
+    BATCH_FAIL["on"] = False
+check(_levantou, "falha na gravacao da recusa propaga (o webhook loga e o turno nao responde)")
+check(STORE["bot_states"]["118"].get("lgpd_consent") is True
+      and STORE["wa_contacts"]["118"].get("lgpd_consent") is True
+      and _n_audit("LGPD_CONSENT_REFUSED") == _recusas,
+      "falha na gravacao: nada fica pela metade (estado e contato seguem aceitos, sem audit)")
+r = envia(118, "lgpd_recusar")
+check(isinstance(r, str) and STORE["wa_contacts"]["118"].get("lgpd_consent") is False
+      and STORE["bot_states"]["118"].get("lgpd_consent") is False,
+      "novo toque depois da falha grava a recusa normalmente")
+
+print("  -- z10: toque em Nao com o lead FORA da fase de bot (fila ou atendente) --")
+# O webhook chama record_lgpd_refusal_outside_bot quando o bot nao vai rodar
+# (contato com dono ou bot_completed); a ligacao e testada no sim_buffer_flow (23).
+_aceite_121 = "2026-11-10T12:00:00+00:00"
+novo_contato(121, wa_id="5571990000121", lgpd_consent=True, lgpd_consent_at=_aceite_121,
+             lgpd_policy_version="varizemed-test-2026-07", bot_completed=True)
+_recusas = _n_audit("LGPD_CONSENT_REFUSED")
+_ok = bot.record_lgpd_refusal_outside_bot(121, dict(STORE["wa_contacts"]["121"]))
+_c = STORE["wa_contacts"]["121"]
+check(_ok is True and _c.get("lgpd_consent") is False and bool(_c.get("lgpd_refused_at"))
+      and _c.get("lgpd_consent_at") == _aceite_121 and not _c.get("lgpd_revoked"),
+      "fora do bot: recusa gravada no contato; aceite anterior fica como historico")
+check("121" not in STORE.get("bot_states", {}),
+      "fora do bot: nao cria bot_states para lead em atendimento humano")
+check(_n_audit("LGPD_CONSENT_REFUSED") == _recusas + 1
+      and any(a["action"] == "LGPD_CONSENT_REFUSED" and "contato 121" in a["detail"]
+              and "fora da fase de bot" in a["detail"] for a in AUDIT),
+      "fora do bot: audit LGPD_CONSENT_REFUSED marcado como fora da fase de bot")
+check(_c.get("bot_completed") is True, "fora do bot: o lead continua na fila (nada alem do aceite muda)")
+check(bot.record_lgpd_refusal_outside_bot(121, dict(STORE["wa_contacts"]["121"])) is False
+      and _n_audit("LGPD_CONSENT_REFUSED") == _recusas + 1,
+      "fora do bot: novo toque com a recusa ja gravada nao repete o registro")
+STORE["wa_contacts"]["121"]["bot_completed"] = False  # devolvido ao agente depois
+r = envia(121, "oi")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar", "lgpd_recusar"],
+      "fora do bot: na proxima fase de bot o aviso sai de novo (prova do contato nao hidrata)")
+
+novo_contato(122, wa_id="5571990000122", lgpd_consent=True,
+             lgpd_policy_version="varizemed-test-2026-07", assigned_to=7)
+STORE["bot_states"]["122"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx",
+                              "human_active": True, "user_first_input": "quero agendar"}
+bot.record_lgpd_refusal_outside_bot(122, dict(STORE["wa_contacts"]["122"]))
+_st = STORE["bot_states"]["122"]
+check(_st.get("lgpd_consent") is False and _st.get("lgpd_status") == "refused"
+      and _st.get("user_first_input") == "" and _st.get("human_active") is True and _st.get("step") == "cx",
+      "fora do bot: estado que sobreviveu ao atendimento humano vira recusa junto (o resto e preservado)")
+STORE["wa_contacts"]["122"]["assigned_to"] = None
+STORE["bot_states"]["122"]["human_active"] = False
+_n = len(CX_CALLS)
+r = envia(122, "voltei")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar"]
+      and len(CX_CALLS) == _n,
+      "fora do bot: devolvido ao agente, o estado preservado NAO ressuscita o aceite")
+
+novo_contato(123, wa_id="5571990000123", bot_completed=True)
+_recusas = _n_audit("LGPD_CONSENT_REFUSED")
+check(bot.record_lgpd_refusal_outside_bot(123, dict(STORE["wa_contacts"]["123"])) is False
+      and "lgpd_consent" not in STORE["wa_contacts"]["123"]
+      and _n_audit("LGPD_CONSENT_REFUSED") == _recusas,
+      "fora do bot: contato que nunca aceitou nao muda e nao gera audit")
+
+novo_contato(125, wa_id="5571990000125", lgpd_consent=True, bot_completed=True)
+STORE["bot_states"]["125"] = {"lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+BATCH_FAIL["on"] = True
+try:
+    try:
+        bot.record_lgpd_refusal_outside_bot(125, dict(STORE["wa_contacts"]["125"]))
+        _levantou = False
+    except RuntimeError:
+        _levantou = True
+finally:
+    BATCH_FAIL["on"] = False
+check(_levantou and STORE["wa_contacts"]["125"].get("lgpd_consent") is True
+      and STORE["bot_states"]["125"].get("lgpd_consent") is True,
+      "fora do bot: falha na gravacao propaga (o webhook loga) e nada fica pela metade")
+
+novo_contato(130, wa_id="5571990000130", lgpd_consent=True,
+             lgpd_policy_version="varizemed-test-2026-07", bot_completed=True)
+_estado_release = {"pending_session_params": {}, "human_active": False}  # formato deixado pelo release
+STORE["bot_states"]["130"] = dict(_estado_release)
+bot.record_lgpd_refusal_outside_bot(130, dict(STORE["wa_contacts"]["130"]))
+check(STORE["bot_states"]["130"] == _estado_release
+      and STORE["wa_contacts"]["130"].get("lgpd_consent") is False,
+      "fora do bot: estado sem lgpd_* nao e tocado (so o contato muda)")
+STORE["wa_contacts"]["130"]["bot_completed"] = False
+r = envia(130, "oi")
+check(isinstance(r, dict) and [b["id"] for b in r.get("buttons", [])] == ["lgpd_aceitar", "lgpd_recusar"],
+      "fora do bot: com estado sem lgpd_*, a proxima fase de bot mostra o aviso completo")
+
+_AI_CFG["lgpd_by_agent"] = True
+try:
+    novo_contato(124, wa_id="5571990000124", lgpd_consent=True, bot_completed=True)
+    check(bot.record_lgpd_refusal_outside_bot(124, dict(STORE["wa_contacts"]["124"])) is False
+          and STORE["wa_contacts"]["124"].get("lgpd_consent") is True,
+          "fora do bot: tenant com lgpd_by_agent nao muda (a LGPD e do agente)")
+    # Rollback documentado do agente para o builtin: bot_engine vazio com a opcao
+    # lgpd_by_agent esquecida em settings.ai. O gate volta a ser do CRM.
+    _engine_bak = _AI_CFG["bot_engine"]
+    try:
+        # O motor e comparado como no dispatcher (sem caixa nem espacos).
+        _AI_CFG["bot_engine"] = " Dialogflow_CX "
+        novo_contato(135, wa_id="5571990000135", lgpd_consent=True, bot_completed=True)
+        check(bot.record_lgpd_refusal_outside_bot(135, dict(STORE["wa_contacts"]["135"])) is False
+              and STORE["wa_contacts"]["135"].get("lgpd_consent") is True,
+              "fora do bot: motor CX escrito com caixa/espacos diferentes continua sendo CX (lgpd_by_agent vale)")
+        _AI_CFG["bot_engine"] = ""
+        novo_contato(134, wa_id="5571990000134", lgpd_consent=True, bot_completed=True)
+        check(bot.record_lgpd_refusal_outside_bot(134, dict(STORE["wa_contacts"]["134"])) is True
+              and STORE["wa_contacts"]["134"].get("lgpd_consent") is False,
+              "fora do bot: no builtin (bot_engine vazio) a opcao lgpd_by_agent esquecida nao desliga o registro")
+    finally:
+        _AI_CFG["bot_engine"] = _engine_bak
+finally:
+    _AI_CFG.pop("lgpd_by_agent", None)
+
+print("  -- z9: tenant com lgpd_by_agent nao muda --")
+_AI_CFG["lgpd_by_agent"] = True
+try:
+    novo_contato(117, wa_id="5571990000117")
+    CX_SCRIPT.append(_cx_ok("Aqui é o Hugo."))
+    envia(117, "oi")
+    for _id in ("lgpd_aceitar", "lgpd_recusar"):
+        CX_SCRIPT.append(_cx_ok("Certo."))
+        _n = len(CX_CALLS)
+        envia(117, _id)
+        check(len(CX_CALLS) == _n + 1 and CX_CALLS[-1]["text"] == _id,
+              f"lgpd_by_agent: '{_id}' segue para o agente (sem gate local)")
+    check(STORE["wa_contacts"]["117"].get("lgpd_consent") is None
+          and not STORE["wa_contacts"]["117"].get("lgpd_refused_at"),
+          "lgpd_by_agent: o CRM nao grava aceite nem recusa")
+    # Estado gravado ANTES de o tenant passar a LGPD para o agente nao pode
+    # desviar nem calar o bot: sem gate local, nada disso e consultado.
+    novo_contato(119, wa_id="5571990000119", lgpd_consent=True,
+                 lgpd_consent_at=datetime.now(timezone.utc).isoformat())
+    STORE.setdefault("bot_states", {})["119"] = {
+        "lgpd_consent": True, "lgpd_status": "accepted", "step": "cx"}
+    CX_SCRIPT.append(_cx_ok("Certo."))
+    _n = len(CX_CALLS)
+    r = envia(119, "lgpd_aceitar")
+    check(r == "Certo." and len(CX_CALLS) == _n + 1,
+          "lgpd_by_agent com estado antigo aceito: o toque em Sim NAO e ignorado")
+    novo_contato(120, wa_id="5571990000120")
+    STORE["bot_states"]["120"] = {"lgpd_consent": False, "lgpd_status": "refused", "step": "lgpd"}
+    CX_SCRIPT.append(_cx_ok("Olá!"))
+    r = envia(120, "bom dia")
+    check(r == "Olá!",
+          "lgpd_by_agent com estado antigo recusado: a resposta do agente sai (bot nao fica mudo)")
+finally:
+    _AI_CFG.pop("lgpd_by_agent", None)
+    CX_SCRIPT.clear()
 
 print("\n" + "=" * 70)
 if FAILS:

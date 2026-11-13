@@ -763,7 +763,7 @@ lista `reopen_batch_sent_at` nem no teto de 2 envios em 90 dias, e tem tetos pr�
 | R13 | Contato com mais de uma thread standard | um candidato por contato; teto no contato; carimbo de entrada do contato no gate |
 | R14 | Na fatia 1 o motor vai para produção sem a tela: uma aba Sistema aberta regravaria a configuração do lembrete com valores antigos | chaves do lembrete em `_CASTRO_ONLY_SETTINGS` até a fatia 2 (4.6) |
 | R15 | A série A fala com quem ainda não aceitou a política de privacidade | texto sem nome e sem dado do paciente; botões do próprio aviso; quem recusou nunca recebe (4.3, 4.5) |
-| R16 | Depois do aceite, o toque em "Não" de um aviso ou lembrete antigo vai à Val como o texto `lgpd_recusar` e não registra recusa (`lgpd_bot.py:417-418`). Já acontece com o aviso; a série A põe até três mensagens a mais com esse botão | o simulador registra o comportamento; a decisão de tratar vai ao PO pela N3 |
+| R16 | Depois do aceite, o toque em "Não" de um aviso ou lembrete antigo vai à Val como o texto `lgpd_recusar` e não registra recusa (`lgpd_bot.py:417-418`). Já acontece com o aviso; a série A põe até três mensagens a mais com esse botão | o simulador registra o comportamento; a decisão de tratar vai ao PO pela N3. **Tratado em 2026-11-13** (emenda do ADR 0009): o toque em "Não" depois do aceite vale como recusa e o segundo toque em "Sim" é ignorado |
 
 ## 6. Decisões do PO
 

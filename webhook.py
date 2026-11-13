@@ -46,7 +46,9 @@ from channel_service import (
 )
 from bot_service import (
     process_bot_message_async, lgpd_consent_resolved, queue_cx_session_params, discard_cx_session_params,
+    record_lgpd_refusal_outside_bot,
 )
+from lgpd_bot import botao_lgpd
 from bot_transport import extract_interactive_inbound
 from bot_sender import send_bot_reply
 from firestore_common import (
@@ -1048,6 +1050,29 @@ def _bot_buffer_consent_resolved(contact_id, contact=None) -> bool:
     return lgpd_consent_resolved(state, contact)
 
 
+async def _record_lgpd_refusal_if_outside_bot(raw_msg_type, content, was_dup, contact_id, contact):
+    """Toque em "Nao" do aviso da LGPD com o lead fora da fase de bot (com dono
+    ou bot_completed): registra a recusa sem responder (decisao do PO,
+    2026-11-13; regra em bot_service.record_lgpd_refusal_outside_bot).
+
+    So toque de verdade (mensagem interativa): o mesmo id digitado nao conta.
+    Reentrega da Meta (was_dup) nao repete. Contato sem aceite valido nao gera
+    leitura nem gravacao. Falha aqui nunca derruba o inbound: a mensagem do
+    paciente ja foi gravada antes."""
+    if not (raw_msg_type == "interactive" and not was_dup
+            and botao_lgpd(content) == "recusar"
+            and contact and contact.get("lgpd_consent") is True
+            and (contact.get("assigned_to") or contact.get("bot_completed"))):
+        return
+    try:
+        await run_in_threadpool(record_lgpd_refusal_outside_bot, contact_id, contact)
+    except Exception as exc:
+        logger.error(
+            "[LGPD] falha ao gravar a recusa fora da fase de bot | contato=%s erro=%s",
+            contact_id, type(exc).__name__,
+        )
+
+
 def _join_bot_buffer_items(items) -> str:
     ordered = sorted(
         (item for item in (items or []) if isinstance(item, dict)),
@@ -1789,6 +1814,15 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             )
             continue
 
+        # -- Toque em "Nao" do aviso da LGPD com o lead FORA da fase de bot --
+        # Na fase de bot o gate (lgpd_bot.handle_lgpd) trata o toque mais
+        # abaixo e manda a despedida. Com o lead na fila ou com atendente o bot
+        # nao roda, mas o aceite deixa de valer do mesmo jeito (decisao do PO,
+        # 2026-11-13): so grava a recusa, sem resposta automatica no meio do
+        # atendimento humano.
+        await _record_lgpd_refusal_if_outside_bot(
+            raw_msg_type, content, was_dup, contact_id, contact_row)
+
         # Comandos exatos do lembrete sao controle proprio, nunca texto para a Val.
         # So no canal STANDARD (decisao do PO 11/11): em numero coex o texto
         # segue o fluxo normal e o bot nao responde pelo numero pessoal.
@@ -1913,6 +1947,20 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         # positivo contato 193). Avaliacao agora e SO por botao
         # (_handle_rating_reply, curto-circuito antes do bot).
         _contact_fresh = get_wa_contact(contact_id) if bot_ran else contact_row
+        # Toque em "Nao" cujo turno encontrou o lead JA fora da fase de bot: a
+        # rajada anterior (processada antes do clique) terminou em handoff, ou
+        # um operador assumiu durante a espera do claim. O turno do clique sai
+        # antes do gate LGPD e nada foi gravado; o contato relido aqui decide.
+        # So invalida o aceite que JA EXISTIA quando o toque chegou (mesmo
+        # carimbo na chegada e na releitura): um "Sim" processado durante o
+        # envio da despedida grava aceite NOVO, posterior ao "Nao", e esse nao
+        # pode ser derrubado. Se o proprio turno gravou a recusa, o contato
+        # relido ja esta com lgpd_consent False e nada repete.
+        if (bot_ran and (contact_row or {}).get("lgpd_consent") is True
+                and (_contact_fresh or {}).get("lgpd_consent_at")
+                == (contact_row or {}).get("lgpd_consent_at")):
+            await _record_lgpd_refusal_if_outside_bot(
+                raw_msg_type, content, was_dup, contact_id, _contact_fresh)
         # not was_dup: reentrega da Meta nao pode re-rodar o reroute (re-
         # atribuia e regravava em_atendimento sobre desfecho recem-marcado).
         if _contact_fresh and not was_dup and _contact_fresh.get("qualification") == "convertido":

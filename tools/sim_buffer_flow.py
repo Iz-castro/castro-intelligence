@@ -272,26 +272,71 @@ async def _fake_cx(text):
     return f"Resposta: {text}"
 
 
+def _fake_record_accept(contact_id):
+    """Espelho de bot_service._record_lgpd_consent: prova no contato, carimbo novo."""
+    CONTACTS[str(contact_id)].update({
+        "lgpd_consent": True,
+        "lgpd_consent_at": datetime.now(timezone.utc).isoformat(),
+        "lgpd_policy_version": AI_CFG.get("lgpd_policy_version"),
+    })
+
+
 async def _fake_process_bot(contact_id, text, contact_name=""):
+    # Duble do turno do bot. Espelha o gate real so no que o webhook enxerga
+    # (quem responde, o que fica gravado em estado e contato); a regra de
+    # verdade dos botoes do aviso e exercitada no sim_cx_flow, cenario z.
     state = STATES.setdefault(str(contact_id), {})
+    normalized = str(text or "").strip().lower()
     # Hidratacao pela prova do contato (espelho de bot_service._process_cx_message).
     contact = CONTACTS.get(str(contact_id)) or {}
+    # Espelho do gate do turno real (bot_service._process_cx_message): lead com
+    # dono ou ja finalizado pelo bot nao tem turno. Sem isto o duble respondia
+    # depois do handoff e escondia o toque em "Nao" serializado atras da
+    # rajada (achado da revisao de 2026-11-13).
+    if contact.get("assigned_to") or contact.get("bot_completed"):
+        if not state:
+            STATES.pop(str(contact_id), None)  # o turno real nao cria bot_states aqui
+        return None
     if (state.get("lgpd_consent") is None and contact.get("lgpd_consent") is True
             and not contact.get("lgpd_revoked")
             and contact.get("lgpd_policy_version") == AI_CFG.get("lgpd_policy_version")):
         state["lgpd_consent"] = True
         state["lgpd_status"] = "accepted"
     if state.get("lgpd_consent") is True:
+        if normalized == "lgpd_recusar":
+            state["lgpd_consent"] = False
+            state["lgpd_status"] = "refused"
+            state["user_first_input"] = ""
+            CONTACTS[str(contact_id)]["lgpd_consent"] = False
+            return "Entendido. Sem o seu consentimento nao podemos prosseguir."
+        # Toque repetido em "Sim": a MESMA funcao do turno real (janela desde o
+        # aceite gravado no contato) e sem falha do motor pendente.
+        if (normalized == "lgpd_aceitar" and bot_service._lgpd_accepted_recently(contact)
+                and not int(state.get("cx_fail_count") or 0)):
+            return None
         return await _fake_cx(text)
-    normalized = str(text or "").strip().lower()
-    if state.get("lgpd_status") == "awaiting" and normalized in ("lgpd_aceitar", "sim"):
-        state["lgpd_consent"] = True
-        state["lgpd_status"] = "accepted"
-        first = str(state.get("user_first_input") or "").strip()
-        cx_reply = await _fake_cx(first) if first else ""
-        return ("Consentimento aceito.\n\n" + cx_reply).strip()
+    if state.get("lgpd_consent") is False:
+        if normalized in ("lgpd_aceitar", "sim"):
+            state["lgpd_consent"] = True
+            state["lgpd_status"] = "accepted"
+            _fake_record_accept(contact_id)
+            return "Consentimento aceito."
+        return {"type": "interactive_buttons", "body": "Voce optou por nao consentir.", "buttons": []}
+    if state.get("lgpd_status") == "awaiting":
+        if normalized in ("lgpd_aceitar", "sim"):
+            state["lgpd_consent"] = True
+            state["lgpd_status"] = "accepted"
+            _fake_record_accept(contact_id)
+            first = str(state.get("user_first_input") or "").strip()
+            cx_reply = await _fake_cx(first) if first else ""
+            return ("Consentimento aceito.\n\n" + cx_reply).strip()
+        if normalized in ("lgpd_recusar", "nao"):
+            # Recusa no aviso: so o estado muda (o contato nao tinha prova).
+            state["lgpd_consent"] = False
+            state["lgpd_status"] = "refused"
+            return "Entendido. Sem o seu consentimento nao podemos prosseguir."
     state["lgpd_status"] = "awaiting"
-    state["user_first_input"] = str(text)
+    state["user_first_input"] = "" if normalized in ("lgpd_aceitar", "lgpd_recusar") else str(text)
     return {"type": "interactive_buttons", "body": "Podemos continuar?", "buttons": []}
 
 
@@ -1278,6 +1323,222 @@ def scenario_transaction_contracts():
           "append_bot_buffer real aceita channel_id (mesmo contrato do duble)")
 
 
+async def scenario_lgpd_buttons_after_consent():
+    global BLOCK_FIRST_CX
+    title("23. Botoes do aviso LGPD depois do aceite: gancho fora da fase de bot e ordem com a rajada (PO 2026-11-13)")
+    calls = []
+    real = wh.record_lgpd_refusal_outside_bot
+
+    def _recorder(contact_id, contact):
+        contact = contact or {}
+        # len(SENT): 0 no gancho da chegada; 1+ quando a conferencia depois do
+        # turno e que registrou (a resposta do turno ja saiu).
+        calls.append((contact_id, contact.get("lgpd_consent"), bool(contact.get("bot_completed")),
+                      contact.get("assigned_to"), len(SENT)))
+        return True
+
+    def _gated_send():
+        """Envio que para na 1a chamada ate ser liberado: abre a janela em que
+        outro inbound do mesmo contato e processado durante o envio da resposta."""
+        started, release = asyncio.Event(), asyncio.Event()
+        base = wh._send_bot_reply
+        pending = {"first": True}
+
+        async def _send(wa_id, reply, contact_id, token, phone_id, **kwargs):
+            if pending["first"]:
+                pending["first"] = False
+                started.set()
+                await release.wait()
+            return await base(wa_id, reply, contact_id, token, phone_id, **kwargs)
+        return _send, started, release, base
+
+    wh.record_lgpd_refusal_outside_bot = _recorder
+    try:
+        # 23a. Lead na fila (bot_completed): o gancho grava a recusa; o bot nao roda.
+        cid = _reset(consented=False, completed=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        await _deliver([_interactive("o1", "lgpd_recusar")])
+        check(calls == [(cid, True, True, None, 0)] and not CX_CALLS and not SENT,
+              "23a. lead na fila: recusa registrada 1x, sem turno do bot e sem resposta automatica")
+        check(len(SAVED) == 1 and SAVED[0].get("content") == "lgpd_recusar"
+              and SAVED[0].get("direction") == "inbound",
+              "23a. o toque continua gravado como mensagem do paciente")
+        # 23b. Reentrega da Meta (mesmo wamid) nao registra de novo.
+        await _deliver([_interactive("o1", "lgpd_recusar")])
+        check(len(calls) == 1, "23b. reentrega do mesmo toque nao repete o registro")
+        # 23c. Lead com atendente.
+        calls.clear()
+        cid = _reset(consented=False, assigned=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        await _deliver([_interactive("o2", "lgpd_recusar")])
+        check(calls == [(cid, True, False, 9, 0)] and not SENT,
+              "23c. lead com atendente: recusa registrada, sem resposta automatica")
+        # 23d. Mesmo id DIGITADO nao e toque.
+        calls.clear()
+        cid = _reset(consented=False, completed=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        await _deliver([_text("o3", "lgpd_recusar")])
+        check(not calls, "23d. 'lgpd_recusar' digitado (mensagem de texto) nao registra recusa")
+        # 23e. Toque em Sim e toque sem aceite previo nao registram nada.
+        await _deliver([_interactive("o4", "lgpd_aceitar")])
+        CONTACTS[str(cid)]["lgpd_consent"] = None
+        await _deliver([_interactive("o5", "lgpd_recusar")])
+        check(not calls, "23e. toque em Sim, ou em Nao sem aceite previo, nao registra recusa")
+        # 23f. Falha do registro nao derruba o inbound.
+        def _boom(contact_id, contact):
+            raise RuntimeError("firestore fora")
+        wh.record_lgpd_refusal_outside_bot = _boom
+        cid = _reset(consented=False, completed=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        try:
+            await _deliver([_interactive("o6", "lgpd_recusar"), _text("o7", "oi")])
+            survived = True
+        except Exception:
+            survived = False
+        check(survived and len(SAVED) == 2,
+              "23f. falha ao registrar nao propaga: as mensagens do payload seguem gravadas")
+        wh.record_lgpd_refusal_outside_bot = _recorder
+        # 23g. Fase de bot: o gancho NAO age (quem trata e o gate do bot, com a despedida).
+        calls.clear()
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        await _deliver([_interactive("o8", "lgpd_recusar")])
+        check(not calls and not CX_CALLS and len(SENT) == 1
+              and STATES[str(cid)].get("lgpd_consent") is False,
+              "23g. fase de bot: gancho fica de fora; o turno do bot grava a recusa e responde 1x")
+        # 23h. Rajada pendente + toque em Nao: a rajada e respondida antes, a recusa vem depois.
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        sleeping = asyncio.create_task(_deliver([_text("o9", "texto pendente")]))
+        await asyncio.sleep(0.008)
+        await _deliver([_interactive("o10", "lgpd_recusar")])
+        await sleeping
+        check(CX_CALLS == ["texto pendente"] and len(SENT) == 2
+              and str(SENT[0]["reply"]).startswith("Resposta:")
+              and str(SENT[1]["reply"]).startswith("Entendido"),
+              "23h. rajada pendente e respondida primeiro; a despedida da recusa sai depois")
+        # 23i. Depois da recusa, texto novo nao arma o buffer (turno direto, sem agente).
+        await _deliver([_text("o11", "oi de novo")])
+        check(CX_CALLS == ["texto pendente"] and not BUFFERS and len(SENT) == 3,
+              "23i. depois da recusa: texto novo vai em turno direto, sem buffer e sem agente")
+        # 23j. Segundo toque em Sim com rajada pendente: so a rajada e respondida.
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)].update({
+            "lgpd_consent": True, "lgpd_consent_at": datetime.now(timezone.utc).isoformat()})
+        sleeping = asyncio.create_task(_deliver([_text("o12", "quero agendar")]))
+        await asyncio.sleep(0.008)
+        await _deliver([_interactive("o13", "lgpd_aceitar")])
+        await sleeping
+        check(CX_CALLS == ["quero agendar"] and len(SENT) == 1 and not BUFFERS,
+              "23j. toque repetido em Sim (aceite recente): rajada respondida 1x, toque ignorado, nada orfao")
+        # Aceite antigo: o toque em Sim e o paciente retomando a conversa e vai ao agente.
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_consent_at": "2026-08-05T00:00:00+00:00"})
+        await _deliver([_interactive("o13b", "lgpd_aceitar")])
+        check(CX_CALLS == ["lgpd_aceitar"] and len(SENT) == 1,
+              "23j. toque em Sim com aceite antigo: vai ao agente (paciente nao fica sem resposta)")
+        # 23k. Rajada pendente que termina em HANDOFF + toque em Nao: o clique roda
+        # depois da rajada, encontra o lead ja na fila e o turno sai sem gate. O
+        # webhook rele o contato depois do turno e registra a recusa (revisao 13/11).
+        calls.clear()
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        sleeping = asyncio.create_task(_deliver([_text("o14", "quero atendente HANDOFF")]))
+        await asyncio.sleep(0.008)
+        await _deliver([_interactive("o15", "lgpd_recusar")])
+        await sleeping
+        check(CX_CALLS == ["quero atendente HANDOFF"] and len(SENT) == 1
+              and CONTACTS[str(cid)].get("bot_completed") is True,
+              "23k. rajada com handoff roda antes do toque; so a transferencia e enviada")
+        check(calls == [(cid, True, True, None, 1)],
+              "23k. toque em Nao serializado atras do handoff: recusa registrada depois do turno, com o contato relido")
+        # 23l. Toque em Nao DURANTE o turno em voo que termina em handoff (claim ocupado).
+        calls.clear()
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        BLOCK_FIRST_CX = True
+        previous_poll = wh._BUFFER_CLAIM_POLL_SECONDS
+        wh._BUFFER_CLAIM_POLL_SECONDS = 0.01
+        try:
+            first = asyncio.create_task(_deliver([_text("o16", "HANDOFF por favor")]))
+            await FIRST_CX_STARTED.wait()
+            click = asyncio.create_task(_deliver([_interactive("o17", "lgpd_recusar")]))
+            await asyncio.sleep(0.03)
+            RELEASE_FIRST_CX.set()
+            await asyncio.gather(first, click)
+        finally:
+            wh._BUFFER_CLAIM_POLL_SECONDS = previous_poll
+        check(calls == [(cid, True, True, None, 1)] and len(SENT) == 1,
+              "23l. toque em Nao durante o turno que faz handoff: recusa registrada depois do turno, sem resposta extra")
+        # 23m. O turno do toque GRAVOU a recusa e, durante o envio da despedida, o
+        # lead saiu da fase de bot (handoff de outro turno / operador assumiu): a
+        # conferencia depois do turno ve o contato ja recusado e nao registra de novo.
+        calls.clear()
+        cid = _reset(consented=True)
+        CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_consent_at": "2026-08-05T00:00:00+00:00"})
+        base_send = wh._send_bot_reply
+
+        async def _send_and_leave_bot(wa_id, reply, contact_id, token, phone_id, **kwargs):
+            CONTACTS[str(contact_id)]["bot_completed"] = True
+            return await base_send(wa_id, reply, contact_id, token, phone_id, **kwargs)
+
+        wh._send_bot_reply = _send_and_leave_bot
+        try:
+            await _deliver([_interactive("o18", "lgpd_recusar")])
+        finally:
+            wh._send_bot_reply = base_send
+        check(not calls and CONTACTS[str(cid)].get("lgpd_consent") is False and len(SENT) == 1,
+              "23m. recusa ja gravada pelo turno: a conferencia depois do turno nao repete o registro")
+        # 23n. Aviso pendente: toque em Nao e, durante o envio da despedida, toque em
+        # Sim (o paciente corrigiu) seguido de handoff. O aceite gravado DEPOIS do
+        # Nao nao pode ser derrubado pela conferencia depois do turno (revisao 13/11).
+        calls.clear()
+        cid = _reset(consented=False)
+        STATES[str(cid)] = {"lgpd_status": "awaiting", "user_first_input": "oi"}
+        send, started, release, base_send = _gated_send()
+        wh._send_bot_reply = send
+        try:
+            nao = asyncio.create_task(_deliver([_interactive("o19", "lgpd_recusar")]))
+            await started.wait()
+            await _deliver([_interactive("o20", "lgpd_aceitar")])
+            CONTACTS[str(cid)]["bot_completed"] = True  # o turno do Sim terminou em handoff
+            release.set()
+            await nao
+        finally:
+            wh._send_bot_reply = base_send
+        check(not calls and CONTACTS[str(cid)].get("lgpd_consent") is True
+              and STATES[str(cid)].get("lgpd_consent") is True,
+              "23n. Nao no aviso e Sim logo depois: o aceite mais novo fica valendo (nada e registrado como recusa)")
+        # 23o. Lead que JA tinha aceite: Nao (recusa gravada pelo turno) e, durante a
+        # despedida, Sim de novo (aceite novo, carimbo novo) + operador assume.
+        calls.clear()
+        cid = _reset(consented=True)
+        aceite_antigo = "2026-08-05T00:00:00+00:00"
+        CONTACTS[str(cid)].update({"lgpd_consent": True, "lgpd_consent_at": aceite_antigo})
+        send, started, release, base_send = _gated_send()
+        wh._send_bot_reply = send
+        try:
+            nao = asyncio.create_task(_deliver([_interactive("o21", "lgpd_recusar")]))
+            await started.wait()
+            await _deliver([_interactive("o22", "lgpd_aceitar")])
+            CONTACTS[str(cid)]["assigned_to"] = 9  # operador assume durante a despedida
+            release.set()
+            await nao
+        finally:
+            wh._send_bot_reply = base_send
+        check(not calls and CONTACTS[str(cid)].get("lgpd_consent") is True
+              and CONTACTS[str(cid)].get("lgpd_consent_at") != aceite_antigo,
+              "23o. lead ja aceito: Nao e depois Sim durante a despedida: o aceite novo nao e derrubado")
+        # 23p. Interativa que nao e do aviso da LGPD, com o lead na fila e com aceite.
+        calls.clear()
+        cid = _reset(consented=False, completed=True)
+        CONTACTS[str(cid)]["lgpd_consent"] = True
+        await _deliver([_interactive("o23", "acao_interativa")])
+        check(not calls, "23p. interativa que nao e botao do aviso nao registra recusa")
+    finally:
+        wh.record_lgpd_refusal_outside_bot = real
+
+
 def scenario_lgpd_by_agent():
     print("\n=== lgpd_by_agent: agente trata a LGPD, buffer arma sem aceite no CRM (Hugo, 2026-10-23) ===")
     check(wh._bot_buffer_consent_resolved(9901, {"id": 9901}) is False,
@@ -1313,6 +1574,7 @@ async def main():
     await scenario_policy_date()
     await scenario_reopen_opt_out_reset()
     await scenario_cron_reply_channel()
+    await scenario_lgpd_buttons_after_consent()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

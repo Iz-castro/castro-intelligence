@@ -100,11 +100,30 @@ class _CollRef:
 # Stubs de firestore_common e database (injetados antes dos imports reais)
 # =========================================================================
 
+class _Batch:
+    """WriteBatch em memoria: os sets so valem no commit (tudo ou nada)."""
+
+    def __init__(self):
+        self._ops = []
+
+    def set(self, ref, data, merge=False):
+        self._ops.append((ref, dict(data), merge))
+
+    def commit(self):
+        for ref, data, merge in self._ops:
+            ref.set(data, merge=merge)
+
+
+class _Client:
+    def batch(self):
+        return _Batch()
+
+
 _fc = types.ModuleType("firestore_common")
 _fc.document = lambda name, doc_id: _DocRef(name, doc_id)
 _fc.collection = lambda name: _CollRef(name)
 _fc.utcnow = lambda: datetime.now(timezone.utc)
-_fc.get_firestore_client = lambda: None
+_fc.get_firestore_client = lambda: _Client()
 _fc.get_tenant_context = lambda: "hubloc"  # _get_dept_map cacheia por tenant
 sys.modules["firestore_common"] = _fc
 
@@ -572,6 +591,72 @@ def cenario_rollback_agente_ia():
     check(str(cid) not in STORE.get("bot_states", {}), "bot_state drenado, nao resetado para a LGPD")
 
 
+def cenario_nao_depois_do_aceite():
+    titulo("CENARIO 9 — Toque em NAO com o aceite ja dado vale como recusa (PO 2026-11-13)")
+    # No builtin o aceite finaliza o bot na hora; o toque so chega ao gate com
+    # aceite em voo (estado legado ask_sector, ou step=cx no rollback do agente).
+    cid = 30
+    _contato_legado_ask_sector(cid, "conv30")
+    aceite_em = "2026-07-01T12:00:00+00:00"
+    STORE["wa_contacts"][str(cid)].update(
+        lgpd_consent=True, lgpd_consent_at=aceite_em, lgpd_policy_version="hubloc-2026-06")
+    recusas = sum(1 for a in AUDIT if a["action"] == "LGPD_CONSENT_REFUSED")
+
+    reply, _, _ = cliente_envia(cid, button_id="lgpd_recusar", button_title="Não")
+    estado = STORE["bot_states"].get(str(cid), {})
+    contato = STORE["wa_contacts"][str(cid)]
+    check(isinstance(reply, str) and "não podemos prosseguir" in reply.lower()
+          and "Hub Loc agradece o seu contato" in reply,
+          "toque em Nao depois do aceite: despedida da recusa")
+    check(estado.get("lgpd_consent") is False and estado.get("lgpd_status") == "refused",
+          "estado vira recusa")
+    check(contato.get("lgpd_consent") is False and bool(contato.get("lgpd_refused_at")),
+          "prova no contato deixa de valer (lgpd_consent=False + lgpd_refused_at)")
+    check(contato.get("lgpd_consent_at") == aceite_em
+          and contato.get("lgpd_policy_version") == "hubloc-2026-06"
+          and not contato.get("lgpd_revoked"),
+          "aceite anterior fica como historico; lgpd_revoked nao e usado")
+    check(contato.get("bot_completed") is not True and contato.get("department_id") is None,
+          "quem recusou nao vai para a fila do Comercial")
+    check(sum(1 for a in AUDIT if a["action"] == "LGPD_CONSENT_REFUSED") == recusas + 1
+          and any(a["action"] == "LGPD_CONSENT_REFUSED" and f"contato {cid}" in a["detail"]
+                  and "hubloc-2026-06" in a["detail"] and aceite_em in a["detail"]
+                  for a in AUDIT),
+          "audit_log registrou LGPD_CONSENT_REFUSED com a versao e a data do aceite anterior")
+
+    # Mudou de ideia: o Sim volta a valer e segue o fluxo normal.
+    reply, _, _ = cliente_envia(cid, button_id="lgpd_aceitar", button_title="Sim")
+    contato = STORE["wa_contacts"][str(cid)]
+    check(contato.get("lgpd_consent") is True and contato.get("lgpd_consent_at") != aceite_em
+          and contato.get("bot_completed") is True,
+          "novo aceite grava prova nova e encaminha ao Comercial")
+
+    # "nao" DIGITADO com aceite em voo nao e toque: segue o fluxo de sempre.
+    cid2 = 31
+    _contato_legado_ask_sector(cid2, "conv31")
+    STORE["wa_contacts"][str(cid2)].update(lgpd_consent=True, lgpd_consent_at=aceite_em)
+    reply, _, _ = cliente_envia(cid2, text="nao")
+    contato2 = STORE["wa_contacts"][str(cid2)]
+    check(contato2.get("lgpd_consent") is True and contato2.get("bot_completed") is True
+          and isinstance(reply, str) and "comercial" in reply.lower(),
+          "'nao' digitado com o aceite ja dado nao vira recusa (fluxo antigo intacto)")
+
+    # Recusa NO AVISO (sem aceite anterior) continua so no estado: nada no
+    # contato, nenhum audit — nem na recusa, nem nas mensagens seguintes.
+    cid3 = 32
+    _novo_contato(cid3)
+    recusas = sum(1 for a in AUDIT if a["action"] == "LGPD_CONSENT_REFUSED")
+    cliente_envia(cid3, text="bom dia")
+    cliente_envia(cid3, button_id="lgpd_recusar", button_title="Não")
+    cliente_envia(cid3, text="oi")
+    cliente_envia(cid3, button_id="lgpd_recusar", button_title="Não")
+    contato3 = STORE["wa_contacts"][str(cid3)]
+    check(STORE["bot_states"][str(cid3)].get("lgpd_consent") is False
+          and "lgpd_consent" not in contato3 and "lgpd_refused_at" not in contato3
+          and sum(1 for a in AUDIT if a["action"] == "LGPD_CONSENT_REFUSED") == recusas,
+          "recusa no aviso (sem aceite anterior) fica so no estado: contato e audit intactos")
+
+
 def main():
     cenario_fluxo_feliz_botoes()
     cenario_recusa_reconsentimento()
@@ -579,6 +664,7 @@ def main():
     cenario_legado_escolha_setor()
     cenario_legado_invalida_vai_comercial()
     cenario_rollback_agente_ia()
+    cenario_nao_depois_do_aceite()
     cenario_limites_payload()
     cenario_horario_comercial()
     cenario_p2b_lgpd_builtin()

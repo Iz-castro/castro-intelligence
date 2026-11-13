@@ -29,9 +29,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py bot_reminders.py bot_reminder_routes.py`
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
-  API, exercita o código real, 76 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (246).
+  API, exercita o código real, 85 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (334).
   Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
-  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4) + canal da resposta no flush do cron (roda o cron real, extraído do `main.py` por AST): `tools\sim_buffer_flow.py` (97).
+  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4) + canal da resposta no flush do cron (roda o cron real, extraído do `main.py` por AST) + botões do aviso da LGPD depois do aceite (registro da recusa fora da fase de bot e ordem com a rajada): `tools\sim_buffer_flow.py` (116).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
   Lembretes (series A e B: classificacao, agenda, transacao, comandos, API e envio): `tools\sim_bot_reminders.py` (175).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
@@ -209,6 +209,20 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   por `contact_id`, só lead próprio/pool, e o gate roda ANTES do `_resolve_send_target` (que faz upsert). Sem ramo
   de takeover: o handler é gravado pelo próprio `/takeover`, que agora só aceita `pending` com handler = eu ou número
   meu (antes qualquer operador virava handler de thread sem conflito, silenciava o bot e forjava posse).
+- **Botões do aviso da LGPD depois do aceite (2026-11-13, emenda do ADR 0009):** só o TOQUE conta
+  (`lgpd_bot.botao_lgpd`, id exato; "sim"/"não" digitados seguem ao agente). **Toque em "Não" = recusa**: estado
+  `refused` **e** contato `lgpd_consent=False` + `lgpd_refused_at` no MESMO batch
+  (`_record_lgpd_refusal_after_consent`). Só o estado não basta: o handoff apaga `bot_states`, a hidratação
+  ressuscitaria o aceite e o lote de reabertura lê só o contato. **Nunca `lgpd_revoked`** (revogação da equipe, J-3
+  D8, que o "Sim" não desfaz). **Toque repetido em "Sim"** só é ignorado até 5 min depois de `lgpd_consent_at` e sem
+  falha do motor pendente — nunca por "há aceite em `bot_states`" (o estado sobrevive à conversa encerrada por
+  atendente; quem volta dias depois tocando "Sim" ficaria sem resposta). Depois do DetectIntent o turno confere
+  `lgpd_consent False` no estado e descarta resposta/handoff atrasados. Fora da fase de bot (dono ou
+  `bot_completed`) o webhook só GRAVA a recusa (`record_lgpd_refusal_outside_bot`), sem resposta automática, em
+  dois pontos: na chegada e **depois do turno com o contato relido** (com buffer, o clique roda depois da rajada;
+  se ela faz handoff, o turno sai antes do gate) — e ali só derruba o aceite que já existia na chegada (mesmo
+  `lgpd_consent_at`), senão um "Sim" de correção logo depois do "Não" seria anulado. Nada disso vale com
+  `lgpd_by_agent` no motor CX.
 - **Buffer CX:** debounce persistido em `bot_buffers/{contact_id}`, somente pós-LGPD e
   somente Dialogflow CX. Default global `BOT_BUFFER_SECONDS=0`; override no READ por
   `settings.ai.buffer_seconds` (`scripts/set_tenant_buffer.py`, dry-run default). Ativar

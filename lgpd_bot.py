@@ -11,7 +11,8 @@ informacoes pessoais no atendimento via WhatsApp.
 Opera como gate no inicio da maquina de estados do bot:
   - Se o consentimento ainda nao foi solicitado, exibe o aviso e
     aguarda resposta.
-  - Se ja foi dado, retorna None para o bot prosseguir.
+  - Se ja foi dado, retorna None para o bot prosseguir. Excecao (2026-11-13):
+    toque no botao "Nao" depois do aceite vale como recusa.
   - Se foi recusado, bloqueia o fluxo e permite re-consentimento.
 
 Campos adicionados ao estado do bot (bot_states/{contact_id}):
@@ -103,6 +104,21 @@ def _eh_recusa(texto: str) -> bool:
 
 _BTN_ACEITAR = {"id": "lgpd_aceitar", "title": "Sim"}
 _BTN_RECUSAR = {"id": "lgpd_recusar", "title": "Não"}
+
+
+def botao_lgpd(texto) -> str:
+    """Toque em botao do aviso: "aceitar", "recusar" ou "" (qualquer outra coisa).
+
+    So o ID exato do botao conta (button_reply.id, que o webhook entrega como
+    texto da mensagem). Texto digitado ("sim", "nao") nunca e toque: depois do
+    aceite ele e fala do paciente para o agente, nao resposta ao aviso.
+    """
+    norm = str(texto or "").strip().lower()
+    if norm == _BTN_ACEITAR["id"]:
+        return "aceitar"
+    if norm == _BTN_RECUSAR["id"]:
+        return "recusar"
+    return ""
 
 
 def _resposta_botoes(
@@ -409,12 +425,28 @@ def handle_lgpd(
         None  -> consentimento ja existe (pass through para o bot).
         str   -> mensagem de texto simples.
         dict  -> mensagem interativa com botoes (type="interactive_buttons").
+
+    Com o aceite ja dado, o unico caso que NAO e pass through e o toque no
+    botao "Nao": o estado vira recusa e sai a despedida (o chamador percebe a
+    virada comparando state["lgpd_consent"] antes e depois).
     """
     lgpd_consent = state.get("lgpd_consent")
     lgpd_status = state.get("lgpd_status")
 
     # --- Consentimento ja dado: pass through ---
     if lgpd_consent is True:
+        # Toque em "Nao" depois do aceite: o aceite deixa de valer e a conversa
+        # segue o caminho da recusa (decisao do PO, 2026-11-13). So o toque no
+        # botao; "nao" digitado e resposta do paciente ao agente.
+        if botao_lgpd(message_text) == "recusar":
+            state["lgpd_consent"] = False
+            state["lgpd_status"] = "refused"
+            # A 1a mensagem do ciclo ja foi respondida pelo agente: se o
+            # paciente aceitar de novo, ela nao volta como replay (so o que
+            # ele digitar durante a recusa, via _maybe_track_first_input).
+            state["user_first_input"] = ""
+            logger.info("[LGPD] Recusa por botao depois do aceite")
+            return _recusa_resposta()
         return None
 
     # --- Consentimento recusado: permitir re-consentimento ---
@@ -458,7 +490,9 @@ def handle_lgpd(
 
     # --- Primeiro contato: exibir aviso LGPD com botoes ---
     state["lgpd_status"] = "awaiting"
-    state["user_first_input"] = message_text
+    # Toque num botao de aviso antigo (ex.: ciclo novo de quem recusou) nao e
+    # fala do paciente: nao fica guardado para o replay ao agente no aceite.
+    state["user_first_input"] = "" if botao_lgpd(message_text) else message_text
 
     logger.info("[LGPD] Aviso enviado ao contato")
 

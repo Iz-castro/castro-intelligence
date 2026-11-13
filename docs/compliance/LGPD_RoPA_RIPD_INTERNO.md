@@ -36,7 +36,10 @@
 >   ampla dentro do tenant (F4 do J-3, decisão J5).
 > - **R-13 (consentimento):** tenants com agente de IA ganharam gate LGPD com prova no
 >   contato (`lgpd_consent`, `lgpd_consent_at`, `lgpd_policy_version` — `lgpd_bot.py` /
->   `bot_service.py`). A **revogação (D8) ainda não existe** no código.
+>   `bot_service.py`). A **revogação (D8) ainda não existe** no código. Desde
+>   2026-11-13 o toque no botão "Não" depois do aceite invalida a prova
+>   (`lgpd_consent=False`, `lgpd_refused_at`, auditoria `LGPD_CONSENT_REFUSED`) e
+>   admite novo aceite — emenda do ADR 0009; não é a revogação D8.
 > - **R-7, R-8, R-9, R-10 seguem abertos**; R-11 segue pendência jurídica. Estado
 >   atual das decisões arquiteturais: ADRs 0007-0011 em `../decisions/`.
 

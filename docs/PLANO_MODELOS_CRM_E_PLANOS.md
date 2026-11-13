@@ -241,6 +241,7 @@ if state.get("lgpd_consent") is None \
 ```
 - Custo zero de read (`contact` já carregado :632). `handle_lgpd` cai no pass-through (`lgpd_bot.py:194-196`) → turno vai DIRETO pro DetectIntent com a mensagem ATUAL (`first_cx_text` fica None → sem replay de `user_first_input` velho — por isso hidratar ANTES do handle_lgpd, nunca dentro do ramo accepted). O `_set_bot_state` de :675-678 persiste de graça.
 - **Guarda `is None` inegociável:** recusa em `bot_states` (`lgpd_consent=False`, nunca vai pro contato) vence prova antiga. Versão divergente → re-pergunta com aviso vigente (fail-closed, D1). `lgpd_bot.py` NÃO muda; NÃO re-chamar `_record_lgpd_consent`.
+  - **Emenda 2026-11-13 (ADR 0009):** a recusa por BOTÃO depois do aceite passou a gravar também no contato (`lgpd_consent=False`, `lgpd_refused_at`), e `lgpd_bot.py` ganhou esse ramo. A recusa no aviso, antes de qualquer aceite, continua só em `bot_states`, e a guarda `is None` da hidratação segue igual.
 - Efeito colateral benigno a anotar: `return_to_bot` manual do admin (main.py:3874/3926) também para de re-perguntar LGPD.
 
 **10. `webhook.py` — reroute de convertido:** envolver SÓ o ramo de reroute (`webhook.py:838-854`, o "não é rating") com `if not _clinic_return_active():` (import via `database`). Ramo de rating (:821-836) fica — exige `rating_requested_at` pendente, que clínica não produz. Sem esse gate, `qualification=="convertido"` preservado reatribuiria o lead ao `original_operator_id` logo após o turno do bot.

@@ -52,6 +52,10 @@ pós-aceite descrita acima passa a se chamar série B.
   separam as séries.
 - Limite conhecido (R16 do handoff): depois do aceite, o toque em "Não" de um aviso ou lembrete antigo chega à Val
   como texto e não registra recusa. Já acontecia com o aviso; a série A acrescenta até três mensagens com esse botão.
+  **Resolvido em 2026-11-13** (emenda do ADR 0009): o toque em "Não" depois do aceite vale como recusa e o toque
+  repetido em "Sim" (até 5 minutos depois do aceite) é ignorado. Efeito nos lembretes: a recusa limpa a agenda
+  (turno `lgpd_refusal`) e barra as duas séries pelo contato; o "Sim" repetido é mensagem nova sem resposta do
+  agente, então encerra o ciclo e a série B só rearma no turno seguinte da Val.
 
 Simulador: 175 verificações (inclui a série A: carimbo, agenda, gate, claim, envio com botões, toque no gate real,
 worker, uso mensal e API).

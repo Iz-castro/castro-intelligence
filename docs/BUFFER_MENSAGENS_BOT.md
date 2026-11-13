@@ -158,6 +158,17 @@ na chegada de interativa elegível ao bot, **drenar o buffer na transação**
 havia itens, rodar PRIMEIRO um turno com o texto junto, DEPOIS o turno do
 clique (2 turnos sequenciais, ordem preservada).
 
+[EMENDA 2026-11-13] Botões do aviso da LGPD depois do aceite (emenda do ADR
+0009): a ordem acima não muda, mas o turno do clique deixou de ir ao agente.
+O toque repetido em "Sim" é ignorado (a rajada pendente é respondida, o toque
+não gera resposta). O toque em "Não" vale como recusa: a rajada é respondida
+e depois sai a despedida; a partir daí o consentimento não está resolvido e
+texto novo volta a rodar em turno direto, sem buffer. Se a rajada termina em
+handoff, o turno do clique encontra o lead já fora da fase de bot e sai sem
+passar pelo gate: o webhook relê o contato depois do turno e registra a
+recusa (sem resposta automática). Cenário 23 do simulador
+(`tools/sim_buffer_flow.py`, 116 checagens).
+
 ## Flush de órfãos (cron) — não é "1 linha" [REV]
 
 Instância morta no sleep deixa buffer órfão. Recuperação: (a) próxima

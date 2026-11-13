@@ -31,13 +31,13 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Optional, Union
 
 from config import CX_DETECT_TIMEOUT_SECONDS
-from firestore_common import document, utcnow, collection
+from firestore_common import document, utcnow, collection, get_firestore_client
 from database import (
     get_wa_contact, get_system_settings, get_all_departments,
     save_wa_message, log_audit,
 )
 from lgpd_bot import (
-    handle_lgpd, aceite_cobre_data, aceite_vigente, aviso_lgpd_builtin,
+    handle_lgpd, botao_lgpd, aceite_cobre_data, aceite_vigente, aviso_lgpd_builtin,
     hoje_br, montar_aviso_lgpd, parse_data_politica, LINK_PRIVACIDADE_BUILTIN,
 )
 from lead_temperature import classify_lead_temperature, signal_keys
@@ -453,6 +453,101 @@ def _record_lgpd_consent(contact_id: int, policy_version: str = ""):
     )
 
 
+# Janela do toque REPETIDO em "Sim" (segundos depois do aceite gravado). Os
+# casos reais da varizemed vieram em ate 99 s (23 de 26 em ate 16 s); o turno do
+# aceite pode levar ~2 min no pior caso do agente. Passada a janela, o toque e
+# o paciente retomando a conversa e segue ao agente.
+_LGPD_REPEAT_TAP_SECONDS = 300
+
+
+def _lgpd_accepted_recently(contact) -> bool:
+    """O aceite deste contato (wa_contacts.lgpd_consent_at) foi gravado ha
+    poucos minutos. E o que separa o toque repetido em "Sim" (ignorado) do
+    toque que abre uma conversa nova com a prova antiga. Carimbo ausente ou
+    ilegivel = nao recente (o toque segue ao agente, comportamento de sempre)."""
+    raw = contact.get("lgpd_consent_at") if isinstance(contact, dict) else None
+    if isinstance(raw, str):
+        try:
+            raw = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if not isinstance(raw, datetime):
+        return False
+    if raw.tzinfo is None:
+        raw = raw.replace(tzinfo=timezone.utc)
+    age = (utcnow() - raw).total_seconds()
+    # Folga de 60 s para relogios de instancias diferentes.
+    return -60 <= age <= _LGPD_REPEAT_TAP_SECONDS
+
+
+def _record_lgpd_refusal_after_consent(contact_id: int, state: Optional[dict], contact: dict,
+                                       outside_bot: bool = False):
+    """Toque em "Nao" DEPOIS do aceite: o aceite deixa de valer (PO 2026-11-13).
+
+    Grava JUNTO (batch: tudo ou nada) o estado recusado em bot_states e a
+    recusa no CONTATO. So o estado nao basta: o handoff apaga bot_states e a
+    hidratacao voltaria a valer a prova antiga; o lote de reabertura e os
+    lembretes leem o contato. lgpd_consent_at e lgpd_policy_version ficam como
+    historico do aceite anterior (nenhum leitor os usa sem lgpd_consent True);
+    um novo aceite regrava os tres. NAO usa lgpd_revoked: aquele campo e a
+    revogacao registrada pela equipe (J-3 D8), que o "Sim" do paciente nao
+    desfaz. Falha na gravacao propaga: o turno falha e nada fica pela metade.
+
+    state=None: nao ha estado a gravar (lead fora da fase de bot, com o
+    bot_states ja apagado pelo handoff) — so o contato muda.
+    """
+    contact = contact if isinstance(contact, dict) else {}
+    batch = get_firestore_client().batch()
+    if state is not None:
+        batch.set(document("bot_states", contact_id), state, merge=True)
+    batch.set(document("wa_contacts", contact_id), {
+        "lgpd_consent": False,
+        "lgpd_refused_at": utcnow().isoformat(),
+    }, merge=True)
+    batch.commit()
+    version = str(contact.get("lgpd_policy_version") or "").strip() or "sem versao"
+    accepted_at = str(contact.get("lgpd_consent_at") or "").strip() or "sem data"
+    where = " (fora da fase de bot)" if outside_bot else ""
+    log_audit(
+        0, "LGPD_CONSENT_REFUSED",
+        f"contato {contact_id} | recusa por botao depois do aceite{where} | "
+        f"aceite anterior {accepted_at} | politica {version}",
+    )
+
+
+def record_lgpd_refusal_outside_bot(contact_id: int, contact: Optional[dict]) -> bool:
+    """Toque em "Nao" do aviso com o lead FORA da fase de bot (na fila ou com
+    atendente). O gate nao roda nesse caso, mas o aceite deixa de valer do
+    mesmo jeito (PO 2026-11-13). So GRAVA: nenhuma resposta automatica entra
+    no meio do atendimento humano, que segue normalmente. Na proxima fase de
+    bot o aviso volta a ser mostrado (contato sem prova valida).
+
+    Chamado pelo webhook so para toque de verdade (mensagem interativa), nunca
+    para texto digitado. Devolve True se registrou a recusa.
+    """
+    contact = contact if isinstance(contact, dict) else {}
+    if contact.get("lgpd_consent") is not True:
+        return False  # nada a invalidar (nunca aceitou, ou ja recusou)
+    ai_cfg = _get_tenant_ai_config()
+    if (str(ai_cfg.get("bot_engine") or "").strip().lower() == "dialogflow_cx"
+            and lgpd_handled_by_agent(ai_cfg)):
+        # A LGPD desse tenant e do agente, nao do CRM. So vale com o motor CX:
+        # no builtin (bot_engine vazio, inclusive no rollback do agente) o gate
+        # e do CRM mesmo que a opcao tenha ficado ligada em settings.ai.
+        return False
+    snap = document("bot_states", contact_id).get()
+    current = (snap.to_dict() or {}) if snap.exists else None
+    state = None
+    if current is not None and current.get("lgpd_consent") is True:
+        # Estado que sobreviveu ao atendimento humano (release/return ao bot
+        # fazem merge e preservam lgpd_*): sem virar junto, o aceite voltaria
+        # a valer no proximo turno do bot, por cima da recusa do contato.
+        state = {"lgpd_consent": False, "lgpd_status": "refused", "user_first_input": ""}
+    _record_lgpd_refusal_after_consent(contact_id, state, contact, outside_bot=True)
+    logger.info("[LGPD] recusa por botao fora da fase de bot | contato=%d", contact_id)
+    return True
+
+
 def process_bot_message(
     contact_id: int, text: str, contact_name: str = ""
 ) -> Optional[Union[str, dict]]:
@@ -488,6 +583,7 @@ def process_bot_message(
     # estado e o aviso novo sai neste turno.
     lgpd_cfg = lgpd_policy_config(sys_settings, cx=False)
     _demote_outdated_consent(contact_id, state, contact, lgpd_cfg["policy_date"])
+    had_consent = state.get("lgpd_consent") is True
     lgpd_response = handle_lgpd(state, text, aviso_text=lgpd_cfg["aviso"])
 
     if lgpd_response is not None:
@@ -503,7 +599,12 @@ def process_bot_message(
         if not step:
             state["step"] = "lgpd"
             state["started_at"] = utcnow().isoformat()
-        _set_bot_state(contact_id, state)
+        if had_consent and state.get("lgpd_consent") is False:
+            # Toque em "Nao" depois do aceite (estado legado ainda em voo):
+            # estado e prova do contato viram recusa juntos.
+            _record_lgpd_refusal_after_consent(contact_id, state, contact)
+        else:
+            _set_bot_state(contact_id, state)
         return lgpd_response
 
     # =================================================================
@@ -928,7 +1029,28 @@ async def _process_cx_message(
     # lgpd_consent=true e nunca refaz a pergunta (flow neutralizado).
     # Excecao: lgpd_by_agent (o proprio agente trata aviso e recusa).
     # ------------------------------------------------------------------
+    # Botoes do aviso DEPOIS do aceite (decisao do PO, 2026-11-13): o toque em
+    # "Nao" vale como recusa (handle_lgpd vira o estado; a prova do contato
+    # cai junto, logo abaixo) e o toque repetido em "Sim" e ignorado. So o
+    # toque (id exato do botao): "sim"/"nao" digitados seguem para o agente.
+    had_consent = state.get("lgpd_consent") is True
     lgpd_response = None if lgpd_by_agent else handle_lgpd(state, text, aviso_text=lgpd_cfg["aviso"])
+
+    if (lgpd_response is None and not lgpd_by_agent
+            and botao_lgpd(text) == "aceitar"
+            and _lgpd_accepted_recently(contact)
+            and not int(state.get("cx_fail_count") or 0)):
+        # Toque REPETIDO: chega logo depois do aceite (o paciente tocou no
+        # aviso e num lembrete, ou duas vezes). Sai antes da baixa dos params
+        # de um turno e do DetectIntent: o id do botao nao e fala do paciente.
+        # Fora da janela, ou com falha do motor pendente (o paciente ainda nao
+        # teve resposta), o toque segue ao agente como antes — quem volta dias
+        # depois tocando "Sim" nao pode ficar sem resposta. Sem resposta nao ha
+        # carimbo de lembrete: o toque e mensagem nova e encerra o ciclo.
+        if turn_meta is not None:
+            turn_meta["kind"] = "lgpd_repeat"
+        logger.info("[BOT-CX] toque repetido em Sim ignorado | contato=%d", contact_id)
+        return None
 
     first_cx_text = None
     if lgpd_response is not None:
@@ -954,7 +1076,12 @@ async def _process_cx_message(
             if not state.get("step"):
                 state["step"] = "lgpd"
                 state["started_at"] = utcnow().isoformat()
-            _set_bot_state(contact_id, state)
+            if had_consent and state.get("lgpd_consent") is False:
+                # Recusa DEPOIS do aceite: estado e prova do contato juntos.
+                _record_lgpd_refusal_after_consent(contact_id, state, contact)
+                logger.info("[BOT-CX] recusa da LGPD depois do aceite | contato=%d", contact_id)
+            else:
+                _set_bot_state(contact_id, state)
             return lgpd_response
 
     if state.get("step") != "cx":
@@ -1070,10 +1197,20 @@ async def _process_cx_message(
             return None
         # Takeover no meio do turno assume a THREAD (nao grava no contato):
         # re-le o bot_state pra pegar o human_active marcado nesse intervalo.
-        if _get_bot_state(contact_id).get("human_active"):
+        _state_after = _get_bot_state(contact_id)
+        if _state_after.get("human_active"):
             logger.info(
                 "[BOT-CX] humano assumiu a thread do contato %d durante o "
                 "DetectIntent — resposta do bot descartada", contact_id,
+            )
+            return None
+        # Recusa da LGPD gravada por OUTRO turno durante o DetectIntent (toque
+        # em "Nao" segundos depois do "Sim"): a resposta atrasada do agente nao
+        # sai e o handoff nao acontece — o paciente fica so com a despedida.
+        if not lgpd_by_agent and _state_after.get("lgpd_consent") is False:
+            logger.info(
+                "[BOT-CX] contato %d recusou a LGPD durante o DetectIntent "
+                "— resposta do bot descartada", contact_id,
             )
             return None
         contact = fresh
