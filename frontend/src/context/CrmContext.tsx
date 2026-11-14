@@ -226,7 +226,7 @@ type CrmContextValue = {
 
   // Lightbox
   lightboxMedia: LightboxMedia | null;
-  openLightbox: (src: string, kind: "image" | "video", alt: string, gifLike?: boolean) => void;
+  openLightbox: (src: string, kind: "image" | "video", alt: string, gifLike?: boolean, extra?: { filename?: string; startTime?: number }) => void;
   closeLightbox: () => void;
 
   // Manual contact creation
@@ -3108,7 +3108,7 @@ export function CrmProvider({ children }: { children: ReactNode }) {
     if (!file) return; void submitMedia(file);
   }
 
-  function openLightbox(src: string, kind: "image" | "video", alt: string, gifLike = false) { setLightboxMedia({ src, kind, alt, gifLike }); }
+  function openLightbox(src: string, kind: "image" | "video", alt: string, gifLike = false, extra?: { filename?: string; startTime?: number }) { setLightboxMedia({ src, kind, alt, gifLike, ...extra }); }
   function closeLightbox() { setLightboxMedia(null); }
 
   function handlePrimaryAction() {

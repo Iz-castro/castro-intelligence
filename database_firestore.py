@@ -3335,7 +3335,7 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
                     reopen_attendance=True,
                     control_message=False,
                     human_outbound=True, automation_kind="", automation_stage="",
-                    automation_series="", is_forwarded=False):
+                    automation_series="", is_forwarded=False, interactive_reply=False):
     """Persiste mensagem WhatsApp.
 
     human_outbound=False: outbound com operador identificado que NAO conta
@@ -3488,6 +3488,9 @@ def save_wa_message(wa_message_id, contact_id, direction, msg_type, content="",
         "sender_user_id": sender_user_id,
         "sent_by_name": sent_by_name or "",
         "is_forwarded": bool(is_forwarded),
+        # Toque em botao/lista interativa: content e o ID do botao (ex.:
+        # lgpd_aceitar), nao texto do cliente — nao pode ser encaminhado.
+        **({"interactive_reply": True} if interactive_reply else {}),
         **({"automation_kind": automation_kind, "automation_stage": automation_stage,
             **({"automation_series": automation_series} if automation_series else {})} if automation_kind else {}),
         "channel_owner_user_id": channel_owner_user_id,
@@ -3697,21 +3700,47 @@ def get_wa_conversation(contact_id, limit=50, offset=0, conversation_id=None):
     return _normalize_many(enriched)
 
 
+def _context_sort_key(row):
+    """Ordena por data real com tolerancia a legado (datetime, string ISO, None)."""
+    value = row.get("timestamp_wa") or row.get("created_at")
+    if isinstance(value, str):
+        value = _coerce_timestamp(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return (value.timestamp(), str(row.get("id")))
+    return (0.0, str(row.get("id")))
+
+
 def get_wa_message_context(message, limit=10):
-    """Janela limitada ao redor da fixada, sem varrer o historico inteiro."""
-    if not message.get("conversation_id"):
+    """Janela limitada ao redor da fixada, sem varrer o historico inteiro.
+
+    Duas consultas INDEPENDENTES (cada uma a partir de collection()): na
+    google-cloud-firestore 2.19 o get() com limit_to_last inverte in place a
+    direcao dos Order compartilhados entre queries derivadas e nao troca os
+    cursores — o lado 'anterior' vinha com as 11 PRIMEIRAS mensagens da
+    conversa (revisao do PR #8). DESC usa o indice existente; ASC usa o novo.
+    """
+    cursor_value = message.get("timestamp_wa")
+    if not message.get("conversation_id") or cursor_value is None:
         return _normalize_many([message])
-    q = collection("wa_messages").where("conversation_id", "==", message["conversation_id"])
-    q = q.order_by("timestamp_wa", direction="DESCENDING")
-    cursor = {"timestamp_wa": message.get("timestamp_wa")}
-    older = q.start_at(cursor).limit(limit + 1).stream()
-    newer = q.end_at(cursor).limit_to_last(limit + 1).get()
+    conversation_id = message["conversation_id"]
+    cursor = {"timestamp_wa": cursor_value}
+
+    def _side(direction):
+        return (collection("wa_messages")
+                .where("conversation_id", "==", conversation_id)
+                .order_by("timestamp_wa", direction=direction)
+                .start_at(cursor)
+                .limit(limit + 1)
+                .stream())
+
     rows = {message["id"]: message}
-    for snap in list(older) + list(newer):
+    for snap in list(_side("DESCENDING")) + list(_side("ASCENDING")):
         row = _raw_doc(snap)
         if row and row.get("contact_id") == message["contact_id"]:
             rows[row["id"]] = row
-    return _normalize_many(sorted(rows.values(), key=lambda row: (row.get("timestamp_wa") or row["created_at"], row["id"])))
+    return _normalize_many(sorted(rows.values(), key=_context_sort_key))
 
 
 def get_wa_message_by_id(message_id: int):
@@ -3755,6 +3784,10 @@ def update_wa_message_status(wa_message_id, status, timestamp_wa=""):
     target = _get_first_by_field("wa_messages", "wa_message_id", wa_message_id)
     if target:
         document("wa_messages", target["id"]).set({"status": status}, merge=True)
+        return True
+    # Status chegou antes do save do envio (webhook processado durante o POST
+    # a Meta ou o save no threadpool): o caller decide se tenta de novo.
+    return False
 
 
 def get_wa_unread_count():

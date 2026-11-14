@@ -33,11 +33,36 @@ from config import (
 )
 from firestore_common import collection, document, utcnow
 
+try:
+    from google.api_core.exceptions import BadRequest as _GcsBadRequest, NotFound as _GcsNotFound
+except Exception:  # pragma: no cover - google-api-core vem com o firestore
+    _GcsBadRequest = _GcsNotFound = ()
+# Objeto inexistente ou nome que o GCS recusa (400: nome longo, controle via
+# %0A) = midia que nao existe -> 404, nunca 503 'tente de novo' na rota anonima.
+_GCS_MISSING = tuple(cls for cls in (_GcsNotFound, _GcsBadRequest) if isinstance(cls, type))
+_gcs_bucket_missing_logged = False
+
 logger = logging.getLogger("castro_crm.media")
 
 _storage_client = None
 _storage_backend_logged = False
 MEDIA_STREAM_CHUNK_SIZE = 1024 * 1024
+# Rota de midia roda no threadpool (ate 40 chamadas ao GCS ao mesmo tempo);
+# o pool padrao do requests (10) descartava conexoes com WARNING a cada rajada.
+GCS_HTTP_POOL_SIZE = 32
+
+
+class MediaNotFound(Exception):
+    """Objeto de midia inexistente no storage (404 para o cliente)."""
+
+
+class MediaStorageUnavailable(Exception):
+    """Falha do storage que nao e 'objeto inexistente' (503, tentar de novo)."""
+
+
+def _base_mime(mime_type):
+    """'audio/ogg; codecs=opus' -> 'audio/ogg' (a Meta e o mapa de extensoes usam o tipo puro)."""
+    return (mime_type or "").split(";", 1)[0].strip().lower()
 
 
 def _normalize_wa_target(wa_id):
@@ -82,7 +107,17 @@ def _get_storage_client():
             from google.cloud import storage
         except ImportError as exc:
             raise RuntimeError("google-cloud-storage nao instalado") from exc
-        _storage_client = storage.Client()
+        client = storage.Client()
+        try:
+            session = client._http
+            # Com mTLS ligado o AuthorizedSession ja montou um adapter com
+            # certificado em https://; trocar por um HTTPAdapter comum quebraria o TLS.
+            if not getattr(session, "_is_mtls", False):
+                from requests.adapters import HTTPAdapter
+                session.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=GCS_HTTP_POOL_SIZE))
+        except Exception as exc:
+            logger.warning("Pool HTTP do Cloud Storage mantido no padrao | erro=%s", type(exc).__name__)
+        _storage_client = client
     return _storage_client
 
 
@@ -147,6 +182,10 @@ def _split_media_path(media_path):
     filename = os.path.basename(parts[3])
     if not subdir or not filename:
         return None, None
+    # '..' passava pelo basename e o fallback local servia o diretorio pai do
+    # MEDIA_DIR (rota anonima). Nomes gerados nunca comecam com ponto.
+    if subdir.startswith(".") or filename.startswith("."):
+        return None, None
     return subdir, filename
 
 
@@ -175,10 +214,20 @@ def _default_mime_type(filename):
 
 
 def _resolve_extension(mime_type, filename=""):
-    ext = MIME_EXTENSIONS.get(mime_type or "", "")
+    # Nota de voz chega como 'audio/ogg; codecs=opus': sem tirar o parametro
+    # o mapa falhava e o arquivo ficava '.bin'.
+    ext = MIME_EXTENSIONS.get(_base_mime(mime_type), "")
     if not ext and filename:
         _, ext = os.path.splitext(filename)
     return ext or ".bin"
+
+
+def media_upload_filename(filename, mime_type):
+    """Nome para reenviar a midia a Meta com extensao coerente com o tipo."""
+    base, ext = os.path.splitext(os.path.basename(filename or ""))
+    if ext and ext.lower() != ".bin":
+        return f"{base}{ext}"
+    return f"{base or 'arquivo'}{_resolve_extension(mime_type)}"
 
 
 def _maybe_compress_content(content):
@@ -344,10 +393,13 @@ def _iter_gcs_media(blob, start, end):
     """Le somente o intervalo pedido, em blocos limitados de memoria."""
     while start <= end:
         chunk_end = min(start + MEDIA_STREAM_CHUNK_SIZE - 1, end)
-        content = blob.download_as_bytes(
-            start=start, end=chunk_end, raw_download=True,
-            if_generation_match=blob.generation,
-        )
+        try:
+            content = blob.download_as_bytes(
+                start=start, end=chunk_end, raw_download=True,
+                if_generation_match=blob.generation,
+            )
+        except _GcsNotFound as exc:
+            raise MediaNotFound() from exc
         if len(content) != chunk_end - start + 1:
             raise OSError("Tamanho inesperado no trecho de midia")
         yield content
@@ -373,8 +425,19 @@ def _iter_memory_media(content, start, end):
         start = chunk_end
 
 
+def _log_missing_bucket_once(exc):
+    global _gcs_bucket_missing_logged
+    if _gcs_bucket_missing_logged or "specified bucket does not exist" not in str(exc).lower():
+        return
+    _gcs_bucket_missing_logged = True
+    logger.warning("Bucket de midia inexistente no Cloud Storage | bucket=%s", GCS_MEDIA_BUCKET)
+
+
 def get_media_stream(media_path):
-    """Resolve tamanho/tipo sem baixar o corpo do GCS; leitura posterior e sincrona."""
+    """Resolve tamanho/tipo sem baixar o corpo do GCS; leitura posterior e sincrona.
+
+    None = midia inexistente. Levanta MediaStorageUnavailable quando o GCS falha
+    por outro motivo (a rota responde 503 em vez de um 404 enganoso)."""
     subdir, filename = _split_media_path(media_path)
     if not subdir or not filename:
         return None
@@ -384,12 +447,19 @@ def get_media_stream(media_path):
             blob = _get_bucket().blob(_build_object_name(subdir, filename))
             # reload traz tamanho, tipo e generation; exists nao preenche os metadados.
             blob.reload()
+        except _GCS_MISSING as exc:
+            # Objeto inexistente e caso normal (midia antiga/local, sonda anonima):
+            # sem log, segue para o fallback local. Bucket inexistente tambem e
+            # 404 no GCS — esse vira UM aviso por processo, senao ficaria invisivel.
+            _log_missing_bucket_once(exc)
         except Exception as exc:
             logger.warning("Falha ao consultar midia no Cloud Storage | erro=%s", type(exc).__name__)
+            raise MediaStorageUnavailable() from exc
         else:
             return {
                 "size": int(blob.size),
                 "mime_type": blob.content_type or _default_mime_type(filename),
+                "filename": filename,
                 "iter_content": lambda start, end: _iter_gcs_media(blob, start, end),
             }
         # Preserva o fallback local, sem tentar baixar o objeto inteiro.
@@ -408,12 +478,14 @@ def get_media_stream(media_path):
         return {
             "size": os.path.getsize(filepath),
             "mime_type": mime_type,
+            "filename": filename,
             "iter_content": lambda start, end: _iter_local_media(filepath, start, end),
         }
     content = asset["content"]
     return {
         "size": len(content),
         "mime_type": mime_type,
+        "filename": filename,
         "iter_content": lambda start, end: _iter_memory_media(content, start, end),
     }
 
@@ -625,6 +697,9 @@ async def upload_media_to_whatsapp(file_content, mime_type, filename="", token=N
     url = f"{GRAPH_API_BASE}/{phone_id}/media"
     headers = {"Authorization": f"Bearer {token}"}
 
+    # A Meta valida o tipo puro; 'audio/ogg; codecs=opus' (nota de voz recebida
+    # e reenviada no encaminhamento) nao entra no mapa de extensoes.
+    mime_type = _base_mime(mime_type) or "application/octet-stream"
     if not filename:
         ext = MIME_EXTENSIONS.get(mime_type, ".bin")
         filename = f"upload{ext}"
@@ -648,7 +723,7 @@ async def upload_media_to_whatsapp(file_content, mime_type, filename="", token=N
             return None
 
 
-async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_message_id="", token=None, phone_id=None):
+async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_message_id="", token=None, phone_id=None, filename=""):
     token = token or WHATSAPP_TOKEN
     phone_id = phone_id or WHATSAPP_PHONE_NUMBER_ID
     if not token or not phone_id:
@@ -664,6 +739,15 @@ async def send_media_message(wa_id, media_id, msg_type, caption="", reply_wa_mes
     media_object = {"id": media_id}
     if caption and msg_type in ("image", "video", "document"):
         media_object["caption"] = caption
+    if filename and msg_type == "document":
+        # Sem o campo, o documento chegava ao paciente sem o nome original.
+        # Corte preserva a extensao (a Cloud API usa a extensao para abrir o arquivo).
+        name = os.path.basename(str(filename))
+        if len(name) > 240:
+            base, ext = os.path.splitext(name)
+            ext = ext[:16]
+            name = base[: 240 - len(ext)] + ext
+        media_object["filename"] = name
 
     payload = {
         "messaging_product": "whatsapp",

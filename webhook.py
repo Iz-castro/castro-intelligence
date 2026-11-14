@@ -933,7 +933,9 @@ async def _process_webhook_payload_inner(payload, ws_notify_callback=None):
                     await _process_messages(value, ws_notify_callback, channel=channel)
 
                 if "statuses" in value and FEATURE_MESSAGE_STATUS:
-                    _process_statuses(value)
+                    missed_failed = _process_statuses(value)
+                    if missed_failed:
+                        await _retry_missed_failed_statuses(missed_failed)
 
 
 _BUFFER_CLAIM_WAIT_SECONDS = 30.0
@@ -1748,6 +1750,8 @@ async def _process_messages(value, ws_notify_callback, channel=None):
             channel_owner_user_id=channel_owner_id,
             sender_user_id=None,
             is_rating_message=bool(_rating_click),
+            # Content e o id do botao: marca para o encaminhamento recusar.
+            interactive_reply=(msg_type == "interactive"),
             visibility="admin_only" if _click_valid else "all",
             control_message=_click_valid,
             **reply_fields,
@@ -2118,8 +2122,44 @@ async def _process_messages(value, ws_notify_callback, channel=None):
         ))
 
 
+_FAILED_STATUS_RETRY_DELAYS = (1.0, 3.0)
+
+
+async def _retry_missed_failed_statuses(missed):
+    """Reaplica 'failed' que chegou antes da mensagem ser salva, DENTRO do request.
+
+    O webhook de status pode ser processado enquanto o envio ainda aguarda o
+    200 da Meta ou grava a mensagem (save no threadpool desde o PR #8);
+    update_wa_message_status nao achava o doc e o 'failed' se perdia — a bolha
+    ficava como enviada. Roda antes do 200 (no maximo ~4 s a mais, so neste
+    caso raro): fora do request o Cloud Run estrangula a CPU e um timer podia
+    nunca disparar. So 'failed' (terminal): reaplicar sent/delivered atrasado
+    poderia regredir um status mais novo. Melhor esforco, nunca levanta.
+    """
+    for delay in _FAILED_STATUS_RETRY_DELAYS:
+        if not missed:
+            return
+        await asyncio.sleep(delay)
+        pending = []
+        for msg_id, ts_iso in missed:
+            try:
+                found = await run_in_threadpool(update_wa_message_status, msg_id, "failed", ts_iso)
+            except Exception as exc:
+                logger.warning("[WA STATUS] retry de failed falhou | id=%s erro=%s", msg_id[-8:], type(exc).__name__)
+                continue
+            if found is False:
+                pending.append((msg_id, ts_iso))
+        missed = pending
+    if missed:
+        logger.warning("[WA STATUS] failed sem mensagem apos retry | ids=%s", [m[-8:] for m, _ in missed])
+
+
 def _process_statuses(value):
-    """Processa atualizacoes de status de mensagens enviadas."""
+    """Processa atualizacoes de status de mensagens enviadas.
+
+    Devolve os 'failed' cuja mensagem ainda nao existia (o caller async
+    reaplica com _retry_missed_failed_statuses antes de responder)."""
+    missed_failed = []
     for status in value.get("statuses", []):
         msg_id = status.get("id", "")
         state = status.get("status", "")
@@ -2133,7 +2173,9 @@ def _process_statuses(value):
             except (ValueError, OSError):
                 pass
 
-        update_wa_message_status(msg_id, state, ts_iso)
+        found = update_wa_message_status(msg_id, state, ts_iso)
+        if state == "failed" and msg_id and found is False:
+            missed_failed.append((msg_id, ts_iso))
         if state == "failed":
             # Meta preenche errors[] apenas em status failed, com
             # code/title/error_data.details. Logamos o motivo para
@@ -2151,6 +2193,7 @@ def _process_statuses(value):
             )
         else:
             logger.info("[WA STATUS] %s -> %s", msg_id[:20], state)
+    return missed_failed
 
 
 # ---------------------------------------------------------------------------

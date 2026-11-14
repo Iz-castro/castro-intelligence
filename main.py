@@ -125,7 +125,7 @@ from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
     save_upload_media, convert_audio_to_ogg_opus,
     save_avatar_media, delete_media, get_media_asset, get_media_stream,
-    _write_media_bytes,
+    _write_media_bytes, MediaNotFound, MediaStorageUnavailable, media_upload_filename,
 )
 from media_http import media_stream_response
 
@@ -674,7 +674,11 @@ def serve_media(request: Request, subdir: str, filename: str):
     # Rota sync: metadados, disco e Firestore tambem ficam fora do event loop.
     safe_subdir = os.path.basename(subdir)
     safe_filename = os.path.basename(filename)
-    asset = get_media_stream(f"/media/{safe_subdir}/{safe_filename}")
+    try:
+        asset = get_media_stream(f"/media/{safe_subdir}/{safe_filename}")
+    except MediaStorageUnavailable:
+        raise HTTPException(status_code=503, detail="Midia indisponivel; tente novamente",
+                            headers={"Retry-After": "2"})
     if not asset:
         raise HTTPException(status_code=404, detail="Arquivo nao encontrado")
     return media_stream_response(asset, request)
@@ -2505,8 +2509,22 @@ def _require_send_contact_access(conversation_id, contact_id, current_user):
     _require_contact_access(contact, current_user)
 
 
-def _require_message_action_access(message_id, current_user):
-    """Autoriza origem sem efeitos de envio (bot/takeover/recencia)."""
+_FORWARD_MEDIA_KINDS = ("image", "audio", "video", "gif", "document", "sticker")
+_FORWARD_MEDIA_MAX_BYTES = 16 * 1024 * 1024
+# Toques em botao gravados ANTES da marca interactive_reply (content = id do botao).
+_LEGACY_BUTTON_IDS = frozenset({"lgpd_aceitar", "lgpd_recusar"})
+
+
+def _require_message_action_access(message_id, current_user, forward=False):
+    """Autoriza origem sem efeitos de envio (bot/takeover/recencia).
+
+    Origem ESTRITA (revisao do PR #8): operador comum so age sobre mensagem da
+    thread que ele atende ou da pool (_require_transfer_source_access), mesmo
+    sendo o Dono do Lead — a thread coex de outra vendedora com o mesmo
+    cliente fica fora (modelo do Ver como e do follow-up).
+    forward=True recusa o que nao e texto do cliente/equipe: template (content
+    e o rotulo '[template: nome] params', com dados de quem recebeu), toque em
+    botao interativo (content = id do botao) e clique de avaliacao."""
     msg = get_wa_message_by_id(message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Mensagem não encontrada")
@@ -2518,13 +2536,16 @@ def _require_message_action_access(message_id, current_user):
     if not can_see_all_tenant(current_user):
         if msg.get("is_backup") or (conv or {}).get("is_backup"):
             raise HTTPException(status_code=403, detail="Acesso negado: mensagem de backup")
-        if contact.get("assigned_to") != current_user.get("id"):
-            _require_transfer_source_access(conv, contact, current_user)
+        _require_transfer_source_access(conv, contact, current_user)
     if msg.get("direction") not in ("inbound", "outbound") or (msg.get("visibility") or "all") != "all":
         raise HTTPException(status_code=400, detail="Esta mensagem não permite encaminhar ou fixar")
     kind = msg.get("msg_type")
-    if kind not in ("text", "template", "image", "audio", "video", "gif", "document", "sticker", "location"):
+    if kind not in ("text", "template", "location") + _FORWARD_MEDIA_KINDS:
         raise HTTPException(status_code=400, detail="Tipo de mensagem não suportado")
+    legacy_button = (msg.get("direction") == "inbound" and kind == "text"
+                     and str(msg.get("content") or "").strip().lower() in _LEGACY_BUTTON_IDS)
+    if forward and (kind == "template" or msg.get("interactive_reply") or msg.get("is_rating_message") or legacy_button):
+        raise HTTPException(status_code=400, detail="Esta mensagem não pode ser encaminhada")
     if kind in ("text", "template") and not str(msg.get("content") or "").strip():
         raise HTTPException(status_code=400, detail="Mensagem sem conteúdo")
     if kind == "location" and (msg.get("latitude") is None or msg.get("longitude") is None):
@@ -2532,18 +2553,63 @@ def _require_message_action_access(message_id, current_user):
     return msg, conv
 
 
+def _require_forward_destination_channel(conv, channel, current_user):
+    """Encaminhamento nunca sai pelo WhatsApp pessoal (coex) de outra pessoa.
+
+    A Opcao A do envio deixa o Dono do Lead (e a co-pilotagem) responder em
+    thread coex de colega; no encaminhamento o destino vem de um picker e o
+    numero de saida nao fica evidente (revisao do PR #8).
+
+    Decide pelo CANAL resolvido. Fora do cache (TTL 60 s entre instancias),
+    faz o mesmo refresh do get_send_credentials antes de decidir — senao o
+    tipo de criacao do contato (source_channel_type) liberava e o envio, que
+    faz refresh, saia pelo coex. Canal que nao resolve = falha fechada."""
+    if channel is None and conv.get("channel_id") is not None:
+        from channel_service import get_channel, refresh_channels
+        refresh_channels()
+        channel = get_channel(conv.get("channel_id"))
+        if channel is None:
+            raise HTTPException(status_code=409, detail="Número de saída desta conversa indisponível para encaminhar.")
+    ch_type = str((channel or {}).get("channel_type")
+                  or conv.get("channel_type") or conv.get("source_channel_type") or "")
+    if ch_type != CHANNEL_TYPE_COEXISTENCE:
+        return
+    owner = (channel or {}).get("owner_user_id")
+    if owner is None or owner != current_user.get("id"):
+        raise HTTPException(
+            status_code=403,
+            detail="Encaminhamento pelo WhatsApp pessoal de outra pessoa não é permitido. Use a conversa no número da empresa.",
+        )
+
+
 def _read_forward_media(source):
-    asset = get_media_asset(source.get("media_path") or "")
+    """Le a midia de origem do storage para novo upload no numero de destino.
+
+    Tamanho conferido ANTES de baixar; objeto inexistente = 404, falha do
+    storage = 503 (antes as duas viravam 404 'nao encontrado')."""
+    try:
+        asset = get_media_stream(source.get("media_path") or "")
+    except MediaStorageUnavailable:
+        raise HTTPException(status_code=503, detail="Arquivo temporariamente indisponível; tente novamente")
     if not asset:
         raise HTTPException(status_code=404, detail="Arquivo não encontrado no Storage")
-    if "content" in asset:
-        content = asset["content"]
-    else:
-        with open(asset["file_path"], "rb") as stream:
-            content = stream.read(16 * 1024 * 1024 + 1)
-    if len(content) > 16 * 1024 * 1024:
+    size = int(asset.get("size") or 0)
+    if size <= 0:
+        raise HTTPException(status_code=404, detail="Arquivo vazio no Storage")
+    if size > _FORWARD_MEDIA_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Arquivo excede 16MB")
-    return content, source.get("media_mime") or asset["mime_type"], source.get("filename") or asset["filename"]
+    try:
+        content = b"".join(asset["iter_content"](0, size - 1))
+    except MediaNotFound:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado no Storage")
+    except Exception as exc:
+        logger.warning("Falha ao ler midia para encaminhar | erro=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Arquivo temporariamente indisponível; tente novamente")
+    # 'audio/ogg; codecs=opus' (nota de voz recebida) -> 'audio/ogg'; nome com extensao do tipo.
+    mime_type = str(source.get("media_mime") or asset.get("mime_type") or "").split(";", 1)[0].strip().lower()
+    mime_type = mime_type or "application/octet-stream"
+    filename = media_upload_filename(source.get("filename") or asset.get("filename") or "", mime_type)
+    return content, mime_type, filename
 
 
 @app.post("/api/wa/messages/{message_id}/pin")
@@ -2574,8 +2640,8 @@ def wa_unpin_message(conversation_id: str, current_user: dict = Depends(get_curr
     if not can_see_all_tenant(current_user):
         if conv.get("is_backup"):
             raise HTTPException(status_code=403, detail="Acesso negado: conversa de backup")
-        if contact.get("assigned_to") != current_user.get("id"):
-            _require_transfer_source_access(conv, contact, current_user)
+        # Mesmo criterio estrito do fixar (thread que atendo ou pool).
+        _require_transfer_source_access(conv, contact, current_user)
     if not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
         ensure_permission(current_user, "enviar_mensagem_propria_thread")
     fs_document("wa_conversations", conversation_id).update({"pinned_message": None})
@@ -2735,7 +2801,8 @@ def _reception_send_allowed(conversation: dict, channel: dict | None) -> bool:
     return is_reception_mode()
 
 
-def _check_conv_send_permission(conversation: dict, current_user: dict, contact: dict | None = None, channel: dict | None = None):
+def _check_conv_send_permission(conversation: dict, current_user: dict, contact: dict | None = None, channel: dict | None = None,
+                                dry_run: bool = False):
     """Permission check baseado na conversation (Fase 2C).
 
     Bloqueia envio se a thread esta atribuida a outro operador. Sem
@@ -2756,7 +2823,9 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
         # co-pilotar qualquer thread nao pode ficar 403 justo nas proprias.
         if not has_permission(current_user, "enviar_mensagem_qualquer_thread"):
             ensure_permission(current_user, "enviar_mensagem_propria_thread")
-        if conversation.get("takeover_status") in ("pending", "active"):
+        # dry_run (encaminhamento): mesma decisao, sem efeitos — eles so valem
+        # depois de a midia de origem ter sido lida com sucesso.
+        if not dry_run and conversation.get("takeover_status") in ("pending", "active"):
             try:
                 clear_conversation_takeover(conversation["id"])
             except Exception as exc:
@@ -2798,7 +2867,7 @@ def _check_conv_send_permission(conversation: dict, current_user: dict, contact:
             # bot_completed; sem isso o retorno aberto pelo picker ficava
             # invisivel — canario #4). O release re-arma o bot no proximo
             # fechamento. Best-effort, mesmo padrao do clear de takeover.
-            if contact and not contact.get("bot_completed"):
+            if not dry_run and contact and not contact.get("bot_completed"):
                 try:
                     from bot_service import mark_human_active
                     from database import mark_contact_bot_done
@@ -2901,38 +2970,55 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     # Origem e destino autorizados antes do resolve (que pode criar thread).
     source = None
     if body.forward_message_id is not None:
-        source, _ = await run_in_threadpool(_require_message_action_access, body.forward_message_id, current_user)
+        if not body.conversation_id:
+            # Pelo contact_id o _resolve_send_target faria upsert da thread no
+            # canal de CRIACAO (pode ser o coex de colega) antes de qualquer recusa.
+            raise HTTPException(status_code=400, detail="Encaminhamento exige a conversa de destino")
+        source, _ = await run_in_threadpool(_require_message_action_access, body.forward_message_id, current_user, True)
         if body.reply_to_message_id is not None:
             raise HTTPException(status_code=400, detail="Encaminhamento não aceita resposta vinculada")
     elif not body.content.strip():
         raise HTTPException(status_code=400, detail="Mensagem vazia")
     await run_in_threadpool(_require_send_contact_access, body.conversation_id, body.contact_id, current_user)
     conv, contact, channel = await run_in_threadpool(_resolve_send_target, body.conversation_id, body.contact_id)
+    if source:
+        await run_in_threadpool(_require_forward_destination_channel, conv, channel, current_user)
     token, phone_id, api_base = await run_in_threadpool(_resolve_channel_creds_by_id,
         channel["id"] if channel else conv.get("channel_id")
     )
+    forward_kind = source.get("msg_type") if source else None
+    forward_media = None
+    if source:
+        # Encaminhamento: primeiro tudo que recusa SEM efeito (janela de 24h e
+        # o gate de envio em dry_run), depois a midia de origem (ate 16 MB) e so
+        # entao o gate de verdade, que na Recepcao silencia a Val/carimba
+        # bot_completed e limpa takeover do destino.
+        _check_24h_window(contact)
+        await run_in_threadpool(_check_conv_send_permission, conv, current_user, contact, channel=channel, dry_run=True)
+        if forward_kind in _FORWARD_MEDIA_KINDS:
+            forward_media = await run_in_threadpool(_read_forward_media, source)
     send_mode = await run_in_threadpool(_check_conv_send_permission, conv, current_user, contact, channel=channel)
-    _check_24h_window(contact)
+    if not source:
+        _check_24h_window(contact)
     reply_fields = _build_reply_fields(contact["id"], body.reply_to_message_id, body.reply_to_preview, body.reply_to_sender_name)
     reply_context = _build_reply_context(contact["id"], body.reply_to_message_id)
 
-    # Modo 2 (co-pilotagem): intervencao de supervisao -> assina o texto.
     content = str(source.get("content") or "") if source else body.content
     msg_type = "text"
     extra_fields = {"is_forwarded": True} if source else {}
-    if source:
-        kind = source.get("msg_type")
-        if kind in ("image", "audio", "video", "gif", "document", "sticker"):
-            file_content, mime_type, filename = await run_in_threadpool(_read_forward_media, source)
-            return await _deliver_wa_media(
-                conv, contact, channel, current_user, token, phone_id,
-                file_content, mime_type, filename, "video" if kind == "gif" else kind,
-                content, source["media_path"], {}, is_forwarded=True,
-            )
-        if kind == "location":
-            msg_type = "location"
-            extra_fields.update(latitude=source["latitude"], longitude=source["longitude"])
-    if send_mode == "intervention":
+    if forward_media is not None:
+        file_content, mime_type, filename = forward_media
+        return await _deliver_wa_media(
+            conv, contact, channel, current_user, token, phone_id,
+            file_content, mime_type, filename, "video" if forward_kind == "gif" else forward_kind,
+            content, source["media_path"], {}, is_forwarded=True, source_id=source["id"],
+        )
+    if forward_kind == "location":
+        msg_type = "location"
+        extra_fields.update(latitude=source["latitude"], longitude=source["longitude"])
+    elif send_mode == "intervention":
+        # Modo 2 (co-pilotagem): intervencao de supervisao -> assina o texto.
+        # Localizacao fica sem assinatura (viraria o nome do local).
         _sup_name = (current_user.get("display_name") or "Supervisao").split()[0]
         content = f"[Supervisao - {_sup_name}]: {content}"
 
@@ -2941,7 +3027,12 @@ async def wa_send(body: WaSendRequest, current_user: dict = Depends(get_current_
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": wa_id, "type": msg_type, **reply_context}
     if msg_type == "location":
-        payload["location"] = {"latitude": source["latitude"], "longitude": source["longitude"], "name": content[:1000]}
+        location_obj = {"latitude": source["latitude"], "longitude": source["longitude"]}
+        # content guarda "nome endereco" (webhook/send-location); vazio nao vai
+        # como name "" (campo opcional na Cloud API).
+        if content.strip():
+            location_obj["name"] = content.strip()[:1000]
+        payload["location"] = location_obj
     else:
         payload["text"] = {"body": content, "preview_url": True}
 
@@ -3013,13 +3104,18 @@ async def wa_send_media(
 
 async def _deliver_wa_media(conv, contact, channel, current_user, token, phone_id,
                             file_content, mime_type, filename, msg_type, caption,
-                            media_path, reply_fields, reply_context=None, is_forwarded=False):
+                            media_path, reply_fields, reply_context=None, is_forwarded=False,
+                            source_id=None):
     """Upload sempre no numero de destino, inclusive ao encaminhar midia."""
     media_id = await upload_media_to_whatsapp(file_content, mime_type, filename, token=token, phone_id=phone_id)
     if not media_id:
         raise HTTPException(status_code=502, detail="Falha no upload para a Meta")
 
-    send_result = await send_media_message(contact["wa_id"], media_id, msg_type, caption, (reply_context or {}).get("context", {}).get("message_id", ""), token=token, phone_id=phone_id)
+    send_result = await send_media_message(
+        contact["wa_id"], media_id, msg_type, caption,
+        (reply_context or {}).get("context", {}).get("message_id", ""),
+        token=token, phone_id=phone_id, filename=filename,
+    )
     if not send_result or "error" in send_result:
         error = send_result.get("error", "Erro desconhecido") if send_result else "Sem resposta"
         raise HTTPException(status_code=502, detail=str(error))
@@ -3041,8 +3137,9 @@ async def _deliver_wa_media(conv, contact, channel, current_user, token, phone_i
         **reply_fields,
     )
     _maybe_credit_assume_counter(contact, current_user["id"])
+    # source_id: apuracao de midia encaminhada ao paciente errado sem varrer wa_messages.
     log_audit(current_user["id"], "WA_FORWARD_MEDIA" if is_forwarded else "WA_SEND_MEDIA",
-              f"type={msg_type} destination_id={conv['id']}")
+              f"type={msg_type} destination_id={conv['id']}" + (f" source_id={source_id}" if source_id else ""))
     return {"status": "sent", "wa_message_id": wa_msg_id, "msg_type": msg_type, "media_path": media_path}
 
 

@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """Respostas de midia com intervalos HTTP e streaming fora do event loop."""
 
+import logging
 import re
+from itertools import chain
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+
+from media import MediaNotFound
+
+logger = logging.getLogger("castro_crm.media_http")
 
 
 def _media_range(value, size):
@@ -45,9 +51,28 @@ def media_stream_response(asset, request: Request):
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
     if request.method == "HEAD":
         return Response(headers=headers, media_type=asset["mime_type"])
+    body = asset["iter_content"](start, end)
+    if end >= start:
+        # O status sai antes do 1o next() do StreamingResponse: uma falha do
+        # storage ali virava 200/206 vazio com ERROR no log. Lendo o 1o bloco
+        # aqui (rota sync = threadpool), objeto sumido vira 404 e falha do
+        # storage vira 503. Falha no MEIO do envio continua cortando a conexao.
+        try:
+            first = next(body)
+        except StopIteration:
+            first = b""
+        except MediaNotFound:
+            raise HTTPException(status_code=404, detail="Arquivo nao encontrado")
+        except Exception as exc:
+            logger.warning("Falha ao ler midia | erro=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503, detail="Midia indisponivel; tente novamente",
+                headers={"Retry-After": "2"},
+            )
+        body = chain((first,), body)
     # StreamingResponse executa next() de iteradores sincronos no threadpool.
     return StreamingResponse(
-        asset["iter_content"](start, end),
+        body,
         status_code=206 if interval else 200,
         headers=headers, media_type=asset["mime_type"],
     )

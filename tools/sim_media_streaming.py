@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import httpx
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import BadRequest, NotFound
 
 import main
 import media
@@ -181,6 +181,109 @@ class MediaStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 206)
         self.assertEqual(response.content, self.content[2:9])
         self.assertEqual(response.headers["content-range"], "bytes 2-8/36")
+
+    async def test_first_chunk_failure_is_clean_status(self):
+        # O status saia antes do 1o bloco: falha ali virava 200/206 vazio + ERROR.
+        blob = self.gcs(self.content)
+        blob.on_download = Mock(side_effect=NotFound("Objeto removido"))
+        response = await self.client.get(self.url)
+        self.assertEqual(response.status_code, 404)
+        blob.on_download = Mock(side_effect=RuntimeError("GCS fora"))
+        response = await self.client.get(self.url, headers={"Range": "bytes=0-1"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("retry-after"), "2")
+
+    async def test_storage_error_is_503_and_missing_is_quiet(self):
+        blob = self.gcs(self.content)
+        blob.on_reload = Mock(side_effect=RuntimeError("GCS fora"))
+        response = await self.client.get(self.url)
+        self.assertEqual(response.status_code, 503)
+        blob.on_reload = Mock(side_effect=NotFound("Objeto inexistente"))
+        with self.assertNoLogs("castro_crm.media", level="WARNING"):
+            response = await self.client.get("/media/video/missing.mp4")
+        self.assertEqual(response.status_code, 404)
+        # Nome que o GCS recusa (400) e midia que nao existe: 404, nunca 503 'tente de novo'.
+        blob.on_reload = Mock(side_effect=BadRequest("Nome invalido"))
+        with self.assertNoLogs("castro_crm.media", level="WARNING"):
+            response = await self.client.get("/media/video/nome-recusado.mp4")
+        self.assertEqual(response.status_code, 404)
+        # Bucket inexistente tambem e 404 no GCS: vira UM aviso por processo.
+        blob.on_reload = Mock(side_effect=NotFound("The specified bucket does not exist."))
+        with patch.object(media, "_gcs_bucket_missing_logged", False):
+            with self.assertLogs("castro_crm.media", level="WARNING") as logs:
+                await self.client.get("/media/video/a.mp4")
+                await self.client.get("/media/video/b.mp4")
+            self.assertEqual(sum("Bucket de midia inexistente" in line for line in logs.output), 1)
+
+    async def test_dot_names_are_rejected(self):
+        # '..' passava pelo basename e o fallback local servia o pai do MEDIA_DIR.
+        media_root = self.folder / "media"
+        (media_root / "video").mkdir(parents=True)
+        (media_root / "video" / "ok.mp4").write_bytes(b"ok")
+        (self.folder / "secret.txt").write_bytes(b"segredo")
+        with patch.object(media, "MEDIA_DIR", str(media_root)):
+            self.assertEqual((await self.client.get("/media/video/ok.mp4")).status_code, 200)
+            for path in ("/media/%2E%2E/secret.txt", "/media/video/.hidden", "/media/./ok.mp4"):
+                with self.subTest(path=path):
+                    response = await self.client.get(path)
+                    self.assertEqual(response.status_code, 404)
+                    self.assertNotEqual(response.content, b"segredo")
+        for value in ("/media/../secret.txt", "/media/video/.env", "/media/./x.mp4"):
+            self.assertEqual(media._split_media_path(value), (None, None))
+
+    async def test_mime_and_upload_names(self):
+        self.assertEqual(media._resolve_extension("audio/ogg; codecs=opus"), ".ogg")
+        self.assertEqual(media.media_upload_filename("20261113_abc.bin", "audio/ogg; codecs=opus"), "20261113_abc.ogg")
+        self.assertEqual(media.media_upload_filename("", "application/pdf"), "arquivo.pdf")
+        self.assertEqual(media.media_upload_filename("Exame.PDF", "application/pdf"), "Exame.PDF")
+        captured = []
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def post(self, url, **kwargs):
+                captured.append(kwargs)
+                body = {"id": "media-1"} if url.endswith("/media") else {"messages": [{"id": "wamid.1"}]}
+                return Mock(status_code=200, json=lambda: body)
+
+        with patch.object(media.httpx, "AsyncClient", FakeClient):
+            await media.upload_media_to_whatsapp(b"ogg", "audio/ogg; codecs=opus", token="t", phone_id="p")
+            self.assertEqual(captured[-1]["data"]["type"], "audio/ogg")
+            self.assertEqual(captured[-1]["files"]["file"][0], "upload.ogg")
+            await media.send_media_message("5531", "media-1", "document", "Legenda", token="t", phone_id="p", filename="Pedido.pdf")
+            self.assertEqual(captured[-1]["json"]["document"]["filename"], "Pedido.pdf")
+            await media.send_media_message("5531", "media-1", "image", "Legenda", token="t", phone_id="p", filename="foto.jpg")
+            self.assertNotIn("filename", captured[-1]["json"]["image"])
+            longo = "R" * 260 + ".pdf"
+            await media.send_media_message("5531", "media-1", "document", "", token="t", phone_id="p", filename=longo)
+            sent_name = captured[-1]["json"]["document"]["filename"]
+            self.assertTrue(sent_name.endswith(".pdf") and len(sent_name) == 240, (len(sent_name), sent_name[-8:]))
+
+    async def test_storage_pool_is_enlarged(self):
+        import requests
+
+        class FakeStorageClient:
+            def __init__(self): self._http = requests.Session()
+            def bucket(self, name): return Mock()
+
+        with patch.object(media, "_storage_client", None), \
+             patch("google.cloud.storage.Client", FakeStorageClient):
+            client = media._get_storage_client()
+            adapter = client._http.get_adapter("https://storage.googleapis.com/x")
+            self.assertEqual(adapter._pool_maxsize, media.GCS_HTTP_POOL_SIZE)
+
+        class FakeMtlsClient(FakeStorageClient):
+            def __init__(self):
+                super().__init__()
+                self._http._is_mtls = True
+                self.mtls_adapter = self._http.get_adapter("https://storage.googleapis.com/x")
+
+        # Com mTLS o adapter com certificado ja montado nao pode ser trocado.
+        with patch.object(media, "_storage_client", None), \
+             patch("google.cloud.storage.Client", FakeMtlsClient):
+            client = media._get_storage_client()
+            self.assertIs(client._http.get_adapter("https://storage.googleapis.com/x"), client.mtls_adapter)
 
     async def test_slow_storage_does_not_block_other_requests(self):
         blob = self.gcs(self.content)

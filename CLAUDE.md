@@ -28,8 +28,9 @@ lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente 
 Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os gates são:
 
 - **Backend:** `.venv\Scripts\python.exe -m py_compile main.py media.py media_http.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py bot_reminders.py bot_reminder_routes.py`
-- **Midia no CRM:** `tools\sim_media_streaming.py` (HTTP real via ASGI, GCS fake, Range/HEAD,
-  fallback local/Firestore e leitura lenta sem bloquear outras requests; sem rede externa).
+- **Midia no CRM:** `tools\sim_media_streaming.py` (13 testes: HTTP real via ASGI, GCS fake, Range/HEAD,
+  fallback local/Firestore, leitura lenta sem bloquear outras requests, falha no 1o bloco = 404/503,
+  nomes com ponto recusados, mime/extensao e pool do GCS; sem rede externa).
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 85 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (334).
   Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
@@ -53,9 +54,10 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   ⚠️ `tools\reopen_conciliation.py --tenant <id>` **não é mockado** — lê o Firestore real (só leitura,
   escrita travada no cliente): conciliação v1 × v2 da reabertura em lote (plano 11.1).
 - **Frontend:** `npm run build` em `frontend/` (`tsc -b && vite build` = typecheck estrito + build).
-  Encaminhar/fixar: `tools\sim_message_actions.py` (backend) e, na raiz,
-  `node tools\sim_message_actions.mjs` (frontend). ADR 0016; novo indice ASC em
-  `firestore.indexes.json` precisa ser aplicado antes da liberacao.
+  Encaminhar/fixar: `tools\sim_message_actions.py` (backend: origem estrita, coex alheio, template/botao,
+  midia 404/503/413, contexto com Firestore falso de ordem/cursor reais, status failed reaplicado) e, na raiz,
+  `node tools\sim_message_actions.mjs` (frontend: picker sem orfa alheia/coex alheio, trecho da fixada).
+  ADR 0016 (com emenda da revisao); novo indice ASC em `firestore.indexes.json` precisa ser aplicado antes da liberacao.
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
   `frontend/` (~32 asserts, exit 0/1; compila com o esbuild do Vite).
 
@@ -125,7 +127,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   **Revisao do merge (2026-10-18):** so role admin inicia (o toggle sozinho nao basta);
   FEATURE_IMPERSONATE=false derruba sessoes ja emitidas no middleware; o solicitante e
   revalidado (ativo, admin, com o toggle; cache de 30 s); get_current_user falha FECHADO
-  (503) se um token imp chegar sem a trava do middleware. `sim_impersonate.py` = 306.
+  (503) se um token imp chegar sem a trava do middleware. `sim_impersonate.py` = 308 (pin/unpin na trava, 2026-11-13).
 - **`_GLOBAL_COLLECTIONS` (`firestore_common.py`)** = `channels, pending_webhook_events,
   super_admins, audit_logs_system, phone_routing, _meta, tenants`. Ficam **flat/globais** mesmo
   com tenant context ativo. Toda coleção que o webhook precisa ler **antes** de saber o tenant
@@ -196,6 +198,11 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   no `save_wa_message`, so para inbound recebido posterior ao registro (clique, reacao e historico nao
   contam). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
   250/dia). Tarefas e historico (`crm_tasks`, `crm_activities`) sao so do backend nas rules.
+- **Encaminhar/fixar (ADR 0016, 2026-11-13):** origem ESTRITA (thread que atendo ou pool, sem o atalho do
+  Dono do Lead) e destino **nunca** pelo coex de outra pessoa (`_require_forward_destination_channel`). Template,
+  toque em botão (`interactive_reply`) e clique de avaliação não são encaminhados. **Não use `limit_to_last` em
+  query derivada** (google-cloud-firestore 2.19): o `get()` inverte in place os `Order` compartilhados e não troca
+  os cursores — o contexto da fixada trazia as 11 primeiras mensagens da conversa.
 - **Event loop único (`--workers 1`): trabalho síncrono pesado roda em `run_in_threadpool`** (2026-10-28).
   O cliente Firestore é síncrono; uma chamada longa dentro de `async def` congela TODAS as requests da
   instância. Já estão fora do loop: Whisper (`_transcribe_off_loop`, semáforo de 1), os crons

@@ -5,6 +5,9 @@ export type LightboxMedia = {
   kind: "image" | "video";
   alt: string;
   gifLike?: boolean;
+  // Video ampliado: nome real para o download e ponto onde o balao parou.
+  filename?: string;
+  startTime?: number;
 };
 
 export type ResolvedMessageMedia =

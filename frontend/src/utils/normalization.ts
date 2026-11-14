@@ -103,6 +103,9 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     phone_number_id: String(record.phone_number_id || ""),
     is_corrected: Boolean(record.is_corrected),
     is_forwarded: Boolean(record.is_forwarded),
+    // Encaminhar recusa clique de avaliacao e toque em botao (o backend tambem).
+    is_rating_message: Boolean(record.is_rating_message),
+    interactive_reply: Boolean(record.interactive_reply),
     latitude: record.latitude == null ? null : num(record.latitude),
     longitude: record.longitude == null ? null : num(record.longitude),
     corrected_by_message_id: record.corrected_by_message_id == null ? null : num(record.corrected_by_message_id),

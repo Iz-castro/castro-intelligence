@@ -351,6 +351,8 @@ export type ChatMessage = {
   visibility?: "all" | "admin_only" | string;
   is_corrected?: boolean;
   is_forwarded?: boolean;
+  // Toque em botao interativo: content e o id do botao (nao encaminhavel).
+  interactive_reply?: boolean;
   latitude?: number | null;
   longitude?: number | null;
   corrected_by_message_id?: number | null;

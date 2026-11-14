@@ -36,6 +36,21 @@ def run():
     messages = {1: deepcopy(original)}
     writes, posts, uploads, media_sends, pin_writes = [], [], [], [], []
     failure = {"http": False, "upload": False, "media": False}
+    channel_owner = {11: 7, 12: 7}
+    stored_media = {"content": b"stored-file", "mime_type": "image/jpeg", "filename": "stored.jpg", "error": None}
+
+    media_reads = []
+
+    def media_stream(path):
+        media_reads.append(path)
+        if stored_media["error"]:
+            raise stored_media["error"]
+        if not path:
+            return None
+        content = stored_media["content"]
+        return {"size": stored_media.get("size", len(content)), "mime_type": stored_media["mime_type"],
+                "filename": stored_media["filename"],
+                "iter_content": lambda start, end: iter([content[start:end + 1]])}
 
     class EmptyQuery:
         def where(self, *a, **k): return self
@@ -53,7 +68,7 @@ def run():
 
     def resolve(cid, contact_id):
         conv = threads[cid or f"thread-{contact_id}"]
-        return deepcopy(conv), deepcopy(contacts[conv["contact_id"]]), {"id": conv["channel_id"], "owner_user_id": 7}
+        return deepcopy(conv), deepcopy(contacts[conv["contact_id"]]), {"id": conv["channel_id"], "owner_user_id": channel_owner[conv["channel_id"]]}
 
     async def upload(content, mime, filename, **kwargs):
         uploads.append((content, mime, filename, kwargs))
@@ -88,7 +103,7 @@ def run():
             _maybe_credit_assume_counter=lambda *a: None,
             log_audit=lambda *a: None,
             fs_document=lambda *a: SimpleNamespace(update=lambda d: pin_writes.append((a, d))),
-            get_media_asset=lambda p: {"content": b"stored-file", "mime_type": "image/jpeg", "filename": "stored.jpg"} if p else None,
+            get_media_stream=media_stream,
             upload_media_to_whatsapp=upload, send_media_message=send_media), \
          patch.object(main.httpx, "AsyncClient", Client):
         asyncio.run(forward())
@@ -114,6 +129,44 @@ def run():
         contacts[11].update(assigned_to=7, assigned_to_uid="uid7")
         threads["thread-11"].update(assigned_to=7, assigned_to_uid="uid7")
 
+        # Origem ESTRITA: ser Dono do Lead nao libera a thread coex de outra
+        # vendedora com o mesmo cliente (antes um atalho pulava a checagem).
+        threads["thread-11"].update(assigned_to=99, assigned_to_uid="uid99")
+        expect(403, forward)
+        expect(403, lambda: main.wa_pin_message(1, main.WaPinRequest(), user))
+        expect(403, lambda: main.wa_unpin_message("thread-11", user))
+        expect(403, lambda: main.wa_message_context(1, user))
+        threads["thread-11"].update(assigned_to=7, assigned_to_uid="uid7")
+
+        # Destino: nunca pelo WhatsApp pessoal (coex) de outra pessoa, mesmo
+        # com o lead sendo meu (Opcao A do envio normal nao vale aqui).
+        channel_owner[12] = 99
+        count = len(posts)
+        expect(403, forward)
+        assert len(posts) == count, "Nada sai pelo coex alheio"
+        channel_owner[12] = 7
+        # Canal fora do cache: refresh antes de decidir, pelo tipo do CANAL (nao
+        # pelo source_channel_type do contato); canal que nao resolve = 409.
+        conv_no_cache = {"id": "thread-12", "channel_id": 12, "channel_type": "coexistence", "source_channel_type": "standard"}
+        refreshed = []
+        with patch("channel_service.refresh_channels", lambda: refreshed.append(1)), \
+             patch("channel_service.get_channel", lambda cid: {"id": cid, "channel_type": "coexistence", "owner_user_id": 99}):
+            try:
+                main._require_forward_destination_channel(conv_no_cache, None, user)
+            except HTTPException as exc:
+                assert exc.status_code == 403 and refreshed == [1], (exc.status_code, refreshed)
+            else:
+                raise AssertionError("Coex de colega fora do cache liberado")
+        with patch("channel_service.refresh_channels", lambda: None), patch("channel_service.get_channel", lambda cid: None):
+            try:
+                main._require_forward_destination_channel(conv_no_cache, None, user)
+            except HTTPException as exc:
+                assert exc.status_code == 409
+            else:
+                raise AssertionError("Canal inexistente deveria falhar fechado")
+        # Sem conversation_id (so contact_id) o resolve faria upsert no canal de criacao.
+        expect(400, lambda: main.wa_send(main.WaSendRequest(contact_id=12, forward_message_id=1), user))
+
         # Janela e gate de envio permanecem reais, inclusive coex/Recepcao.
         contacts[12]["last_inbound_at"] = now - timedelta(hours=25)
         expect(403, forward)
@@ -138,6 +191,46 @@ def run():
             assert media_sends[-1][0][1] == "new-destination-media-id"
             assert writes[-1]["media_path"] == messages[1]["media_path"] and writes[-1]["is_forwarded"]
             assert writes[-1]["msg_type"] == ("video" if kind == "gif" else kind)
+        # Nota de voz recebida: tipo puro e extensao coerente no novo upload.
+        messages[1].update(msg_type="audio", media_mime="audio/ogg; codecs=opus", filename="20261113_abc.bin")
+        asyncio.run(forward())
+        assert uploads[-1][1] == "audio/ogg" and uploads[-1][2] == "20261113_abc.ogg", uploads[-1][1:3]
+        # Documento chega ao paciente com o nome original.
+        messages[1].update(msg_type="document", media_mime="application/pdf", filename="Pedido_exame.pdf")
+        asyncio.run(forward())
+        assert media_sends[-1][1].get("filename") == "Pedido_exame.pdf", media_sends[-1][1]
+        messages[1].update(media_mime="", filename="original.jpg")
+        # Storage fora do ar = 503 (antes 404 'nao encontrado'); acima de 16 MB = 413 sem baixar.
+        stored_media["error"] = main.MediaStorageUnavailable()
+        expect(503, forward)
+        stored_media["error"] = None
+        stored_media["size"] = 16 * 1024 * 1024 + 1
+        expect(413, forward)
+        stored_media.pop("size")
+        # Janela vencida ou gate de envio recusando: a midia (ate 16 MB) nem e lida.
+        reads = len(media_reads)
+        contacts[12]["last_inbound_at"] = now - timedelta(hours=25)
+        expect(403, forward)
+        contacts[12]["last_inbound_at"] = now
+        with patch.object(main, "ensure_permission", side_effect=HTTPException(403, "RBAC")):
+            expect(403, forward)
+        assert len(media_reads) == reads, "Midia lida antes de recusa sem efeito"
+        # Recepcao: midia de origem ausente responde 404 SEM silenciar a Val do
+        # destino (antes o gate de envio rodava antes da leitura da midia).
+        marks = []
+        threads["thread-12"].update(assigned_to=None, assigned_to_uid="", source_channel_type="standard")
+        contacts[12].update(assigned_to=None, assigned_to_uid="", bot_completed=False)
+        with patch("database.is_reception_mode", lambda: True), \
+             patch("bot_service.mark_human_active", lambda cid: marks.append(("human", cid))), \
+             patch("database.mark_contact_bot_done", lambda cid: marks.append(("done", cid))):
+            messages[1]["media_path"] = ""
+            expect(404, forward)
+            assert marks == [], marks
+            messages[1]["media_path"] = "/media/images/stored.jpg"
+            asyncio.run(forward())
+            assert ("human", 12) in marks and ("done", 12) in marks, marks
+        contacts[12].update(assigned_to=7, assigned_to_uid="uid7", bot_completed=True)
+        threads["thread-12"].update(assigned_to=7, assigned_to_uid="uid7", source_channel_type="coexistence")
         messages[1]["media_path"] = ""
         expect(404, forward)
         messages[1]["media_path"] = "/media/images/stored.jpg"
@@ -149,6 +242,30 @@ def run():
         messages[1].update(msg_type="location", latitude=-20.0, longitude=-40.0)
         asyncio.run(forward())
         assert posts[-1][1]["json"]["location"]["latitude"] == -20.0 and writes[-1]["longitude"] == -40.0
+        # Localizacao sem nome nao manda name "" (campo opcional na Cloud API).
+        messages[1]["content"] = ""
+        asyncio.run(forward())
+        assert "name" not in posts[-1][1]["json"]["location"]
+        # Co-pilotagem: texto assinado, localizacao nao (a assinatura viraria o nome do local).
+        with patch.object(main, "_check_conv_send_permission", lambda *a, **k: "intervention"):
+            messages[1]["content"] = "Clinica Centro"
+            asyncio.run(forward())
+            assert posts[-1][1]["json"]["location"]["name"] == "Clinica Centro"
+            messages[1] = deepcopy(original)
+            asyncio.run(forward())
+            assert posts[-1][1]["json"]["text"]["body"] == "[Supervisao - Sim]: Texto original"
+        messages[1] = deepcopy(original)
+        # Template (rotulo interno com dados de quem recebeu), toque em botao e
+        # clique de avaliacao nao sao encaminhados; fixar template continua ok.
+        for updates in ({"msg_type": "template", "content": "[template: lembrete] Maria | 14/11"},
+                        {"interactive_reply": True, "content": "lgpd_aceitar"},
+                        {"content": "lgpd_recusar"},  # toque gravado antes da marca interactive_reply
+                        {"is_rating_message": True, "content": "[Avaliação do atendimento: 5]"}):
+            messages[1].update(updates)
+            expect(400, forward)
+            messages[1] = deepcopy(original)
+        messages[1].update(msg_type="template", content="[template: lembrete] Maria | 14/11")
+        assert main.wa_pin_message(1, main.WaPinRequest(), user)["pinned_message"]["message_id"] == 1
         messages[1] = deepcopy(original)
         for updates in ({"direction": "internal"}, {"direction": "system"}, {"visibility": "admin_only"}, {"msg_type": "unknown"}):
             messages[1].update(updates)
@@ -205,26 +322,78 @@ def run():
         with patch.object(db, "_get_first_by_field", lambda *a: {"id": 100, "is_forwarded": True}):
             db.save_wa_message("wamid", 12, "outbound", "text")
             assert stored[-1]["is_forwarded"] is True
+        # Toque em botao interativo recebe a marca que o encaminhamento recusa.
+        db.save_wa_message("", 12, "outbound", "text", content="lgpd_aceitar", conversation_id="thread-12", contact={}, interactive_reply=True)
+        assert next(d for d in reversed(stored) if d.get("content") == "lgpd_aceitar").get("interactive_reply") is True
+        db.save_wa_message("", 12, "outbound", "text", content="texto comum", conversation_id="thread-12", contact={})
+        assert "interactive_reply" not in next(d for d in reversed(stored) if d.get("content") == "texto comum")
 
-    queries = []
+    # Contexto da fixada: Firestore falso com ordem, cursor e limite de verdade
+    # (o duble antigo devolvia listas fixas e escondia o bug do limit_to_last,
+    # que na google-cloud-firestore 2.19 trazia as 11 PRIMEIRAS da conversa).
+    base = now.replace(microsecond=0)
+    dataset = [dict(original, id=i, conversation_id="thread-11", timestamp_wa=base + timedelta(minutes=i)) for i in range(1, 41)]
+    dataset.append(dict(original, id=99, contact_id=99, conversation_id="thread-11", timestamp_wa=base + timedelta(minutes=25, seconds=30)))
+    context_queries = []
+
     class ContextQuery:
-        def where(self, *a): queries.append(("where", a)); return self
-        def order_by(self, *a, **k): return self
-        def start_at(self, cursor): queries.append(("start", cursor)); return self
-        def end_at(self, cursor): queries.append(("end", cursor)); return self
-        def limit(self, n): queries.append(("limit", n)); return self
-        def limit_to_last(self, n): queries.append(("last", n)); return self
+        def __init__(self):
+            self.filters, self.direction, self.cursor, self.n = [], "ASCENDING", None, None
+            context_queries.append(self)
+        def where(self, field, op, value): self.filters.append((field, op, value)); return self
+        def order_by(self, field, direction="ASCENDING"): self.direction = direction; return self
+        def start_at(self, cursor): self.cursor = cursor["timestamp_wa"]; return self
+        def end_at(self, cursor): raise AssertionError("end_at nao e usado")
+        def limit(self, n): self.n = n; return self
+        def limit_to_last(self, n): raise AssertionError("limit_to_last inverte os Order in place (firestore 2.19)")
         def stream(self):
-            return [SimpleNamespace(id="3", exists=True, to_dict=lambda: dict(original, id=3, timestamp_wa=now - timedelta(seconds=1))),
-                    SimpleNamespace(id="4", exists=True, to_dict=lambda: dict(original, id=4, contact_id=99))]
-        def get(self):
-            return [SimpleNamespace(id="2", exists=True, to_dict=lambda: dict(original, id=2, timestamp_wa=now + timedelta(seconds=1)))]
+            desc = self.direction == "DESCENDING"
+            rows = sorted((r for r in dataset if all(r.get(f) == v for f, _, v in self.filters)),
+                          key=lambda r: r["timestamp_wa"], reverse=desc)
+            if self.cursor is not None:
+                rows = [r for r in rows if ((r["timestamp_wa"] <= self.cursor) if desc else (r["timestamp_wa"] >= self.cursor))]
+            return [SimpleNamespace(id=str(r["id"]), exists=True, to_dict=lambda r=r: dict(r)) for r in rows[: self.n]]
+
+    pinned = next(r for r in dataset if r["id"] == 30)
     with patch.object(db, "collection", lambda *a: ContextQuery()):
-        context = db.get_wa_message_context(original)
-        assert [row["id"] for row in context] == [3, 1, 2]
-        assert ("where", ("conversation_id", "==", "thread-11")) in queries
-        assert ("limit", 11) in queries and ("last", 11) in queries
-    print("OK: encaminhamento, origem/destino, gates reais, midia, falhas, pin/TTL, contexto limitado e persistencia; sem rede/ADC")
+        ids = [row["id"] for row in db.get_wa_message_context(pinned)]
+    # 10 antes (uma vaga ocupada pela linha de outro contato, filtrada) + marco + 10 depois.
+    assert ids == list(range(21, 41)), ids
+    assert {q.direction for q in context_queries} == {"DESCENDING", "ASCENDING"} and len(context_queries) == 2
+    assert all(q.filters == [("conversation_id", "==", "thread-11")] and q.n == 11 for q in context_queries)
+    assert db._context_sort_key({"id": 1, "timestamp_wa": "2026-01-01T00:00:00+00:00"}) < \
+        db._context_sort_key({"id": 2, "timestamp_wa": datetime(2026, 1, 2, tzinfo=timezone.utc)})
+    assert db._context_sort_key({"id": 3}) == (0.0, "3")
+
+    # Status: update devolve se achou a mensagem; 'failed' que chega antes do
+    # save do envio e reaplicado depois (sent/delivered nao: regrediria status).
+    with patch.object(db, "_get_first_by_field", lambda *a: None):
+        assert db.update_wa_message_status("wamid.missing", "failed") is False
+    with patch.multiple(db, _get_first_by_field=lambda *a: {"id": 5},
+                        document=lambda *a: SimpleNamespace(set=lambda *x, **k: None)):
+        assert db.update_wa_message_status("wamid.ok", "delivered") is True
+    import webhook
+    status_calls = []
+
+    def fake_status(msg_id, state, ts=""):
+        status_calls.append((msg_id, state))
+        return len(status_calls) >= 3
+
+    async def statuses():
+        # Retry DENTRO do request (antes do 200): fora dele o Cloud Run estrangula a CPU.
+        with patch.object(webhook, "update_wa_message_status", fake_status), \
+             patch.object(webhook, "_FAILED_STATUS_RETRY_DELAYS", (0.01, 0.01)):
+            missed = webhook._process_statuses({"statuses": [
+                {"id": "wamid.sent", "status": "sent", "timestamp": "1700000000"},
+                {"id": "wamid.fail", "status": "failed", "timestamp": "1700000000", "errors": [{"code": 131026}]},
+            ]})
+            assert [m for m, _ in missed] == ["wamid.fail"], missed
+            await webhook._retry_missed_failed_statuses(missed)
+    asyncio.run(statuses())
+    assert status_calls == [("wamid.sent", "sent"), ("wamid.fail", "failed"), ("wamid.fail", "failed")], status_calls
+    print("OK: encaminhamento, origem estrita/destino sem coex alheio, gates reais, midia (404/503/413, voz, documento), "
+          "template/botao/avaliacao recusados, efeitos so depois da midia, localizacao, pin/TTL, contexto real, "
+          "persistencia e status failed reaplicado; sem rede/ADC")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
 import { VideoMedia } from "./components/chat/VideoMedia";
 import { ChatTabs, CHAT_TABPANEL_ID, chatTabDomId } from "./components/chat/ChatTabs";
-import { canForwardMessage, ForwardIcon, PinIcon, useMessageActions } from "./components/chat/MessageActions";
+import { canForwardMessage, canPinMessage, ForwardIcon, PinIcon, useMessageActions } from "./components/chat/MessageActions";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
 import { BotRemindersSettings } from "./components/settings/BotRemindersSettings";
 import { MonitorModal } from "./components/monitor/MonitorModal";
@@ -1145,7 +1145,7 @@ function MessageMedia({ message }: { message: ChatMessage }) {
     if (media.gifLike) return <button type="button" className="media-button gif-button" onClick={() => openLightbox(message.media_path || "", "video", media.alt, true)} aria-label="Ampliar GIF"><video className="media video-media gif-video" src={message.media_path} autoPlay loop muted playsInline /></button>;
     return (
       <VideoMedia key={message.media_path} src={message.media_path} alt={media.alt} filename={message.filename}
-        onExpand={() => openLightbox(message.media_path || "", "video", media.alt)} />
+        onExpand={(startTime) => openLightbox(message.media_path || "", "video", media.alt, false, { filename: message.filename, startTime })} />
     );
   }
   if (media.kind === "audio") return (
@@ -1265,7 +1265,14 @@ function ChatPanel() {
   useEffect(() => {
     const container = messagesRef.current;
     if (!container) return;
-    if (messageActions.historicalMessages) return;
+    if (messageActions.historicalMessages) {
+      // Trecho da fixada na tela: sem scroll automatico, mas um "carregar
+      // anteriores" que chegue agora nao pode deixar o "Carregando..." preso.
+      if (scrollIntentRef.current === "load_older") scrollIntentRef.current = "normal";
+      prevMessageCountRef.current = messages.length;
+      setLoadingMore(false);
+      return;
+    }
     if (scrollIntentRef.current === "load_older") {
       // Older messages loaded (or all messages already fetched — count unchanged)
       if (messages.length > prevMessageCountRef.current) {
@@ -1485,7 +1492,7 @@ function ChatPanel() {
             const bubbleColor = bubbleOperator ? operatorColor(bubbleOperator.id) : null;
             return (
               <div key={message.id} className={`message-row ${message.direction} ${messageActions.selection?.has(message.id) ? "is-selected" : ""}`}>
-                {messageActions.selection && <div className="message-checkbox-slot">{canForwardMessage(message) && <input type="checkbox" checked={messageActions.selection.has(message.id)} disabled={readOnly} onChange={() => messageActions.toggleSelection(message)} aria-label={messageActions.selectionLabel(message)} />}</div>}
+                {messageActions.selection && (message.direction === "inbound" || message.direction === "outbound") && <div className="message-checkbox-slot">{canForwardMessage(message) && <input type="checkbox" checked={messageActions.selection.has(message.id)} disabled={readOnly} onChange={() => messageActions.toggleSelection(message)} aria-label={messageActions.selectionLabel(message)} />}</div>}
               <article data-message-id={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""} ${messageActions.highlight === message.id ? "is-highlighted" : ""}`} style={isInternal ? { background: "#fef9c3", borderColor: "#facc15", color: "#713f12" } : operatorAccentStyle(bubbleColor)}>
                 {canInteract && !messageActions.selection ? (
                   <div className="bubble-menu-anchor" ref={isMenuOpen ? activeMessageMenuRef : null}>
@@ -1497,8 +1504,8 @@ function ChatPanel() {
                         {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && ((message.sender_user_id ?? message.operator_id) === sessionUser?.id || isManager) ? (
                           <button type="button" className="attach-option" disabled={readOnly || (busySend || busyAudio || busyUpload || recording)} onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}><span>Corrigir</span></button>
                         ) : null}
-                        <button type="button" className="attach-option" disabled={readOnly || recording || busySend || busyAudio || busyUpload || !canForwardMessage(message)} onClick={() => { messageActions.startForward(message); setOpenMessageMenuId(null); }}><ForwardIcon /><span>Encaminhar</span></button>
-                        <button type="button" className="attach-option" disabled={readOnly || !canForwardMessage(message)} onClick={() => { messageActions.startPin(message); setOpenMessageMenuId(null); }}><PinIcon /><span>Fixar</span></button>
+                        <button type="button" className="attach-option" disabled={readOnly || recording || busySend || busyAudio || busyUpload || !messageActions.canAct || !canForwardMessage(message)} title={readOnly ? READ_ONLY_TOOLTIP : !messageActions.canAct ? "Disponível na conversa que você atende" : undefined} onClick={() => { messageActions.startForward(message); setOpenMessageMenuId(null); }}><ForwardIcon /><span>Encaminhar</span></button>
+                        <button type="button" className="attach-option" disabled={readOnly || !messageActions.canAct || !canPinMessage(message)} title={readOnly ? READ_ONLY_TOOLTIP : !messageActions.canAct ? "Disponível na conversa que você atende" : undefined} onClick={() => { messageActions.startPin(message); setOpenMessageMenuId(null); }}><PinIcon /><span>Fixar</span></button>
                       </div>
                     ) : null}
                   </div>
@@ -1513,7 +1520,7 @@ function ChatPanel() {
               </div>
             );
           })}
-          {visibleMessagesFiltered !== null && visibleMessagesFiltered.length === 0 ? <div className="empty" style={{ alignSelf: "center" }}>Nenhuma mensagem encontrada para "{chatSearch}".</div> : null}
+          {!messageActions.historicalMessages && visibleMessagesFiltered !== null && visibleMessagesFiltered.length === 0 ? <div className="empty" style={{ alignSelf: "center" }}>Nenhuma mensagem encontrada para "{chatSearch}".</div> : null}
         </div>
         {messageActions.selectionBar}
         {messageActions.dialogs}
@@ -3869,17 +3876,25 @@ function NotificationsTab() {
 
 function Lightbox() {
   const { lightboxMedia, closeLightbox } = useCrm();
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!lightboxMedia) return undefined;
+    // Foco entra no overlay (antes ficava no botao atras dele) e volta ao gatilho ao fechar.
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
+    return () => { if (previous?.isConnected) previous.focus(); };
+  }, [lightboxMedia]);
   if (!lightboxMedia) return null;
   return (
     <div className="lightbox" role="dialog" aria-modal="true" aria-label="Visualização de mídia" onClick={closeLightbox}>
-      <button type="button" className="lightbox-close" onClick={closeLightbox} aria-label="Fechar visualização">Fechar</button>
+      <button ref={closeRef} type="button" className="lightbox-close" onClick={closeLightbox} aria-label="Fechar visualização">Fechar</button>
       <div className="lightbox-content" onClick={(e) => e.stopPropagation()}>
         {lightboxMedia.kind === "image" ? (
           <img className="lightbox-media" src={lightboxMedia.src} alt={lightboxMedia.alt} />
         ) : lightboxMedia.gifLike ? (
           <video className="lightbox-media" src={lightboxMedia.src} autoPlay loop muted playsInline />
         ) : (
-          <VideoMedia key={lightboxMedia.src} src={lightboxMedia.src} alt={lightboxMedia.alt} filename={lightboxMedia.alt} expanded />
+          <VideoMedia key={lightboxMedia.src} src={lightboxMedia.src} alt={lightboxMedia.alt} filename={lightboxMedia.filename} startTime={lightboxMedia.startTime} expanded />
         )}
       </div>
     </div>
