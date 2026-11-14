@@ -724,6 +724,9 @@ def scenario_middleware():
         check(response.status_code == 403 and not executed, f"{method}: 403 sem executar endpoint")
         check(json.loads(response.body)["detail"] == "Modo visualizacao: somente leitura",
               f"{method}: motivo de somente leitura")
+    for method, path in (("POST", "/api/wa/messages/1/pin"), ("DELETE", "/api/wa/conversation/thread-sim/pin")):
+        response, executed = run_middleware(method, path, decoded_imp())
+        check(response.status_code == 403 and not executed, f"{method} {path}: pin bloqueado antes do endpoint")
     for method in ("GET", "HEAD", "OPTIONS"):
         response, executed = run_middleware(method, "/api/session", decoded_imp())
         check(response.status_code == 200 and executed == [TENANT], f"{method} passivo passa no tenant do alvo")

@@ -6,6 +6,7 @@ import { waPlainText } from "./utils/waFormat";
 import { WaText } from "./components/chat/WaText";
 import { VideoMedia } from "./components/chat/VideoMedia";
 import { ChatTabs, CHAT_TABPANEL_ID, chatTabDomId } from "./components/chat/ChatTabs";
+import { canForwardMessage, ForwardIcon, PinIcon, useMessageActions } from "./components/chat/MessageActions";
 import { QuickMessagesEditor } from "./components/settings/QuickMessagesEditor";
 import { BotRemindersSettings } from "./components/settings/BotRemindersSettings";
 import { MonitorModal } from "./components/monitor/MonitorModal";
@@ -1171,6 +1172,7 @@ function ReplyQuote({ senderName, preview, compact = false }: { senderName: stri
 function ChatPanel() {
   const { readOnly } = useCrm();
   const ctx = useCrm();
+  const messageActions = useMessageActions();
   const { activeView, operators, selectedContact, sessionUser, error, notice, config, messagesRef, scrollIntentRef, prevMessageCountRef, messages, selectedContactId, loadingMore, setLoadingMore, messageLimit, setMessageLimit, visibleMessages, visibleMessagesFiltered, showChatSearch, chatSearch, setChatSearch, toggleChatSearch, showDotsMenu, toggleDotsMenu, closeDotsMenu, dotsMenuRef, busyAssume, assumeContact, quickSuggestions, quickSelectedIndex, applyQuickMessage, replyTarget, startReplyToMessage, cancelReply, copyMessageText, draft, handleDraftChange, handleDraftKeyDown, submitText, recording, recordingSeconds, discardRecording, handlePrimaryAction, busySend, busyAudio, busyUpload, busyComposerAction, showAttachMenu, toggleAttachMenu, openImagePicker, openVideoPicker, openDocPicker, sendLocation, handleImageSelected, submitFile, imageInputRef, videoInputRef, documentInputRef, attachMenuRef, composerInputRef, correctionTarget, startCorrection, cancelCorrection, updateDeclaredName, selectedConversation, selectedThreadId, takeoverConversation, returnConversation, internalMode, setInternalMode, supervisorTakeover, setAttendance } = { ...ctx, busyComposerAction: ctx.busyAudio || ctx.busySend };
   // Canal usado para listar templates: prioriza o canal da thread aberta
   // (mesma regra do _resolve_send_target no backend) sobre o canal do
@@ -1263,6 +1265,7 @@ function ChatPanel() {
   useEffect(() => {
     const container = messagesRef.current;
     if (!container) return;
+    if (messageActions.historicalMessages) return;
     if (scrollIntentRef.current === "load_older") {
       // Older messages loaded (or all messages already fetched — count unchanged)
       if (messages.length > prevMessageCountRef.current) {
@@ -1290,6 +1293,7 @@ function ChatPanel() {
   useEffect(() => {
     const container = messagesRef.current;
     if (!container || !selectedContactId) return undefined;
+    if (messageActions.historicalMessages) return undefined;
     const handleScroll = () => {
       const hasPotentialOlderMessages = messages.length >= messageLimit;
       if (container.scrollTop < 40 && !loadingMore && hasPotentialOlderMessages) {
@@ -1301,7 +1305,7 @@ function ChatPanel() {
     };
     container.addEventListener("scroll", handleScroll, { passive: true });
     return () => container.removeEventListener("scroll", handleScroll);
-  }, [selectedContactId, loadingMore, messageLimit, messages.length]);
+  }, [selectedContactId, loadingMore, messageLimit, messages.length, messageActions.historicalMessages]);
 
   useEffect(() => {
     setOpenMessageMenuId(null);
@@ -1463,7 +1467,9 @@ function ChatPanel() {
         {showChatSearch ? <div className="toolbar"><input value={chatSearch} onChange={(e) => setChatSearch(e.target.value)} placeholder="Buscar na conversa..." autoFocus />{chatSearch ? <span className="sub">{(visibleMessagesFiltered ?? []).length} resultado(s)</span> : null}</div> : null}
 
         <CommercialContactBanner contact={selectedContact} />
-        <div className="messages" ref={messagesRef}>
+        {messageActions.pinBar}
+        {messageActions.historyBar}
+        <div className={`messages ${messageActions.selection ? "is-selecting" : ""}`} ref={messagesRef}>
           {chatIsEmpty && isManualContact ? (
             <div className="empty" style={{ alignSelf: "center", textAlign: "center", marginTop: "2rem" }}>
               <p style={{ marginBottom: "0.5rem" }}>Contato criado manualmente.</p>
@@ -1471,15 +1477,17 @@ function ChatPanel() {
             </div>
           ) : null}
           {loadingMore && <div className="sub" style={{ textAlign: "center", padding: "0.5rem" }}>Carregando mensagens anteriores...</div>}
-          {(visibleMessagesFiltered ?? visibleMessages).map((message) => {
+          {(messageActions.historicalMessages ?? visibleMessagesFiltered ?? visibleMessages).map((message) => {
             const isInternal = message.direction === "internal";
             const canInteract = message.direction !== "system" && !isInternal;
             const isMenuOpen = openMessageMenuId === message.id;
             const bubbleOperator = activeView === "equipe" && message.direction === "outbound" ? findMessageOperator(message, operators, selectedContact) : null;
             const bubbleColor = bubbleOperator ? operatorColor(bubbleOperator.id) : null;
             return (
-              <article key={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""}`} style={isInternal ? { background: "#fef9c3", borderColor: "#facc15", color: "#713f12" } : operatorAccentStyle(bubbleColor)}>
-                {canInteract ? (
+              <div key={message.id} className={`message-row ${message.direction} ${messageActions.selection?.has(message.id) ? "is-selected" : ""}`}>
+                {messageActions.selection && <div className="message-checkbox-slot">{canForwardMessage(message) && <input type="checkbox" checked={messageActions.selection.has(message.id)} disabled={readOnly} onChange={() => messageActions.toggleSelection(message)} aria-label={messageActions.selectionLabel(message)} />}</div>}
+              <article data-message-id={message.id} className={`bubble ${message.direction} ${canInteract ? "has-actions" : ""} ${bubbleColor ? "bubble--team-accent" : ""} ${messageActions.highlight === message.id ? "is-highlighted" : ""}`} style={isInternal ? { background: "#fef9c3", borderColor: "#facc15", color: "#713f12" } : operatorAccentStyle(bubbleColor)}>
+                {canInteract && !messageActions.selection ? (
                   <div className="bubble-menu-anchor" ref={isMenuOpen ? activeMessageMenuRef : null}>
                     <button type="button" className="bubble-menu-trigger" onClick={() => setOpenMessageMenuId((current) => current === message.id ? null : message.id)} aria-label="Ações da mensagem" aria-expanded={isMenuOpen}>v</button>
                     {isMenuOpen ? (
@@ -1489,20 +1497,26 @@ function ChatPanel() {
                         {message.direction === "outbound" && message.msg_type === "text" && !message.is_corrected && ((message.sender_user_id ?? message.operator_id) === sessionUser?.id || isManager) ? (
                           <button type="button" className="attach-option" disabled={readOnly || (busySend || busyAudio || busyUpload || recording)} onClick={() => { startCorrection(message); setOpenMessageMenuId(null); }} title={readOnly ? READ_ONLY_TOOLTIP : undefined}><span>Corrigir</span></button>
                         ) : null}
+                        <button type="button" className="attach-option" disabled={readOnly || recording || busySend || busyAudio || busyUpload || !canForwardMessage(message)} onClick={() => { messageActions.startForward(message); setOpenMessageMenuId(null); }}><ForwardIcon /><span>Encaminhar</span></button>
+                        <button type="button" className="attach-option" disabled={readOnly || !canForwardMessage(message)} onClick={() => { messageActions.startPin(message); setOpenMessageMenuId(null); }}><PinIcon /><span>Fixar</span></button>
                       </div>
                     ) : null}
                   </div>
                 ) : null}
+                {message.is_forwarded && <div className="forwarded-label"><ForwardIcon /><span>Encaminhada</span></div>}
                 <header><strong style={bubbleColor ? { color: bubbleColor } : undefined}>{messageSenderLabel(message, operators)}{isInternal ? " · 🔒 nota interna" : ""}</strong><span>{when(message.timestamp_wa || message.created_at)}</span></header>
                 {message.reply_to_preview ? <ReplyQuote senderName={message.reply_to_sender_name || "Mensagem"} preview={message.reply_to_preview} /> : null}
                 {messageContentLabel(message) ? <div className="bubble-text"><WaText text={messageContentLabel(message)} /></div> : null}
                 <MessageMedia message={message} />
                 <footer><span>{messageTypeLabel(message.msg_type)}{message.is_corrected ? " · corrigida" : ""}</span>{config?.feature_message_status !== false && <span>{message.status || "ok"}</span>}</footer>
               </article>
+              </div>
             );
           })}
           {visibleMessagesFiltered !== null && visibleMessagesFiltered.length === 0 ? <div className="empty" style={{ alignSelf: "center" }}>Nenhuma mensagem encontrada para "{chatSearch}".</div> : null}
         </div>
+        {messageActions.selectionBar}
+        {messageActions.dialogs}
 
         {quickSuggestions.length > 0 && (
           <div className="quick-suggestions" role="listbox" aria-label="Mensagens rápidas" ref={quickListRef}>{quickSuggestions.map((qm, idx) => (
@@ -1514,7 +1528,7 @@ function ChatPanel() {
           ))}</div>
         )}
 
-        {channelInactive ? (
+        {messageActions.selection ? null : channelInactive ? (
           <div className="composer" style={{ padding: "0.8rem 1rem" }}>
             <div className="sub" style={{ textAlign: "center", width: "100%" }}>{selectedThread?.is_backup
               ? "📦 Conversa de backup (histórico) — somente leitura. Transfira para um operador para atender quando o cliente voltar."

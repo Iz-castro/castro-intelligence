@@ -102,6 +102,9 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
     channel_id: record.channel_id == null ? null : num(record.channel_id),
     phone_number_id: String(record.phone_number_id || ""),
     is_corrected: Boolean(record.is_corrected),
+    is_forwarded: Boolean(record.is_forwarded),
+    latitude: record.latitude == null ? null : num(record.latitude),
+    longitude: record.longitude == null ? null : num(record.longitude),
     corrected_by_message_id: record.corrected_by_message_id == null ? null : num(record.corrected_by_message_id),
     // Sem este mapeamento o filtro de admin_only (CrmContext visibleMessages)
     // fica INERTE em snapshot mode: a whitelist dropava o campo e mensagens
@@ -111,8 +114,13 @@ export function normalizeMessage(record: Record<string, unknown>, docId: string)
 }
 
 export function normalizeConversation(record: Record<string, unknown>, docId: string): Conversation {
+  const pin = record.pinned_message as Record<string, unknown> | null | undefined;
   return {
     id: String(record.id || docId),
+    pinned_message: pin && num(pin.message_id) > 0 ? {
+      message_id: num(pin.message_id), preview: String(pin.preview || "Mensagem"),
+      expires_at: iso(pin.expires_at), pinned_by: num(pin.pinned_by),
+    } : null,
     contact_id: num(record.contact_id),
     wa_id: String(record.wa_id || ""),
     channel_id: record.channel_id == null ? null : num(record.channel_id),
