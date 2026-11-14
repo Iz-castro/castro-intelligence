@@ -124,9 +124,10 @@ from webhook_google_chat import validate_google_chat_token, process_google_chat_
 from media import (
     ensure_media_dir, upload_media_to_whatsapp, send_media_message,
     save_upload_media, convert_audio_to_ogg_opus,
-    save_avatar_media, delete_media, get_media_asset,
+    save_avatar_media, delete_media, get_media_asset, get_media_stream,
     _write_media_bytes,
 )
+from media_http import media_stream_response
 
 # -- Logging --
 
@@ -665,16 +666,15 @@ async def app_shell():
 
 # -- Servir midia --
 
-@app.get("/media/{subdir}/{filename}")
-async def serve_media(subdir: str, filename: str):
+@app.api_route("/media/{subdir}/{filename}", methods=["GET", "HEAD"])
+def serve_media(request: Request, subdir: str, filename: str):
+    # Rota sync: metadados, disco e Firestore tambem ficam fora do event loop.
     safe_subdir = os.path.basename(subdir)
     safe_filename = os.path.basename(filename)
-    asset = get_media_asset(f"/media/{safe_subdir}/{safe_filename}")
+    asset = get_media_stream(f"/media/{safe_subdir}/{safe_filename}")
     if not asset:
         raise HTTPException(status_code=404, detail="Arquivo nao encontrado")
-    if asset.get("file_path"):
-        return FileResponse(asset["file_path"], media_type=asset.get("mime_type"))
-    return Response(content=asset["content"], media_type=asset.get("mime_type"))
+    return media_stream_response(asset, request)
 
 
 # -- Webhook WABA --

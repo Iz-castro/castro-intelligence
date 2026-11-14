@@ -27,7 +27,9 @@ lead). Há ainda um 3º tenant interno de teste (`varizemed-test`, mesmo agente 
 
 Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os gates são:
 
-- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py bot_reminders.py bot_reminder_routes.py`
+- **Backend:** `.venv\Scripts\python.exe -m py_compile main.py media.py media_http.py webhook.py bot_service.py bot_engine_dialogflow.py bot_sender.py lgpd_bot.py database_firestore.py config.py tenant_service.py channel_service.py bot_reminders.py bot_reminder_routes.py`
+- **Midia no CRM:** `tools\sim_media_streaming.py` (HTTP real via ASGI, GCS fake, Range/HEAD,
+  fallback local/Firestore e leitura lenta sem bloquear outras requests; sem rede externa).
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 85 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (334).
   Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
@@ -253,6 +255,7 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
 |---|---|
 | Config / env / feature flags | `config.py` |
 | App, rotas, middleware de tenant | `main.py` |
+| Midia: armazenamento/leitura por blocos e HTTP Range | `media.py`, `media_http.py`; player em `frontend/src/components/chat/VideoMedia.tsx` |
 | Persistência CRM (tudo) | `database_firestore.py` (via `database.py`) |
 | Acesso a dados, prefixo, tenant context, `next_sequence` | `firestore_common.py` |
 | Webhook Meta (resolve tenant → canal, nunca propaga exceção) | `webhook.py` |
