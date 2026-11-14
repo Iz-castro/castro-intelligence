@@ -65,7 +65,7 @@ A leitura recomendada agora e:
 
 ### Decisoes
 - [ADRs](decisions/README.md)
-- [Encaminhamento e mensagem fixada por conversa](decisions/0016-encaminhamento-e-mensagem-fixada.md) — mergeado no develop (emenda da revisao 2026-11-13); regras, testes e indice necessario para liberacao
+- [Encaminhamento e mensagem fixada por conversa](decisions/0016-encaminhamento-e-mensagem-fixada.md) — em producao desde 2026-11-14 (rev castro-crm-00132-2nk; emenda da revisao 2026-11-13); regras, testes e indice
 
 ### Compliance LGPD
 - [RoPA/RIPD versao cliente](compliance/LGPD_RoPA_RIPD_CLIENTE.md)

@@ -1,6 +1,7 @@
 # Videos no chat
 
-Implementado em 13/11/2026 (PR #7, mergeado no develop com os ajustes da revisao); sem deploy.
+Implementado em 13/11/2026 (PR #7, com os ajustes da revisao); em producao desde 14/11/2026
+(rev `castro-crm-00132-2nk`). Falta a checagem em Safari/iPhone.
 
 - Videos recebidos e enviados podem ser reproduzidos no balao, com controles e som.
 - O player usa `preload="none"`: abrir uma conversa nao inicia downloads dos videos.

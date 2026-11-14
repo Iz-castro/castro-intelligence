@@ -21,7 +21,7 @@
 Visao funcional do CRM hoje.
 
 - [Guia das operadoras — Follow-up](GUIA_OPERADORAS_FOLLOWUP.md): F1 implementada localmente sob flag, com filas, tentativas, calendário e recusas; aguarda liberação.
-- [Videos no chat](VIDEOS_NO_CHAT.md): player no balao, ampliacao e entrega por intervalos; mergeado no develop (13/11), sem deploy.
+- [Videos no chat](VIDEOS_NO_CHAT.md): player no balao, ampliacao e entrega por intervalos; em producao desde 14/11 (rev castro-crm-00132-2nk); falta o teste em Safari/iPhone.
 
 ## Objetivo do produto
 

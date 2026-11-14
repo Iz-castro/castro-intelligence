@@ -57,7 +57,9 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   Encaminhar/fixar: `tools\sim_message_actions.py` (backend: origem estrita, coex alheio, template/botao,
   midia 404/503/413, contexto com Firestore falso de ordem/cursor reais, status failed reaplicado) e, na raiz,
   `node tools\sim_message_actions.mjs` (frontend: picker sem orfa alheia/coex alheio, trecho da fixada).
-  ADR 0016 (com emenda da revisao); novo indice ASC em `firestore.indexes.json` precisa ser aplicado antes da liberacao.
+  ADR 0016 (com emenda da revisao); EM PROD desde 2026-11-14 (rev `castro-crm-00132-2nk`), indice ASC aplicado antes.
+  Indices de `wa_messages`: o lado DESC do contexto e o chat usam o indice COLLECTION_GROUP; a entrada COLLECTION
+  DESC do `firestore.indexes.json` NAO existe em prod (conferido 14/11) — liste com `gcloud firestore indexes composite list`.
   Parser da formatação WhatsApp (`src/utils/waFormat.ts`): `node tools\check_wa_format.mjs` em
   `frontend/` (~32 asserts, exit 0/1; compila com o esbuild do Vite).
 

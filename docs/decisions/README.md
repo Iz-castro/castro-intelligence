@@ -11,11 +11,11 @@ Formato sugerido:
 
 Boa opcao para ADRs simples ao longo da evolucao do projeto.
 
-## Indice dos ADRs (atualizado em 2026-11-13)
+## Indice dos ADRs (atualizado em 2026-11-14)
 
 | # | Titulo | Status |
 |---|---|---|
-| [0016](0016-encaminhamento-e-mensagem-fixada.md) | Encaminhamento e mensagem fixada por conversa | Mergeado no develop com emenda da revisao (2026-11-13), sem deploy |
+| [0016](0016-encaminhamento-e-mensagem-fixada.md) | Encaminhamento e mensagem fixada por conversa | Em producao desde 2026-11-14 (rev castro-crm-00132-2nk), com emenda da revisao de 2026-11-13 |
 | [0001](0001-prevenir-coex-signup-duplicado.md) | Prevenir Embedded Signup duplicado pro mesmo numero coexistence | Proposed |
 | [0002](0002-lgpd-canal-coex-compartilhado.md) | LGPD em canal coexistence compartilhado por multiplos operadores | Proposed (emenda 2026-06-03: visibilidade por `department_id` removida) |
 | [0003](0003-refactor-lead-atendimento.md) | Refactor Lead/Atendimento/Mensagem + regras coex hibrido (Fases 1-5A) | Implementado em prod (Fases 2b/5B/5C pendentes) |

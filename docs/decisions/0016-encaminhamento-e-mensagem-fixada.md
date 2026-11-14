@@ -1,6 +1,7 @@
 # ADR 0016: Encaminhamento e mensagem fixada por conversa
 
-Data: 2026-11-13. Status: mergeado no develop com a emenda da revisao (abaixo), sem deploy.
+Data: 2026-11-13. Status: em producao desde 2026-11-14 (rev `castro-crm-00132-2nk`), com a emenda da
+revisao (abaixo).
 
 ## Contexto
 
@@ -117,6 +118,13 @@ Antes de liberar, aplicar o novo indice de `firestore.indexes.json`:
 `wa_messages` / COLLECTION / `conversation_id ASC, timestamp_wa ASC`.
 O Firestore inverte a consulta de `limit_to_last` para buscar o lado posterior;
 o indice DESC do outro lado ja existe. Nenhum backfill/rules novos sao necessarios.
+
+**Aplicado em 2026-11-14**, antes da promocao: criado com `gcloud firestore indexes composite create`
+(READY as 12:17 BRT, cerca de 14 min de construcao). Uma sonda so de leitura (as duas consultas do
+contexto com um `conversation_id` inexistente, nos tres tenants) dava "The query requires an index" no
+lado ASC antes e passou depois. Achado da conferencia: o lado DESC e atendido pelo indice
+**COLLECTION_GROUP** `conversation_id ASC, timestamp_wa DESC`; a entrada de escopo COLLECTION com os
+mesmos campos que o `firestore.indexes.json` declara nunca existiu em producao.
 Verificar o layout e o envio em ambiente de homologacao. No Ver como, a faixa e
 visivel; a busca extra de contexto fora da janela carregada permanece indisponivel,
 preservando a allowlist de leituras do transporte aprovado.
