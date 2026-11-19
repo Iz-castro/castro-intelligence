@@ -1937,10 +1937,12 @@ def monitor_messages_between(start, end, limit):
     return rows[:limit], len(rows) > limit
 
 
-def set_attendance_status(conversation_id, status, clear_takeover=False):
+def set_attendance_status(conversation_id, status, clear_takeover=False, keep_bot_cycle=False):
     """Define o attendance_status manualmente (Fase 4 — fechar/reabrir).
     status: 'aberto' | 'fechado_manual'. clear_takeover encerra a sessao
-    temporaria de takeover junto. Retorna a conversation atualizada ou None."""
+    temporaria de takeover junto. keep_bot_cycle (so reception): o lead nunca
+    saiu da Val, entao o fechamento nao abre ciclo novo (ver release_lead_to_bot).
+    Retorna a conversation atualizada ou None."""
     conv = get_wa_conversation_by_id(conversation_id)
     if not conv:
         return None
@@ -1954,7 +1956,8 @@ def set_attendance_status(conversation_id, status, clear_takeover=False):
     if str(status).startswith("fechado"):
         _owner_fields = None
         if not conv.get("is_backup") and is_reception_mode():
-            _owner_fields = release_lead_to_bot(conv.get("contact_id"), conversation_id, status)
+            _owner_fields = release_lead_to_bot(conv.get("contact_id"), conversation_id, status,
+                                                keep_bot_cycle=keep_bot_cycle)
         if _owner_fields is None:
             _owner_fields = revert_lead_to_sale_owner(conv.get("contact_id"))
         if _owner_fields:
@@ -3030,9 +3033,16 @@ def mark_contact_bot_done(contact_id):
         return False
 
 
-def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=None):
+def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=None, keep_bot_cycle=False):
     """Fechamento devolve o lead ao AGENTE DE IA (Fase 2 do PLANO_MODELOS,
     antecipada com gate por pool_mode=reception — decisao do PO 2026-08-05).
+
+    keep_bot_cycle=True (Encerrar conversa do ultimo lembrete com o lead ainda
+    na fase de bot, emenda de 19/11 ao ADR 0015): o lead nunca saiu da Val,
+    entao nao ha devolucao — sem a mensagem "devolvido ao assistente virtual"
+    e sem _bot_cycle_reset_fields (bot_outcome e o marco bot_released_at ficam,
+    senao a protecao P5 do publico Bot da reabertura perderia o desfecho e o
+    link ja enviado). O resto (bot_states, buffer, threads sem dono) e igual.
 
     NAO reusa return_contact_to_bot (clobberaria qualification/protocolo/
     department_id). Preserva por omissao: sale_owner, lead_temperature,
@@ -3076,21 +3086,23 @@ def release_lead_to_bot(contact_id, closed_conversation_id=None, close_status=No
             continue
         _snap.reference.set({"assigned_to": None, "assigned_to_uid": ""}, merge=True)
     # Passo 3 — system message (best-effort; recencia nao infla).
-    try:
-        insert_transfer_system_message(
-            contact_id, "Atendimento devolvido ao assistente virtual.",
-            None, conversation_id=closed_conversation_id, advance_recency=False,
-        )
-    except Exception as exc:
-        logger.warning("release_lead_to_bot: system message falhou %s: %s", contact_id, exc)
+    if not keep_bot_cycle:
+        try:
+            insert_transfer_system_message(
+                contact_id, "Atendimento devolvido ao assistente virtual.",
+                None, conversation_id=closed_conversation_id, advance_recency=False,
+            )
+        except Exception as exc:
+            logger.warning("release_lead_to_bot: system message falhou %s: %s", contact_id, exc)
     # Passo 4 — CONTATO (commit point): bot volta a atender no proximo turno.
     # No MESMO write: marco de ciclo (bot_released_at) e desfecho anterior com
     # a Val zerado — o ciclo novo comeca sem desfecho (plano de reabertura 2.2).
+    # keep_bot_cycle preserva os dois (o ciclo com a Val continua o mesmo).
     document("wa_contacts", contact_id).set({
         "bot_completed": False,
         "assigned_to": None,
         "assigned_to_uid": "",
-        **_bot_cycle_reset_fields(),
+        **({} if keep_bot_cycle else _bot_cycle_reset_fields()),
     }, merge=True)
     return {
         "assigned_to": None,

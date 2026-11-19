@@ -3611,13 +3611,14 @@ async def wa_reopen_conversation(
     _require_commercial_contact_allowed(contact)
     _check_conv_send_permission(conv, current_user, contact, channel=channel)
 
-    # Frente C1 (ADR 0009 D2): cliente que respondeu Encerrar a uma
-    # reabertura anterior esta em OPT-OUT de retomada — envio manual bloqueia
-    # com aviso (e o lote futuro filtra). Opt-out != revogacao LGPD.
+    # Frente C1 (ADR 0009 D2): cliente que tocou Encerrar numa reabertura
+    # anterior ou no ultimo lembrete automatico (emenda de 19/11 ao ADR 0015)
+    # esta em OPT-OUT de retomada — envio manual bloqueia com aviso (e o lote
+    # futuro filtra). Opt-out != revogacao LGPD.
     if contact and contact.get("reopen_opt_out"):
         raise HTTPException(
             status_code=409,
-            detail="Cliente pediu para nao ser reaberto (respondeu Encerrar a uma reabertura anterior).",
+            detail="Cliente pediu para não ser reaberto (tocou Encerrar numa reabertura ou no lembrete automático).",
         )
 
     template_name = (body.template_name if body else None) or REOPEN_TEMPLATE_NAME

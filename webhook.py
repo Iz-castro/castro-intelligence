@@ -51,6 +51,7 @@ from bot_service import (
 from lgpd_bot import botao_lgpd
 from bot_transport import extract_interactive_inbound
 from bot_sender import send_bot_reply
+from bot_reminders import CLOSING_BUTTON_IDS as REMINDER_CLOSING_BUTTON_IDS
 from firestore_common import (
     set_tenant_context, reset_tenant_context, get_tenant_context, document, utcnow,
 )
@@ -365,7 +366,7 @@ def _reopen_handoff_unattended(thread):
     return human_at is None or human_at <= handoff_at
 
 
-def _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id):
+def _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id, tag="[REOPEN BTN]", err=None):
     """Plano v2.2 (secao 3, caso 3): Retomar/Continuar que leva o lead para a
     EQUIPE renova handoff_at das threads com handoff NUNCA atendido, senao a
     valvula de 7 dias do Modo Recepcao (_reception_unattended_release_due)
@@ -382,15 +383,18 @@ def _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id):
     bot (revisao de 09/11). As threads sao RELIDAS aqui: o `conv` do clique
     pode ter ate ~2 min de idade quando o turno do agente rodou antes, e um
     operador pode ter assumido e respondido nesse meio-tempo. Se a leitura
-    falhar, usa so a thread do clique. Retorna os ids renovados."""
+    falhar, usa so a thread do clique. Retorna os ids renovados.
+
+    tag/err: o toque do lembrete loga com a propria tag e so o tipo da excecao
+    (o caminho do doc embute o telefone)."""
     threads = {}
     try:
         for thread in get_conversations_by_contact(contact_id) or []:
             if isinstance(thread, dict) and thread.get("id") and not thread.get("is_backup"):
                 threads[str(thread["id"])] = thread
     except Exception as exc:
-        logger.warning("[REOPEN BTN] leitura das threads do contato falhou contato=%s: %s",
-                       contact_id, exc)
+        logger.warning("%s leitura das threads do contato falhou contato=%s: %s",
+                       tag, contact_id, err(exc) if err else exc)
     if not threads and isinstance(conv, dict) and conversation_id:
         threads[str(conversation_id)] = conv
     now = utcnow()
@@ -418,8 +422,17 @@ def _reopen_message_after_opt_out(ts_iso, opt_out_at):
 
 
 async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
-                                db_id, content, ts_iso, reply_fields, ws_notify_callback=None):
+                                db_id, content, ts_iso, reply_fields, ws_notify_callback=None,
+                                origin="reabertura"):
     """Processa a resposta de um botao quick-reply do template de reabertura.
+
+    origin="lembrete": toque em Continuar conversa / Encerrar conversa do ultimo
+    lembrete automatico (emenda de 19/11 ao ADR 0015). Mesmo efeito, com quatro
+    diferencas: mensagem de sistema propria; auditoria BOT_REMINDER_RESPONSE com
+    contact_id (o conversation_id embute o telefone); logs com a tag
+    [REMINDER BTN], sem o conversation_id e so com o tipo da excecao (as linhas
+    [REOPEN BTN] medem o lote); e o Encerrar de lead ainda na fase de bot nao
+    abre ciclo novo (keep_bot_cycle: preserva bot_outcome/bot_released_at).
 
     Resolve a conversation alvo via context.id (mensagem-template original),
     com fallback no id deterministico {channel_id}__{wa_id}. Registra a
@@ -431,6 +444,13 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
     - 'Retomar': reabre o atendimento (aberto) e o Atendimento diario.
     """
     channel_id = channel.get("id") if channel else None
+    from_reminder = origin == "lembrete"
+    audit_event = "BOT_REMINDER_RESPONSE" if from_reminder else "WA_REOPEN_RESPONSE"
+    tag = "[REMINDER BTN]" if from_reminder else "[REOPEN BTN]"
+
+    def _err(exc):
+        # Lembrete: so o tipo (a mensagem pode trazer o caminho do doc, com o telefone).
+        return type(exc).__name__ if from_reminder else exc
 
     # Resolve a conversation alvo a partir da mensagem-template citada.
     conversation_id = None
@@ -442,10 +462,12 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
             conversation_id = original.get("conversation_id")
     if not conversation_id and channel_id and wa_id:
         conversation_id = f"{channel_id}__{wa_id}"
+    log_ref = (f"contact_id={contact_id} canal={channel_id}" if from_reminder
+               else f"conv={conversation_id}")
 
     action = _reopen_action_from_choice(button.get("payload") or button.get("text"))
     if action is None:
-        logger.info("[REOPEN BTN] resposta nao reconhecida | conv=%s", conversation_id)
+        logger.info("%s resposta nao reconhecida | %s", tag, log_ref)
 
     # Emite a mensagem de botao p/ clientes conectados (paridade com o emit
     # padrao de inbound; em snapshot mode o Firestore tambem propaga).
@@ -464,13 +486,14 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
 
     conv = get_wa_conversation_by_id(conversation_id)
     contact = get_wa_contact(contact_id)
+    in_bot_phase = bool(contact) and not contact.get("bot_completed") and not contact.get("assigned_to")
 
     # Cenario 22b: sem o guard, Continuar dobrado rodaria dois turnos do
     # agente e Encerrar dobrado mandaria o recibo de protocolo duas vezes. A
     # mensagem do 2o clique ja foi persistida e emitida acima.
     if _reopen_click_is_repeat(conv, action):
-        logger.info("[REOPEN BTN] clique repetido em menos de %ds ignorado | conv=%s | acao=%s",
-                    REOPEN_CLICK_REPEAT_SECONDS, conversation_id, action)
+        logger.info("%s clique repetido em menos de %ds ignorado | %s | acao=%s",
+                    tag, REOPEN_CLICK_REPEAT_SECONDS, log_ref, action)
         return
 
     # Registra a escolha na conversation (auditavel + trava de reabertura
@@ -478,13 +501,15 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
     response_fields = {
         "reopen_response": action,
         "reopen_response_at": utcnow().isoformat(),
+        # Separa, na contagem por thread, o toque do lembrete do toque no template.
+        "reopen_response_origin": origin,
     }
     if action == "encerrar":
         response_fields["client_requested_close"] = True
     try:
         document("wa_conversations", conversation_id).set(response_fields, merge=True)
     except Exception as exc:
-        logger.warning("[REOPEN BTN] falha ao gravar reopen_response conv=%s: %s", conversation_id, exc)
+        logger.warning("%s falha ao gravar reopen_response %s: %s", tag, log_ref, _err(exc))
 
     if action == "encerrar":
         # Frente C1 (ADR 0009 D2): opt-out de retomada carimbado no CONTATO —
@@ -499,11 +524,16 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
                 "reopen_opt_out_at": ts_iso or utcnow().isoformat(),
             }, merge=True)
         except Exception as exc:
-            logger.warning("[REOPEN BTN] opt-out stamp falhou contato=%s: %s", contact_id, exc)
-        set_attendance_status(conversation_id, "fechado_cliente", clear_takeover=True)
+            logger.warning("%s opt-out stamp falhou contato=%s: %s", tag, contact_id, _err(exc))
+        # Lembrete com o lead ainda na Val: o fechamento nao e devolucao ao bot
+        # (sem "devolvido ao assistente virtual" e sem zerar o desfecho da Val,
+        # que a protecao P5 do publico Bot da reabertura le).
+        set_attendance_status(conversation_id, "fechado_cliente", clear_takeover=True,
+                              keep_bot_cycle=from_reminder and in_bot_phase)
         insert_transfer_system_message(
             contact_id,
-            "Cliente encerrou o chamado pelo botao de reabertura.",
+            "Cliente encerrou a conversa pelo botao do lembrete automatico." if from_reminder
+            else "Cliente encerrou o chamado pelo botao de reabertura.",
             None, conversation_id=conversation_id, channel_id=channel_id,
         )
         # Fecha o Atendimento diario + envia recibo de protocolo (mesma
@@ -512,9 +542,9 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
             from main import _close_daily_and_send_protocol
             await _close_daily_and_send_protocol(contact, conv, channel, None, "fechado_cliente")
         except Exception as exc:
-            logger.warning("[REOPEN BTN] close_daily/protocolo falhou conv=%s: %s", conversation_id, exc)
-        log_audit(None, "WA_REOPEN_RESPONSE", f"conv={conversation_id} -> encerrar (cliente)")
-        logger.info("[REOPEN BTN] Cliente encerrou | conv=%s", conversation_id)
+            logger.warning("%s close_daily/protocolo falhou %s: %s", tag, log_ref, _err(exc))
+        log_audit(None, audit_event, f"{log_ref} -> encerrar (cliente)")
+        logger.info("%s Cliente encerrou | %s", tag, log_ref)
     else:  # retomar
         set_attendance_status(conversation_id, "aberto")
         # Publico BOT (plano v2.2, D3 — 2026-10-29): lead em fase de bot que
@@ -523,7 +553,6 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
         # agente manda o aviso antes de qualquer turno (mesmo caminho de um
         # texto do cliente). So tenant com motor CX ativo; falha do turno cai
         # no caminho antigo (equipe), para o cliente nao ficar sem resposta.
-        in_bot_phase = bool(contact) and not contact.get("bot_completed") and not contact.get("assigned_to")
         resumed_by_bot = False
         _queued_origem = False
         if in_bot_phase and REOPEN_RESUME_BOT_TEXT and _tenant_bot_engine_is_cx():
@@ -548,13 +577,13 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
                 # equipe, abaixo, como na excecao.
                 resumed_by_bot = bool(_reply)
                 if resumed_by_bot:
-                    logger.info("[REOPEN BTN] Continuar devolvido ao agente | conv=%s", conversation_id)
+                    logger.info("%s Continuar devolvido ao agente | %s", tag, log_ref)
                 else:
-                    logger.warning("[REOPEN BTN] agente sem resposta no Continuar; lead vai para a equipe | conv=%s",
-                                   conversation_id)
+                    logger.warning("%s agente sem resposta no Continuar; lead vai para a equipe | %s",
+                                   tag, log_ref)
             except Exception as exc:
-                logger.warning("[REOPEN BTN] turno do agente no Continuar falhou conv=%s: %s",
-                               conversation_id, exc)
+                logger.warning("%s turno do agente no Continuar falhou %s: %s",
+                               tag, log_ref, _err(exc))
         if _queued_origem and not resumed_by_bot:
             # origem=retomada_lote nao foi consumido por um turno real: sai de
             # bot_states, senao entraria no 1o turno do PROXIMO ciclo com o
@@ -562,8 +591,8 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
             try:
                 discard_cx_session_params(contact_id)
             except Exception as exc:
-                logger.warning("[REOPEN BTN] descartar origem pendente falhou contato=%s: %s",
-                               contact_id, exc)
+                logger.warning("%s descartar origem pendente falhou contato=%s: %s",
+                               tag, contact_id, _err(exc))
         # Revisao adversarial C2: lead devolvido ao bot (reception) que clica
         # Retomar/Continuar caia em zona morta — bot_completed falso esconde a
         # thread da aba Recepcao e clique de botao nao dispara turno de bot.
@@ -573,20 +602,21 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
             try:
                 mark_contact_bot_done(contact_id)
             except Exception as exc:
-                logger.warning("[REOPEN BTN] mark_contact_bot_done falhou contato=%s: %s",
-                               contact_id, exc)
+                logger.warning("%s mark_contact_bot_done falhou contato=%s: %s",
+                               tag, contact_id, _err(exc))
         # Plano v2.2 (secao 3, caso 3): so quando o lead vai para a EQUIPE -
         # thread com handoff nunca atendida ganha handoff_at novo, senao a
         # valvula de 7 dias devolve o lead ao bot logo apos o clique. Thread
         # ja atendida nao renova (caso 4).
         if not resumed_by_bot:
             try:
-                _renewed = _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id)
+                _renewed = _reopen_renew_handoff_if_unattended(conv, conversation_id, contact_id,
+                                                               tag=tag, err=_err)
                 if _renewed:
-                    logger.info("[REOPEN BTN] handoff_at renovado em %d thread(s) nunca atendida(s) | conv=%s",
-                                len(_renewed), conversation_id)
+                    logger.info("%s handoff_at renovado em %d thread(s) nunca atendida(s) | %s",
+                                tag, len(_renewed), log_ref)
             except Exception as exc:
-                logger.warning("[REOPEN BTN] renovar handoff_at falhou conv=%s: %s", conversation_id, exc)
+                logger.warning("%s renovar handoff_at falhou %s: %s", tag, log_ref, _err(exc))
         # Reabre o Atendimento diario se existir (espelha set-attendance).
         pid = get_current_protocol_id(contact_id)
         if pid:
@@ -595,14 +625,15 @@ async def _handle_reopen_button(contact_id, wa_id, channel, button, context,
                     {"status": "aberto", "fechado_em": None, "fechado_por_user_id": None}, merge=True,
                 )
             except Exception as exc:
-                logger.warning("[REOPEN BTN] reabrir daily pid=%s falhou: %s", pid, exc)
+                logger.warning("%s reabrir daily pid=%s falhou: %s", tag, pid, _err(exc))
         insert_transfer_system_message(
             contact_id,
-            "Cliente optou por retomar a solicitacao.",
+            "Cliente optou por continuar a conversa pelo lembrete automatico." if from_reminder
+            else "Cliente optou por retomar a solicitacao.",
             None, conversation_id=conversation_id, channel_id=channel_id,
         )
-        log_audit(None, "WA_REOPEN_RESPONSE", f"conv={conversation_id} -> retomar (cliente)")
-        logger.info("[REOPEN BTN] Cliente retomou | conv=%s", conversation_id)
+        log_audit(None, audit_event, f"{log_ref} -> retomar (cliente)")
+        logger.info("%s Cliente retomou | %s", tag, log_ref)
 
 
 # Recibo v2 (2026-09): vocabulario dos cliques de avaliacao. IDs rating_*
@@ -1815,6 +1846,30 @@ async def _process_messages(value, ws_notify_callback, channel=None):
                 ts_iso=ts_iso,
                 reply_fields=reply_fields,
                 ws_notify_callback=ws_notify_callback,
+            )
+            continue
+
+        # -- Botoes do ultimo lembrete automatico (emenda de 19/11 ao ADR 0015) --
+        # Continuar conversa / Encerrar conversa valem como o Continuar/Encerrar
+        # da reabertura (Val retoma ou atendimento encerrado com protocolo e
+        # opt-out do lote). O toque nunca vira texto para a Val; reentrega da
+        # Meta (was_dup) nao reprocessa. A conversa alvo vem do context.id (o
+        # lembrete citado), com fallback no id deterministico.
+        if raw_msg_type == "interactive" and content in REMINDER_CLOSING_BUTTON_IDS:
+            if was_dup:
+                continue
+            await _handle_reopen_button(
+                contact_id=contact_id,
+                wa_id=wa_id,
+                channel=channel,
+                button={"payload": content},
+                context=msg.get("context"),
+                db_id=db_id,
+                content=content,
+                ts_iso=ts_iso,
+                reply_fields=reply_fields,
+                ws_notify_callback=ws_notify_callback,
+                origin="lembrete",
             )
             continue
 

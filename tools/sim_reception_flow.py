@@ -802,6 +802,59 @@ def cenario_release_to_bot():
     check(dbf.release_lead_to_bot(21, None, "fechado_manual") is None
           and "bot_released_at" not in STORE["wa_contacts"]["21"],
           "guard J-3: lgpd_revoked NAO volta pro funil (release=None, sem marco)")
+    # Emenda de 19/11 ao ADR 0015: Encerrar conversa do lembrete com o lead ainda na
+    # Val nao abre ciclo novo (desfecho e marco ficam para a protecao P5).
+    _marco23 = _antes - timedelta(days=9)
+    STORE["wa_contacts"]["23"] = {"id": 23, "bot_completed": False, "assigned_to": None,
+                                  "bot_outcome": "link_enviado", "bot_outcome_at": _antes - timedelta(hours=2),
+                                  "bot_released_at": _marco23}
+    STORE["wa_conversations"]["T3"] = {"id": "T3", "contact_id": 23, "assigned_to": None, "assigned_to_uid": ""}
+    STORE["bot_states"]["23"] = {"lgpd_status": "accepted", "cx_snapshot": {"x": 1}, "human_active": False}
+    _sys_calls = []
+    _real_sys = dbf.insert_transfer_system_message
+    dbf.insert_transfer_system_message = lambda cid, text, *a, **k: _sys_calls.append((cid, text))
+    try:
+        fields23 = dbf.release_lead_to_bot(23, "T3", "fechado_cliente", keep_bot_cycle=True)
+        c23 = STORE["wa_contacts"]["23"]
+        check(fields23 == {"assigned_to": None, "assigned_to_uid": "",
+                           "takeover_status": "none", "takeover_started_at": None}
+              and c23.get("bot_completed") is False and c23.get("assigned_to") is None,
+              "keep_bot_cycle: mesmo retorno e lead segue com a Val")
+        check(c23.get("bot_outcome") == "link_enviado" and c23.get("bot_released_at") == _marco23
+              and c23.get("bot_outcome_at") is not None,
+              "keep_bot_cycle: desfecho da Val e marco de ciclo preservados (P5)")
+        check(_sys_calls == [], "keep_bot_cycle: sem 'Atendimento devolvido ao assistente virtual.'")
+        check(STORE["bot_states"]["23"].get("cx_snapshot") is None and STORE["bot_states"]["23"].get("lgpd_status") == "accepted",
+              "keep_bot_cycle: ciclo CX zerado como no fechamento normal, prova LGPD preservada")
+        STORE["wa_contacts"]["24"] = {"id": 24, "bot_completed": True, "assigned_to": 3, "bot_outcome": "agendado"}
+        dbf.release_lead_to_bot(24, None, "fechado_cliente")
+        check(len(_sys_calls) == 1 and "devolvido" in _sys_calls[0][1] and STORE["wa_contacts"]["24"].get("bot_outcome") is None,
+              "sem keep_bot_cycle (padrao): devolve ao assistente e zera o desfecho, como antes")
+        # Elo set_attendance_status -> release_lead_to_bot (2a rodada da revisao):
+        # o fechamento real repassa keep_bot_cycle; sem ele, comportamento antigo.
+        _real_rm = dbf.is_reception_mode
+        dbf.is_reception_mode = lambda: True
+        try:
+            for cid, tid, keep in ((25, "T5", True), (26, "T6", False)):
+                STORE["wa_contacts"][str(cid)] = {"id": cid, "bot_completed": False, "assigned_to": None,
+                                                  "bot_outcome": "link_enviado", "bot_released_at": _marco23}
+                STORE["wa_conversations"][tid] = {"id": tid, "contact_id": cid, "attendance_status": "aberto",
+                                                  "assigned_to": None, "assigned_to_uid": ""}
+                _sys_calls.clear()
+                conv_after = dbf.set_attendance_status(tid, "fechado_cliente", clear_takeover=True, keep_bot_cycle=keep)
+                ck = STORE["wa_contacts"][str(cid)]
+                if keep:
+                    check((conv_after or {}).get("attendance_status") == "fechado_cliente" and ck.get("bot_outcome") == "link_enviado"
+                          and ck.get("bot_released_at") == _marco23 and _sys_calls == [],
+                          "set_attendance_status(keep_bot_cycle=True) chega ao release: desfecho e marco preservados")
+                else:
+                    check((conv_after or {}).get("attendance_status") == "fechado_cliente" and ck.get("bot_outcome") is None
+                          and ck.get("bot_released_at") != _marco23 and len(_sys_calls) == 1,
+                          "set_attendance_status sem keep_bot_cycle: fechamento de sempre (desfecho zerado, devolvido)")
+        finally:
+            dbf.is_reception_mode = _real_rm
+    finally:
+        dbf.insert_transfer_system_message = _real_sys
     WRITES.clear()
     check(dbf.return_contact_to_bot(22, 7) is True
           and "22" not in STORE.get("bot_buffers", {}),
@@ -1238,7 +1291,7 @@ def cenario_continuar_devolve_ao_agente():
              "queue_cx_session_params", "discard_cx_session_params", "get_conversations_by_contact")
     saved = {n: getattr(wh, n) for n in names}
     rec = {"turns": [], "marks": [], "status": [], "docs": [], "queued": [], "discarded": [], "reply": "",
-           "threads": None, "threads_boom": False}
+           "threads": None, "threads_boom": False, "sys": [], "audit": [], "status_kw": []}
 
     def fake_threads(cid):
         if rec.get("threads_boom"):
@@ -1260,10 +1313,10 @@ def cenario_continuar_devolve_ao_agente():
 
     wh.get_wa_message_by_wa_message_id = lambda wamid: None
     wh.document = lambda name, key: _Doc(name, key)
-    wh.set_attendance_status = lambda cid, st: rec["status"].append((cid, st))
+    wh.set_attendance_status = lambda cid, st, **kw: rec["status"].append((cid, st)) or rec["status_kw"].append(kw)
     wh.get_current_protocol_id = lambda cid: None
-    wh.insert_transfer_system_message = lambda *a, **k: None
-    wh.log_audit = lambda *a, **k: None
+    wh.insert_transfer_system_message = lambda cid, text, *a, **k: rec["sys"].append(text)
+    wh.log_audit = lambda *a, **k: rec["audit"].append((a[1], a[2]))
     wh.mark_contact_bot_done = lambda cid: rec["marks"].append(cid)
     wh._run_bot_turn_and_send = fake_turn
     wh.queue_cx_session_params = lambda cid, params: rec["queued"].append((cid, dict(params)))
@@ -1280,8 +1333,8 @@ def cenario_continuar_devolve_ao_agente():
 
     def click(contact, cx=True, text="Quero continuar o atendimento.", boom=False,
               reply="Que bom te ver de novo! Como posso ajudar?", conv=None, button="Continuar",
-              threads=None, threads_boom=False):
-        for k in ("turns", "marks", "status", "docs", "queued", "discarded"):
+              threads=None, threads_boom=False, origin="reabertura"):
+        for k in ("turns", "marks", "status", "docs", "queued", "discarded", "sys", "audit", "status_kw"):
             rec[k].clear()
         rec["boom"] = boom
         rec["reply"] = reply
@@ -1294,7 +1347,7 @@ def cenario_continuar_devolve_ao_agente():
         asyncio.run(wh._handle_reopen_button(
             contact_id=1, wa_id="5531900000001", channel=channel, button={"text": button},
             context={"id": "wamid.template"}, db_id=10, content=button, ts_iso="2026-10-29T13:00:00Z",
-            reply_fields=None, ws_notify_callback=None))
+            reply_fields=None, ws_notify_callback=None, origin=origin))
 
     try:
         bot_phase = {"id": 1, "display_name": "Paciente", "bot_completed": False, "assigned_to": None}
@@ -1309,6 +1362,57 @@ def cenario_continuar_devolve_ao_agente():
 
         click(dict(bot_phase, bot_completed=True))
         check(rec["turns"] == [] and rec["marks"] == [], "lead ja fora do bot (Recepcao): sem turno e sem marcar")
+
+        check(rec["sys"] == ["Cliente optou por retomar a solicitacao."]
+              and rec["audit"] == [("WA_REOPEN_RESPONSE", f"conv={CONV_ID} -> retomar (cliente)")],
+              "reabertura: mensagem de sistema e auditoria de sempre")
+
+        # Emenda de 19/11 ao ADR 0015: botao Continuar conversa do ultimo lembrete.
+        click(bot_phase, button="lembrete_continuar", origin="lembrete")
+        check(len(rec["turns"]) == 1 and rec["queued"] == [(1, {"origem": "retomada_lote"})] and rec["marks"] == [],
+              "lembrete Continuar conversa: a Val retoma pelo mesmo caminho")
+        check(rec["sys"] == ["Cliente optou por continuar a conversa pelo lembrete automatico."]
+              and rec["audit"] == [("BOT_REMINDER_RESPONSE", "contact_id=1 canal=6 -> retomar (cliente)")],
+              "lembrete: mensagem de sistema propria; auditoria sem o conversation_id (telefone)")
+        check(response_writes()[0][2].get("reopen_response_origin") == "lembrete", "thread registra a origem do toque")
+
+        # Encerrar conversa do lembrete (revisao de 19/11): fecha sem abrir ciclo
+        # novo quando o lead ainda esta com a Val; com a equipe, fechamento normal.
+        _closes = []
+
+        async def _fake_close(contact, conv, channel, user, status):
+            _closes.append(((contact or {}).get("id"), status, user))
+
+        _real_close = main._close_daily_and_send_protocol
+        main._close_daily_and_send_protocol = _fake_close
+        try:
+            click(bot_phase, button="lembrete_encerrar", origin="lembrete")
+            check(rec["status"] == [(CONV_ID, "fechado_cliente")]
+                  and rec["status_kw"] == [{"clear_takeover": True, "keep_bot_cycle": True}],
+                  "lembrete Encerrar com o lead na Val: fecha com keep_bot_cycle")
+            check(rec["turns"] == [] and _closes == [(1, "fechado_cliente", None)],
+                  "sem turno da Val; protocolo pelo caminho do fechamento")
+            check(len([d for d in rec["docs"] if d[0] == "wa_contacts" and d[2].get("reopen_opt_out") is True]) == 1,
+                  "opt-out da reabertura carimbado no contato")
+            _resp = response_writes()
+            check(len(_resp) == 1 and _resp[0][2]["reopen_response"] == "encerrar"
+                  and _resp[0][2].get("client_requested_close") is True
+                  and _resp[0][2].get("reopen_response_origin") == "lembrete",
+                  "thread: escolha, trava da reabertura e origem do toque")
+            check(rec["sys"] == ["Cliente encerrou a conversa pelo botao do lembrete automatico."]
+                  and rec["audit"] == [("BOT_REMINDER_RESPONSE", "contact_id=1 canal=6 -> encerrar (cliente)")],
+                  "lembrete Encerrar: mensagem de sistema propria e auditoria sem telefone")
+            click(dict(bot_phase, bot_completed=True), button="lembrete_encerrar", origin="lembrete")
+            check(rec["status_kw"] == [{"clear_takeover": True, "keep_bot_cycle": False}],
+                  "lembrete Encerrar com o lead ja na equipe: fechamento normal (devolve ao assistente)")
+            click(bot_phase, button="Encerrar")
+            check(rec["status_kw"] == [{"clear_takeover": True, "keep_bot_cycle": False}]
+                  and rec["sys"] == ["Cliente encerrou o chamado pelo botao de reabertura."]
+                  and rec["audit"] == [("WA_REOPEN_RESPONSE", f"conv={CONV_ID} -> encerrar (cliente)")]
+                  and response_writes()[0][2].get("reopen_response_origin") == "reabertura",
+                  "template de reabertura: fechamento, mensagem e auditoria de sempre")
+        finally:
+            main._close_daily_and_send_protocol = _real_close
 
         click(bot_phase, cx=False)
         check(rec["turns"] == [] and rec["marks"] == [1] and rec["discarded"] == [],
@@ -1393,6 +1497,30 @@ def cenario_continuar_devolve_ao_agente():
               "leitura das threads falhou: cai na thread do clique")
         click(recepcao, conv={"handoff_at": _old}, threads=[])
         check(len(handoff_writes()) == 1, "lista vazia: cai na thread do clique")
+        # 2a rodada da revisao: a falha de leitura no helper loga com a tag do
+        # lembrete e so o tipo da excecao; a reabertura segue com a linha de sempre.
+        import logging as _logging
+        _lines = []
+
+        class _Grab(_logging.Handler):
+            def emit(self, record):
+                _lines.append(record.getMessage())
+
+        _grab = _Grab()
+        _wh_logger = _logging.getLogger("castro_crm.webhook")
+        _wh_logger.addHandler(_grab)
+        try:
+            click(recepcao, conv={"handoff_at": _old}, threads_boom=True, button="lembrete_continuar", origin="lembrete")
+            _r = [line for line in _lines if "leitura das threads" in line]
+            check(len(_r) == 1 and _r[0].startswith("[REMINDER BTN]") and "RuntimeError" in _r[0]
+                  and "fora do ar" not in _r[0], "lembrete: falha de leitura logada com a tag propria e so o tipo")
+            _lines.clear()
+            click(recepcao, conv={"handoff_at": _old}, threads_boom=True)
+            _r = [line for line in _lines if "leitura das threads" in line]
+            check(len(_r) == 1 and _r[0] == "[REOPEN BTN] leitura das threads do contato falhou contato=1: Firestore fora do ar",
+                  "reabertura: linha de log identica a de antes")
+        finally:
+            _wh_logger.removeHandler(_grab)
 
         # Achado 1: D4 so para mensagem posterior ao clique de Encerrar.
         check(wh._reopen_message_after_opt_out((_now + timedelta(seconds=1)).isoformat(), _now.isoformat())

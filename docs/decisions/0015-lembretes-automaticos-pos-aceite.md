@@ -59,3 +59,47 @@ pós-aceite descrita acima passa a se chamar série B.
 
 Simulador: 175 verificações (inclui a série A: carimbo, agenda, gate, claim, envio com botões, toque no gate real,
 worker, uso mensal e API).
+
+## Emenda — 2026-11-19: sem rodapé de parada; último lembrete com botões
+
+Decisão da clínica, repassada pelo PO: nenhum lembrete leva mais o rodapé "Para desativar os lembretes, envie PARAR
+LEMBRETES.". O último lembrete da série B (fechamento, 23h40 depois da última mensagem do lead) passa a sair como
+mensagem interativa com os botões **Continuar conversa** (`lembrete_continuar`) e **Encerrar conversa**
+(`lembrete_encerrar`), e os textos da série B aceitam `[Nome]` ou `{Nome}` nas três etapas: primeiro nome do perfil
+do WhatsApp (`whatsapp_profile_name`; se não tiver letra, o nome declarado), a mesma prioridade do recibo de protocolo.
+Sem nome, o token sai sem deixar pontuação solta: "Olá, [Nome]!" e "Olá [Nome]!" viram "Olá!", e o vocativo que abre a
+frase sai com a pontuação dele ("[Nome], tudo bem?" vira "Tudo bem?"). Se o nome fizer o último lembrete passar de
+1.024 caracteres (limite da mensagem com botões), ele sai sem o nome. Etapas 1 e 2 da série B seguem como texto simples.
+
+- Os toques valem como o Continuar/Encerrar da reabertura (`webhook._handle_reopen_button`, `origin="lembrete"`):
+  Continuar devolve o lead à Val com o turno sintético de retomada (`origem=retomada_lote`; se a Val não responder,
+  o lead vai para a equipe); Encerrar fecha o atendimento como `fechado_cliente`, envia o recibo de protocolo e grava
+  `reopen_opt_out` (a conversa não é reaberta, nem em lote nem pela equipe, até o paciente mandar mensagem nova, D4).
+  O toque nunca vira texto para a Val; reentrega da Meta (`was_dup`) não reprocessa.
+- Diferenças da origem lembrete (revisão de 19/11): mensagem de sistema própria; auditoria `BOT_REMINDER_RESPONSE`
+  com `contact_id` (o `conversation_id` embute o telefone); logs com a tag `[REMINDER BTN]`, sem o `conversation_id`
+  e só com o tipo da exceção (as linhas `[REOPEN BTN]` medem o lote); `reopen_response_origin` na thread; e o
+  Encerrar de lead ainda na fase de bot fecha com `keep_bot_cycle` — sem "Atendimento devolvido ao assistente
+  virtual." e sem zerar `bot_outcome`/`bot_released_at`, que a proteção P5 do público Bot da reabertura lê (o lead
+  nunca saiu da Val). Lead já com a equipe fecha como sempre.
+- Follow-up: toque em botão interativo (`interactive_reply`, inclusive `lembrete_*`) não conta como resposta do
+  paciente.
+- Série A não muda: os três lembretes seguem com os botões Sim/Não do aviso, agora sem rodapé, e sem nome — o
+  salvamento pela API e a tela recusam `[Nome]`/`{Nome}` nos textos da série A (o paciente ainda não aceitou a
+  política). No envio, um token gravado antes dessa trava é retirado (nunca vira nome), sem parar os lembretes do tenant.
+- `PARAR LEMBRETES` / `ATIVAR LEMBRETES` continuam funcionando, só não são anunciados.
+- Implantar antes de gravar o texto novo: a revisão anterior enviaria `[Nome]` literal e o rodapé.
+- **Rollback para revisão anterior a esta só depois de tirar `[Nome]` dos textos da série B** (na tela) e deixar o
+  3º texto legível sem botões: a revisão antiga envia `[Nome]` literal com o rodapé e o último lembrete como texto
+  simples. Toques em botões de lembretes já entregues chegam à Val como texto (`lembrete_continuar` /
+  `lembrete_encerrar`): sem fechamento, protocolo ou opt-out até voltar a esta revisão.
+
+Ficam como estão, iguais aos botões do template de reabertura (pontos para o PO, não defeitos desta mudança): o toque
+vale pelo estado ATUAL do lead (um Encerrar tocado dias depois fecha o atendimento em curso); Continuar depois de
+Encerrar não desfaz o `reopen_opt_out` (só mensagem nova desfaz); o turno sintético do Continuar não passa pelo
+buffer; um turno da Val já em andamento quando o paciente toca Encerrar não é descartado; e o toque, como qualquer
+mensagem nova, desfaz a recusa comercial (emenda de 13/11 ao ADR 0009).
+
+Simuladores: `sim_bot_reminders.py` (231), `sim_buffer_flow.py` (122, roteamento do toque), `sim_reception_flow.py`
+(370, Continuar e Encerrar pelo lembrete, `keep_bot_cycle` até o fechamento real, log do helper) e
+`sim_followup_flow.py` (82). Duas rodadas de revisão adversarial (19/11) antes do deploy.

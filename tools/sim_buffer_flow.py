@@ -1539,6 +1539,37 @@ async def scenario_lgpd_buttons_after_consent():
         wh.record_lgpd_refusal_outside_bot = real
 
 
+async def scenario_reminder_closing_buttons():
+    title("24. Botoes do ultimo lembrete automatico (emenda de 19/11 ao ADR 0015)")
+    calls = []
+    saved_btn = wh._handle_reopen_button
+
+    async def _capture(**kwargs):
+        calls.append(kwargs)
+
+    wh._handle_reopen_button = _capture
+    try:
+        _reset(consented=True)
+        await _deliver([_interactive("rl1", "lembrete_encerrar")])
+        check(len(calls) == 1 and calls[0]["origin"] == "lembrete"
+              and calls[0]["button"] == {"payload": "lembrete_encerrar"},
+              "Encerrar conversa: tratamento do Encerrar da reabertura, origem lembrete")
+        check(not CX_CALLS and not BUFFERS and not SENT, "o toque nao vira texto para a Val nem entra no buffer")
+        await _deliver([_interactive("rl1", "lembrete_encerrar")])
+        check(len(calls) == 1, "reentrega da Meta (mesmo wamid) nao reprocessa")
+        await _deliver([_interactive("rl2", "lembrete_continuar")])
+        check(len(calls) == 2 and calls[1]["button"] == {"payload": "lembrete_continuar"} and not CX_CALLS,
+              "Continuar conversa: mesmo caminho; o turno da Val fica com o handler")
+        check(wh._reopen_action_from_choice("lembrete_continuar") == "retomar"
+              and wh._reopen_action_from_choice("lembrete_encerrar") == "encerrar",
+              "ids do lembrete viram retomar/encerrar")
+        _reset(consented=True)
+        await _deliver([_interactive("rl3", "acao_interativa")])
+        check(len(calls) == 2 and CX_CALLS == ["acao_interativa"], "outra interativa segue para a Val como antes")
+    finally:
+        wh._handle_reopen_button = saved_btn
+
+
 def scenario_lgpd_by_agent():
     print("\n=== lgpd_by_agent: agente trata a LGPD, buffer arma sem aceite no CRM (Hugo, 2026-10-23) ===")
     check(wh._bot_buffer_consent_resolved(9901, {"id": 9901}) is False,
@@ -1575,6 +1606,7 @@ async def main():
     await scenario_reopen_opt_out_reset()
     await scenario_cron_reply_channel()
     await scenario_lgpd_buttons_after_consent()
+    await scenario_reminder_closing_buttons()
     scenario_transaction_contracts()
     print("\n" + "=" * 72)
     if FAILS:

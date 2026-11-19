@@ -41,7 +41,7 @@ def _save(transaction, ref, body):
     # Geracao e exclusiva do servidor, mesmo com body forjado.
     supplied = {key: value for key, value in supplied.items() if key in KEYS and key != "bot_reminder_generation"}
     try:
-        cfg = clean_settings(supplied, current)
+        cfg = clean_settings(supplied, current, strict=True)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
     if cfg["bot_reminder_enabled"] != current["bot_reminder_enabled"] or not cfg["bot_reminder_generation"]:

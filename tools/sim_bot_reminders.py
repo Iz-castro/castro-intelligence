@@ -235,7 +235,8 @@ def sender():
         check(bot_sender.send_bot_reminder(contact, thread, channel, "texto", "etapa_1")["ok"], "envia")
         check(not writes[0]["advance_recency"] and not writes[0]["reopen_attendance"], "preserva recencia e fechamento")
         check(writes[0]["sender_user_id"] is None and not writes[0]["human_outbound"], "nao simula humano")
-        check(writes[0]["automation_kind"] == "bot_reminder" and "PARAR LEMBRETES" in writes[0]["content"], "marcador e comando")
+        check(writes[0]["automation_kind"] == "bot_reminder" and writes[0]["content"] == "texto",
+              "marcador; sem rodape de PARAR LEMBRETES (emenda de 19/11)")
         Client.code = 131047
         check(bot_sender.send_bot_reminder(contact, thread, channel, "texto", "etapa_1")["code"] == 131047, "erro de janela")
         check(len(writes) == 1, "falha nao grava doc failed")
@@ -531,10 +532,10 @@ def sender_serie_a():
     interactive = posted[0].get("interactive") or {}
     ids = [b["reply"]["id"] for b in interactive.get("action", {}).get("buttons", [])]
     check(posted[0]["type"] == "interactive" and ids == ["lgpd_aceitar", "lgpd_recusar"], "serie A sai com os botoes do aviso")
-    check(interactive["body"]["text"] == "Podemos continuar?" and "PARAR LEMBRETES" in interactive["footer"]["text"],
-          "corpo e o texto da clinica; parada no rodape")
-    check(len(interactive["footer"]["text"]) <= 60, "rodape dentro do limite da Meta")
-    check(writes[0]["automation_series"] == "A" and "PARAR LEMBRETES" in writes[0]["content"], "serie gravada e rodape visivel no CRM")
+    check(interactive["body"]["text"] == "Podemos continuar?" and "footer" not in interactive,
+          "corpo e o texto da clinica; sem rodape de parada (emenda de 19/11)")
+    check(writes[0]["automation_series"] == "A" and writes[0]["content"] == "Podemos continuar?",
+          "serie gravada; o CRM mostra o mesmo corpo")
     check(not writes[0]["advance_recency"] and writes[0]["sender_user_id"] is None, "serie A tambem nao simula humano")
     check(posted[1]["type"] == "text" and writes[1]["automation_series"] == "B", "serie B continua texto simples")
     # O toque nos botoes do lembrete entra no gate LGPD que ja existe.
@@ -544,6 +545,87 @@ def sender_serie_a():
     st = {"lgpd_status": "awaiting"}
     lgpd_bot.handle_lgpd(st, ids[1])
     check(st.get("lgpd_consent") is False, "toque em Nao do lembrete registra a recusa")
+
+
+def sender_fechamento():
+    """Emenda de 19/11: ultimo lembrete da serie B com [Nome] e Continuar/Encerrar."""
+    thread, contact, _, _, _, cfg, channel = fixture()
+    posted, writes = [], []
+    class Client:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def post(self, url, json=None, headers=None):
+            posted.append(json)
+            return type("Response", (), {"status_code": 200, "json": lambda s: {"messages": [{"id": "local_f"}]}})()
+    texto = ("Olá, [Nome]! Talvez agora não seja o melhor momento para seguir com o atendimento. "
+             "Como você prefere seguir?")
+    named = dict(contact, whatsapp_profile_name="maria clara")
+    with patch.object(bot_sender.httpx, "Client", Client), patch.object(db, "save_wa_message", lambda *a, **kw: writes.append(kw)):
+        check(bot_sender.send_bot_reminder(named, thread, channel, texto, "fechamento")["ok"], "ultimo lembrete envia")
+        check(bot_sender.send_bot_reminder(named, thread, channel, "Oi [nome], podemos seguir?", "etapa_1")["ok"], "etapa 1 envia")
+        check(bot_sender.send_bot_reminder(contact, thread, channel, texto, "fechamento")["ok"], "sem nome envia")
+        check(bot_sender.send_bot_reminder(named, thread, channel, "aviso 3", "fechamento", series="A")["ok"], "serie A envia")
+    inter = posted[0].get("interactive") or {}
+    buttons = [b["reply"] for b in inter.get("action", {}).get("buttons", [])]
+    check(posted[0]["type"] == "interactive" and [b["id"] for b in buttons] == ["lembrete_continuar", "lembrete_encerrar"],
+          "ultimo lembrete da serie B sai com Continuar/Encerrar")
+    check([b["title"] for b in buttons] == ["Continuar conversa", "Encerrar conversa"]
+          and all(len(b["title"]) <= 20 for b in buttons), "rotulos pedidos, dentro do limite da Meta")
+    check(inter["body"]["text"].startswith("Olá, Maria! Talvez") and "footer" not in inter, "primeiro nome no corpo, sem rodape")
+    check(writes[0]["content"] == inter["body"]["text"] and writes[0]["automation_stage"] == "fechamento"
+          and writes[0]["automation_series"] == "B" and not writes[0]["advance_recency"], "CRM grava o corpo; segue sem recencia")
+    check(posted[1]["type"] == "text" and posted[1]["text"]["body"] == "Oi Maria, podemos seguir?",
+          "etapas 1 e 2: texto simples, [Nome] tambem vale")
+    check(posted[2]["interactive"]["body"]["text"].startswith("Olá! Talvez"), "sem nome: o trecho com [Nome] sai com a virgula")
+    ids_a = [b["reply"]["id"] for b in posted[3]["interactive"]["action"]["buttons"]]
+    check(ids_a == ["lgpd_aceitar", "lgpd_recusar"] and posted[3]["interactive"]["body"]["text"] == "aviso 3",
+          "serie A: ultimo lembrete segue com Sim/Nao do aviso")
+    for value, expected in (({"whatsapp_profile_name": "\U0001F338 MARIA silva"}, "Maria"),
+                            ({"whatsapp_profile_name": "\U0001F338", "declared_name": "ana"}, "Ana"),
+                            ({"display_name": "João Pedro"}, "João"), ({}, ""), (None, "")):
+        check(br.first_name(value) == expected, "primeiro nome: %r" % (value,))
+    check(br.fill_name("[Nome], tudo bem?", {}) == "Tudo bem?", "sem nome: vocativo no inicio sai com a virgula e a frase ganha maiuscula")
+    check(br.fill_name("Olá, [ NOME ]!", {"declared_name": "Ana"}) == "Olá, Ana!", "token tolerante a caixa e espacos")
+    # Sem nome, nenhuma pontuacao solta e nenhuma quebra de linha engolida (revisao de 19/11).
+    for raw, expected in (("Olá [Nome]!", "Olá!"), ("Oi [Nome].", "Oi."), ("Tudo bem [Nome]? Podemos seguir?", "Tudo bem? Podemos seguir?"),
+                          ("[Nome]! Tudo bem?", "Tudo bem?"), ("Oi, *[Nome]*!", "Oi!"), ("Oi _[Nome]_!", "Oi!"),
+                          ("*Olá [Nome]*", "*Olá*"), ("Olá [Nome]\nComo vai?", "Olá\nComo vai?"),
+                          ("Olá, [Nome]!\n\nTalvez agora", "Olá!\n\nTalvez agora"), ("Olá [Nome], tudo bem?", "Olá, tudo bem?"),
+                          ("Aqui [Nome] para ajudar", "Aqui para ajudar"), ("Linha 1,\n[Nome] podemos", "Linha 1,\nPodemos"),
+                          # 2a rodada: vocativo no meio da linha, ? e reticencias, NBSP, pontuacao dentro da marca, emoji.
+                          ("Olá! [Nome], tudo bem?", "Olá! Tudo bem?"), ("Tudo bem? [Nome], podemos continuar?", "Tudo bem? Podemos continuar?"),
+                          ("Olá! Aqui é a Val. [Nome], ainda deseja agendar?", "Olá! Aqui é a Val. Ainda deseja agendar?"),
+                          ("[Nome]? Você ainda está aí?", "Você ainda está aí?"), ("Oi.\n\n[Nome]? Ainda por aí?", "Oi.\n\nAinda por aí?"),
+                          ("[Nome]\u2026 tudo bem?", "Tudo bem?"), ("Olá,\u00a0[Nome]!", "Olá!"), ("Oi\u202f[Nome]!", "Oi!"),
+                          ("Olá, *[Nome]!*", "Olá!"), ("Oi *[Nome],* tudo bem?", "Oi, tudo bem?"), ("Olá, *_[Nome]_*!", "Olá!"),
+                          ("_[Nome],_ tudo bem?", "Tudo bem?"), ("\U0001F60A [Nome], tudo bem?", "\U0001F60A Tudo bem?"),
+                          ("[Nome], passando para saber", "Passando para saber"), ("Olá, [Nome] tudo bem?", "Olá, tudo bem?"),
+                          ("Olá, {Nome}! Talvez", "Olá! Talvez"), ("{nome}, tudo bem?", "Tudo bem?"), ("Sem token aqui. ", "Sem token aqui.")):
+        check(br.fill_name(raw, {}) == expected, "sem nome: %r -> %r" % (raw, br.fill_name(raw, {})))
+    check(br.fill_name("Olá, {Nome}! Como vai, [nome]?", {"whatsapp_profile_name": "Ana"}) == "Olá, Ana! Como vai, Ana?",
+          "{Nome} e [Nome] valem com nome")
+    long_name = {"declared_name": "Maximilianoaugustoferreira"}
+    big = ("Olá, [Nome]! " + "x" * 960 + " Até logo, [Nome].")[:1000]
+    big_reply = br.reminder_reply("B", "fechamento", big, long_name)
+    check(len(br.fill_name(big, long_name)) > br.INTERACTIVE_BODY_MAX and len(big_reply["body"]) <= br.INTERACTIVE_BODY_MAX
+          and "Maximiliano" not in big_reply["body"] and big_reply["body"].startswith("Olá! "),
+          "ultimo lembrete que passaria de 1024 com o nome sai sem o nome (nada cortado)")
+    a_reply = br.reminder_reply("A", "etapa_1", "Olá, [Nome]! Você aceita o termo?", {"whatsapp_profile_name": "Maria"})
+    check(a_reply["body"] == "Olá! Você aceita o termo?", "serie A: [Nome] gravado antes da trava sai sem nome (nunca o nome antes do aceite)")
+    check(br.fill_name("Oi, *[Nome]*!", {"declared_name": "Ana"}) == "Oi, *Ana*!", "com nome, a formatacao fica")
+    check(not (br.CLOSING_BUTTON_IDS & {"lgpd_aceitar", "lgpd_recusar"}) and br.command("lembrete_encerrar") is None,
+          "ids proprios, fora do gate LGPD e dos comandos")
+    ok = br.clean_settings({"bot_reminder_text_3": texto}, cfg)
+    check(ok["bot_reminder_text_3"] == texto, "serie B aceita [Nome]")
+    for token in ("Olá, [Nome]!", "Olá, {nome}!"):
+        try:
+            br.clean_settings({"bot_reminder_lgpd_text_2": token}, cfg, strict=True)
+            check(False, "serie A com o token deveria ser recusada na API")
+        except ValueError as exc:
+            check("[Nome]" in str(exc), "API (strict) recusa %s na serie A" % token)
+    check(br.clean_settings({"bot_reminder_lgpd_text_2": "Olá, [Nome]!"}, cfg)["bot_reminder_lgpd_text_2"] == "Olá, [Nome]!",
+          "worker (sem strict) nao para os lembretes do tenant por um [Nome] gravado antes")
 
 
 def worker_serie_a():
@@ -596,6 +678,7 @@ def main():
     pipeline()
     serie_a()
     sender_serie_a()
+    sender_fechamento()
     worker_serie_a()
     from bot_reminder_measure import summarize
     report = summarize([{"conversation_id": "private", "direction": "outbound", "msg_type": "text", "timestamp_wa": NOW, "content": "Qual seu nome?"}], NOW)

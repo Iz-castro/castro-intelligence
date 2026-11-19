@@ -290,6 +290,12 @@ def run():
         put("wa_messages", msg_id, {"id": msg_id, "contact_id": 10, "conversation_id": "4__synthetic", "direction": "inbound", "msg_type": "text", "timestamp_wa": NOW[0], "status": "received", **extra})
     check(not service().get_task(task["id"])["task"]["response_received"], "replay antigo e rating nao simulam resposta nova")
     check(not service().get_task(task["id"])["task"]["response_received"], "admin legado, controles LGPD e data futura nao sao resposta")
+    # Emenda de 19/11 ao ADR 0015: toque nos botoes do ultimo lembrete nao e resposta.
+    for msg_id, extra in (("reminder-tap", {"content": "lembrete_encerrar", "interactive_reply": True}),
+                          ("reminder-tap-legacy", {"content": "lembrete_continuar"}),
+                          ("other-tap", {"content": "acao_interativa", "interactive_reply": True})):
+        put("wa_messages", msg_id, {"id": msg_id, "contact_id": 10, "conversation_id": "4__synthetic", "direction": "inbound", "msg_type": "text", "timestamp_wa": NOW[0], "status": "received", **extra})
+    check(not service().get_task(task["id"])["task"]["response_received"], "toque em botao interativo (lembrete ou outro) nao e resposta")
     put("wa_messages", "genuine", {"id": "genuine", "contact_id": 10, "conversation_id": "4__synthetic", "direction": "inbound", "msg_type": "image", "timestamp_wa": NOW[0], "status": "received"})
     DATA[(TENANT, "wa_messages", "genuine")]["status"] = "read"
     check(service().get_task(task["id"])["task"]["response_received"], "ler a mensagem nao apaga sinal de resposta apos ancora")

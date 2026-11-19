@@ -17,9 +17,13 @@ type Settings = {
   bot_reminder_closing_minutes: number;
 };
 type Payload = { settings: Settings; version: string; simulation: boolean };
-const FOOTER = "Para desativar os lembretes, envie PARAR LEMBRETES.";
-// Serie B: depois do aceite da LGPD. Serie A: sem resposta ao aviso da LGPD
-// (sai com os botoes Sim/Nao do aviso). Mesmos horarios nas duas.
+// Serie B: depois do aceite da LGPD (aceita [Nome]; o ultimo sai com os botoes
+// Continuar conversa / Encerrar conversa). Serie A: sem resposta ao aviso da LGPD
+// (sai com os botoes Sim/Nao do aviso, sem nome). Mesmos horarios nas duas.
+// Sem rodape de PARAR LEMBRETES desde 19/11 (o comando segue valendo).
+const NAME_TOKEN = /[[{]\s*nome\s*[\]}]/i; // [Nome] ou {Nome}, como no backend
+const NAME_EXAMPLE = "Maria";
+const CLOSING_BUTTONS = ["Continuar conversa", "Encerrar conversa"];
 const acceptedKeys = ["bot_reminder_text_1", "bot_reminder_text_2", "bot_reminder_text_3"] as const;
 const noticeKeys = ["bot_reminder_lgpd_text_1", "bot_reminder_lgpd_text_2", "bot_reminder_lgpd_text_3"] as const;
 type TextKey = typeof acceptedKeys[number] | typeof noticeKeys[number];
@@ -81,6 +85,8 @@ export function BotRemindersSettings() {
   const timings = draft ? [duration(draft.bot_reminder_minutes_1), duration(draft.bot_reminder_minutes_2), duration(draft.bot_reminder_closing_minutes)] : [];
   const dirty = !!draft && !!loaded && JSON.stringify(draft) !== JSON.stringify(loaded.settings);
   const empty = !!draft?.bot_reminder_enabled && textKeys.every((key) => !draft[key].trim());
+  const nameInNotice = !!draft && noticeKeys.some((key) => NAME_TOKEN.test(draft[key]));
+  const buttons = (labels: string[]) => <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>{labels.map((label) => <span key={label} className="chip">{label}</span>)}</div>;
   const group = (d: Settings, keys: readonly TextKey[], notice: boolean) => keys.map((key, index) => <div className="settings-block" key={key} style={{ marginTop: "1rem" }}>
     <label htmlFor={key} style={{ display: "block", fontWeight: 600 }}>{index === 0 ? "Primeiro" : index === 1 ? "Segundo" : "Último"} lembrete · {timings[index]}</label>
     <p className="sub" style={{ fontSize: "0.8rem" }}>{index < 2 ? (notice ? "Depois do aviso da política de privacidade." : "Depois da resposta do assistente.") : "Depois da última mensagem do cliente, antes de terminar a janela de 24 horas."}</p>
@@ -90,9 +96,9 @@ export function BotRemindersSettings() {
     <p className="sub" style={{ fontSize: "0.75rem" }}>{d[key].length}/1.000 caracteres · Campo vazio desativa esta etapa.</p>
     {d[key].trim() && <details><summary>Ver como fica no WhatsApp</summary><div className="settings-block" style={{ whiteSpace: "pre-wrap", padding: 12 }}>
       {notice
-        ? <><WaText text={d[key]} /><p className="sub" style={{ fontSize: "0.75rem", margin: "0.5rem 0" }}>{FOOTER}</p>
-          <div style={{ display: "flex", gap: 8 }}>{["Sim", "Não"].map((label) => <span key={label} className="chip">{label}</span>)}</div></>
-        : <WaText text={`${d[key]}\n\n${FOOTER}`} />}
+        ? <><WaText text={d[key]} />{buttons(["Sim", "Não"])}</>
+        : <><WaText text={d[key].replace(new RegExp(NAME_TOKEN.source, "gi"), NAME_EXAMPLE)} />{index === 2 && buttons(CLOSING_BUTTONS)}</>}
+      {!notice && NAME_TOKEN.test(d[key]) && <p className="sub" style={{ fontSize: "0.75rem", margin: "0.5rem 0 0" }}>Exemplo com o nome “{NAME_EXAMPLE}”. Sem nome cadastrado, o trecho com [Nome] é retirado.</p>}
     </div></details>}
   </div>);
 
@@ -131,12 +137,12 @@ export function BotRemindersSettings() {
             <span>Ativar lembretes automáticos</span>
           </label>
           <h3 style={{ marginTop: "1.2rem" }}>Depois do aceite da política de privacidade</h3>
-          <p className="sub">O cliente aceitou a política e parou de responder ao assistente.</p>
+          <p className="sub">O cliente aceitou a política e parou de responder ao assistente. Escreva [Nome] onde quiser o primeiro nome do cliente. O último lembrete sai com os botões Continuar conversa e Encerrar conversa: Continuar devolve a conversa ao assistente; Encerrar encerra o atendimento, envia o protocolo e impede reabrir a conversa (em lote ou pela equipe) até o cliente escrever de novo.</p>
           {group(draft, acceptedKeys, false)}
           <h3 style={{ marginTop: "1.6rem" }}>Sem resposta ao aviso da política de privacidade</h3>
-          <p className="sub">O cliente recebeu o aviso e não respondeu. Os lembretes saem com os botões Sim e Não do aviso: um toque em Sim registra o aceite. Quem recusou não recebe. Não use nome nem dados do cliente, porque ele ainda não aceitou a política.</p>
+          <p className="sub">O cliente recebeu o aviso e não respondeu. Os lembretes saem com os botões Sim e Não do aviso: um toque em Sim registra o aceite. Quem recusou não recebe. Não use nome ([Nome]) nem dados do cliente, porque ele ainda não aceitou a política.</p>
           {group(draft, noticeKeys, true)}
-          <p className="sub" style={{ fontSize: "0.8rem", marginTop: "1rem" }}>O sistema acrescenta a cada mensagem: “{FOOTER}” A preferência permanece até o cliente enviar ATIVAR LEMBRETES.</p>
+          <p className="sub" style={{ fontSize: "0.8rem", marginTop: "1rem" }}>As mensagens não trazem instrução de parada. Se o cliente enviar PARAR LEMBRETES, deixa de recebê-los até enviar ATIVAR LEMBRETES.</p>
           <details style={{ margin: "1rem 0" }}><summary>Ajustar intervalos</summary>
             {(["bot_reminder_minutes_1", "bot_reminder_minutes_2"] as const).map((key, index) => <label key={key} style={{ display: "block", marginTop: 12 }}>
               {index === 0 ? "Primeiro" : "Segundo"} lembrete, em minutos após a resposta: <input type="number" min={10} step={1} value={draft[key]} disabled={readOnly || busy} style={{ width: 90 }} onChange={(event) => setDraft({ ...draft, [key]: Number(event.target.value) })} />
@@ -145,9 +151,10 @@ export function BotRemindersSettings() {
             <p className="sub">Mínimo de 10 minutos para o primeiro e 60 minutos entre as etapas. O último precisa de pelo menos 15 minutos de antecedência. Os intervalos valem para as duas situações.</p>
           </details>
           {empty && <p role="alert">Preencha pelo menos uma mensagem antes de ativar.</p>}
+          {nameInNotice && <p role="alert">Retire o [Nome] dos lembretes do aviso de privacidade: o cliente ainda não aceitou a política.</p>}
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 20 }}>
             <button type="button" className="ghost" onClick={close} disabled={busy}>Cancelar</button>
-            <button type="button" className="primary" onClick={save} disabled={readOnly || busy || !dirty || empty} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "Salvando…" : "Salvar lembretes"}</button>
+            <button type="button" className="primary" onClick={save} disabled={readOnly || busy || !dirty || empty || nameInNotice} title={readOnly ? READ_ONLY_TOOLTIP : undefined}>{busy ? "Salvando…" : "Salvar lembretes"}</button>
           </div>
         </>}
       </div>

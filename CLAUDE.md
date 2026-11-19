@@ -33,17 +33,17 @@ Não há suíte de testes automatizada versionada (sem pytest/tox/conftest). Os 
   nomes com ponto recusados, mime/extensao e pool do GCS; sem rede externa).
 - **Lógica do bot:** `.venv\Scripts\python.exe tools\sim_bot_flow.py` (mocka Firestore + WhatsApp
   API, exercita o código real, 85 asserts, exit 0/1). CX: `tools\sim_cx_flow.py` (334).
-  Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (350).
-  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4) + canal da resposta no flush do cron (roda o cron real, extraído do `main.py` por AST) + botões do aviso da LGPD depois do aceite (registro da recusa fora da fase de bot e ordem com a rajada): `tools\sim_buffer_flow.py` (116).
+  Modo Recepção (pool compartilhada) + reabertura em lote por público + gates de origem do transfer/takeover + Continuar devolve ao agente (inclusive pelo lembrete) + Encerrar do lembrete (`keep_bot_cycle`) + clique duplo + renovação de `handoff_at`: `tools\sim_reception_flow.py` (370).
+  Buffer/debounce do webhook + reset do opt-out por mensagem nova (D4) + canal da resposta no flush do cron (roda o cron real, extraído do `main.py` por AST) + botões do aviso da LGPD depois do aceite (registro da recusa fora da fase de bot e ordem com a rajada) + toque nos botões do último lembrete: `tools\sim_buffer_flow.py` (122).
   Aviso de espera na pool (cron 5 min): `tools\sim_pool_wait_notice.py` (48).
-  Lembretes (series A e B: classificacao, agenda, transacao, comandos, API e envio): `tools\sim_bot_reminders.py` (175).
+  Lembretes (series A e B: classificacao, agenda, transacao, comandos, API, envio, [Nome] e botoes do ultimo): `tools\sim_bot_reminders.py` (231).
   Monitor de atendimento (fila, metricas, origem, auditoria): `tools\sim_monitor_flow.py` (73).
   History sync/eco do coex (recência real, janela de 24h, dono da thread, idempotência por bloco): `tools\sim_history_recency.py` (62).
   Ver como (UID temporario, registro/end/cleanup, trava de escrita, TTL e auditoria):
   `tools\sim_impersonate.py`. Janelas HTTP/polling, backup e IDOR:
   `tools\sim_impersonate_views.py`. Auth/Firestore Emulators locais: `tools/impersonate_emulators/README.md`
   (rules combinadas com o follow-up: 861 verificacoes em 2026-10-18).
-  Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (81),
+  Follow-up (tarefas, API/RBAC, preferencia comercial, produtores de envio): `tools\sim_followup_flow.py` (82),
   `tools\sim_followup_api.py` (56), `tools\sim_commercial_contact_policy.py` (55), `tools\sim_followup_send_guards.py`;
   na raiz, `node tools\sim_followup_frontend.mjs` (19) e `node tools\sim_followup_lifecycle.mjs` (25).
   Guias de conversa (limite por uso, rascunho+modo por guia, storage por uid + restauracao sem abrir, auto-fechamento so com dado do servidor, Ctrl+Alt+Seta, Sair apaga rascunho, Ver como/polling sem guias): na raiz, `node tools\sim_chat_tabs.mjs` (174).
@@ -197,8 +197,9 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   comercial (`wa_contacts.commercial_contact_block`) barra template comercial, reabertura pontual, o scan
   v2 do lote (`scan_reopen_audiences`), o worker (pulo contado em `pulados_recusa_comercial`) e o script
   one-off; **se desfaz quando o paciente manda mensagem nova** (decisao do PO, mesmo D4 do Encerrar),
-  no `save_wa_message`, so para inbound recebido posterior ao registro (clique, reacao e historico nao
-  contam). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
+  no `save_wa_message`, so para inbound recebido posterior ao registro (clique de avaliacao valido, reacao
+  e historico nao contam; toque em botao — template, aviso da LGPD, lembrete — conta como mensagem nova,
+  como aceito na emenda de 13/11 ao ADR 0009). `scripts/send_template_bulk.py` fica sem envio (campanha encerrada; nao respeitava o teto de
   250/dia). Tarefas e historico (`crm_tasks`, `crm_activities`) sao so do backend nas rules.
 - **Encaminhar/fixar (ADR 0016, 2026-11-13):** origem ESTRITA (thread que atendo ou pool, sem o atalho do
   Dono do Lead) e destino **nunca** pelo coex de outra pessoa (`_require_forward_destination_channel`). Template,
@@ -257,7 +258,13 @@ Três pegadinhas que **já quebraram** deploy — não esqueça nenhuma:
   por tenant e toggle proprio na UI. Apenas CX com LGPD local: serie B (aceite resolvido) e serie A (emenda 11/11:
   parado no aviso, `lgpd_status=awaiting`; sai com os botoes Sim/Nao do aviso; textos `bot_reminder_lgpd_text_*`;
   recusa nunca recebe). Mesmos horarios nas duas; `bot_reminder_series` na thread. Tres etapas, classificacao textual, sem link
-  atual e sem cortesia; mensagem nova encerra ciclo. `PARAR LEMBRETES` persiste ate `ATIVAR LEMBRETES`.
+  atual e sem cortesia; mensagem nova encerra ciclo. `PARAR LEMBRETES` persiste ate `ATIVAR LEMBRETES` (sem rodape
+  anunciando desde 19/11). Serie B aceita `[Nome]`/`{Nome}` (perfil do WhatsApp) nas tres etapas; o ultimo
+  sai com botoes Continuar conversa/Encerrar conversa, tratados como o Continuar/Encerrar da reabertura
+  (`_handle_reopen_button`, `origin="lembrete"`; Encerrar de lead ainda na Val fecha com `keep_bot_cycle`, sem zerar
+  o desfecho da Val); serie A recusa `[Nome]`. **Rollback para revisao anterior a de 19/11 so depois de tirar `[Nome]`
+  da serie B** (a antiga manda `[Nome]` literal + rodape e o ultimo sem botoes; toque em `lembrete_*` ja entregue vira
+  texto para a Val).
   Claim transacional antes do POST, sem retry incerto; envio nao sobe recencia, nao reabre nem simula humano.
   API `/api/settings/bot-reminders` com RBAC/versao; generic PUT e upload de som preservam configuracao.
   Mudanca de modo/religamento invalida agenda antiga. Nenhum contador do lote e alterado; uso mensal por etapa.

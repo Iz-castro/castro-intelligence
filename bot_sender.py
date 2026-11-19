@@ -57,27 +57,18 @@ async def send_bot_reply(
     return False
 
 
-REMINDER_FOOTER = "Para desativar os lembretes, envie PARAR LEMBRETES."
-
-
 def send_bot_reminder(contact, thread, channel, text, stage, series="B"):
     """POST sem retry. Chamado somente no worker fora do event loop.
 
-    Serie A (lead parado no aviso da LGPD) sai com os botoes do proprio aviso,
-    mesmos ids, para o toque entrar no gate que ja existe; a instrucao de
-    parada vai no rodape da mensagem interativa. Serie B sai como texto simples.
+    Formato em bot_reminders.reminder_reply: serie A com os botoes do aviso da
+    LGPD (mesmos ids, o toque entra no gate que ja existe); serie B em texto
+    com [Nome], e o ultimo lembrete com Continuar conversa / Encerrar conversa.
+    Sem rodape de PARAR LEMBRETES desde 19/11 (o comando segue valendo).
     """
     from database_firestore import save_wa_message
-    if series == "A":
-        from lgpd_bot import _BTN_ACEITAR, _BTN_RECUSAR
-        reply = {"type": "interactive_buttons", "body": text, "footer": REMINDER_FOOTER,
-                 "buttons": [dict(_BTN_ACEITAR), dict(_BTN_RECUSAR)]}
-    else:
-        reply = text + "\n\n" + REMINDER_FOOTER
-    payload, content = build_outbound_payload(reply, str(thread["wa_id"]))
-    if series == "A":
-        # O chat do CRM mostra o rodape como na serie B (o corpo gravado e so o body).
-        content = content + "\n\n" + REMINDER_FOOTER
+    from bot_reminders import reminder_reply
+    payload, content = build_outbound_payload(reminder_reply(series, stage, text, contact),
+                                              str(thread["wa_id"]))
     try:
         with httpx.Client(timeout=15.0) as client:
             response = client.post(f"{GRAPH_API_BASE}/{channel['phone_number_id']}/messages", json=payload,

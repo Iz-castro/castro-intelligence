@@ -57,6 +57,115 @@ def command(text):
     return {"parar lembretes": "stop", "ativar lembretes": "start"}.get(normalize(text))
 
 
+# Emenda de 19/11 ao ADR 0015: nenhum lembrete leva rodape de PARAR LEMBRETES (o
+# comando segue valendo, sem anuncio); o ultimo da serie B sai com dois botoes e
+# pode usar [Nome]. Os toques tem o mesmo efeito do Continuar/Encerrar da
+# reabertura (webhook._handle_reopen_button, origem "lembrete").
+CLOSING_BUTTONS = ({"id": "lembrete_continuar", "title": "Continuar conversa"},
+                   {"id": "lembrete_encerrar", "title": "Encerrar conversa"})
+CLOSING_BUTTON_IDS = frozenset(button["id"] for button in CLOSING_BUTTONS)
+# [Nome] ou {Nome} (a clinica pode digitar de um jeito ou de outro), sem caixa.
+_TOKEN = r"[\[{]\s*nome\s*[\]}]"
+NAME_TOKEN = re.compile(_TOKEN, re.IGNORECASE)
+INTERACTIVE_BODY_MAX = 1024  # limite da Meta para o corpo da mensagem com botoes
+_HSPACE = r"[^\S\r\n]"  # espaco sem quebra de linha (inclui NBSP e U+202F)
+_PUNCT = r"[,!.;:?…]"
+# Sem nome, a marca do WhatsApp que envolve o token sai; a pontuacao de dentro fica
+# do lado de fora: "*[Nome]!*" -> "[Nome]!".
+_UNWRAP = re.compile(r"(?P<mk>[*_~])(?P<tok>" + _TOKEN + r")(?P<p>" + _PUNCT + r"*)(?P=mk)", re.IGNORECASE)
+_NO_NAME = re.compile(r"(?P<comma>" + _HSPACE + r"*," + _HSPACE + r"*)?" + _TOKEN + r"(?P<sp>" + _HSPACE
+                      + r"*)(?P<p>" + _PUNCT + r"*)(?P<sp2>" + _HSPACE + r"*)", re.IGNORECASE)
+
+
+def first_name(contact):
+    """Primeiro nome legivel, na prioridade do recibo de protocolo; vazio sem nome.
+
+    Palavra sem letra (emoji, numero) e ignorada; nome todo minusculo ou todo
+    maiusculo ganha so a inicial maiuscula."""
+    for key in ("whatsapp_profile_name", "declared_name", "display_name"):
+        for word in str((contact or {}).get(key) or "").split():
+            word = re.sub(r"^[\W_]+|[\W_]+$", "", word)
+            if any(char.isalpha() for char in word):
+                return word.capitalize() if word.islower() or word.isupper() else word
+    return ""
+
+
+def _rstrip_hspace(text):
+    return re.sub(_HSPACE + r"+$", "", text)
+
+
+def _drop_name(text):
+    """Tira [Nome] sem deixar pontuacao solta (paciente sem nome utilizavel).
+
+    - Depois de virgula: "Ola, [Nome]!" -> "Ola!"; "Ola, [Nome] tudo bem?" -> "Ola, tudo bem?".
+    - No meio da frase (letra ou numero antes): "Ola [Nome]!" -> "Ola!";
+      "Ola [Nome], tudo bem?" -> "Ola, tudo bem?"; "aqui [Nome] para" -> "aqui para".
+    - Abrindo a frase (inicio de linha, depois de pontuacao, emoji ou simbolo): o
+      vocativo sai com a pontuacao dele e a letra seguinte vira maiuscula:
+      "[Nome], tudo bem?" -> "Tudo bem?"; "Ola! [Nome]? Ainda ai?" -> "Ola! Ainda ai?".
+    Quebras de linha ficam; espaco inclui NBSP."""
+    for _ in range(3):  # marcas aninhadas: *_[Nome]_*
+        unwrapped = _UNWRAP.sub(lambda m: m.group("tok") + m.group("p"), text)
+        if unwrapped == text:
+            break
+        text = unwrapped
+    out, pos, capitalize = "", 0, False
+    for match in _NO_NAME.finditer(text):
+        chunk = text[pos:match.start()]
+        if capitalize and chunk:
+            chunk = chunk[0].upper() + chunk[1:]
+            capitalize = False
+        out += chunk
+        pos = match.end()
+        nxt = text[pos:pos + 1]
+        ends_here = nxt == "" or nxt in "\r\n*_~"
+        punct = match.group("p")
+        stripped = _rstrip_hspace(out)
+        if match.group("comma") is not None:
+            out = stripped + (punct + match.group("sp2") if punct else ("" if ends_here else ", "))
+        elif stripped[-1:].isalnum():
+            out = stripped + (punct + match.group("sp2") if punct else ("" if ends_here else " "))
+        else:
+            out = stripped if ends_here else out
+            capitalize = True
+    rest = text[pos:]
+    if capitalize and rest:
+        rest = rest[0].upper() + rest[1:]
+    return (out + rest).strip()
+
+
+def fill_name(text, contact):
+    """[Nome] (ou {Nome}) vira o primeiro nome; sem nome, sai sem deixar
+    pontuacao solta (_drop_name)."""
+    text = str(text or "")
+    name = first_name(contact)
+    if name:
+        return NAME_TOKEN.sub(lambda _match: name, text)
+    return _drop_name(text) if NAME_TOKEN.search(text) else text.strip()
+
+
+def reminder_reply(series, stage, text, contact):
+    """Mensagem abstrata (texto ou interactive_buttons) para build_outbound_payload.
+
+    Serie A sai com os botoes do proprio aviso da LGPD, sem nome (o paciente
+    ainda nao aceitou a politica). Serie B e texto simples com [Nome]; o ultimo
+    lembrete leva Continuar conversa / Encerrar conversa."""
+    if series == "A":
+        from lgpd_bot import _BTN_ACEITAR, _BTN_RECUSAR
+        # Nunca nome antes do aceite: um [Nome] gravado antes da trava da API sai do texto.
+        return {"type": "interactive_buttons", "body": fill_name(text, None),
+                "buttons": [dict(_BTN_ACEITAR), dict(_BTN_RECUSAR)]}
+    body = fill_name(text, contact)
+    if stage == STAGES[-1]:
+        # Texto de ate 1.000 caracteres + nome longo pode passar do limite da
+        # mensagem com botoes: sem o nome, cabe (e nao e cortado no meio).
+        if len(body) > INTERACTIVE_BODY_MAX:
+            body = fill_name(text, None)
+        return {"type": "interactive_buttons", "body": body,
+                "buttons": [dict(button) for button in CLOSING_BUTTONS]}
+    return body
+
+
 def classify_reply(reply, kind="cx_reply", link="marcaconsultas"):
     """Heuristica conservadora compartilhada pelo medidor e pelo turno real."""
     text = str(reply.get("body", "") if isinstance(reply, dict) else reply or "")
@@ -124,7 +233,7 @@ def commands_available():
                 and ai.get("bot_engine") == "dialogflow_cx" and ai.get("lgpd_by_agent") is not True)
 
 
-def clean_settings(values, current=None):
+def clean_settings(values, current=None, strict=False):
     cfg = {**DEFAULTS, **(current or {}), **{k: v for k, v in values.items() if k in KEYS}}
     cfg = {k: cfg[k] for k in KEYS}
     cfg["bot_reminder_enabled"] = cfg["bot_reminder_enabled"] is True
@@ -135,6 +244,11 @@ def clean_settings(values, current=None):
             raise ValueError("Cada lembrete deve ter no máximo 1.000 caracteres.")
         if REOPEN_DESFECHO_LINK and REOPEN_DESFECHO_LINK in cfg[key].lower():
             raise ValueError("O lembrete não pode conter o link de agendamento.")
+        # So no salvamento pela API (strict): no worker, um [Nome] gravado antes da
+        # trava nao para os lembretes do tenant — reminder_reply tira o token da serie A.
+        if strict and key.startswith("bot_reminder_lgpd_text_") and NAME_TOKEN.search(cfg[key]):
+            raise ValueError("Os lembretes do aviso de privacidade não podem usar [Nome]: "
+                             "o cliente ainda não aceitou a política.")
     times = []
     for key in ("bot_reminder_minutes_1", "bot_reminder_minutes_2", "bot_reminder_closing_minutes"):
         val = cfg[key]

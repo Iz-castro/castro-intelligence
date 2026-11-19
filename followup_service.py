@@ -631,7 +631,9 @@ class FollowupService:
             if row.get("direction") != "inbound" or row.get("is_backup") or row.get("is_rating_message") or row.get("admin_only"):
                 continue
             # IDs de controle existentes sao normalizados para text pelo webhook.
-            if row.get("msg_type") == "text" and str(row.get("content") or "").strip().lower() in {"lgpd_aceitar", "lgpd_recusar", "rating_ruim", "rating_bom", "rating_excelente"}:
+            # Toque em botao interativo (marca interactive_reply, ex.: Continuar
+            # conversa / Encerrar conversa do lembrete) tambem nao e resposta.
+            if row.get("interactive_reply") or (row.get("msg_type") == "text" and str(row.get("content") or "").strip().lower() in {"lgpd_aceitar", "lgpd_recusar", "rating_ruim", "rating_bom", "rating_excelente", "lembrete_continuar", "lembrete_encerrar"}):
                 continue
             if row.get("visibility", "all") != "all" or row.get("msg_type") not in {"text", "audio", "image", "document", "video", "gif", "sticker", "location", "contacts"}:
                 continue
